@@ -61,7 +61,7 @@ version_from_git() {
 }
 
 VERSION="$(version_from_git)"
-OUTPUT_NAME="${PROJECT_NAME}-${VERSION}-merged.bin"
+OUTPUT_NAME="${PROJECT_NAME}-${VERSION}-full.bin"
 OTA_NAME="${PROJECT_NAME}-${VERSION}-ota.bin"
 
 # --- Build ------------------------------------------------------------------
@@ -82,7 +82,7 @@ cp "${PROJECT_DIR}/build/merged.bin" "${DIST_DIR}/${OUTPUT_NAME}"
 cp "${PROJECT_DIR}/build/${PROJECT_NAME}.bin" "${DIST_DIR}/${OTA_NAME}"
 
 # Convenience pointers to the most recent builds.
-ln -sf "${OUTPUT_NAME}" "${DIST_DIR}/${PROJECT_NAME}-latest-merged.bin"
+ln -sf "${OUTPUT_NAME}" "${DIST_DIR}/${PROJECT_NAME}-latest-full.bin"
 ln -sf "${OTA_NAME}" "${DIST_DIR}/${PROJECT_NAME}-latest-ota.bin"
 
 # --- Clean up transient artifacts -------------------------------------------

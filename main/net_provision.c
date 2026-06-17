@@ -359,37 +359,197 @@ static bool form_get(const char *body, const char *key, char *out, size_t out_si
 static const char PORTAL_HTML[] =
 "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>SomnoTrace Setup</title><style>"
-"body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0;display:flex;justify-content:center}"
-".card{max-width:420px;width:100%;padding:24px}"
-"h1{font-size:1.4rem;margin:.2em 0}p{color:#94a3b8}"
-"label{display:block;margin:14px 0 6px;font-weight:600}"
-"select,input{width:100%;padding:12px;border-radius:10px;border:1px solid #334155;background:#1e293b;color:#e2e8f0;box-sizing:border-box}"
-"button{margin-top:18px;width:100%;padding:13px;border:0;border-radius:10px;background:#22c55e;color:#04210f;font-weight:700;font-size:1rem;cursor:pointer}"
-"button.sec{background:#334155;color:#e2e8f0;margin-top:8px}"
-"#status{margin-top:14px;min-height:1.2em;color:#fbbf24}"
-"</style></head><body><div class=\"card\">"
-"<h1>SomnoTrace</h1><p>Select a WiFi network and enter the password.</p>"
-"<label for=\"ssid\">Network</label>"
-"<select id=\"ssid\"><option value=\"\">-- scan to list networks --</option></select>"
-"<button class=\"sec\" onclick=\"scan()\">Scan for networks</button>"
-"<label for=\"pass\">Password</label>"
-"<input id=\"pass\" type=\"password\" placeholder=\"WiFi password\">"
-"<button onclick=\"save()\">Save &amp; Reboot</button>"
-"<div id=\"status\"></div></div><script>"
-"function scan(){var s=document.getElementById('status');s.textContent='Scanning...';"
-"fetch('/scan').then(r=>r.json()).then(d=>{var sel=document.getElementById('ssid');"
-"sel.innerHTML='';d.sort((a,b)=>b.rssi-a.rssi);d.forEach(n=>{var o=document.createElement('option');"
-"o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm)'+(n.lock?' [SEC]':'');sel.appendChild(o);});"
-"s.textContent=d.length+' networks found';}).catch(e=>{s.textContent='Scan failed';});}"
-"function save(){var ssid=document.getElementById('ssid').value;var pass=document.getElementById('pass').value;"
-"if(!ssid){document.getElementById('status').textContent='Pick a network first';return;}"
-"document.getElementById('status').textContent='Saving...';"
-"fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-"body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)})"
-".then(r=>r.text()).then(t=>{document.getElementById('status').textContent='Saved. Rebooting...';})"
-".catch(e=>{document.getElementById('status').textContent='Save failed';});}"
-"window.onload=scan;</script></body></html>";
+"<link rel=\"manifest\" href=\"/manifest.json\">"
+"<title>SomnoTrace Portal</title><style>"
+":root{--bg-color:#f1f5f9;--card-bg:#f8fafc;--text-color:#0f172a;--text-muted:#64748b;--border-color:#e2e8f0;--accent-color:#10b981;--accent-hover:#059669;--btn-sec-bg:#e2e8f0;--btn-sec-text:#0f172a;--btn-sec-hover:#cbd5e1;--glow-color:rgba(16,185,129,0.2)}"
+"[data-theme=\"dark\"]{--bg-color:#0f172a;--card-bg:#1e293b;--text-color:#f1f5f9;--text-muted:#94a3b8;--border-color:#334155;--btn-sec-bg:#334155;--btn-sec-text:#f1f5f9;--btn-sec-hover:#475569;--glow-color:rgba(16,185,129,0.4)}"
+"body{margin:0;padding:0;background-color:var(--bg-color);color:var(--text-color);font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;transition:background-color .3s,color .3s}"
+".card{max-width:400px;width:100%;margin:16px;background-color:var(--card-bg);border:1px solid var(--border-color);border-radius:16px;padding:28px;box-shadow:0 10px 15px -3px rgba(0,0,0,0.1);box-sizing:border-box}"
+"header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}"
+".logo{font-size:1.3rem;font-weight:800;color:var(--accent-color)}"
+".theme-toggle{display:flex;background-color:var(--btn-sec-bg);border-radius:8px;padding:2px}"
+".theme-toggle button{background:none;border:none;color:var(--text-muted);padding:4px 8px;border-radius:6px;cursor:pointer;font-size:0.75rem;font-weight:600}"
+".theme-toggle button.active{background-color:var(--card-bg);color:var(--text-color);box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
+"h1{font-size:1.4rem;margin:0 0 6px 0;font-weight:700}"
+"p{color:var(--text-muted);font-size:0.9rem;margin:0 0 20px 0}"
+".form-group{margin-bottom:16px}"
+"label{display:block;font-size:0.8rem;font-weight:700;margin-bottom:6px;text-transform:uppercase;color:var(--text-muted)}"
+"select,input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border-color);background-color:var(--card-bg);color:var(--text-color);font-size:0.9rem;box-sizing:border-box;outline:none}"
+"select:focus,input:focus{border-color:var(--accent-color);box-shadow:0 0 0 2px var(--glow-color)}"
+"button.primary{width:100%;padding:12px;border-radius:8px;border:none;background-color:var(--accent-color);color:#04210f;font-size:0.95rem;font-weight:700;cursor:pointer}"
+"button.primary:hover{background-color:var(--accent-hover)}"
+"button.secondary{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border-color);background-color:var(--btn-sec-bg);color:var(--btn-sec-text);font-size:0.85rem;font-weight:600;cursor:pointer;margin-bottom:12px}"
+"button.secondary:hover{background-color:var(--btn-sec-hover)}"
+".status-msg{margin-top:12px;text-align:center;font-weight:600;font-size:0.85rem;min-height:1.2em;color:#fbbf24}"
+".connected-view{text-align:center;display:flex;flex-direction:column;align-items:center}"
+".status-icon{width:48px;height:48px;background-color:var(--glow-color);border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:16px;position:relative}"
+".status-icon::after{content:'';width:16px;height:16px;background-color:var(--accent-color);border-radius:50%;animation:pulse 2s infinite}"
+"@keyframes pulse{0%{transform:scale(0.95);box-shadow:0 0 0 0 var(--glow-color)}70%{transform:scale(1);box-shadow:0 0 0 8px rgba(16,185,129,0)}100%{transform:scale(0.95);box-shadow:0 0 0 0 rgba(16,185,129,0)}}"
+".ip-badge{font-family:monospace;font-size:1.1rem;background-color:var(--btn-sec-bg);color:var(--text-color);padding:6px 12px;border-radius:6px;margin-top:8px;border:1px solid var(--border-color)}"
+".wifi-block{border:1px solid var(--border-color);border-radius:12px;padding:16px;margin-bottom:16px;background-color:var(--bg-color);position:relative}"
+".block-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}"
+".block-title{font-size:0.75rem;font-weight:700;color:var(--text-muted);text-transform:uppercase}"
+".btn-remove{background:none;border:none;color:#ef4444;font-size:0.8rem;font-weight:600;cursor:pointer;padding:0}"
+".btn-remove:hover{text-decoration:underline}"
+".btn-toggle-input{background:none;border:none;color:var(--accent-color);font-size:0.75rem;font-weight:600;cursor:pointer;padding:0}"
+".btn-toggle-input:hover{text-decoration:underline}"
+".btn-pass-toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:1.1rem;padding:4px;color:var(--text-muted);outline:none}"
+".btn-add-container{margin-bottom:20px}"
+"button.add-btn{width:100%;padding:10px;border-radius:8px;border:1px dashed var(--border-color);background:none;color:var(--text-color);font-size:0.85rem;font-weight:600;cursor:pointer;transition:border-color 0.2s,background-color 0.2s}"
+"button.add-btn:hover{border-color:var(--accent-color);background-color:var(--glow-color)}"
+"</style></head><body>"
+"<div class=\"card\">"
+"<header><div class=\"logo\">SomnoTrace</div>"
+"<div class=\"theme-toggle\">"
+"<button id=\"btn-theme-day\" onclick=\"applyTheme('day')\">Day</button>"
+"<button id=\"btn-theme-night\" onclick=\"applyTheme('night')\">Night</button>"
+"<button id=\"btn-theme-auto\" onclick=\"applyTheme('auto')\">Auto</button>"
+"</div></header>"
+"<div id=\"view-setup\" style=\"display:none\">"
+"<h1>Setup Wi-Fi</h1><p>Configure up to 4 Wi-Fi networks.</p>"
+"<button class=\"secondary\" onclick=\"scan()\">Scan for networks</button>"
+"<div id=\"wifi-blocks\"></div>"
+"<div class=\"btn-add-container\">"
+"<button id=\"btn-add-wifi\" type=\"button\" class=\"add-btn\" onclick=\"addBlock()\">+ Add Another Wi-Fi Network</button>"
+"</div>"
+"<button class=\"primary\" onclick=\"save()\">Save &amp; Reboot</button>"
+"<button id=\"btn-back-status\" class=\"secondary\" style=\"margin-top:12px;display:none\" onclick=\"showConnected()\">Back to Status</button>"
+"<div id=\"status\" class=\"status-msg\"></div>"
+"</div>"
+"<div id=\"view-connected\" style=\"display:none\" class=\"connected-view\">"
+"<div class=\"status-icon\"></div>"
+"<h1>Connected</h1><p>The device has connected to the Wi-Fi network. You can reach it at:</p>"
+"<div id=\"ip-addr\" class=\"ip-badge\">0.0.0.0</div>"
+"<button class=\"secondary\" style=\"margin-top:24px\" onclick=\"showSetup()\">Configure Wi-Fi / Add Networks</button>"
+"</div>"
+"</div>"
+"<script>"
+"var activeBlocks = 1;"
+"var manualSSID = {};"
+"var passRevealed = {};"
+"var scannedNetworks = [];"
+"function initTheme(){applyTheme(localStorage.getItem('theme-mode')||'auto')}"
+"function applyTheme(m){"
+"const r=document.documentElement;let t='light';"
+"if(m==='night')t='dark';"
+"else if(m==='auto'){t=(new Date().getHours()>=8&&new Date().getHours()<20)?'light':'dark'}"
+"r.setAttribute('data-theme',t);localStorage.setItem('theme-mode',m);"
+"['day','night','auto'].forEach(x=>{const b=document.getElementById('btn-theme-'+x);"
+"if(b){if(x===m)b.classList.add('active');else b.classList.remove('active')}})}"
+"function loadStatus(){"
+"fetch('/api/status').then(r=>r.json()).then(d=>{"
+"const s=document.getElementById('view-setup'),c=document.getElementById('view-connected');"
+"const isWifiPath = window.location.pathname === '/wifi';"
+"const backBtn = document.getElementById('btn-back-status');"
+"if(d.mode==='connected'){if(backBtn)backBtn.style.display='block'}else{if(backBtn)backBtn.style.display='none'}"
+"if(d.ssids && d.ssids.length > 0){"
+"activeBlocks = d.ssids.length;"
+"for(let i=1;i<=d.ssids.length;i++){manualSSID[i]=true}"
+"}"
+"renderBlocks();"
+"if(d.ssids && d.ssids.length > 0){"
+"for(let i=1;i<=d.ssids.length;i++){"
+"const el=document.getElementById('ssid-'+i);"
+"if(el)el.value=d.ssids[i-1];"
+"}"
+"}"
+"if(d.mode==='setup' || isWifiPath){"
+"s.style.display='block';c.style.display='none';scan()}"
+"else{"
+"s.style.display='none';c.style.display='block';document.getElementById('ip-addr').textContent=d.ip}"
+"}).catch(()=>{renderBlocks();document.getElementById('view-setup').style.display='block';scan()})}"
+"function scan(){"
+"const s=document.getElementById('status');s.textContent='Scanning...';"
+"fetch('/scan').then(r=>r.json()).then(d=>{"
+"const unique={};"
+"d.forEach(n=>{if(!unique[n.ssid]||unique[n.ssid].rssi<n.rssi){unique[n.ssid]=n}});"
+"scannedNetworks=Object.values(unique).sort((a,b)=>b.rssi-a.rssi);"
+"s.textContent=scannedNetworks.length+' networks found';"
+"for(let i=1;i<=activeBlocks;i++){if(!manualSSID[i])populateSelect(i)}"
+"}).catch(()=>{s.textContent='Scan failed'})"
+"}"
+"function populateSelect(id){"
+"const sel=document.getElementById('ssid-'+id);if(!sel)return;"
+"const currentVal=sel.value;"
+"sel.innerHTML='<option value=\"\">-- select network --</option>';"
+"scannedNetworks.forEach(n=>{"
+"const o=document.createElement('option');o.value=n.ssid;"
+"o.textContent=n.ssid+' ('+n.rssi+' dBm)'+(n.lock?' 🔒':'');"
+"if(n.ssid===currentVal)o.selected=true;"
+"sel.appendChild(o)});"
+"}"
+"function renderBlocks(){"
+"const container=document.getElementById('wifi-blocks');"
+"const savedVals=[];"
+"for(let i=1;i<=4;i++){"
+"const sEl=document.getElementById('ssid-'+i),pEl=document.getElementById('pass-'+i);"
+"savedVals.push({ssid:sEl?sEl.value:'',pass:pEl?pEl.value:''})}"
+"container.innerHTML='';"
+"for(let i=1;i<=activeBlocks;i++){"
+"const block=document.createElement('div');block.className='wifi-block';"
+"block.innerHTML='<div class=\"block-header\"><span class=\"block-title\">Wi-Fi Network #'+i+'</span>'+"
+"(i>1?'<button type=\"button\" class=\"btn-remove\" onclick=\"removeBlock('+i+')\">Remove</button>':'')+'</div>'+"
+"'<div class=\"form-group\"><div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:6px\">'+"
+"'<label>SSID</label><button type=\"button\" class=\"btn-toggle-input\" id=\"btn-manual-'+i+'\" onclick=\"toggleManualSSID('+i+')\">Enter Manually</button></div>'+"
+"'<div id=\"ssid-container-'+i+'\"></div></div>'+"
+"'<div class=\"form-group\"><label>Password</label><div style=\"display:flex;position:relative\">'+"
+"'<input id=\"pass-'+i+'\" type=\"'+(passRevealed[i]?'text':'password')+'\" placeholder=\"Password\" style=\"padding-right:45px\">'+"
+"'<button type=\"button\" class=\"btn-pass-toggle\" onclick=\"togglePass('+i+')\">'+(passRevealed[i]?'🙈':'👁️')+'</button></div></div>';"
+"container.appendChild(block);"
+"const sCont=document.getElementById('ssid-container-'+i);"
+"if(manualSSID[i]){"
+"sCont.innerHTML='<input id=\"ssid-'+i+'\" type=\"text\" placeholder=\"Enter custom SSID\">';"
+"document.getElementById('btn-manual-'+i).textContent='Select Scanned'}"
+"else{"
+"sCont.innerHTML='<select id=\"ssid-'+i+'\"><option value=\"\">-- select network --</option></select>';"
+"document.getElementById('btn-manual-'+i).textContent='Enter Manually';"
+"populateSelect(i)}"
+"const sEl=document.getElementById('ssid-'+i),pEl=document.getElementById('pass-'+i);"
+"if(sEl&&savedVals[i-1])sEl.value=savedVals[i-1].ssid;"
+"if(pEl&&savedVals[i-1])pEl.value=savedVals[i-1].pass}"
+"const addBtn=document.getElementById('btn-add-wifi');"
+"if(addBtn)addBtn.style.display=(activeBlocks<4)?'block':'none'"
+"}"
+"function addBlock(){if(activeBlocks<4){activeBlocks++;renderBlocks()}}"
+"function removeBlock(idx){"
+"for(let i=idx;i<activeBlocks;i++){"
+"const nextSSID=document.getElementById('ssid-'+(i+1)),nextPass=document.getElementById('pass-'+(i+1));"
+"const currSSID=document.getElementById('ssid-'+i),currPass=document.getElementById('pass-'+i);"
+"if(currSSID&&nextSSID)currSSID.value=nextSSID.value;"
+"if(currPass&&nextPass)currPass.value=nextPass.value;"
+"manualSSID[i]=manualSSID[i+1];passRevealed[i]=passRevealed[i+1]}"
+"activeBlocks--;renderBlocks()}"
+"function toggleManualSSID(id){manualSSID[id]=!manualSSID[id];renderBlocks()}"
+"function togglePass(id){passRevealed[id]=!passRevealed[id];renderBlocks()}"
+"function showSetup(){"
+"document.getElementById('view-setup').style.display='block';"
+"document.getElementById('view-connected').style.display='none';"
+"scan();"
+"}"
+"function showConnected(){"
+"document.getElementById('view-setup').style.display='none';"
+"document.getElementById('view-connected').style.display='block';"
+"}"
+"function save(){"
+"const s=document.getElementById('status');let body='';"
+"let validCount=0;"
+"for(let i=1;i<=activeBlocks;i++){"
+"const ssidEl=document.getElementById('ssid-'+i),passEl=document.getElementById('pass-'+i);"
+"const ssid=ssidEl?ssidEl.value.trim():'',pass=passEl?passEl.value:'';"
+"if(ssid){"
+"if(body)body+='&';"
+"body+='ssid'+i+'='+encodeURIComponent(ssid)+'&pass'+i+'='+encodeURIComponent(pass);"
+"validCount++"
+"}"
+"}"
+"if(validCount===0){s.textContent='Please configure at least one network';return}"
+"s.textContent='Saving...';"
+"fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
+".then(r=>r.text()).then(()=>{s.textContent='Saved. Rebooting...';})"
+".catch(()=>{s.textContent='Save failed'})"
+"}"
+"window.onload=()=>{initTheme();loadStatus();if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')};"
+"</script></body></html>";
 
 static esp_err_t redirect_to_portal(httpd_req_t *req)
 {
@@ -402,22 +562,79 @@ static esp_err_t redirect_to_portal(httpd_req_t *req)
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    if (s_portal_mode) {
-        httpd_resp_send(req, PORTAL_HTML, HTTPD_RESP_USE_STRLEN);
-    } else {
-        char page[768];
-        snprintf(page, sizeof(page),
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<title>SomnoTrace</title><style>"
-            "body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;"
-            "display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}"
-            ".c{padding:24px}h1{color:#22c55e}code{font-size:1.3rem;background:#1e293b;padding:6px 12px;border-radius:8px}"
-            "</style></head><body><div class=\"c\"><h1>Connected</h1>"
-            "<p>This device is reachable at:</p><code>%s</code></div></body></html>",
-            s_connected_ip);
-        httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, PORTAL_HTML, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t manifest_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    const char manifest[] =
+        "{\n"
+        "  \"short_name\": \"SomnoTrace\",\n"
+        "  \"name\": \"SomnoTrace Web Portal\",\n"
+        "  \"start_url\": \"/\",\n"
+        "  \"background_color\": \"#0f172a\",\n"
+        "  \"theme_color\": \"#0f172a\",\n"
+        "  \"display\": \"standalone\",\n"
+        "  \"orientation\": \"any\",\n"
+        "  \"icons\": [\n"
+        "    {\n"
+        "      \"src\": \"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='%2310b981'/></svg>\",\n"
+        "      \"sizes\": \"192x192\",\n"
+        "      \"type\": \"image/svg+xml\"\n"
+        "    }\n"
+        "  ]\n"
+        "}";
+    httpd_resp_send(req, manifest, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t sw_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    const char sw[] =
+        "const CACHE_NAME = 'somnotrace-v1';\n"
+        "self.addEventListener('install', e => {\n"
+        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(['/', '/manifest.json'])));\n"
+        "});\n"
+        "self.addEventListener('fetch', e => {\n"
+        "  if (e.request.url.includes('/api/') || e.request.url.includes('/scan') || e.request.url.includes('/save')) {\n"
+        "    e.respondWith(fetch(e.request));\n"
+        "  } else {\n"
+        "    e.respondWith(caches.match(e.request).then(res => res || fetch(e.request)));\n"
+        "  }\n"
+        "});\n";
+    httpd_resp_send(req, sw, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t status_get_handler(httpd_req_t *req)
+{
+    struct netprov_config cfg;
+    bool has_cfg = netprov_load_config(&cfg);
+
+    char ssids_json[256] = "";
+    int added = 0;
+    if (has_cfg) {
+        for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
+            if (cfg.wifi[i].ssid[0] != '\0') {
+                char item[80];
+                snprintf(item, sizeof(item), "%s\"%s\"", added > 0 ? "," : "", cfg.wifi[i].ssid);
+                strlcat(ssids_json, item, sizeof(ssids_json));
+                added++;
+            }
+        }
     }
+
+    httpd_resp_set_type(req, "application/json");
+    char resp[512];
+    if (s_portal_mode) {
+        snprintf(resp, sizeof(resp), "{\"mode\":\"setup\",\"ssids\":[%s]}", ssids_json);
+    } else {
+        snprintf(resp, sizeof(resp), "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s]}", s_connected_ip, ssids_json);
+    }
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -463,7 +680,7 @@ static void reboot_task(void *arg)
 
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
-    char body[256];
+    char body[768];
     int total = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
     int received = 0;
     while (received < total) {
@@ -476,25 +693,38 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     }
     body[received] = '\0';
 
-    char ssid[NETPROV_SSID_MAXLEN + 1] = { 0 };
-    char pass[NETPROV_PASS_MAXLEN + 1] = { 0 };
-    if (!form_get(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
+    struct netprov_config cfg;
+    netprov_load_config(&cfg);
+    memset(cfg.wifi, 0, sizeof(cfg.wifi));
+
+    int saved_count = 0;
+    for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
+        char ssid_key[16];
+        char pass_key[16];
+        snprintf(ssid_key, sizeof(ssid_key), "ssid%d", i + 1);
+        snprintf(pass_key, sizeof(pass_key), "pass%d", i + 1);
+
+        char ssid[NETPROV_SSID_MAXLEN + 1] = { 0 };
+        char pass[NETPROV_PASS_MAXLEN + 1] = { 0 };
+
+        if (form_get(body, ssid_key, ssid, sizeof(ssid)) && ssid[0] != '\0') {
+            form_get(body, pass_key, pass, sizeof(pass));
+            strlcpy(cfg.wifi[saved_count].ssid, ssid, sizeof(cfg.wifi[saved_count].ssid));
+            strlcpy(cfg.wifi[saved_count].pass, pass, sizeof(cfg.wifi[saved_count].pass));
+            saved_count++;
+        }
+    }
+
+    if (saved_count == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ssid");
         return ESP_FAIL;
     }
-    form_get(body, "pass", pass, sizeof(pass));
-
-    /* Load existing config, overwrite slot 1, save */
-    struct netprov_config cfg;
-    netprov_load_config(&cfg);
-    strlcpy(cfg.wifi[0].ssid, ssid, sizeof(cfg.wifi[0].ssid));
-    strlcpy(cfg.wifi[0].pass, pass, sizeof(cfg.wifi[0].pass));
 
     if (netprov_save_config(&cfg) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs save failed");
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "saved credentials for SSID '%s'", ssid);
+    ESP_LOGI(TAG, "saved %d credentials", saved_count);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req,
@@ -524,12 +754,24 @@ static esp_err_t start_webserver(void)
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
     httpd_register_uri_handler(s_httpd, &root);
 
-    if (s_portal_mode) {
-        httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler };
-        httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
-        httpd_register_uri_handler(s_httpd, &scan);
-        httpd_register_uri_handler(s_httpd, &save);
+    httpd_uri_t wifi_uri = { .uri = "/wifi", .method = HTTP_GET, .handler = root_get_handler };
+    httpd_register_uri_handler(s_httpd, &wifi_uri);
 
+    httpd_uri_t manifest = { .uri = "/manifest.json", .method = HTTP_GET, .handler = manifest_get_handler };
+    httpd_register_uri_handler(s_httpd, &manifest);
+
+    httpd_uri_t sw = { .uri = "/sw.js", .method = HTTP_GET, .handler = sw_get_handler };
+    httpd_register_uri_handler(s_httpd, &sw);
+
+    httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
+    httpd_register_uri_handler(s_httpd, &status);
+
+    httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler };
+    httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
+    httpd_register_uri_handler(s_httpd, &scan);
+    httpd_register_uri_handler(s_httpd, &save);
+
+    if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */
         const char *probes[] = {
             "/hotspot-detect.html",

@@ -361,9 +361,9 @@ void bsp_display_show_lines(const char *title, const char *const *lines, int n_l
         int x = (LCD_H_RES - w) / 2;
         if (x < 4) x = 4;
         fb_draw_string_aa(x, y, &roboto_title, title, title_col);
-        y += 30; // advance baseline for body
+        y += 40; // advance baseline for body
     } else {
-        y = 50;  // baseline if no title
+        y = 60;  // baseline if no title
     }
 
     int line_h = roboto_body.height + 6;
