@@ -1,0 +1,13 @@
+# SomnoTrace default project configuration.
+# These defaults seed the generated (git-ignored) sdkconfig. Set the target
+# with: ./scripts/idf.sh set-target esp32s3
+
+# Target chip
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash: 16 MB, recommended for OTA + EDF staging. Adjust to your module.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Use the native USB Serial/JTAG for console/logging (USB-C).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
