@@ -17,16 +17,19 @@ code.
   structure.
 - When a spec changes materially, update its **Status** and **Changelog**.
 
-## Suggested initial specs
+## Index
 
 - `0001-airsense11-ble-sync.md` — discovering, pairing, and pulling therapy
-  data from the ResMed AirSense 11 over BLE.
-- `0002-edf-export.md` — mapping pulled data to EDF/EDF+ files.
+  data from the ResMed AirSense 11 over BLE. _(Draft stub)_
+- `0002-edf-export.md` — mapping pulled data to EDF/EDF+ files. _(Draft stub)_
 - `0003-o2ring-ble-sync.md` — retrieving overnight oximetry from the Wellue /
-  O2 Ring devices.
-- `0004-upload-smb.md` — SMB upload behaviour, paths, retries.
-- `0005-upload-sleephq.md` — SleepHQ upload/integration behaviour.
+  O2 Ring devices. _(Draft stub)_
+- `0004-upload-smb.md` — SMB upload behaviour, paths, retries. _(Draft stub)_
+- `0005-upload-sleephq.md` — SleepHQ upload/integration behaviour. _(Draft stub)_
 - `0006-device-provisioning.md` — Wi-Fi/credentials provisioning & config.
+  _(Draft stub)_
+- `0007-button-controls.md` — physical button navigation model and SoftAP entry
+  gesture. _(Accepted)_
 
-> These are placeholders to guide structure; create them as the design firms
-> up.
+> Draft stubs are placeholders to guide structure; flesh them out as the design
+> firms up.
