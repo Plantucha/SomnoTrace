@@ -29,6 +29,13 @@ determined to have been incorporated.
 - **Referenced for:** understanding of the Wellue / O2 Ring S BLE protocol.
 - **License:** MIT
 
+## Roboto Font
+
+- **Project:** Roboto Font
+- **Source:** https://github.com/google/fonts/tree/main/ofl/roboto
+- **Used for:** Display UI typeface
+- **License:** SIL Open Font License 1.1 (OFL)
+
 ---
 
 ## MIT License (reference text)

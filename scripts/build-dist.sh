@@ -62,6 +62,7 @@ version_from_git() {
 
 VERSION="$(version_from_git)"
 OUTPUT_NAME="${PROJECT_NAME}-${VERSION}-merged.bin"
+OTA_NAME="${PROJECT_NAME}-${VERSION}-ota.bin"
 
 # --- Build ------------------------------------------------------------------
 if [ "${DO_CLEAN}" -eq 1 ]; then
@@ -75,12 +76,14 @@ echo "==> Building firmware (version: ${VERSION})..."
 echo "==> Merging into a single image (flashable at 0x0)..."
 "${SCRIPT_DIR}/idf.sh" merge-bin -o merged.bin
 
-echo "==> Publishing image to dist/..."
+echo "==> Publishing images to dist/..."
 mkdir -p "${DIST_DIR}"
 cp "${PROJECT_DIR}/build/merged.bin" "${DIST_DIR}/${OUTPUT_NAME}"
+cp "${PROJECT_DIR}/build/${PROJECT_NAME}.bin" "${DIST_DIR}/${OTA_NAME}"
 
-# Convenience pointer to the most recent build.
+# Convenience pointers to the most recent builds.
 ln -sf "${OUTPUT_NAME}" "${DIST_DIR}/${PROJECT_NAME}-latest-merged.bin"
+ln -sf "${OTA_NAME}" "${DIST_DIR}/${PROJECT_NAME}-latest-ota.bin"
 
 # --- Clean up transient artifacts -------------------------------------------
 # The merged image is a derived convenience artifact; the rest of build/ is
@@ -91,3 +94,6 @@ echo ""
 echo "Done. Flash this file at offset 0x0:"
 echo "  ${DIST_DIR}/${OUTPUT_NAME}"
 ls -lh "${DIST_DIR}/${OUTPUT_NAME}"
+echo "OTA application image:"
+echo "  ${DIST_DIR}/${OTA_NAME}"
+ls -lh "${DIST_DIR}/${OTA_NAME}"

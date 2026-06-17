@@ -23,17 +23,131 @@
  */
 
 #include <stdio.h>
+#include <string.h>
+
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "bsp_power.h"
+#include "bsp_display.h"
+#include "net_provision.h"
+#include "esp_system.h"
+
 static const char *TAG = "somnotrace";
+static volatile bool s_softap_requested = false;
+
+static void show_status(const char *title, const char *lines[], int n)
+{
+    bsp_display_show_lines(title, lines, n);
+    for (int i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "  %s", lines[i]);
+    }
+}
+
+static void enter_softap(const struct netprov_config *cfg)
+{
+    bsp_display_set_wifi_connected(false);
+    char ap_ip[16] = "0.0.0.0";
+    esp_err_t err = netprov_start_portal(cfg, ap_ip);
+    if (err != ESP_OK) {
+        const char *lines[] = { "SoftAP failed" };
+        show_status("Error", lines, 1);
+        return;
+    }
+
+    char ssid_line[48];
+    snprintf(ssid_line, sizeof(ssid_line), "SSID: %s-setup", cfg->hostname);
+    const char *lines[] = {
+        "Wi-Fi Setup Mode",
+        ssid_line,
+        ap_ip,
+        "Connect and configure",
+    };
+    show_status("Setup", lines, 4);
+}
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "SomnoTrace starting up");
 
+    /* 1. Power latch — must be first or device powers off on button release. */
+    bsp_power_hold();
+
+    /* 2. Start button monitors. */
+    bsp_power_start_button_monitor(5000);   /* PWR 5 s = power off */
+    bsp_power_start_boot_monitor(&s_softap_requested, 5000);
+
+    /* 3. Initialise display. */
+    if (bsp_display_init() != ESP_OK) {
+        ESP_LOGE(TAG, "display init failed");
+    }
+
+    const char *boot_lines[] = { "Booting..." };
+    show_status("SomnoTrace", boot_lines, 1);
+
+    /* 4. Initialise networking stack. */
+    ESP_ERROR_CHECK(netprov_init());
+
+    /* 5. Load config from NVS. */
+    struct netprov_config cfg;
+    bool has_creds = netprov_load_config(&cfg);
+
+    /* 6. If BOOT was held at boot, force SoftAP regardless. */
+    if (s_softap_requested) {
+        ESP_LOGW(TAG, "BOOT long-press detected: forcing SoftAP");
+        enter_softap(&cfg);
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    /* 7. Try to connect to configured Wi-Fi. */
+    char ip[16] = "0.0.0.0";
+    esp_err_t err = ESP_FAIL;
+    if (has_creds) {
+        const char *lines[] = { "Connecting to Wi-Fi..." };
+        show_status("SomnoTrace", lines, 1);
+        err = netprov_try_connect(&cfg, ip, 15000);
+    }
+
+    bool in_softap = false;
+    uint32_t softap_start_ticks = 0;
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Wi-Fi connected, IP=%s", ip);
+        bsp_display_set_wifi_connected(true);
+        netprov_start_connected_server(ip);
+
+        char ip_line[32];
+        snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
+        const char *lines[] = {
+            "Wi-Fi Connected",
+            ip_line,
+            cfg.hostname,
+        };
+        show_status("SomnoTrace", lines, 3);
+    } else {
+        ESP_LOGW(TAG, "Wi-Fi connect failed, entering SoftAP");
+        enter_softap(&cfg);
+        in_softap = true;
+        softap_start_ticks = xTaskGetTickCount();
+    }
+
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        if (s_softap_requested && !in_softap) {
+            ESP_LOGW(TAG, "BOOT long-press detected at runtime: entering SoftAP");
+            in_softap = true;
+            enter_softap(&cfg);
+            softap_start_ticks = xTaskGetTickCount();
+        }
+        if (in_softap) {
+            uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - softap_start_ticks);
+            if (elapsed_ms >= 10 * 60 * 1000) { // 10 minutes idle timeout
+                ESP_LOGW(TAG, "SoftAP 10-minute idle timeout: rebooting to retry connection");
+                esp_restart();
+            }
+        }
     }
 }
