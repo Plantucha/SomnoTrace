@@ -30,6 +30,8 @@ code.
   _(Draft stub)_
 - `0007-button-controls.md` — physical button navigation model and SoftAP entry
   gesture. _(Accepted)_
+- `0008-config-and-network-lifecycle.md` — NVS configuration schema, Wi-Fi
+  selection/roaming logic, and SoftAP captive-portal fallback. _(Draft)_
 
 > Draft stubs are placeholders to guide structure; flesh them out as the design
 > firms up.
