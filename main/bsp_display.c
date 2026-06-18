@@ -313,6 +313,19 @@ void bsp_display_show_number(uint32_t value)
     esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
 }
 
+static uint16_t get_wifi_rssi_color(int rssi)
+{
+    if (rssi >= -60) {
+        return rgb565(0, 255, 120);   // Excellent: green
+    } else if (rssi >= -70) {
+        return rgb565(100, 255, 100);  // Good: vibrant light green
+    } else if (rssi >= -80) {
+        return rgb565(255, 220, 0);   // Fair: yellow
+    } else {
+        return rgb565(255, 50, 50);   // Poor: red
+    }
+}
+
 static void fb_draw_wifi_indicator(int x, int y)
 {
     if (!s_wifi_connected) {
@@ -331,7 +344,7 @@ static void fb_draw_wifi_indicator(int x, int y)
     else if (rssi >= -90) active_bars = 1;
 
     uint16_t inactive_col = rgb565(60, 60, 60);
-    uint16_t active_col = rgb565(0, 255, 120);
+    uint16_t active_col = get_wifi_rssi_color(rssi);
 
     // Draw 4 bars of increasing height
     for (int i = 0; i < 4; i++) {
@@ -339,6 +352,12 @@ static void fb_draw_wifi_indicator(int x, int y)
         int bar_h = (i + 1) * 4;
         fb_fill_rect(x + i * 5, y + 16 - bar_h, 3, bar_h, col);
     }
+
+    // Draw Wi-Fi signal strength in dB (e.g. "-65 dB") to the left of the icon in white
+    char rssi_str[16];
+    snprintf(rssi_str, sizeof(rssi_str), "%d dB", rssi);
+    int text_w = str_width_aa(&roboto_body, rssi_str);
+    fb_draw_string_aa(x - text_w - 6, y, &roboto_body, rssi_str, rgb565(255, 255, 255));
 }
 
 void bsp_display_show_lines(const char *title, const char *const *lines, int n_lines)
@@ -352,9 +371,20 @@ void bsp_display_show_lines(const char *title, const char *const *lines, int n_l
     fb_clear(bg);
 
     // Draw Wi-Fi signal strength indicator at the top right
-    fb_draw_wifi_indicator(215, 10);
+    fb_draw_wifi_indicator(218, 10);
 
-    int y = 45; // baseline for title
+    // Draw Wi-Fi channel indicator at the top left in white
+    if (s_wifi_connected) {
+        uint8_t primary_chan = 0;
+        wifi_second_chan_t second_chan;
+        if (esp_wifi_get_channel(&primary_chan, &second_chan) == ESP_OK) {
+            char ch_str[16];
+            snprintf(ch_str, sizeof(ch_str), "CH: %d", primary_chan);
+            fb_draw_string_aa(6, 10, &roboto_body, ch_str, rgb565(255, 255, 255));
+        }
+    }
+
+    int y = 48; // baseline for title
 
     if (title && title[0]) {
         int w = str_width_aa(&roboto_title, title);

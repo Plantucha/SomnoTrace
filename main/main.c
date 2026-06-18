@@ -33,6 +33,8 @@
 #include "bsp_display.h"
 #include "net_provision.h"
 #include "esp_system.h"
+#include "esp_wifi.h"
+
 
 static const char *TAG = "somnotrace";
 static volatile bool s_softap_requested = false;
@@ -121,12 +123,12 @@ void app_main(void)
 
         char ip_line[32];
         snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
+
         const char *lines[] = {
             "Wi-Fi Connected",
             ip_line,
-            cfg.hostname,
         };
-        show_status("SomnoTrace", lines, 3);
+        show_status("SomnoTrace", lines, 2);
     } else {
         ESP_LOGW(TAG, "Wi-Fi connect failed, entering SoftAP");
         enter_softap(&cfg);
@@ -134,6 +136,7 @@ void app_main(void)
         softap_start_ticks = xTaskGetTickCount();
     }
 
+    int refresh_counter = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (s_softap_requested && !in_softap) {
@@ -147,6 +150,19 @@ void app_main(void)
             if (elapsed_ms >= 10 * 60 * 1000) { // 10 minutes idle timeout
                 ESP_LOGW(TAG, "SoftAP 10-minute idle timeout: rebooting to retry connection");
                 esp_restart();
+            }
+        } else if (err == ESP_OK) {
+            // Wi-Fi is connected, refresh display periodically to update RSSI (every 3 seconds)
+            if (++refresh_counter >= 3) {
+                refresh_counter = 0;
+                char ip_line[32];
+                snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
+
+                const char *lines[] = {
+                    "Wi-Fi Connected",
+                    ip_line,
+                };
+                bsp_display_show_lines("SomnoTrace", lines, 2);
             }
         }
     }
