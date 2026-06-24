@@ -894,6 +894,183 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/*  EZShare-compatible file server (/dir, /download)                  */
+/* ------------------------------------------------------------------ */
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+#define SD_ROOT "/somnotrace"
+
+/* Check if path contains ".." (traversal protection) */
+static bool path_is_safe(const char *path)
+{
+    if (!path) return false;
+    if (strstr(path, "..")) return false;
+    return true;
+}
+
+/* URL-decode a query parameter value in-place */
+static int fs_url_decode(char *dst, const char *src, int max_len)
+{
+    int i = 0;
+    while (*src && i < max_len - 1) {
+        if (*src == '%' && src[1] && src[2]) {
+            int hi = src[1] >= 'A' ? (src[1] | 0x20) - 'a' + 10 : src[1] - '0';
+            int lo = src[2] >= 'A' ? (src[2] | 0x20) - 'a' + 10 : src[2] - '0';
+            dst[i++] = (char)((hi << 4) | lo);
+            src += 3;
+        } else if (*src == '+') {
+            dst[i++] = ' ';
+            src++;
+        } else {
+            dst[i++] = *src++;
+        }
+    }
+    dst[i] = '\0';
+    return i;
+}
+
+/* Extract a query parameter from the URI query string */
+static bool get_query_param(httpd_req_t *req, const char *key, char *out, int out_len)
+{
+    char buf[512];
+    int len = httpd_req_get_url_query_str(req, buf, sizeof(buf));
+    if (len <= 0) return false;
+
+    char key_eq[32];
+    snprintf(key_eq, sizeof(key_eq), "%s=", key);
+
+    char *p = strstr(buf, key_eq);
+    if (!p) return false;
+    p += strlen(key_eq);
+
+    char *end = strchr(p, '&');
+    int val_len = end ? (int)(end - p) : (int)strlen(p);
+    if (val_len <= 0) return false;
+
+    char raw[256];
+    if (val_len >= (int)sizeof(raw)) val_len = sizeof(raw) - 1;
+    memcpy(raw, p, val_len);
+    raw[val_len] = '\0';
+
+    fs_url_decode(out, raw, out_len);
+    return true;
+}
+
+static esp_err_t dir_get_handler(httpd_req_t *req)
+{
+    char dir_path[256];
+    if (!get_query_param(req, "dir", dir_path, sizeof(dir_path)) || dir_path[0] == '\0') {
+        strlcpy(dir_path, "/", sizeof(dir_path));
+    }
+
+    if (!path_is_safe(dir_path)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path");
+        return ESP_FAIL;
+    }
+
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "dir not found");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/html");
+
+    /* Build HTML <pre> listing — heap-allocated to avoid stack overflow */
+    char *html = malloc(4096);
+    if (!html) {
+        closedir(d);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    int pos = 0;
+    pos += snprintf(html + pos, 4096 - pos, "<html><body><pre>\n");
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && pos < 4096 - 128) {
+        if (ent->d_name[0] == '.') continue;
+
+        char full_path[530];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+
+        struct stat st;
+        if (stat(full_path, &st) != 0) continue;
+
+        char timestr[32];
+        struct tm tm;
+        localtime_r(&st.st_mtime, &tm);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm);
+
+        if (S_ISDIR(st.st_mode)) {
+            pos += snprintf(html + pos, 4096 - pos,
+                "%s    &lt;DIR&gt;    <a href=\"/dir?dir=%s/%s\">%s</a>\n",
+                timestr, dir_path, ent->d_name, ent->d_name);
+        } else {
+            pos += snprintf(html + pos, 4096 - pos,
+                "%s    %8ld    <a href=\"/download?path=%s/%s\">%s</a>\n",
+                timestr, (long)st.st_size, dir_path, ent->d_name, ent->d_name);
+        }
+    }
+    closedir(d);
+
+    pos += snprintf(html + pos, 4096 - pos, "</pre></body></html>\n");
+    httpd_resp_send(req, html, pos);
+    free(html);
+    return ESP_OK;
+}
+
+static esp_err_t download_get_handler(httpd_req_t *req)
+{
+    char file_path[256];
+    if (!get_query_param(req, "path", file_path, sizeof(file_path))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing path");
+        return ESP_FAIL;
+    }
+
+    if (!path_is_safe(file_path)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path");
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(file_path, "rb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
+        return ESP_FAIL;
+    }
+
+    struct stat st;
+    if (stat(file_path, &st) == 0) {
+        char len_str[16];
+        snprintf(len_str, sizeof(len_str), "%ld", (long)st.st_size);
+        httpd_resp_set_hdr(req, "Content-Length", len_str);
+    }
+
+    httpd_resp_set_type(req, "application/octet-stream");
+
+    /* Heap-allocate to avoid stack overflow */
+    char *buf = malloc(2048);
+    if (!buf) {
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    size_t n;
+    while ((n = fread(buf, 1, 2048, f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
+            free(buf);
+            fclose(f);
+            return ESP_FAIL;
+        }
+    }
+    free(buf);
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
@@ -904,7 +1081,7 @@ static esp_err_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 26;
 
     if (httpd_start(&s_httpd, &config) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start httpd");
@@ -942,6 +1119,12 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &ble_conf);
     httpd_register_uri_handler(s_httpd, &ble_stat);
     httpd_register_uri_handler(s_httpd, &ble_forget);
+
+    /* EZShare-compatible file server endpoints */
+    httpd_uri_t dir_hdl = { .uri = "/dir", .method = HTTP_GET, .handler = dir_get_handler };
+    httpd_uri_t dl_hdl = { .uri = "/download", .method = HTTP_GET, .handler = download_get_handler };
+    httpd_register_uri_handler(s_httpd, &dir_hdl);
+    httpd_register_uri_handler(s_httpd, &dl_hdl);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */

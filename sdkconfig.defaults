@@ -5,6 +5,20 @@
 # Target chip
 CONFIG_IDF_TARGET="esp32s3"
 
+# PSRAM: ESP32-S3R8 has 8 MB octal SPI RAM. The app runs Wi-Fi + BLE + SD/FATFS
+# + HTTP + a 240x240 LCD framebuffer concurrently, which exhausts the ~290 KB
+# internal RAM and makes the Wi-Fi SoftAP beacon / SDMMC DMA allocations fail.
+# We do NOT route Wi-Fi/LWIP or SDMMC buffers to PSRAM — those need internal
+# DMA-capable RAM. Instead we leave them internal and let only LARGE (>16 KB)
+# allocations (the LCD framebuffer, HTTP/cJSON scratch) spill into PSRAM, which
+# frees enough internal RAM for the DMA-critical buffers.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
 # Flash: 16 MB, recommended for OTA + EDF staging. Adjust to your module.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
@@ -26,6 +40,7 @@ CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 # Mobile browsers send very long headers during captive-portal detection.
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
 CONFIG_HTTPD_MAX_URI_LEN=512
+CONFIG_HTTPD_STACK_SIZE=8192
 
 # BLE: NimBLE host.  We are a central (GATT client) for AirSense 11, but
 # ROLE_PERIPHERAL + GATT_SERVER must also be enabled so that NimBLE compiles
@@ -52,3 +67,16 @@ CONFIG_BT_NIMBLE_DEBUG=y
 CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG=y
 CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# SD card (SDMMC 4-bit mode on GPIO 13-18)
+CONFIG_SDMMC_MAX_BLK_LEN=512
+
+# FatFS via VFS
+CONFIG_FATFS=y
+CONFIG_FATFS_VOLUME_COUNT=2
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_CODEPAGE=850
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_FS_LOCK=0
+CONFIG_FATFS_USE_LABEL=y
+CONFIG_FATFS_SECTOR_512=y

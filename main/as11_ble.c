@@ -39,6 +39,7 @@
  */
 
 #include "as11_ble.h"
+#include "session_writer.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -53,11 +54,14 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_rom_crc.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
 #include "mbedtls/sha256.h"
 #include "mbedtls/bignum.h"
+#include "mbedtls/aes.h"
+#include "mbedtls/md.h"
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -84,6 +88,8 @@ static const ble_uuid128_t UUID_RX =
 #define FIG_SYNC            0xCAFEBABEu
 #define FIG_HEADER_LEN      12               /* bytes 0x04..0x0f */
 #define FIG_VCID_TX         0x0393           /* plaintext, key-exchange only */
+#define FIG_VCID_TX_ENC     0x0397           /* encrypted TX (RPC requests) */
+#define FIG_VCID_RX_ENC     0x0396           /* encrypted RX (notifications/responses) */
 
 #define RX_BUF_MAX          4096
 #define TX_PAYLOAD_MAX      1024
@@ -139,6 +145,10 @@ static cJSON *s_resp_json;            /* owned; freed by waiter */
 
 static uint8_t s_rx_buf[RX_BUF_MAX];
 static int s_rx_len;
+
+/* Encrypted session state (set after reconnect or pairing). */
+static uint8_t s_session_key[32];       /* AES-256 key */
+static bool s_session_encrypted = false;
 
 static char s_target_name[32];
 static ble_addr_t s_target_addr;
@@ -240,6 +250,94 @@ static void sha256_segs(const uint8_t *const *segs, const size_t *lens,
     }
     mbedtls_sha256_finish(&c, out);
     mbedtls_sha256_free(&c);
+}
+
+/* HMAC-SHA256(key, data) -> out[32]. */
+static void hmac_sha256(const uint8_t *key, size_t key_len,
+                        const uint8_t *data, size_t data_len,
+                        uint8_t out[32])
+{
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_hmac(info, key, key_len, data, data_len, out);
+}
+
+/* AES-256-CBC encrypt with random IV.
+ * Wire format: [IV (16 bytes)][ciphertext([u16 len][payload][zero pad to 16])]
+ * Returns total output length (16 + padded_len) or -1 on error. */
+static int aes_cbc_encrypt(const uint8_t *key, const uint8_t *plaintext,
+                           int plen, uint8_t *out, int out_max)
+{
+    /* Frame: 2-byte LE length prefix + payload + zero padding to 16-byte boundary */
+    int framed_len = 2 + plen;
+    int pad_len = (16 - framed_len % 16) % 16;
+    int padded_len = framed_len + pad_len;
+    ESP_LOGI(TAG, "aes_cbc_encrypt: plen=%d framed=%d pad=%d padded=%d out_max=%d",
+             plen, framed_len, pad_len, padded_len, out_max);
+    if (16 + padded_len > out_max) {
+        ESP_LOGE(TAG, "aes_cbc_encrypt: output too large: %d > %d", 16 + padded_len, out_max);
+        return -1;
+    }
+
+    uint8_t *framed = out + 16;  /* ciphertext starts after IV */
+    framed[0] = plen & 0xFF;
+    framed[1] = (plen >> 8) & 0xFF;
+    memcpy(framed + 2, plaintext, plen);
+    memset(framed + 2 + plen, 0, pad_len);
+
+    /* Random IV — must be in a separate buffer because mbedtls_aes_crypt_cbc
+     * overwrites the IV in-place with the last ciphertext block. */
+    uint8_t iv[16];
+    esp_fill_random(iv, 16);
+    /* Copy IV to output before encryption (it won't be modified there) */
+    memcpy(out, iv, 16);
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    int rc_setkey = mbedtls_aes_setkey_enc(&aes, key, 256);
+    if (rc_setkey != 0) {
+        ESP_LOGE(TAG, "aes_cbc_encrypt: setkey_enc failed rc=%d", rc_setkey);
+        mbedtls_aes_free(&aes);
+        return -1;
+    }
+    int rc = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded_len,
+                                   iv, framed, framed);
+    mbedtls_aes_free(&aes);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "aes_cbc_encrypt: crypt_cbc failed rc=%d", rc);
+        return -1;
+    }
+    return 16 + padded_len;
+}
+
+/* AES-256-CBC decrypt.
+ * Input: [IV (16 bytes)][ciphertext]
+ * Output: plaintext (without the 2-byte length prefix), written to out.
+ * Returns plaintext length or -1 on error. */
+static int aes_cbc_decrypt(const uint8_t *key, const uint8_t *data,
+                           int data_len, uint8_t *out, int out_max)
+{
+    if (data_len < 32 || (data_len - 16) % 16 != 0) return -1;
+
+    const uint8_t *iv = data;
+    int ct_len = data_len - 16;
+    uint8_t *pt = out;  /* decrypt in-place into out */
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, key, 256);
+    int rc = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, ct_len,
+                                   (uint8_t *)iv, data + 16, pt);
+    mbedtls_aes_free(&aes);
+    if (rc != 0) return -1;
+
+    /* Read the 2-byte LE length prefix to get actual payload length */
+    if (ct_len < 2) return -1;
+    int plen = pt[0] | (pt[1] << 8);
+    if (plen < 0 || plen > ct_len - 2 || plen > out_max) return -1;
+
+    /* Move payload to start of out buffer */
+    memmove(out, pt + 2, plen);
+    return plen;
 }
 
 static void addr_to_str(const ble_addr_t *a, char *out /* >=18 */)
@@ -551,19 +649,36 @@ static void handle_notify(const uint8_t *data, int len)
     memcpy(s_rx_buf + s_rx_len, data, len);
     s_rx_len += len;
 
-    uint8_t payload[1024];
+    static uint8_t payload[1024];
+    static uint8_t decrypted[1024];
     uint16_t vcid;
     int n;
     while ((n = fig_take_packet(payload, sizeof(payload) - 1, &vcid)) >= 0) {
-        payload[n] = '\0';
         ESP_LOGI(TAG, "FIG packet received: vcid=0x%04x len=%d", vcid, n);
-        ESP_LOG_BUFFER_HEX(TAG, payload, n > 64 ? 64 : n); /* first 64 bytes for debug */
+        ESP_LOG_BUFFER_HEX(TAG, payload, n > 64 ? 64 : n);
+
+        /* Decrypt encrypted payloads (VCID 0x0396) using the session key. */
+        const uint8_t *parse_ptr = payload;
+        int            parse_len = n;
+
+        if (vcid == FIG_VCID_RX_ENC && s_session_encrypted) {
+            int dlen = aes_cbc_decrypt(s_session_key, payload, n,
+                                       decrypted, sizeof(decrypted) - 1);
+            if (dlen < 0) {
+                ESP_LOGW(TAG, "AES decrypt failed for vcid=0x%04x len=%d", vcid, n);
+                continue;
+            }
+            decrypted[dlen] = '\0';
+            parse_ptr = decrypted;
+            parse_len = dlen;
+            ESP_LOGI(TAG, "decrypted vcid=0x%04x len=%d", vcid, dlen);
+        } else {
+            payload[n] = '\0';
+        }
 
         /* Parse JSON.  The AS11 sometimes prepends a 2-byte LE length field
          * to the payload (same pattern as the Python reference client handles
          * in its fallback path).  Try plain first, then strip the prefix. */
-        const uint8_t *parse_ptr = payload;
-        int            parse_len = n;
         cJSON *msg = cJSON_ParseWithLength((const char *)parse_ptr, parse_len);
         if (!msg && parse_len > 2) {
             uint16_t inner = (uint16_t)(parse_ptr[0] | (parse_ptr[1] << 8));
@@ -581,8 +696,11 @@ static void handle_notify(const uint8_t *data, int len)
         cJSON *id = cJSON_GetObjectItem(msg, "id");
         cJSON *method = cJSON_GetObjectItem(msg, "method");
         if (method && !id) {
-            /* notification (e.g. HeartBeat) - ignore during pairing */
-            ESP_LOGD(TAG, "notification: %s", method->valuestring ? method->valuestring : "?");
+            /* Notification (e.g. HeartBeat, therapy events, data).
+             * Forward to session writer for therapy detection and data logging. */
+            const char *m = method->valuestring ? method->valuestring : "?";
+            ESP_LOGI(TAG, "notification: %s", m);
+            session_writer_on_notification(session_writer_get_active(), msg);
             cJSON_Delete(msg);
             continue;
         }
@@ -763,6 +881,63 @@ static esp_err_t send_fig(uint16_t vcid, const char *json)
         }
     }
     return ESP_OK;
+}
+
+/* Send a raw binary FIG packet (for encrypted payloads). */
+static esp_err_t send_fig_raw(uint16_t vcid, const uint8_t *data, int len)
+{
+    static uint8_t pkt[16 + TX_PAYLOAD_MAX];
+    if (len > TX_PAYLOAD_MAX) return ESP_ERR_INVALID_SIZE;
+    int total = fig_encode(vcid, data, (uint16_t)len, pkt);
+
+    ESP_LOGI(TAG, "send_fig_raw: VCID=0x%04x payload=%d total=%d", vcid, len, total);
+
+    int chunk = s_mtu > 3 ? s_mtu - 3 : 20;
+    for (int off = 0; off < total; off += chunk) {
+        int n = total - off;
+        if (n > chunk) n = chunk;
+        clear_op_sem();
+        int rc = ble_gattc_write_flat(s_conn_handle, s_tx_handle, pkt + off, n, on_write_done, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "write chunk failed rc=%d off=%d", rc, off);
+            return ESP_FAIL;
+        }
+        if (wait_op(5000) != 0) {
+            ESP_LOGE(TAG, "write chunk timeout off=%d", off);
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
+/* Send an encrypted JSON-RPC request on VCID 0x0397.
+ * Encrypts with AES-256-CBC using the session key, then sends via send_fig_raw.
+ * Returns ESP_OK on success. Caller should call wait_response() to get reply. */
+static esp_err_t send_rpc_encrypted(const char *json)
+{
+    if (!s_session_encrypted) {
+        ESP_LOGE(TAG, "send_rpc_encrypted: no session key");
+        return ESP_ERR_INVALID_STATE;
+    }
+    int plen = (int)strlen(json);
+    uint8_t *enc = heap_caps_malloc(TX_PAYLOAD_MAX, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!enc) {
+        enc = malloc(TX_PAYLOAD_MAX);
+        if (!enc) return ESP_ERR_NO_MEM;
+        ESP_LOGW(TAG, "send_rpc_encrypted: fell back to default malloc (PSRAM?)");
+    }
+
+    int enc_len = aes_cbc_encrypt(s_session_key, (const uint8_t *)json, plen,
+                                  enc, TX_PAYLOAD_MAX);
+    if (enc_len < 0) {
+        free(enc);
+        ESP_LOGE(TAG, "AES encrypt failed");
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = send_fig_raw(FIG_VCID_TX_ENC, enc, enc_len);
+    free(enc);
+    return ret;
 }
 
 /* Clear any stale RPC response state before sending a new RPC. */
@@ -1338,6 +1513,7 @@ static void confirm_task(void *arg)
     }
 
     ESP_LOGI(TAG, "paired with %s (clientId=%s)", addr_str, cid_buf);
+    session_writer_set_device_info(addr_str, cid_buf);
     set_state(AS11_STATUS_PAIRED);
     srp_free();
     /* leave the link up; later phases will subscribe to streams */
@@ -1345,8 +1521,287 @@ static void confirm_task(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/*  NimBLE host bring-up                                              */
+/*  Auto-reconnect (uses saved NVS pairing, no SRP needed)             */
 /* ------------------------------------------------------------------ */
+static void reconnect_task(void *arg)
+{
+    (void)arg;
+
+    /* Wait for NimBLE host to be ready */
+    int wait_ms = 0;
+    while (!s_host_ready && wait_ms < 10000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait_ms += 100;
+    }
+    if (!s_host_ready) {
+        ESP_LOGW(TAG, "reconnect: host not ready, aborting");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Load saved pairing info from NVS */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        ESP_LOGD(TAG, "reconnect: no NVS pairing");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char addr_str[24] = {0};
+    char name_str[32] = {0};
+    char cid_str[64]  = {0};
+    char pair_key_hex[65] = {0};
+    nvs_get_str_opt(h, NVS_K_ADDR, addr_str, sizeof(addr_str));
+    nvs_get_str_opt(h, NVS_K_NAME, name_str, sizeof(name_str));
+    nvs_get_str_opt(h, NVS_K_CLIENTID, cid_str, sizeof(cid_str));
+    nvs_get_str_opt(h, NVS_K_PAIRKEY, pair_key_hex, sizeof(pair_key_hex));
+    nvs_close(h);
+
+    if (addr_str[0] == '\0' || cid_str[0] == '\0' || pair_key_hex[0] == '\0') {
+        ESP_LOGD(TAG, "reconnect: incomplete NVS pairing");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "reconnect: connecting to %s (%s)", addr_str, name_str);
+
+    /* Parse address and set up target */
+    s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+    if (!str_to_addr(addr_str, &s_target_addr)) {
+        ESP_LOGE(TAG, "reconnect: bad addr '%s'", addr_str);
+        vTaskDelete(NULL);
+        return;
+    }
+    strlcpy(s_target_name, name_str, sizeof(s_target_name));
+
+    set_state(AS11_STATUS_CONNECTING);
+
+    if (do_connect_and_discover() != ESP_OK) {
+        ESP_LOGW(TAG, "reconnect: connect/discover failed: %s", as11_ble_get_error());
+        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        set_state(AS11_STATUS_IDLE);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Set device info for session metadata */
+    session_writer_set_device_info(addr_str, cid_str);
+
+    /* ---- Encrypted session establishment ----
+     * 1. RequestSession(clientId) -> {challenge, nonce}  [plaintext RPC]
+     * 2. response = HMAC-SHA256(K, challenge)
+     * 3. CheckSessionIntegrity(response)                  [plaintext RPC]
+     * 4. session_key = SHA256(K || nonce)
+     */
+    uint8_t K_bytes[32];
+    if (hex_to_bytes(pair_key_hex, K_bytes, sizeof(K_bytes)) != 32) {
+        ESP_LOGE(TAG, "reconnect: bad pair key");
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 1. RequestSession */
+    char *rpc = malloc(512);
+    snprintf(rpc, 512,
+             "{\"id\":10,\"jsonrpc\":\"2.0\",\"method\":\"RequestSession\","
+             "\"params\":{\"clientId\":\"%s\"}}", cid_str);
+    clear_response();
+    if (send_fig(FIG_VCID_TX, rpc) != ESP_OK) {
+        ESP_LOGE(TAG, "reconnect: RequestSession send failed");
+        free(rpc);
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+    free(rpc);
+
+    cJSON *resp = wait_response(10000);
+    if (!resp) {
+        ESP_LOGE(TAG, "reconnect: RequestSession timeout");
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    cJSON *challenge_j = result ? cJSON_GetObjectItem(result, "challenge") : NULL;
+    cJSON *nonce_j = result ? cJSON_GetObjectItem(result, "nonce") : NULL;
+    if (!cJSON_IsString(challenge_j) || !cJSON_IsString(nonce_j)) {
+        ESP_LOGE(TAG, "reconnect: RequestSession missing challenge/nonce");
+        cJSON_Delete(resp);
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 2. HMAC-SHA256(K, challenge) */
+    uint8_t challenge_bytes[64];
+    int ch_len = hex_to_bytes(challenge_j->valuestring, challenge_bytes, sizeof(challenge_bytes));
+    if (ch_len <= 0) {
+        ESP_LOGE(TAG, "reconnect: bad challenge hex");
+        cJSON_Delete(resp);
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t hmac_out[32];
+    hmac_sha256(K_bytes, 32, challenge_bytes, ch_len, hmac_out);
+    char response_hex[65];
+    bytes_to_hex(hmac_out, 32, response_hex);
+
+    /* Save nonce before deleting resp (needed for key derivation later) */
+    char nonce_hex_saved[130];
+    strlcpy(nonce_hex_saved, nonce_j->valuestring, sizeof(nonce_hex_saved));
+
+    ESP_LOGI(TAG, "reconnect: challenge=%s... response=%s...",
+             challenge_j->valuestring, response_hex);
+
+    /* 3. CheckSessionIntegrity */
+    rpc = malloc(512);
+    snprintf(rpc, 512,
+             "{\"id\":11,\"jsonrpc\":\"2.0\",\"method\":\"CheckSessionIntegrity\","
+             "\"params\":{\"response\":\"%s\"}}", response_hex);
+    clear_response();
+    if (send_fig(FIG_VCID_TX, rpc) != ESP_OK) {
+        ESP_LOGE(TAG, "reconnect: CheckSessionIntegrity send failed");
+        free(rpc);
+        cJSON_Delete(resp);
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+    free(rpc);
+    cJSON_Delete(resp);
+
+    resp = wait_response(10000);
+    if (!resp) {
+        ESP_LOGE(TAG, "reconnect: CheckSessionIntegrity timeout");
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+    cJSON *err = cJSON_GetObjectItem(resp, "error");
+    if (err) {
+        ESP_LOGE(TAG, "reconnect: CheckSessionIntegrity error: %s",
+                 cJSON_PrintUnformatted(err));
+        cJSON_Delete(resp);
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "reconnect: session integrity verified");
+    cJSON_Delete(resp);
+
+    /* 4. Derive session key = SHA256(K || nonce) */
+    uint8_t nonce_bytes[64];
+    int nonce_len = hex_to_bytes(nonce_hex_saved, nonce_bytes, sizeof(nonce_bytes));
+    if (nonce_len <= 0) {
+        ESP_LOGE(TAG, "reconnect: bad nonce hex");
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        set_state(AS11_STATUS_ERROR);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    {
+        const uint8_t *segs[] = { K_bytes, nonce_bytes };
+        size_t lens[] = { 32, (size_t)nonce_len };
+        sha256_segs(segs, lens, 2, s_session_key);
+    }
+    s_session_encrypted = true;
+    ESP_LOGI(TAG, "reconnect: session key derived");
+
+    /* Small delay to let the AS11 process the session establishment */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* ---- Test encrypted channel: Get device identity ---- */
+    rpc = malloc(512);
+    snprintf(rpc, 512,
+             "{\"id\":12,\"jsonrpc\":\"1.0\",\"method\":\"Get\","
+             "\"params\":[\"ProductGeographicIdentifier\",\"HardwareIdentifier\"]}");
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGW(TAG, "reconnect: Get (test) send failed");
+    } else {
+        resp = wait_response(10000);
+        if (resp) {
+            ESP_LOGI(TAG, "reconnect: Get (test) response received");
+            cJSON_Delete(resp);
+        } else {
+            ESP_LOGW(TAG, "reconnect: Get (test) timeout (non-fatal)");
+        }
+    }
+    free(rpc);
+
+    /* ---- Subscribe to therapy events (encrypted) ---- */
+    rpc = malloc(512);
+    snprintf(rpc, 512,
+             "{\"id\":13,\"jsonrpc\":\"1.0\",\"method\":\"SubscribeEvent\","
+             "\"params\":{\"dataIds\":["
+             "\"TherapyEvents-RespiratoryEvents\","
+             "\"UsageEvents-TherapyStatusEvents\""
+             "]}}");
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGW(TAG, "reconnect: SubscribeEvent send failed");
+    } else {
+        resp = wait_response(10000);
+        if (resp) {
+            ESP_LOGI(TAG, "reconnect: SubscribeEvent response received");
+            cJSON_Delete(resp);
+        } else {
+            ESP_LOGW(TAG, "reconnect: SubscribeEvent timeout (non-fatal)");
+        }
+    }
+    free(rpc);
+
+    /* ---- Start data stream (encrypted) ----
+     * BRP: PatientFlow + MaskPressure @ 40ms (25 Hz)
+     * PLD: 9 channels @ 2000ms (0.5 Hz)
+     * SA2: HeartRate + SpO2 @ 1000ms (1 Hz)
+     * StartStream applies one sampleIntervalMs to all, so use 40ms. */
+    rpc = malloc(800);
+    snprintf(rpc, 800,
+             "{\"id\":14,\"jsonrpc\":\"1.0\",\"method\":\"StartStream\","
+             "\"params\":{\"dataIds\":["
+             "\"PatientFlow-100hz\",\"MaskPressure-100hz\","
+             "\"MaskPressure-TwoSecond\",\"InspiratoryPressure-TwoSecond\","
+             "\"ExpiratoryPressure-TwoSecond\",\"Leak-50hz\",\"RespiratoryRate-50hz\","
+             "\"TidalVolume-50hz\",\"MinuteVentilation-50hz\",\"SnoreIndex-50hz\","
+             "\"FlowLimitation-50hz\",\"HeartRate\",\"SpO2\""
+             "],\"sampleIntervalMs\":40,\"reportIntervalMs\":200}}");
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGW(TAG, "reconnect: StartStream send failed");
+    } else {
+        resp = wait_response(10000);
+        if (resp) {
+            ESP_LOGI(TAG, "reconnect: StartStream response received");
+            cJSON_Delete(resp);
+        } else {
+            ESP_LOGW(TAG, "reconnect: StartStream timeout (non-fatal)");
+        }
+    }
+    free(rpc);
+
+    set_state(AS11_STATUS_PAIRED);
+    ESP_LOGI(TAG, "reconnect: connected to %s, session established, streams started", addr_str);
+
+    vTaskDelete(NULL);
+}
+
+
 static void on_sync(void)
 {
     int rc = ble_hs_util_ensure_addr(0);
@@ -1406,6 +1861,16 @@ esp_err_t as11_ble_init(void)
     
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "BLE initialised");
+
+    /* If we have saved pairing credentials, auto-reconnect to the AS11
+     * in the background. The reconnect task waits for host sync, loads
+     * the address from NVS, connects, discovers GATT services, and
+     * enables notifications — no SRP key exchange needed. */
+    if (as11_ble_is_paired()) {
+        ESP_LOGI(TAG, "saved pairing found, auto-reconnecting...");
+        xTaskCreate(reconnect_task, "as11_reconn", 8192, NULL, 5, NULL);
+    }
+
     return ESP_OK;
 }
 

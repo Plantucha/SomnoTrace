@@ -260,7 +260,14 @@ esp_err_t bsp_display_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 0));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
-    s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
+    /* Allocate the framebuffer from PSRAM. The ESP32-S3 GDMA can stream SPI
+     * pixel data directly from external RAM, so the ~115 KB framebuffer does
+     * not need scarce internal DMA-capable RAM (which Wi-Fi SoftAP beacon and
+     * SDMMC buffers require). Fall back to internal DMA RAM if PSRAM is absent. */
+    s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!s_fb) {
+        s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
+    }
     if (!s_fb) {
         ESP_LOGE(TAG, "framebuffer alloc failed");
         return ESP_ERR_NO_MEM;

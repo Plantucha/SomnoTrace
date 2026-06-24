@@ -33,6 +33,8 @@
 #include "bsp_display.h"
 #include "net_provision.h"
 #include "as11_ble.h"
+#include "sd_storage.h"
+#include "session_writer.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 
@@ -95,6 +97,14 @@ void app_main(void)
     /* 4b. Initialise BLE (AirSense 11 pairing). Non-fatal on failure. */
     if (as11_ble_init() != ESP_OK) {
         ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
+    }
+
+    /* 4c. Initialise SD card storage and session writer. Non-fatal. */
+    if (sd_storage_init() != ESP_OK) {
+        ESP_LOGE(TAG, "SD card init failed; session storage unavailable");
+    } else {
+        session_writer_init();
+        session_writer_recover();
     }
 
     /* 5. Load config from NVS. */
