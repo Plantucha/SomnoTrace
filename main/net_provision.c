@@ -4,6 +4,7 @@
  */
 
 #include "net_provision.h"
+#include "as11_ble.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -421,6 +422,23 @@ static const char PORTAL_HTML[] =
 "<h1>Connected</h1><p>The device has connected to the Wi-Fi network. You can reach it at:</p>"
 "<div id=\"ip-addr\" class=\"ip-badge\">0.0.0.0</div>"
 "<button class=\"secondary\" style=\"margin-top:24px\" onclick=\"showSetup()\">Configure Wi-Fi / Add Networks</button>"
+"<div class=\"wifi-block\" style=\"margin-top:20px;text-align:left\">"
+"<div class=\"block-header\"><span class=\"block-title\">CPAP Device</span>"
+"<button type=\"button\" id=\"btn-ble-forget\" class=\"btn-remove\" style=\"display:none\" onclick=\"bleForget()\">Forget</button></div>"
+"<div id=\"ble-paired\" style=\"display:none\">"
+"<p style=\"margin:0 0 10px 0\">Paired with <strong id=\"ble-dev-name\"></strong></p></div>"
+"<div id=\"ble-unpaired\">"
+"<button type=\"button\" class=\"secondary\" onclick=\"bleScan()\">Scan for AirSense 11</button>"
+"<div class=\"form-group\" id=\"ble-select-group\" style=\"display:none\">"
+"<label>Device</label><select id=\"ble-dev\"></select></div>"
+"<button type=\"button\" id=\"btn-ble-pair\" class=\"primary\" style=\"display:none\" onclick=\"blePair()\">Pair</button>"
+"<div class=\"form-group\" id=\"ble-passkey-group\" style=\"display:none;margin-top:12px\">"
+"<label>4-digit code shown on the device</label>"
+"<input id=\"ble-passkey\" type=\"text\" inputmode=\"numeric\" maxlength=\"4\" placeholder=\"1234\">"
+"<button type=\"button\" class=\"primary\" style=\"margin-top:10px\" onclick=\"bleConfirm()\">Confirm</button></div>"
+"</div>"
+"<div id=\"ble-status\" class=\"status-msg\"></div>"
+"</div>"
 "</div>"
 "</div>"
 "<script>"
@@ -548,7 +566,44 @@ static const char PORTAL_HTML[] =
 ".then(r=>r.text()).then(()=>{s.textContent='Saved. Rebooting...';})"
 ".catch(()=>{s.textContent='Save failed'})"
 "}"
-"window.onload=()=>{initTheme();loadStatus();if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')};"
+"var blePollTimer=null;"
+"function bleStatusMsg(t){document.getElementById('ble-status').textContent=t}"
+"function bleScan(){bleStatusMsg('Scanning for AirSense 11...');"
+"fetch('/api/ble/scan').then(r=>r.json()).then(d=>{"
+"var sel=document.getElementById('ble-dev');sel.innerHTML='';"
+"if(!d.length){bleStatusMsg('No AirSense 11 devices found');return}"
+"d.sort((a,b)=>b.rssi-a.rssi);d.forEach(n=>{var o=document.createElement('option');"
+"o.value=n.addr;o.textContent=n.name+' ('+n.rssi+' dBm)';sel.appendChild(o)});"
+"document.getElementById('ble-select-group').style.display='block';"
+"document.getElementById('btn-ble-pair').style.display='block';"
+"bleStatusMsg(d.length+' device(s) found')}).catch(()=>bleStatusMsg('Scan failed'))}"
+"function blePair(){var addr=document.getElementById('ble-dev').value;if(!addr){bleStatusMsg('Pick a device');return}"
+"bleStatusMsg('Connecting...');"
+"fetch('/api/ble/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addr:addr})})"
+".then(r=>r.json()).then(()=>blePoll()).catch(()=>bleStatusMsg('Pair failed'))}"
+"function bleConfirm(){var pk=document.getElementById('ble-passkey').value.trim();"
+"if(pk.length!==4){bleStatusMsg('Enter the 4-digit code');return}"
+"bleStatusMsg('Verifying...');"
+"fetch('/api/ble/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({passkey:pk})})"
+".then(r=>r.json()).then(()=>blePoll()).catch(()=>bleStatusMsg('Confirm failed'))}"
+"function bleForget(){if(!confirm('Forget the paired CPAP device?'))return;"
+"fetch('/api/ble/forget',{method:'POST'}).then(()=>bleRefresh())}"
+"function blePoll(){if(blePollTimer)clearInterval(blePollTimer);"
+"blePollTimer=setInterval(bleRefresh,1500);bleRefresh()}"
+"function bleRefresh(){fetch('/api/ble/status').then(r=>r.json()).then(d=>{"
+"var paired=document.getElementById('ble-paired'),unp=document.getElementById('ble-unpaired'),"
+"fgt=document.getElementById('btn-ble-forget'),pg=document.getElementById('ble-passkey-group');"
+"if(d.state==='waiting_passkey'){pg.style.display='block';bleStatusMsg('Enter the code shown on the device screen');return}"
+"if(d.state==='connecting'){bleStatusMsg('Connecting to device...');return}"
+"if(d.state==='confirming'){bleStatusMsg('Verifying code...');return}"
+"if(d.state==='error'){if(blePollTimer)clearInterval(blePollTimer);pg.style.display='none';bleStatusMsg('Error: '+(d.error||'pairing failed'));return}"
+"if(d.paired){if(blePollTimer)clearInterval(blePollTimer);"
+"paired.style.display='block';unp.style.display='none';fgt.style.display='block';pg.style.display='none';"
+"document.getElementById('ble-dev-name').textContent=(d.device&&d.device.name)||'AirSense 11';"
+"bleStatusMsg(d.state==='paired'?'Paired successfully':'')}"
+"else{paired.style.display='none';unp.style.display='block';fgt.style.display='none'}"
+"}).catch(()=>{})}"
+"window.onload=()=>{initTheme();loadStatus();bleRefresh();if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')};"
 "</script></body></html>";
 
 static esp_err_t redirect_to_portal(httpd_req_t *req)
@@ -670,6 +725,111 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/*  BLE (AirSense 11) pairing endpoints                               */
+/* ------------------------------------------------------------------ */
+static esp_err_t recv_body(httpd_req_t *req, char *buf, size_t cap)
+{
+    int total = req->content_len < (int)cap - 1 ? req->content_len : (int)cap - 1;
+    int received = 0;
+    while (received < total) {
+        int r = httpd_req_recv(req, buf + received, total - received);
+        if (r <= 0) return ESP_FAIL;
+        received += r;
+    }
+    buf[received] = '\0';
+    return ESP_OK;
+}
+
+static esp_err_t ble_scan_handler(httpd_req_t *req)
+{
+    if (as11_ble_scan(6) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ble not ready");
+        return ESP_FAIL;
+    }
+    cJSON *arr = as11_ble_get_scan_results();
+    char *json = cJSON_PrintUnformatted(arr);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(json);
+    cJSON_Delete(arr);
+    return ESP_OK;
+}
+
+static esp_err_t ble_pair_handler(httpd_req_t *req)
+{
+    char body[128];
+    if (recv_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+        return ESP_FAIL;
+    }
+    cJSON *j = cJSON_Parse(body);
+    cJSON *addr = j ? cJSON_GetObjectItem(j, "addr") : NULL;
+    if (!cJSON_IsString(addr)) {
+        if (j) cJSON_Delete(j);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing addr");
+        return ESP_FAIL;
+    }
+    esp_err_t e = as11_ble_start_pair(addr->valuestring);
+    cJSON_Delete(j);
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pair start failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t ble_confirm_handler(httpd_req_t *req)
+{
+    char body[96];
+    if (recv_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+        return ESP_FAIL;
+    }
+    cJSON *j = cJSON_Parse(body);
+    cJSON *pk = j ? cJSON_GetObjectItem(j, "passkey") : NULL;
+    if (!cJSON_IsString(pk)) {
+        if (j) cJSON_Delete(j);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing passkey");
+        return ESP_FAIL;
+    }
+    esp_err_t e = as11_ble_confirm_pair(pk->valuestring);
+    cJSON_Delete(j);
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "confirm failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t ble_status_handler(httpd_req_t *req)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "state", as11_ble_get_status());
+    cJSON_AddStringToObject(o, "error", as11_ble_get_error());
+    cJSON_AddBoolToObject(o, "paired", as11_ble_is_paired());
+    cJSON *info = as11_ble_get_paired_info();
+    if (info) cJSON_AddItemToObject(o, "device", info);
+    char *json = cJSON_PrintUnformatted(o);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(json);
+    cJSON_Delete(o);
+    return ESP_OK;
+}
+
+static esp_err_t ble_forget_handler(httpd_req_t *req)
+{
+    as11_ble_forget();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 static void reboot_task(void *arg)
 {
     (void)arg;
@@ -744,7 +904,7 @@ static esp_err_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 24;
 
     if (httpd_start(&s_httpd, &config) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start httpd");
@@ -770,6 +930,18 @@ static esp_err_t start_webserver(void)
     httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
     httpd_register_uri_handler(s_httpd, &scan);
     httpd_register_uri_handler(s_httpd, &save);
+
+    /* AirSense 11 BLE pairing endpoints */
+    httpd_uri_t ble_scan = { .uri = "/api/ble/scan", .method = HTTP_GET, .handler = ble_scan_handler };
+    httpd_uri_t ble_pair = { .uri = "/api/ble/pair", .method = HTTP_POST, .handler = ble_pair_handler };
+    httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
+    httpd_uri_t ble_stat = { .uri = "/api/ble/status", .method = HTTP_GET, .handler = ble_status_handler };
+    httpd_uri_t ble_forget = { .uri = "/api/ble/forget", .method = HTTP_POST, .handler = ble_forget_handler };
+    httpd_register_uri_handler(s_httpd, &ble_scan);
+    httpd_register_uri_handler(s_httpd, &ble_pair);
+    httpd_register_uri_handler(s_httpd, &ble_conf);
+    httpd_register_uri_handler(s_httpd, &ble_stat);
+    httpd_register_uri_handler(s_httpd, &ble_forget);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */

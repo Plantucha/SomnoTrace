@@ -26,3 +26,29 @@ CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 # Mobile browsers send very long headers during captive-portal detection.
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
 CONFIG_HTTPD_MAX_URI_LEN=512
+
+# BLE: NimBLE host.  We are a central (GATT client) for AirSense 11, but
+# ROLE_PERIPHERAL + GATT_SERVER must also be enabled so that NimBLE compiles
+# in ble_att_svr_rx_notify -- the ATT dispatch entry that generates
+# BLE_GAP_EVENT_NOTIFY_RX for incoming notifications.  Without it, the AS11's
+# responses are silently dropped at the ATT layer.  We never advertise.
+# See spec/0001-airsense11-ble-sync.md §4.4 and as11_ble.c file header.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+
+# WiFi + BLE coexistence
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=24
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_SIZE=256
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# CONFIG_BT_NIMBLE_SECURITY_ENABLE is not set
+CONFIG_BT_NIMBLE_DEBUG=y
+CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG=y
+CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

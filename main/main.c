@@ -32,6 +32,7 @@
 #include "bsp_power.h"
 #include "bsp_display.h"
 #include "net_provision.h"
+#include "as11_ble.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 
@@ -90,6 +91,11 @@ void app_main(void)
 
     /* 4. Initialise networking stack. */
     ESP_ERROR_CHECK(netprov_init());
+
+    /* 4b. Initialise BLE (AirSense 11 pairing). Non-fatal on failure. */
+    if (as11_ble_init() != ESP_OK) {
+        ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
+    }
 
     /* 5. Load config from NVS. */
     struct netprov_config cfg;
