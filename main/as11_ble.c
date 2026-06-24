@@ -1205,6 +1205,13 @@ static void pair_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    /* The AS11 shows the passkey as soon as it receives StartKeyExchange,
+     * well before it finishes sending the response.  Update the UI state
+     * now so the user can start entering the code while we wait for the
+     * response (serverPk + salt) in the background. */
+    set_state(AS11_STATUS_WAIT_PASSKEY);
+
     /* Post-send delay: give the AS11 time to process the packet before
      * we start waiting for the response (matches Python client). */
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -1233,7 +1240,6 @@ static void pair_task(void *arg)
     cJSON_Delete(resp);
 
     ESP_LOGI(TAG, "StartKeyExchange OK - device should show a 4-digit passkey");
-    set_state(AS11_STATUS_WAIT_PASSKEY);
     vTaskDelete(NULL);
 }
 
@@ -1244,6 +1250,11 @@ static void confirm_task(void *arg)
 
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         set_error("not connected"); vTaskDelete(NULL); return;
+    }
+    /* The StartKeyExchange response may still be arriving if the user
+     * entered the PIN quickly.  Wait up to 5 s for s_kex_ready. */
+    for (int i = 0; i < 50 && !s_kex_ready; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     if (!s_kex_ready) {
         set_error("no key-exchange state"); vTaskDelete(NULL); return;

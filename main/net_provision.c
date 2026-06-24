@@ -589,7 +589,7 @@ static const char PORTAL_HTML[] =
 "function bleForget(){if(!confirm('Forget the paired CPAP device?'))return;"
 "fetch('/api/ble/forget',{method:'POST'}).then(()=>bleRefresh())}"
 "function blePoll(){if(blePollTimer)clearInterval(blePollTimer);"
-"blePollTimer=setInterval(bleRefresh,1500);bleRefresh()}"
+"blePollTimer=setInterval(bleRefresh,500);bleRefresh()}"
 "function bleRefresh(){fetch('/api/ble/status').then(r=>r.json()).then(d=>{"
 "var paired=document.getElementById('ble-paired'),unp=document.getElementById('ble-unpaired'),"
 "fgt=document.getElementById('btn-ble-forget'),pg=document.getElementById('ble-passkey-group');"
