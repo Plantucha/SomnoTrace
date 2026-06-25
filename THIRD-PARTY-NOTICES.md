@@ -36,6 +36,16 @@ determined to have been incorporated.
 - **Used for:** Display UI typeface
 - **License:** SIL Open Font License 1.1 (OFL)
 
+## esp-idf-ftpServer
+
+- **Project:** esp-idf-ftpServer
+- **Source:** https://github.com/nopnop2002/esp-idf-ftpServer
+- **Used for:** lightweight FTP server for Wi-Fi file transfer to/from SD card
+- **License:** MIT (Copyright (c) 2021 nopnop2002, Copyright (c) 2018 LoBo)
+- **Notes:** Vendored in `third_party/esp-idf-ftpServer/`. Modified to use
+  `/somnotrace` as mount point, default to anonymous credentials, and remove
+  external event-group dependency.
+
 ---
 
 ## MIT License (reference text)

@@ -37,6 +37,7 @@
 #include "session_writer.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "ftp.h"
 
 
 static const char *TAG = "somnotrace";
@@ -136,6 +137,10 @@ void app_main(void)
         ESP_LOGI(TAG, "Wi-Fi connected, IP=%s", ip);
         bsp_display_set_wifi_connected(true);
         netprov_start_connected_server(ip);
+
+        if (sd_storage_is_ready()) {
+            ftp_server_start();
+        }
 
         char ip_line[32];
         snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
