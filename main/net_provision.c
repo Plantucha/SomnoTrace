@@ -711,13 +711,26 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     } else {
         strlcpy(time_str, "null", sizeof(time_str));
     }
+
+    int rssi = -128;
+    uint8_t primary_chan = 0;
+    wifi_second_chan_t second_chan;
+    esp_wifi_sta_get_rssi(&rssi);
+    esp_wifi_get_channel(&primary_chan, &second_chan);
+
     char resp[512];
     if (s_portal_mode) {
-        snprintf(resp, sizeof(resp), "{\"mode\":\"setup\",\"ssids\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s}",
-                 ssids_json, gmt, time_str, synced ? "true" : "false");
+        snprintf(resp, sizeof(resp),
+                 "{\"mode\":\"setup\",\"ssids\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s,"
+                 "\"rssi\":%d,\"channel\":%d}",
+                 ssids_json, gmt, time_str, synced ? "true" : "false",
+                 rssi, primary_chan);
     } else {
-        snprintf(resp, sizeof(resp), "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s}",
-                 s_connected_ip, ssids_json, gmt, time_str, synced ? "true" : "false");
+        snprintf(resp, sizeof(resp),
+                 "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s,"
+                 "\"rssi\":%d,\"channel\":%d}",
+                 s_connected_ip, ssids_json, gmt, time_str, synced ? "true" : "false",
+                 rssi, primary_chan);
     }
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;

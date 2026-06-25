@@ -54,6 +54,7 @@ static esp_lcd_panel_handle_t s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_io = NULL;
 static uint16_t *s_fb = NULL;
 static bool s_wifi_connected = false;
+static bool s_as11_paired = false;
 
 /* Strip blit: the framebuffer lives in PSRAM (not DMA-capable), so it is
  * pushed to the panel in chunks via small internal DMA-capable buffers.
@@ -501,6 +502,19 @@ void bsp_display_set_wifi_connected(bool connected)
     if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
+void bsp_display_set_as11_paired(bool paired)
+{
+    if (!s_state_mutex) {
+        s_as11_paired = paired;
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_as11_paired = paired;
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
 static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
 {
     for (int row = y; row < y + h; row++) {
@@ -621,12 +635,6 @@ static void fb_draw_wifi_indicator(int x, int y, bool connected)
         int bar_h = (i + 1) * 4;
         fb_fill_rect(x + i * 5, y + 16 - bar_h, 3, bar_h, col);
     }
-
-    // Draw Wi-Fi signal strength in dB (e.g. "-65 dB") to the left of the icon in white
-    char rssi_str[16];
-    snprintf(rssi_str, sizeof(rssi_str), "%d dB", rssi);
-    int text_w = str_width_aa(&roboto_body, rssi_str);
-    fb_draw_string_aa(x - text_w - 6, y, &roboto_body, rssi_str, rgb565(255, 255, 255));
 }
 
 void bsp_display_show_lines(const char *title, const char *const *lines, int n_lines)
@@ -733,7 +741,7 @@ static void render_graph(void)
     static float yf[LCD_H_RES];
     for (int j = 0; j < m; j++) {
         float val = local[(start + j) % FLOW_BUF_SIZE];
-        float y = mid_y + val * scale;
+        float y = mid_y - val * scale;  /* positive flow (inhale) → up */
         if (y < GRAPH_PLOT_TOP) y = GRAPH_PLOT_TOP;   /* static hard cut */
         if (y > GRAPH_PLOT_BOT) y = GRAPH_PLOT_BOT;
         yf[xbase + j] = y;
@@ -777,6 +785,7 @@ static void render_status(void)
     memcpy(lines, s_status_lines, sizeof(lines));
     nlines = s_status_nlines;
     wifi = s_wifi_connected;
+    bool as11_paired = s_as11_paired;
     xSemaphoreGive(s_state_mutex);
 
     const uint16_t bg = rgb565(0, 0, 0);
@@ -785,27 +794,29 @@ static void render_status(void)
 
     fb_clear(bg);
 
-    /* Clock display (top-right, before WiFi icon) */
+    /* Clock display (top-left) */
     time_t now = time(NULL);
     if (now > 1700000000) {  /* only show if NTP-synced (after ~Nov 2023) */
         struct tm tm_info;
         localtime_r(&now, &tm_info);
         char time_str[16];
         strftime(time_str, sizeof(time_str), "%H:%M", &tm_info);
-        int tw = str_width_aa(&roboto_body, time_str);
-        fb_draw_string_aa(218 - tw - 4, 10, &roboto_body, time_str, rgb565(200, 210, 225));
+        fb_draw_string_aa(6, 10, &roboto_body, time_str, rgb565(200, 210, 225));
     }
 
     fb_draw_wifi_indicator(218, 10, wifi);
 
-    if (wifi) {
-        uint8_t primary_chan = 0;
-        wifi_second_chan_t second_chan;
-        if (esp_wifi_get_channel(&primary_chan, &second_chan) == ESP_OK) {
-            char ch_str[16];
-            snprintf(ch_str, sizeof(ch_str), "CH: %d", primary_chan);
-            fb_draw_string_aa(6, 10, &roboto_body, ch_str, rgb565(255, 255, 255));
-        }
+    /* AS11 paired icon — small CPAP mask indicator to the left of WiFi bars */
+    if (as11_paired) {
+        int bx = 218 - 22;
+        int by = 10;
+        uint16_t icon_col = rgb565(100, 200, 255);
+        /* Simple mask icon: rounded rectangle body + nose bridge */
+        fb_fill_rect(bx, by + 4, 14, 10, icon_col);
+        fb_fill_rect(bx + 5, by + 2, 4, 4, icon_col);
+        /* Strap line */
+        for (int dx = 0; dx < 14; dx += 3)
+            fb_fill_rect(bx + dx, by + 14, 2, 2, icon_col);
     }
 
     int y = 48;

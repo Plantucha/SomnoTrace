@@ -40,6 +40,7 @@
 
 #include "as11_ble.h"
 #include "session_writer.h"
+#include "bsp_display.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -194,6 +195,7 @@ static void set_state(const char *st)
     xSemaphoreTake(s_state_mtx, portMAX_DELAY);
     s_state = st;
     xSemaphoreGive(s_state_mtx);
+    bsp_display_set_as11_paired(strcmp(st, AS11_STATUS_PAIRED) == 0);
 }
 
 static void set_error(const char *msg)
@@ -202,6 +204,7 @@ static void set_error(const char *msg)
     strlcpy(s_error, msg ? msg : "", sizeof(s_error));
     s_state = AS11_STATUS_ERROR;
     xSemaphoreGive(s_state_mtx);
+    bsp_display_set_as11_paired(false);
     ESP_LOGE(TAG, "error: %s", msg ? msg : "");
 }
 
