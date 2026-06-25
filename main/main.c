@@ -168,8 +168,11 @@ void app_main(void)
                 esp_restart();
             }
         } else if (err == ESP_OK) {
-            // Wi-Fi is connected, refresh display periodically to update RSSI (every 3 seconds)
-            if (++refresh_counter >= 3) {
+            /* Keep the status content current (IP line). The display render task
+             * owns the screen and auto-refreshes RSSI on its own cadence, and it
+             * automatically restores the status screen when therapy ends.
+             * Skipped during therapy (graph mode owns the display). */
+            if (++refresh_counter >= 3 && !bsp_display_is_therapy_active()) {
                 refresh_counter = 0;
                 char ip_line[32];
                 snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);

@@ -80,3 +80,9 @@ CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_FS_LOCK=0
 CONFIG_FATFS_USE_LABEL=y
 CONFIG_FATFS_SECTOR_512=y
+
+# mbedTLS: disable hardware AES — the ESP32-S3 AES accelerator intermittently
+# fails (MBEDTLS_ERR_PLATFORM_HW_ACCEL_FAILED) on larger payloads (>256 bytes)
+# when BLE + Wi-Fi coexistence is active. Software AES is fast enough for our
+# RPC encryption use case.
+CONFIG_MBEDTLS_HARDWARE_AES=n

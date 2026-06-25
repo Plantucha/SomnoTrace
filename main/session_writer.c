@@ -23,6 +23,7 @@
 
 #include "session_writer.h"
 #include "sd_storage.h"
+#include "bsp_display.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#include <errno.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -338,16 +340,45 @@ session_writer_t *session_writer_start(void)
     }
 
     make_session_id(s->session_id, sizeof(s->session_id));
+
+    /* Try to create the session directory. If it already exists (same-minute
+     * restart), append a suffix to keep session data separate. */
     snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_SESSIONS_DIR, s->session_id);
+    if (mkdir(s->dir, 0775) != 0) {
+        if (errno == EEXIST) {
+            /* Directory exists — try with _2, _3, etc. */
+            for (int suffix = 2; suffix < 100; suffix++) {
+                snprintf(s->dir, sizeof(s->dir), "%s/%s_%d",
+                         SD_SESSIONS_DIR, s->session_id, suffix);
+                if (mkdir(s->dir, 0775) == 0) break;
+            }
+            /* Update session_id to include the suffix for session.json */
+            char sid_with_suffix[64];
+            snprintf(sid_with_suffix, sizeof(sid_with_suffix),
+                     "%s_%d", s->session_id, 2);
+            /* Check if we found a valid dir */
+            struct stat st;
+            if (stat(s->dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                ESP_LOGE(TAG, "failed to create session dir for %s", s->session_id);
+                free(s);
+                xSemaphoreGive(s_active_mutex);
+                return NULL;
+            }
+            /* Update session_id to match the directory name */
+            char *last_slash = strrchr(s->dir, '/');
+            if (last_slash) {
+                strncpy(s->session_id, last_slash + 1, sizeof(s->session_id) - 1);
+            }
+        } else {
+            ESP_LOGE(TAG, "failed to create session dir %s", s->dir);
+            free(s);
+            xSemaphoreGive(s_active_mutex);
+            return NULL;
+        }
+    }
+
     s->start_time_us = esp_timer_get_time();
     s->active = true;
-
-    if (mkdir(s->dir, 0775) != 0) {
-        ESP_LOGE(TAG, "failed to create session dir %s", s->dir);
-        free(s);
-        xSemaphoreGive(s_active_mutex);
-        return NULL;
-    }
 
     /* Open files and write headers */
     char path[MAX_SESSION_DIR_LEN + 32];
@@ -525,10 +556,11 @@ static void parse_stream_data(session_writer_t *s, const cJSON *msg)
             if (strcmp(name, "PatientFlow-100hz") == 0) {
                 for (int j = 0; j < n_samples && s->brp_buf_count < 1500; j++) {
                     cJSON *v = cJSON_GetArrayItem(child, j);
-                    if (v && cJSON_IsNumber(v))
+                    if (v && cJSON_IsNumber(v)) {
                         s->brp_flow[s->brp_buf_count] = float_to_s16(v->valuedouble);
-                    else
+                    } else {
                         s->brp_flow[s->brp_buf_count] = INT16_MIN;
+                    }
                     s->brp_buf_count++;
                 }
             } else if (strcmp(name, "MaskPressure-100hz") == 0) {
@@ -639,6 +671,33 @@ static bool stream_data_has_active_flow(const cJSON *msg)
     return false;
 }
 
+/* Push PatientFlow samples from a StreamData notification to the display graph.
+ * Called regardless of whether the session is fully started — the display
+ * should show the breathing waveform as soon as therapy data arrives. */
+static void stream_data_push_flow(const cJSON *msg)
+{
+    cJSON *params = cJSON_GetObjectItem(msg, "params");
+    if (!params) return;
+    cJSON *data = cJSON_GetObjectItem(params, "data");
+    if (!data || !cJSON_IsArray(data)) return;
+
+    int n = cJSON_GetArraySize(data);
+    for (int i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(data, i);
+        if (!item) continue;
+        cJSON *flow = cJSON_GetObjectItem(item, "PatientFlow-100hz");
+        if (flow && cJSON_IsArray(flow)) {
+            int ns = cJSON_GetArraySize(flow);
+            for (int j = 0; j < ns; j++) {
+                cJSON *v = cJSON_GetArrayItem(flow, j);
+                if (v && cJSON_IsNumber(v)) {
+                    bsp_display_push_flow(v->valuedouble);
+                }
+            }
+        }
+    }
+}
+
 /* Write an event as a JSON line to events.ndjson */
 static void write_event(session_writer_t *s, const cJSON *msg)
 {
@@ -671,6 +730,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
 
         if (start) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
+            bsp_display_set_therapy_active(true);
             if (!s || !s->active) {
                 s = session_writer_start();
             }
@@ -679,6 +739,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         }
         if (stop) {
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
+            bsp_display_set_therapy_active(false);
             if (s && s->active) {
                 write_event(s, msg);
                 session_writer_stop(s);
@@ -692,11 +753,15 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
 
     /* Handle StreamData: route samples to buffers */
     if (strcmp(method_str, "StreamData") == 0) {
+        /* Push flow samples to display graph regardless of session state */
+        stream_data_push_flow(msg);
+
         /* Edge case: if no session active but flow is non-trivial,
          * therapy may have started before reboot — auto-start a session */
         if (!s || !s->active) {
             if (stream_data_has_active_flow(msg)) {
                 ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
+                bsp_display_set_therapy_active(true);
                 s = session_writer_start();
             }
         }

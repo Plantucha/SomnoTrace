@@ -6,9 +6,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "bsp_display.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -17,6 +19,9 @@
 #include "esp_lcd_panel_ops.h"
 #include "font_roboto.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #define LCD_PIN_SCLK        38
 #define LCD_PIN_MOSI        39
@@ -27,7 +32,7 @@
 
 #define LCD_H_RES           240
 #define LCD_V_RES           240
-#define LCD_PIXEL_CLOCK_HZ  (40 * 1000 * 1000)
+#define LCD_PIXEL_CLOCK_HZ  (80 * 1000 * 1000)
 #define LCD_SPI_HOST        SPI2_HOST
 #define LCD_CMD_BITS        8
 #define LCD_PARAM_BITS      8
@@ -35,9 +40,185 @@
 
 static const char *TAG = "bsp_display";
 
+/* Forward declarations */
+static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b);
+static void fb_clear(uint16_t color);
+static int fb_draw_string_aa(int x, int y, const font_info_t *font, const char *str, uint16_t color);
+static void fb_draw_wifi_indicator(int x, int y, bool connected);
+static void render_graph(void);
+static void render_status(void);
+static void display_task(void *arg);
+
 static esp_lcd_panel_handle_t s_panel = NULL;
+static esp_lcd_panel_io_handle_t s_io = NULL;
 static uint16_t *s_fb = NULL;
 static bool s_wifi_connected = false;
+
+/* Strip blit: the framebuffer lives in PSRAM (not DMA-capable), so it is
+ * pushed to the panel in chunks via small internal DMA-capable buffers.
+ * Two buffers are used so the DMA of one strip overlaps the CPU copy of the
+ * next (pipelining). A counting semaphore tracks completed transfers so a
+ * buffer is never reused while its DMA is still in flight. */
+#define LCD_STRIP_ROWS 40
+#define LCD_STRIP_BUFS 2
+static uint16_t *s_strip[LCD_STRIP_BUFS] = { NULL, NULL };
+static SemaphoreHandle_t s_flush_done = NULL;
+static TaskHandle_t s_display_task = NULL;
+
+/* ── Display state (single-owner render task model) ──────────────────
+ *
+ * Only the render task (display_task) ever touches the framebuffer s_fb
+ * or calls esp_lcd_panel_draw_bitmap(). Every other function merely
+ * mutates shared state under s_state_mutex and never draws. This makes
+ * the display impossible to corrupt via concurrent access and guarantees
+ * a clean full-frame redraw on every mode transition (no leftover
+ * artifacts, no partial frames, no stuck modes). */
+
+typedef enum {
+    DISP_MODE_STATUS = 0,
+    DISP_MODE_GRAPH,
+} disp_mode_t;
+
+#define FLOW_BUF_SIZE      240   /* one flow sample per pixel column */
+#define MAX_STATUS_LINES   4
+#define STATUS_TITLE_LEN   32
+#define STATUS_LINE_LEN    48
+
+#define DISPLAY_TASK_STACK 4096
+#define STATUS_FRAME_MS    1000  /* status refresh cadence (live RSSI) */
+
+/* ── Flow graph layout (static, non-adaptive) ───────────────────────────
+ * GRAPH_FULL_SCALE is the fixed full-scale deflection (L/min) from the zero
+ * line to the top/bottom of the plot. It is intentionally static so the view
+ * does not jitter; values beyond it clip at the plot edge (the "hard cut").
+ * Adjust this single constant to match the device's flow range. */
+#define GRAPH_FULL_SCALE   150.0f
+#define GRAPH_AXIS_W       34    /* left scale-axis gutter width (px) */
+#define GRAPH_PLOT_X0      GRAPH_AXIS_W
+#define GRAPH_PLOT_TOP     16
+#define GRAPH_PLOT_BOT     224
+#define GRAPH_PLOT_W       (LCD_H_RES - GRAPH_AXIS_W)
+
+static SemaphoreHandle_t s_state_mutex = NULL;  /* protects all shared state below */
+static disp_mode_t s_mode = DISP_MODE_STATUS;
+static bool s_status_dirty = true;              /* status content changed, force redraw */
+
+/* Status-screen content (copied from callers) */
+static char s_status_title[STATUS_TITLE_LEN];
+static char s_status_lines[MAX_STATUS_LINES][STATUS_LINE_LEN];
+static int  s_status_nlines = 0;
+
+/* Live flow ring buffer for the therapy graph */
+static float s_flow_buf[FLOW_BUF_SIZE];
+static int   s_flow_head = 0;
+static int   s_flow_count = 0;
+
+/* ── Public state-mutating API (never draws; render task handles drawing) ── */
+
+void bsp_display_set_therapy_active(bool active)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    disp_mode_t new_mode = active ? DISP_MODE_GRAPH : DISP_MODE_STATUS;
+    if (s_mode != new_mode) {
+        s_mode = new_mode;
+        if (active) {
+            s_flow_head = 0;
+            s_flow_count = 0;
+            ESP_LOGI(TAG, "therapy graph mode enabled");
+        } else {
+            s_status_dirty = true;  /* force immediate status redraw */
+            ESP_LOGI(TAG, "therapy graph mode disabled");
+        }
+    }
+    xSemaphoreGive(s_state_mutex);
+    /* Wake the render task so the mode change is reflected immediately. */
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+bool bsp_display_is_therapy_active(void)
+{
+    if (!s_state_mutex) return false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool active = (s_mode == DISP_MODE_GRAPH);
+    xSemaphoreGive(s_state_mutex);
+    return active;
+}
+
+void bsp_display_push_flow(float flow_lpm)
+{
+    if (!s_state_mutex) return;
+    bool notify = false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_mode == DISP_MODE_GRAPH) {
+        s_flow_buf[s_flow_head] = flow_lpm * 60.0f;
+        s_flow_head = (s_flow_head + 1) % FLOW_BUF_SIZE;
+        if (s_flow_count < FLOW_BUF_SIZE) s_flow_count++;
+        notify = true;
+    }
+    xSemaphoreGive(s_state_mutex);
+    /* Wake the render task so the graph advances at the data rate. Multiple
+     * notifications between renders coalesce into a single redraw. */
+    if (notify && s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+/* ── Framebuffer → panel blit ───────────────────────────────────────── */
+
+static bool IRAM_ATTR lcd_color_done_cb(esp_lcd_panel_io_handle_t io,
+                                        esp_lcd_panel_io_event_data_t *edata,
+                                        void *user_ctx)
+{
+    (void)io; (void)edata; (void)user_ctx;
+    BaseType_t hp = pdFALSE;
+    if (s_flush_done) xSemaphoreGiveFromISR(s_flush_done, &hp);
+    return hp == pdTRUE;
+}
+
+/* Push the entire PSRAM framebuffer to the LCD in horizontal strips.
+ *
+ * The framebuffer is in PSRAM, which is not DMA-capable for the SPI master,
+ * so a direct full-frame draw_bitmap() forces the driver to allocate a
+ * ~115 KB internal DMA bounce buffer every frame. That allocation fails once
+ * Wi-Fi and SDMMC have claimed internal RAM, silently dropping frames. By
+ * copying each strip into a small, permanently-allocated internal DMA buffer
+ * we guarantee the transfer always succeeds regardless of heap state. */
+static void lcd_flush(void)
+{
+    if (!s_panel || !s_fb) return;
+
+    if (!s_strip[0] || !s_flush_done) {
+        /* Fallback (e.g. strip alloc failed): single direct draw. */
+        esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
+        return;
+    }
+
+    int inflight = 0;
+    int bi = 0;
+    for (int y0 = 0; y0 < LCD_V_RES; y0 += LCD_STRIP_ROWS) {
+        int rows = LCD_V_RES - y0;
+        if (rows > LCD_STRIP_ROWS) rows = LCD_STRIP_ROWS;
+
+        /* Don't overwrite a buffer whose DMA is still running. */
+        if (inflight >= LCD_STRIP_BUFS) {
+            xSemaphoreTake(s_flush_done, portMAX_DELAY);
+            inflight--;
+        }
+
+        uint16_t *buf = s_strip[bi];
+        bi = (bi + 1) % LCD_STRIP_BUFS;
+        memcpy(buf, &s_fb[y0 * LCD_H_RES],
+               (size_t)rows * LCD_H_RES * sizeof(uint16_t));
+        /* Queue asynchronously; the DMA of this strip overlaps the memcpy of
+         * the next one (the completion callback gives s_flush_done). */
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y0, LCD_H_RES, y0 + rows, buf);
+        inflight++;
+    }
+    /* Drain remaining in-flight transfers. */
+    while (inflight > 0) {
+        xSemaphoreTake(s_flush_done, portMAX_DELAY);
+        inflight--;
+    }
+}
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -218,12 +399,19 @@ static int str_width_aa(const font_info_t *font, const char *str)
 
 esp_err_t bsp_display_init(void)
 {
+    /* The project's default log level is DEBUG; spi_master emits several DEBUG
+     * lines per DMA transaction. At the LCD's transfer rate that is a real CPU
+     * and I/O drain, so quiet it down to WARN regardless of the global level. */
+    esp_log_level_set("spi_master", ESP_LOG_WARN);
+
     gpio_config_t bl_cfg = {
         .mode = GPIO_MODE_OUTPUT,
         .pin_bit_mask = 1ULL << LCD_PIN_BL,
     };
     ESP_ERROR_CHECK(gpio_config(&bl_cfg));
     gpio_set_level(LCD_PIN_BL, 1);
+
+    s_flush_done = xSemaphoreCreateCounting(LCD_STRIP_BUFS, 0);
 
     spi_bus_config_t bus_cfg = {
         .sclk_io_num = LCD_PIN_SCLK,
@@ -244,8 +432,11 @@ esp_err_t bsp_display_init(void)
         .lcd_param_bits = LCD_PARAM_BITS,
         .spi_mode = 0,
         .trans_queue_depth = 10,
+        .on_color_trans_done = lcd_color_done_cb,
+        .user_ctx = NULL,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST, &io_cfg, &io));
+    s_io = io;
 
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = LCD_PIN_RST,
@@ -273,13 +464,40 @@ esp_err_t bsp_display_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Permanently allocate the internal DMA-capable strip buffers up front,
+     * while internal RAM is still free. */
+    for (int i = 0; i < LCD_STRIP_BUFS; i++) {
+        s_strip[i] = heap_caps_malloc(LCD_H_RES * LCD_STRIP_ROWS * sizeof(uint16_t),
+                                      MALLOC_CAP_DMA);
+        if (!s_strip[i]) {
+            ESP_LOGW(TAG, "strip buffer %d alloc failed; using direct flush", i);
+        }
+    }
+
+    /* Create the state mutex and start the single-owner render task. Only this
+     * task ever touches the framebuffer or the LCD panel. */
+    s_state_mutex = xSemaphoreCreateMutex();
+    if (s_state_mutex) {
+        xTaskCreate(display_task, "display", DISPLAY_TASK_STACK, NULL, 4, &s_display_task);
+    } else {
+        ESP_LOGE(TAG, "state mutex alloc failed, display task not started");
+    }
+
     ESP_LOGI(TAG, "ST7789 display initialised");
     return ESP_OK;
 }
 
 void bsp_display_set_wifi_connected(bool connected)
 {
+    if (!s_state_mutex) {
+        s_wifi_connected = connected;
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_wifi_connected = connected;
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
 static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
@@ -300,24 +518,67 @@ static void fb_clear(uint16_t color)
     }
 }
 
+/* Alpha-blend src over dst. Both are byte-swapped RGB565 (the on-wire format
+ * produced by rgb565()); a is 0..255 coverage. */
+static inline uint16_t blend565(uint16_t dst_sw, uint16_t src_sw, uint8_t a)
+{
+    uint16_t d = (uint16_t)((dst_sw >> 8) | (dst_sw << 8));
+    uint16_t s = (uint16_t)((src_sw >> 8) | (src_sw << 8));
+    uint16_t ia = (uint16_t)(255 - a);
+    uint16_t dr = (d >> 11) & 0x1F, dg = (d >> 5) & 0x3F, db = d & 0x1F;
+    uint16_t sr = (s >> 11) & 0x1F, sg = (s >> 5) & 0x3F, sb = s & 0x1F;
+    uint16_t rr = (uint16_t)((sr * a + dr * ia) / 255);
+    uint16_t rg = (uint16_t)((sg * a + dg * ia) / 255);
+    uint16_t rb = (uint16_t)((sb * a + db * ia) / 255);
+    uint16_t r = (uint16_t)((rr << 11) | (rg << 5) | rb);
+    return (uint16_t)((r >> 8) | (r << 8));
+}
+
+static inline void fb_blend(int x, int y, uint16_t color_sw, uint8_t a)
+{
+    if (a == 0 || x < 0 || x >= LCD_H_RES || y < 0 || y >= LCD_V_RES) return;
+    uint16_t *p = &s_fb[y * LCD_H_RES + x];
+    *p = blend565(*p, color_sw, a);
+}
+
+/* Antialiased line of given thickness, drawn via per-pixel distance coverage
+ * and alpha-blended at up to max_alpha. Round end caps. */
+static void fb_draw_line_aa(float x0, float y0, float x1, float y1,
+                            float thick, uint16_t color, uint8_t max_alpha)
+{
+    float half = thick * 0.5f;
+    int ix0 = (int)floorf(fminf(x0, x1) - half - 1.0f);
+    int ix1 = (int)ceilf(fmaxf(x0, x1) + half + 1.0f);
+    int iy0 = (int)floorf(fminf(y0, y1) - half - 1.0f);
+    int iy1 = (int)ceilf(fmaxf(y0, y1) + half + 1.0f);
+
+    float dx = x1 - x0, dy = y1 - y0;
+    float len2 = dx * dx + dy * dy;
+
+    for (int y = iy0; y <= iy1; y++) {
+        if (y < 0 || y >= LCD_V_RES) continue;
+        for (int x = ix0; x <= ix1; x++) {
+            if (x < 0 || x >= LCD_H_RES) continue;
+            float t = len2 > 0.0f ? ((x - x0) * dx + (y - y0) * dy) / len2 : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            float cx = x0 + t * dx, cy = y0 + t * dy;
+            float ex = x - cx, ey = y - cy;
+            float dist = sqrtf(ex * ex + ey * ey);
+            float cov = half + 0.5f - dist;   /* coverage in px */
+            if (cov <= 0.0f) continue;
+            if (cov > 1.0f) cov = 1.0f;
+            fb_blend(x, y, color, (uint8_t)(cov * max_alpha));
+        }
+    }
+}
+
 void bsp_display_show_number(uint32_t value)
 {
-    if (!s_panel || !s_fb) return;
-
-    const uint16_t bg = rgb565(0, 0, 0);
-    const uint16_t fg = rgb565(0, 255, 120);
-
-    fb_clear(bg);
-
     char buf[12];
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)value);
-
-    int w = str_width_aa(&roboto_title, buf);
-    int x = (LCD_H_RES - w) / 2;
-    int y = (LCD_V_RES - roboto_title.height) / 2 + roboto_title.ascender;
-    fb_draw_string_aa(x, y, &roboto_title, buf, fg);
-
-    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
+    const char *lines[] = { buf };
+    bsp_display_show_lines(NULL, lines, 1);
 }
 
 static uint16_t get_wifi_rssi_color(int rssi)
@@ -333,9 +594,9 @@ static uint16_t get_wifi_rssi_color(int rssi)
     }
 }
 
-static void fb_draw_wifi_indicator(int x, int y)
+static void fb_draw_wifi_indicator(int x, int y, bool connected)
 {
-    if (!s_wifi_connected) {
+    if (!connected) {
         return; // Not connected, don't draw indicator
     }
 
@@ -369,7 +630,153 @@ static void fb_draw_wifi_indicator(int x, int y)
 
 void bsp_display_show_lines(const char *title, const char *const *lines, int n_lines)
 {
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+
+    if (title) {
+        strncpy(s_status_title, title, STATUS_TITLE_LEN - 1);
+        s_status_title[STATUS_TITLE_LEN - 1] = '\0';
+    } else {
+        s_status_title[0] = '\0';
+    }
+
+    if (n_lines < 0) n_lines = 0;
+    if (n_lines > MAX_STATUS_LINES) n_lines = MAX_STATUS_LINES;
+    s_status_nlines = n_lines;
+    for (int i = 0; i < n_lines; i++) {
+        if (lines[i]) {
+            strncpy(s_status_lines[i], lines[i], STATUS_LINE_LEN - 1);
+            s_status_lines[i][STATUS_LINE_LEN - 1] = '\0';
+        } else {
+            s_status_lines[i][0] = '\0';
+        }
+    }
+
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+/* ── Render helpers — called ONLY by display_task ───────────────────── */
+
+/* Render the scrolling flow waveform with a fixed (static) vertical scale and
+ * a left scale axis. Snapshots the flow ring buffer under the state mutex,
+ * then draws without holding it so high-rate push_flow() callers are never
+ * blocked for long. */
+static void render_graph(void)
+{
     if (!s_panel || !s_fb) return;
+
+    const uint16_t bg        = rgb565(9, 11, 18);
+    const uint16_t grid_col  = rgb565(28, 32, 46);
+    const uint16_t zero_col  = rgb565(70, 78, 102);
+    const uint16_t axis_col  = rgb565(40, 46, 64);
+    const uint16_t flow_col  = rgb565(54, 247, 160);   /* sharp mint line */
+    const uint16_t glow_col  = rgb565(20, 205, 132);   /* soft glow */
+    const uint16_t fill_col  = rgb565(28, 150, 104);   /* area under curve */
+    const uint16_t label_col = rgb565(122, 134, 158);
+    const uint16_t unit_col  = rgb565(86, 96, 120);
+
+    static float local[FLOW_BUF_SIZE];
+    int n, head;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    n = s_flow_count;
+    head = s_flow_head;
+    memcpy(local, s_flow_buf, sizeof(local));
+    xSemaphoreGive(s_state_mutex);
+
+    fb_clear(bg);
+
+    const int mid_y  = (GRAPH_PLOT_TOP + GRAPH_PLOT_BOT) / 2;
+    const int half_h = (GRAPH_PLOT_BOT - GRAPH_PLOT_TOP) / 2;
+    const float scale = (float)half_h / GRAPH_FULL_SCALE;  /* px per L/min */
+
+    /* ── Grid + left scale axis ──────────────────────────────────────── */
+    const int tick_step = 50;  /* L/min between labelled ticks */
+    int nticks = (int)(GRAPH_FULL_SCALE / tick_step);
+    if (nticks < 1) nticks = 1;
+    for (int t = -nticks; t <= nticks; t++) {
+        int gy = mid_y + (int)lroundf(t * tick_step * scale);
+        if (gy < GRAPH_PLOT_TOP || gy > GRAPH_PLOT_BOT) continue;
+        if (t == 0) {
+            for (int x = GRAPH_PLOT_X0; x < LCD_H_RES; x++)
+                s_fb[gy * LCD_H_RES + x] = zero_col;
+        } else {
+            for (int x = GRAPH_PLOT_X0; x < LCD_H_RES; x += 5)
+                s_fb[gy * LCD_H_RES + x] = grid_col;
+        }
+        char tb[8];
+        snprintf(tb, sizeof(tb), "%d", t < 0 ? -t * tick_step : t * tick_step);
+        int tw = str_width_aa(&roboto_body, tb);
+        int tx = GRAPH_AXIS_W - 4 - tw;
+        if (tx < 1) tx = 1;
+        fb_draw_string_aa(tx, gy - roboto_body.height / 2, &roboto_body, tb, label_col);
+    }
+
+    /* Vertical time gridlines (anchored to the right/newest edge). */
+    for (int x = LCD_H_RES - 1; x >= GRAPH_PLOT_X0; x -= 42)
+        for (int y = GRAPH_PLOT_TOP; y <= GRAPH_PLOT_BOT; y += 5)
+            s_fb[y * LCD_H_RES + x] = grid_col;
+
+    /* Axis separator + unit label. */
+    for (int y = GRAPH_PLOT_TOP; y <= GRAPH_PLOT_BOT; y++)
+        s_fb[y * LCD_H_RES + (GRAPH_AXIS_W - 1)] = axis_col;
+    fb_draw_string_aa(GRAPH_AXIS_W + 3, 1, &roboto_body, "L/m", unit_col);
+
+    /* ── Waveform (static scale, right-aligned newest sample) ────────── */
+    int m = n;
+    if (m > GRAPH_PLOT_W) m = GRAPH_PLOT_W;
+    int start = (head - m + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
+    int xbase = LCD_H_RES - m;
+
+    static float yf[LCD_H_RES];
+    for (int j = 0; j < m; j++) {
+        float val = local[(start + j) % FLOW_BUF_SIZE];
+        float y = mid_y + val * scale;
+        if (y < GRAPH_PLOT_TOP) y = GRAPH_PLOT_TOP;   /* static hard cut */
+        if (y > GRAPH_PLOT_BOT) y = GRAPH_PLOT_BOT;
+        yf[xbase + j] = y;
+    }
+
+    /* Translucent area fill between the curve and the zero line. */
+    for (int j = 0; j < m; j++) {
+        int x = xbase + j;
+        int y0 = (int)(yf[x] < mid_y ? yf[x] : mid_y);
+        int y1 = (int)(yf[x] < mid_y ? mid_y : yf[x]);
+        for (int y = y0; y <= y1; y++)
+            fb_blend(x, y, fill_col, 30);
+    }
+
+    /* Soft glow pass, then the sharp antialiased line on top. */
+    for (int j = 1; j < m; j++) {
+        int x = xbase + j;
+        fb_draw_line_aa(x - 1, yf[x - 1], x, yf[x], 4.5f, glow_col, 45);
+    }
+    for (int j = 1; j < m; j++) {
+        int x = xbase + j;
+        fb_draw_line_aa(x - 1, yf[x - 1], x, yf[x], 2.0f, flow_col, 255);
+    }
+
+    lcd_flush();
+}
+
+/* Render the status screen. Snapshots content under the state mutex, then
+ * draws without holding it. RSSI is read live each refresh. */
+static void render_status(void)
+{
+    if (!s_panel || !s_fb) return;
+
+    char title[STATUS_TITLE_LEN];
+    char lines[MAX_STATUS_LINES][STATUS_LINE_LEN];
+    int nlines;
+    bool wifi;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    memcpy(title, s_status_title, sizeof(title));
+    memcpy(lines, s_status_lines, sizeof(lines));
+    nlines = s_status_nlines;
+    wifi = s_wifi_connected;
+    xSemaphoreGive(s_state_mutex);
 
     const uint16_t bg = rgb565(0, 0, 0);
     const uint16_t title_col = rgb565(0, 255, 120);
@@ -377,11 +784,9 @@ void bsp_display_show_lines(const char *title, const char *const *lines, int n_l
 
     fb_clear(bg);
 
-    // Draw Wi-Fi signal strength indicator at the top right
-    fb_draw_wifi_indicator(218, 10);
+    fb_draw_wifi_indicator(218, 10, wifi);
 
-    // Draw Wi-Fi channel indicator at the top left in white
-    if (s_wifi_connected) {
+    if (wifi) {
         uint8_t primary_chan = 0;
         wifi_second_chan_t second_chan;
         if (esp_wifi_get_channel(&primary_chan, &second_chan) == ESP_OK) {
@@ -391,23 +796,21 @@ void bsp_display_show_lines(const char *title, const char *const *lines, int n_l
         }
     }
 
-    int y = 48; // baseline for title
-
-    if (title && title[0]) {
+    int y = 48;
+    if (title[0]) {
         int w = str_width_aa(&roboto_title, title);
         int x = (LCD_H_RES - w) / 2;
         if (x < 4) x = 4;
         fb_draw_string_aa(x, y, &roboto_title, title, title_col);
-        y += 40; // advance baseline for body
+        y += 40;
     } else {
-        y = 60;  // baseline if no title
+        y = 60;
     }
 
     int line_h = roboto_body.height + 6;
     if (line_h < 18) line_h = 18;
-
-    for (int i = 0; i < n_lines; i++) {
-        if (!lines[i]) continue;
+    for (int i = 0; i < nlines; i++) {
+        if (!lines[i][0]) continue;
         int w = str_width_aa(&roboto_body, lines[i]);
         int x = (LCD_H_RES - w) / 2;
         if (x < 4) x = 4;
@@ -415,5 +818,47 @@ void bsp_display_show_lines(const char *title, const char *const *lines, int n_l
         y += line_h;
     }
 
-    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
+    lcd_flush();
+}
+
+/* The single owner of the framebuffer and LCD panel. Renders the current
+ * mode at a fixed cadence and on every mode/content change. */
+static void display_task(void *arg)
+{
+    (void)arg;
+    TickType_t last_render = 0;
+    disp_mode_t last_mode = (disp_mode_t)-1;
+
+    for (;;) {
+        /* Block until woken by new data / a state change (push_flow,
+         * set_therapy_active, show_lines, set_wifi_connected) or until the
+         * status refresh interval elapses. This drives the graph at exactly
+         * the data rate (25 Hz) with zero busy-polling; coalesced
+         * notifications mean we never render more often than data arrives. */
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(STATUS_FRAME_MS));
+
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        disp_mode_t mode = s_mode;
+        bool dirty = s_status_dirty;
+        s_status_dirty = false;
+        xSemaphoreGive(s_state_mutex);
+
+        bool mode_changed = (mode != last_mode);
+        TickType_t now = xTaskGetTickCount();
+
+        if (mode == DISP_MODE_GRAPH) {
+            /* Redraw on new data or when first entering graph mode. */
+            if (notified || mode_changed) {
+                render_graph();
+                last_render = now;
+            }
+        } else {
+            if (mode_changed || dirty ||
+                (now - last_render) >= pdMS_TO_TICKS(STATUS_FRAME_MS)) {
+                render_status();
+                last_render = now;
+            }
+        }
+        last_mode = mode;
+    }
 }
