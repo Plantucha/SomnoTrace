@@ -107,6 +107,7 @@ struct session_writer {
 
 static session_writer_t *s_active = NULL;
 static SemaphoreHandle_t s_active_mutex = NULL;
+static bool s_therapy_stopped = false;  /* set on TherapyStop, cleared on TherapyStart */
 
 static char s_device_addr[32] = {0};
 static char s_client_id[64] = {0};
@@ -727,24 +728,30 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         bool start = false, stop = false;
         check_event_notification(msg, &start, &stop);
 
+        /* Handle stop first so that a single message containing both
+         * TherapyStart + TherapyStop (quick start/stop) doesn't leave
+         * the display stuck in graph mode. */
+        if (stop) {
+            ESP_LOGI(TAG, ">>> THERAPY STOP detected");
+            s_therapy_stopped = true;
+            bsp_display_set_therapy_active(false);
+            if (s && s->active) {
+                write_event(s, msg);
+                session_writer_stop(s);
+                s = NULL;
+            }
+        }
         if (start) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
+            s_therapy_stopped = false;
             bsp_display_set_therapy_active(true);
             if (!s || !s->active) {
                 s = session_writer_start();
             }
             if (s) write_event(s, msg);
-            return;
         }
-        if (stop) {
-            ESP_LOGI(TAG, ">>> THERAPY STOP detected");
-            bsp_display_set_therapy_active(false);
-            if (s && s->active) {
-                write_event(s, msg);
-                session_writer_stop(s);
-            }
-            return;
-        }
+        if (start || stop) return;
+
         /* Other events (MaskOn, MaskOff, etc.) — write if session active */
         if (s && s->active) write_event(s, msg);
         return;
@@ -756,9 +763,10 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         stream_data_push_flow(msg);
 
         /* Edge case: if no session active but flow is non-trivial,
-         * therapy may have started before reboot — auto-start a session */
+         * therapy may have started before reboot — auto-start a session.
+         * Skip if we recently saw a TherapyStop (residual flow after stop). */
         if (!s || !s->active) {
-            if (stream_data_has_active_flow(msg)) {
+            if (!s_therapy_stopped && stream_data_has_active_flow(msg)) {
                 ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
                 bsp_display_set_therapy_active(true);
                 s = session_writer_start();
