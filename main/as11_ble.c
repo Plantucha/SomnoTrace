@@ -423,7 +423,7 @@ static int fig_take_packet(uint8_t *payload_out, int payload_max, uint16_t *vcid
             s_rx_len -= idx;
         }
         if (s_rx_len < 4 + FIG_HEADER_LEN) {
-            ESP_LOGI(TAG, "fig_take_packet: sync found, but waiting for header (%d bytes total)", s_rx_len);
+            ESP_LOGD(TAG, "fig_take_packet: sync found, but waiting for header (%d bytes total)", s_rx_len);
             return -1;
         }
 
@@ -441,7 +441,7 @@ static int fig_take_packet(uint8_t *payload_out, int payload_max, uint16_t *vcid
         }
         int total = 4 + FIG_HEADER_LEN + plen;
         if (s_rx_len < total) {
-            ESP_LOGI(TAG, "fig_take_packet: header OK, waiting for full payload (need %d, have %d)", total, s_rx_len);
+            ESP_LOGD(TAG, "fig_take_packet: header OK, waiting for full payload (need %d, have %d)", total, s_rx_len);
             return -1;   /* wait for more */
         }
 
@@ -640,7 +640,7 @@ static int on_dsc(uint16_t conn, const struct ble_gatt_error *err,
 
 static void handle_notify(const uint8_t *data, int len)
 {
-    ESP_LOGI(TAG, "handle_notify: len=%d", len);
+    ESP_LOGD(TAG, "handle_notify: len=%d", len);
     if (s_rx_len + len > RX_BUF_MAX) {
         ESP_LOGW(TAG, "rx buffer overflow, resetting");
         s_rx_len = 0;
@@ -654,8 +654,8 @@ static void handle_notify(const uint8_t *data, int len)
     uint16_t vcid;
     int n;
     while ((n = fig_take_packet(payload, sizeof(payload) - 1, &vcid)) >= 0) {
-        ESP_LOGI(TAG, "FIG packet received: vcid=0x%04x len=%d", vcid, n);
-        ESP_LOG_BUFFER_HEX(TAG, payload, n > 64 ? 64 : n);
+        ESP_LOGD(TAG, "FIG packet received: vcid=0x%04x len=%d", vcid, n);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, payload, n > 64 ? 64 : n, ESP_LOG_DEBUG);
 
         /* Decrypt encrypted payloads (VCID 0x0396) using the session key. */
         const uint8_t *parse_ptr = payload;
@@ -671,7 +671,7 @@ static void handle_notify(const uint8_t *data, int len)
             decrypted[dlen] = '\0';
             parse_ptr = decrypted;
             parse_len = dlen;
-            ESP_LOGI(TAG, "decrypted vcid=0x%04x len=%d", vcid, dlen);
+            ESP_LOGD(TAG, "decrypted vcid=0x%04x len=%d", vcid, dlen);
         } else {
             payload[n] = '\0';
         }
@@ -699,7 +699,7 @@ static void handle_notify(const uint8_t *data, int len)
             /* Notification (e.g. HeartBeat, therapy events, data).
              * Forward to session writer for therapy detection and data logging. */
             const char *m = method->valuestring ? method->valuestring : "?";
-            ESP_LOGI(TAG, "notification: %s", m);
+            ESP_LOGD(TAG, "notification: %s", m);
             session_writer_on_notification(session_writer_get_active(), msg);
             cJSON_Delete(msg);
             continue;
@@ -804,7 +804,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
         uint16_t notif_len = OS_MBUF_PKTLEN(event->notify_rx.om);
-        ESP_LOGI(TAG, "Notification RX: handle=%d len=%d", event->notify_rx.attr_handle, notif_len);
+        ESP_LOGD(TAG, "Notification RX: handle=%d len=%d", event->notify_rx.attr_handle, notif_len);
         if (notif_len > 0) {
             uint8_t *notif_data = malloc(notif_len);
             if (notif_data) {
@@ -1855,9 +1855,9 @@ esp_err_t as11_ble_init(void)
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
 
-    /* Enable NimBLE debug logging to see HCI traffic and internal L2CAP drops */
-    esp_log_level_set("NimBLE", ESP_LOG_DEBUG);
-    esp_log_level_set("NimBLE_HCI", ESP_LOG_DEBUG);
+    /* Quiet NimBLE's per-byte HCI hex dumps — warnings/errors only. */
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+    esp_log_level_set("NimBLE_HCI", ESP_LOG_WARN);
     
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "BLE initialised");

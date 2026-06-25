@@ -720,8 +720,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
 
     if (!method_str) return;
 
-    /* Log every notification at INFO level for protocol analysis */
-    ESP_LOGI(TAG, "notification: %s", method_str);
+    ESP_LOGD(TAG, "notification: %s", method_str);
 
     /* Handle EventNotification: check for TherapyStart/TherapyStop */
     if (strcmp(method_str, "EventNotification") == 0) {
