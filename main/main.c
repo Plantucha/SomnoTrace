@@ -38,6 +38,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "ftp.h"
+#include "time_sync.h"
 
 
 static const char *TAG = "somnotrace";
@@ -137,6 +138,7 @@ void app_main(void)
         ESP_LOGI(TAG, "Wi-Fi connected, IP=%s", ip);
         bsp_display_set_wifi_connected(true);
         netprov_start_connected_server(ip);
+        time_sync_init();
 
         if (sd_storage_is_ready()) {
             ftp_server_start();

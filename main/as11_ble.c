@@ -1335,6 +1335,8 @@ static esp_err_t do_connect_and_discover(void)
     return ESP_OK;
 }
 
+static void reconnect_task(void *arg);
+
 static void pair_task(void *arg)
 {
     (void)arg;
@@ -1516,7 +1518,15 @@ static void confirm_task(void *arg)
     session_writer_set_device_info(addr_str, cid_buf);
     set_state(AS11_STATUS_PAIRED);
     srp_free();
-    /* leave the link up; later phases will subscribe to streams */
+
+    /* Disconnect the pairing link; reconnect_task will re-establish
+     * the connection with encrypted session + stream subscriptions.
+     * Without this, therapy data never flows until a manual reboot. */
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    xTaskCreate(reconnect_task, "as11_reconn", 8192, NULL, 5, NULL);
     vTaskDelete(NULL);
 }
 

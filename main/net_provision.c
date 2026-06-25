@@ -5,6 +5,7 @@
 
 #include "net_provision.h"
 #include "as11_ble.h"
+#include "time_sync.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -413,6 +414,10 @@ static const char PORTAL_HTML[] =
 "<div class=\"btn-add-container\">"
 "<button id=\"btn-add-wifi\" type=\"button\" class=\"add-btn\" onclick=\"addBlock()\">+ Add Another Wi-Fi Network</button>"
 "</div>"
+"<div class=\"form-group\">"
+"<label>Timezone (GMT offset)</label>"
+"<select id=\"gmt-off\"><option value=\"0\">UTC (GMT+0)</option></select>"
+"</div>"
 "<button class=\"primary\" onclick=\"save()\">Save &amp; Reboot</button>"
 "<button id=\"btn-back-status\" class=\"secondary\" style=\"margin-top:12px;display:none\" onclick=\"showConnected()\">Back to Status</button>"
 "<div id=\"status\" class=\"status-msg\"></div>"
@@ -454,12 +459,22 @@ static const char PORTAL_HTML[] =
 "r.setAttribute('data-theme',t);localStorage.setItem('theme-mode',m);"
 "['day','night','auto'].forEach(x=>{const b=document.getElementById('btn-theme-'+x);"
 "if(b){if(x===m)b.classList.add('active');else b.classList.remove('active')}})}"
+"function populateGmtOff(saved){"
+"var sel=document.getElementById('gmt-off');if(!sel)return;"
+"sel.innerHTML='';"
+"for(var i=-12;i<=14;i++){"
+"var o=document.createElement('option');"
+"o.value=i;"
+"o.textContent='GMT'+(i>=0?'+':'')+i;"
+"if(i===saved)o.selected=true;"
+"sel.appendChild(o)}}"
 "function loadStatus(){"
 "fetch('/api/status').then(r=>r.json()).then(d=>{"
 "const s=document.getElementById('view-setup'),c=document.getElementById('view-connected');"
 "const isWifiPath = window.location.pathname === '/wifi';"
 "const backBtn = document.getElementById('btn-back-status');"
 "if(d.mode==='connected'){if(backBtn)backBtn.style.display='block'}else{if(backBtn)backBtn.style.display='none'}"
+"populateGmtOff(d.gmt_off||0);"
 "if(d.ssids && d.ssids.length > 0){"
 "activeBlocks = d.ssids.length;"
 "for(let i=1;i<=d.ssids.length;i++){manualSSID[i]=true}"
@@ -561,6 +576,8 @@ static const char PORTAL_HTML[] =
 "}"
 "}"
 "if(validCount===0){s.textContent='Please configure at least one network';return}"
+"var gmtEl=document.getElementById('gmt-off');"
+"if(gmtEl)body+='&gmt_off='+gmtEl.value;"
 "s.textContent='Saving...';"
 "fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
 ".then(r=>r.text()).then(()=>{s.textContent='Saved. Rebooting...';})"
@@ -683,11 +700,24 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
+    int gmt = time_sync_get_gmt_offset();
+    bool synced = time_sync_is_synced();
+    char time_str[32] = "";
+    time_t now = time(NULL);
+    if (now > 1700000000) {
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+        strftime(time_str, sizeof(time_str), "\"%Y-%m-%dT%H:%M:%S\"", &tm_info);
+    } else {
+        strlcpy(time_str, "null", sizeof(time_str));
+    }
     char resp[512];
     if (s_portal_mode) {
-        snprintf(resp, sizeof(resp), "{\"mode\":\"setup\",\"ssids\":[%s]}", ssids_json);
+        snprintf(resp, sizeof(resp), "{\"mode\":\"setup\",\"ssids\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s}",
+                 ssids_json, gmt, time_str, synced ? "true" : "false");
     } else {
-        snprintf(resp, sizeof(resp), "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s]}", s_connected_ip, ssids_json);
+        snprintf(resp, sizeof(resp), "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s}",
+                 s_connected_ip, ssids_json, gmt, time_str, synced ? "true" : "false");
     }
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -885,6 +915,16 @@ static esp_err_t save_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "saved %d credentials", saved_count);
+
+    /* Save GMT offset if present */
+    char gmt_str[8] = { 0 };
+    if (form_get(body, "gmt_off", gmt_str, sizeof(gmt_str)) && gmt_str[0] != '\0') {
+        int gmt = atoi(gmt_str);
+        if (gmt >= -12 && gmt <= 14) {
+            time_sync_set_gmt_offset(gmt);
+            ESP_LOGI(TAG, "saved GMT offset %d", gmt);
+        }
+    }
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req,

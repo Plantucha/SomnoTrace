@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 
 #include "bsp_display.h"
 #include "esp_log.h"
@@ -783,6 +784,17 @@ static void render_status(void)
     const uint16_t text_col = rgb565(255, 255, 255);
 
     fb_clear(bg);
+
+    /* Clock display (top-right, before WiFi icon) */
+    time_t now = time(NULL);
+    if (now > 1700000000) {  /* only show if NTP-synced (after ~Nov 2023) */
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+        char time_str[16];
+        strftime(time_str, sizeof(time_str), "%H:%M", &tm_info);
+        int tw = str_width_aa(&roboto_body, time_str);
+        fb_draw_string_aa(218 - tw - 4, 10, &roboto_body, time_str, rgb565(200, 210, 225));
+    }
 
     fb_draw_wifi_indicator(218, 10, wifi);
 

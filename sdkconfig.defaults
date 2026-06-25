@@ -86,3 +86,8 @@ CONFIG_FATFS_SECTOR_512=y
 # when BLE + Wi-Fi coexistence is active. Software AES is fast enough for our
 # RPC encryption use case.
 CONFIG_MBEDTLS_HARDWARE_AES=n
+
+# NTP time sync: parse DHCP option 42 for NTP servers, allow multiple servers
+# (DHCP-provided + fallback pools). SNTP poll mode re-syncs every hour.
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
