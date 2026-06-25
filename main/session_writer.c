@@ -259,7 +259,8 @@ static void flush_task(void *arg)
 {
     session_writer_t *s = (session_writer_t *)arg;
     while (s && s->active) {
-        vTaskDelay(pdMS_TO_TICKS(FLUSH_INTERVAL_SEC * 1000));
+        /* Wait for flush interval OR until woken by stop_task */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FLUSH_INTERVAL_SEC * 1000));
         if (s->active) {
             ESP_LOGI(TAG, "periodic flush tick");
             flush_all(s);
@@ -486,6 +487,23 @@ esp_err_t session_writer_stop(session_writer_t *s)
     s->end_epoch_ms = end_epoch_ms;
     if (have_drift) s->clock_drift_ms = clock_drift_ms;
 
+    /* Signal flush_task to exit BEFORE doing any cleanup.
+     * flush_task might be sleeping or about to call flush_all.
+     * By setting s->active=false and sending notification first,
+     * flush_task will see active==false and exit without touching files. */
+    if (s->flush_task_handle) {
+        xTaskNotifyGive(s->flush_task_handle);
+        int wait = 0;
+        while (eTaskGetState(s->flush_task_handle) != eDeleted && wait < 100) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            wait++;
+        }
+        if (wait >= 100) {
+            ESP_LOGW(TAG, "flush_task did not exit in 1s, proceeding anyway");
+        }
+        s->flush_task_handle = NULL;
+    }
+
     /* Final flush */
     flush_all(s);
 
@@ -506,20 +524,6 @@ esp_err_t session_writer_stop(session_writer_t *s)
              (unsigned)s->pld.sample_count);
 
     if (s_active == s) s_active = NULL;
-
-    /* Wait for flush_task to exit before destroying shared resources.
-     * flush_task checks s->active each loop; once false, it calls vTaskDelete. */
-    if (s->flush_task_handle) {
-        /* Give flush_task time to observe s->active == false and exit */
-        vTaskDelay(pdMS_TO_TICKS(100));
-        /* If still running, wait a bit more */
-        int wait = 0;
-        while (eTaskGetState(s->flush_task_handle) != eDeleted && wait < 20) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            wait++;
-        }
-        s->flush_task_handle = NULL;
-    }
 
     if (s->mutex) vSemaphoreDelete(s->mutex);
     free(s);
