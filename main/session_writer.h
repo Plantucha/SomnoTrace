@@ -53,6 +53,11 @@ esp_err_t session_writer_stop(session_writer_t *s);
  * If no session is active, therapy-start notifications will auto-start one. */
 void session_writer_on_notification(session_writer_t *s, const cJSON *msg);
 
+/* Fast-path processor for StreamData notifications using raw JSON.
+ * Bypasses cJSON tree building for the high-frequency StreamData path.
+ * Handles flow display push, active-flow detection, and sample routing. */
+void session_writer_on_stream_data_raw(const char *json, int len);
+
 /* Returns true if a session is currently active. */
 bool session_writer_is_active(const session_writer_t *s);
 

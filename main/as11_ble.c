@@ -69,6 +69,8 @@
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 
+#include <time.h>
+
 static const char *TAG = "as11_ble";
 
 /* ------------------------------------------------------------------ */
@@ -130,6 +132,12 @@ static uint16_t s_svc_start, s_svc_end;
 static uint16_t s_cccd_handle;
 static uint16_t s_mtu = 23;
 
+/* AS11 device clock captured before stream starts (epoch ms).
+ * Used to compute clock_drift_ms at session stop without sending
+ * RPCs during active streaming (which congests BLE buffers). */
+static int64_t s_as11_clock_ms = 0;
+static int64_t s_as11_clock_capture_ntp_ms = 0;
+
 /* Handles for characteristics discovered during full GATT scan.
  * The AS11 btmon trace shows BlueZ reads these by handle (ATT Read Request
  * opcode 0x0a), not by UUID (Read By Type opcode 0x08).  We must match. */
@@ -146,6 +154,17 @@ static cJSON *s_resp_json;            /* owned; freed by waiter */
 
 static uint8_t s_rx_buf[RX_BUF_MAX];
 static int s_rx_len;
+
+/* Notification processing queue — offloads heavy work from NimBLE host task.
+ * The host task just copies raw notification bytes and enqueues them;
+ * a dedicated task does FIG parsing, AES decrypt, cJSON, and dispatch. */
+#define NOTIF_QUEUE_LEN  64
+typedef struct {
+    uint8_t *data;
+    int      len;
+} notif_item_t;
+static QueueHandle_t s_notif_queue = NULL;
+static TaskHandle_t  s_notif_task  = NULL;
 
 /* Encrypted session state (set after reconnect or pairing). */
 static uint8_t s_session_key[32];       /* AES-256 key */
@@ -641,6 +660,22 @@ static int on_dsc(uint16_t conn, const struct ble_gatt_error *err,
     return 0;
 }
 
+static void handle_notify(const uint8_t *data, int len);
+
+/* Notification processing task — drains the queue and does the heavy
+ * FIG/AES/cJSON work off the NimBLE host task. */
+static void notif_proc_task(void *arg)
+{
+    (void)arg;
+    notif_item_t item;
+    while (1) {
+        if (xQueueReceive(s_notif_queue, &item, portMAX_DELAY) == pdTRUE) {
+            handle_notify(item.data, item.len);
+            free(item.data);
+        }
+    }
+}
+
 static void handle_notify(const uint8_t *data, int len)
 {
     ESP_LOGD(TAG, "handle_notify: len=%d", len);
@@ -679,9 +714,20 @@ static void handle_notify(const uint8_t *data, int len)
             payload[n] = '\0';
         }
 
-        /* Parse JSON.  The AS11 sometimes prepends a 2-byte LE length field
-         * to the payload (same pattern as the Python reference client handles
-         * in its fallback path).  Try plain first, then strip the prefix. */
+        /* Fast path: check if this is a StreamData notification.
+         * StreamData is high-frequency (~5/sec) and benefits from bypassing
+         * cJSON tree building. We scan the raw decrypted text for the method
+         * string. If it's StreamData, use the fast parser and skip cJSON. */
+        if (parse_len > 20) {
+            /* Ensure null-terminated for strstr */
+            ((char *)parse_ptr)[parse_len] = '\0';
+            if (strstr((const char *)parse_ptr, "\"method\":\"StreamData\"") != NULL) {
+                session_writer_on_stream_data_raw((const char *)parse_ptr, parse_len);
+                continue;
+            }
+        }
+
+        /* Slow path: full cJSON parse for events, RPC responses, etc. */
         cJSON *msg = cJSON_ParseWithLength((const char *)parse_ptr, parse_len);
         if (!msg && parse_len > 2) {
             uint16_t inner = (uint16_t)(parse_ptr[0] | (parse_ptr[1] << 8));
@@ -808,16 +854,27 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_NOTIFY_RX: {
         uint16_t notif_len = OS_MBUF_PKTLEN(event->notify_rx.om);
         ESP_LOGD(TAG, "Notification RX: handle=%d len=%d", event->notify_rx.attr_handle, notif_len);
-        if (notif_len > 0) {
+        if (notif_len > 0 && s_notif_queue) {
             uint8_t *notif_data = malloc(notif_len);
             if (notif_data) {
                 int rc = os_mbuf_copydata(event->notify_rx.om, 0, notif_len, notif_data);
                 if (rc == 0) {
-                    handle_notify(notif_data, notif_len);
+                    notif_item_t item = { .data = notif_data, .len = notif_len };
+                    if (xQueueSend(s_notif_queue, &item, 0) != pdTRUE) {
+                        /* Queue full — drop oldest, then enqueue */
+                        notif_item_t dropped;
+                        xQueueReceive(s_notif_queue, &dropped, 0);
+                        free(dropped.data);
+                        xQueueSend(s_notif_queue, &item, 0);
+                        notif_data = NULL;  /* owned by queue now */
+                        ESP_LOGW(TAG, "notif queue full, dropped 1 item");
+                    } else {
+                        notif_data = NULL;  /* owned by queue now */
+                    }
                 } else {
                     ESP_LOGE(TAG, "os_mbuf_copydata failed: %d", rc);
                 }
-                free(notif_data);
+                if (notif_data) free(notif_data);
             } else {
                 ESP_LOGE(TAG, "failed to allocate notif_data");
             }
@@ -1779,6 +1836,21 @@ static void reconnect_task(void *arg)
     }
     free(rpc);
 
+    /* ---- Query AS11 clock before starting stream ----
+     * GetDateTime must be sent before StartStream because active streaming
+     * congests BLE ACL buffers, making subsequent RPCs fail. */
+    {
+        int64_t as11_ms = 0;
+        if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
+            s_as11_clock_ms = as11_ms;
+            s_as11_clock_capture_ntp_ms = (int64_t)time(NULL) * 1000;
+            ESP_LOGI(TAG, "reconnect: AS11 clock captured: %lld ms (NTP=%lld)",
+                     (long long)as11_ms, (long long)s_as11_clock_capture_ntp_ms);
+        } else {
+            ESP_LOGW(TAG, "reconnect: GetDateTime failed — clock_drift_ms will be unavailable");
+        }
+    }
+
     /* ---- Start data stream (encrypted) ----
      * BRP: PatientFlow + MaskPressure @ 40ms (25 Hz)
      * PLD: 9 channels @ 2000ms (0.5 Hz)
@@ -1859,6 +1931,12 @@ esp_err_t as11_ble_init(void)
     if (!s_state_mtx || !s_op_sem || !s_connect_sem || !s_resp_sem || !s_scan_done) {
         return ESP_ERR_NO_MEM;
     }
+
+    /* Create notification queue and processing task */
+    s_notif_queue = xQueueCreate(NOTIF_QUEUE_LEN, sizeof(notif_item_t));
+    if (!s_notif_queue) return ESP_ERR_NO_MEM;
+    xTaskCreate(notif_proc_task, "notif_proc", 8192, NULL, 10, &s_notif_task);
+    ESP_LOGI(TAG, "notification processing task started");
 
     esp_err_t ret = nimble_port_init();
     if (ret != ESP_OK) {
@@ -2021,4 +2099,108 @@ esp_err_t as11_ble_forget(void)
     }
     set_state(AS11_STATUS_IDLE);
     return e;
+}
+
+/* Stop the AS11 data stream.
+ * With 64 ACL buffers + offloaded notification processing, outgoing RPCs
+ * can be sent while stream notifications are active. */
+esp_err_t as11_ble_stop_stream(void)
+{
+    /* No-op for now — the stream continues between sessions and is
+     * restarted on next reconnect. Stopping via CCCD would block RPC
+     * responses (which arrive as notifications on the same characteristic). */
+    return ESP_OK;
+}
+
+/* Compute clock drift from AS11 clock captured before stream start.
+ * Returns ESP_OK and stores drift in *out_drift_ms.
+ * drift = NTP_time - AS11_time (positive = AS11 clock is behind). */
+esp_err_t as11_ble_get_clock_drift(int64_t *out_drift_ms)
+{
+    if (!out_drift_ms) return ESP_ERR_INVALID_ARG;
+    if (s_as11_clock_ms == 0 || s_as11_clock_capture_ntp_ms == 0) {
+        ESP_LOGW(TAG, "get_clock_drift: no AS11 clock capture available");
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_drift_ms = s_as11_clock_capture_ntp_ms - s_as11_clock_ms;
+    ESP_LOGI(TAG, "get_clock_drift: drift=%lld ms (NTP=%lld AS11=%lld)",
+             (long long)*out_drift_ms,
+             (long long)s_as11_clock_capture_ntp_ms,
+             (long long)s_as11_clock_ms);
+    return ESP_OK;
+}
+
+/* Query the AS11 device clock via GetDateTime RPC.
+ * Returns ESP_OK and stores epoch milliseconds in *out_epoch_ms.
+ * The response format is {"result":{"dateTime":"2026-06-25T15:08:00.000Z"}}.
+ * Returns ESP_FAIL if the RPC fails or the response can't be parsed. */
+esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
+{
+    if (!out_epoch_ms) return ESP_ERR_INVALID_ARG;
+    if (!s_session_encrypted) {
+        ESP_LOGW(TAG, "get_datetime: no encrypted session");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const char *rpc = "{\"id\":20,\"jsonrpc\":\"1.0\",\"method\":\"GetDateTime\"}";
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGW(TAG, "get_datetime: send failed");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = wait_response(5000);
+    if (!resp) {
+        ESP_LOGW(TAG, "get_datetime: timeout");
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = ESP_FAIL;
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    if (result) {
+        cJSON *dt = cJSON_GetObjectItem(result, "dateTime");
+        if (dt && cJSON_IsString(dt)) {
+            /* Parse ISO 8601: "2026-06-25T15:08:00.000Z" */
+            struct tm tm = {0};
+            int ms = 0;
+            int parsed = sscanf(dt->valuestring, "%d-%d-%dT%d:%d:%d.%dZ",
+                                &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+                                &tm.tm_hour, &tm.tm_min, &tm.tm_sec, &ms);
+            if (parsed >= 6) {
+                tm.tm_year -= 1900;
+                tm.tm_mon -= 1;
+                /* Manual UTC epoch calculation (timegm not available in newlib) */
+                /* Days from 1970-01-01 to start of given year */
+                int year = tm.tm_year + 1900;
+                int days = (year - 1970) * 365L;
+                /* Add leap years */
+                for (int y = 1970; y < year; y++) {
+                    if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0))
+                        days++;
+                }
+                /* Days in months before the given month */
+                static const int mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                for (int m = 0; m < tm.tm_mon; m++) {
+                    days += mdays[m];
+                    if (m == 1 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)))
+                        days++;
+                }
+                days += tm.tm_mday - 1;
+                int64_t epoch = (int64_t)days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
+                *out_epoch_ms = epoch * 1000 + ms;
+                ret = ESP_OK;
+                ESP_LOGI(TAG, "get_datetime: AS11 clock = %s (%lld ms)",
+                         dt->valuestring, (long long)*out_epoch_ms);
+            }
+        }
+    }
+
+    if (ret != ESP_OK) {
+        char *s = cJSON_Print(resp);
+        ESP_LOGW(TAG, "get_datetime: parse failed: %s", s ? s : "?");
+        if (s) free(s);
+    }
+
+    cJSON_Delete(resp);
+    return ret;
 }

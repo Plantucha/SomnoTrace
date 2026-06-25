@@ -78,3 +78,17 @@ cJSON *as11_ble_get_paired_info(void);
 
 /* Erase stored pairing credentials from NVS. */
 esp_err_t as11_ble_forget(void);
+
+/* Stop the AS11 data stream (sends StartStream with empty dataIds).
+ * Call before as11_ble_get_datetime() to free BLE buffers. */
+esp_err_t as11_ble_stop_stream(void);
+
+/* Compute clock drift from AS11 clock captured before stream start.
+ * drift = NTP_time - AS11_time (positive = AS11 clock is behind).
+ * Returns ESP_OK and stores drift in *out_drift_ms. */
+esp_err_t as11_ble_get_clock_drift(int64_t *out_drift_ms);
+
+/* Query the AS11 device clock via GetDateTime RPC.
+ * Returns ESP_OK and stores epoch milliseconds in *out_epoch_ms.
+ * Requires an active encrypted BLE session with available ACL buffers. */
+esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms);

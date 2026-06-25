@@ -24,6 +24,7 @@
 #include "session_writer.h"
 #include "sd_storage.h"
 #include "bsp_display.h"
+#include "as11_ble.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -49,16 +50,19 @@ static const char *TAG = "session";
 #define SNT_VERSION     1
 
 typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t sample_rate_hz;    /* samples per second per channel */
-    uint16_t channel_count;     /* interleaved channels */
-    uint16_t record_size;       /* bytes per sample (ch_count * sizeof(int16_t)) */
-    uint32_t sample_count;      /* total samples written (per channel) */
-    uint32_t reserved;
-} snt_header_t;
+    uint32_t magic;            /* 0x534E5442 "SNTB"                  */
+    uint8_t  version;          /* format version (1)                  */
+    uint8_t  tier;             /* 0 = L0 raw, 1 = L1 MinMax          */
+    uint8_t  n_channels;       /* channels per record                 */
+    uint8_t  sample_bytes;     /* 2 (int16)                           */
+    uint16_t sample_hz_x10;   /* rate × 10 (250 = 25 Hz)            */
+    uint16_t reserved;
+    int64_t  start_epoch_ms;  /* session start (NTP clock)           */
+    uint32_t sample_count;    /* records written (updated each flush) */
+    uint32_t reserved2;
+} snt_header_t;              /* 32 bytes */
 
-#define SNT_HEADER_SIZE  sizeof(snt_header_t)   /* 20 bytes */
+#define SNT_HEADER_SIZE  sizeof(snt_header_t)   /* 32 bytes */
 
 /* ── Session state ────────────────────────────────────────────────── */
 
@@ -76,30 +80,35 @@ typedef struct {
 struct session_writer {
     char     dir[MAX_SESSION_DIR_LEN];
     char     session_id[16];      /* YYYYMMDD_HHMM */
-    int64_t  start_time_us;
-    int64_t  end_time_us;
+    int64_t  start_time_us;       /* boot-relative us (for duration) */
+    int64_t  start_epoch_ms;      /* NTP epoch ms at session start */
+    int64_t  end_time_us;         /* boot-relative us (for duration) */
+    int64_t  end_epoch_ms;        /* NTP epoch ms at session stop */
     bool     active;
 
-    stream_files_t brp;   /* 25 Hz, 2 ch: flow + mask_pressure */
-    stream_files_t sa2;   /* 1 Hz, 2 ch: heart_rate + spo2 */
-    stream_files_t pld;   /* 0.5 Hz, 12 ch */
+    stream_files_t brp;     /* 25 Hz, 2 ch: flow + mask_pressure */
+    stream_files_t sa2;     /* 5 Hz, 2 ch: heart_rate + spo2 (decimated from 25 Hz) */
+    stream_files_t pld;     /* 5 Hz, 12 ch (decimated from 25 Hz) */
     FILE    *f_events;
+    uint32_t brp_mm_count;  /* L1 MinMax records written */
+
+    int64_t  clock_drift_ms;   /* NTP time - AS11 device time at session stop */
 
     /* recent buffer: holds data between flushes */
     SemaphoreHandle_t mutex;
 
-    /* BRP recent buffer (largest, 25 Hz × 2 ch × 60 s = 6000 samples) */
+    /* BRP recent buffer (largest, 25 Hz × 2 ch × 60 s = 3000 samples) */
     int16_t brp_flow[1500];
     int16_t brp_press[1500];
     uint32_t brp_buf_count;     /* samples in buffer (per channel) */
 
-    /* SA2 recent buffer (1 Hz × 2 ch × 60 s = 60 samples) */
-    int16_t sa2_hr[60];
-    int16_t sa2_spo2[60];
+    /* SA2 recent buffer (5 Hz × 2 ch × 60 s = 300 samples) */
+    int16_t sa2_hr[300];
+    int16_t sa2_spo2[300];
     uint32_t sa2_buf_count;
 
-    /* PLD recent buffer (0.5 Hz × 12 ch × 60 s = 30 samples) */
-    int16_t pld_buf[30][12];
+    /* PLD recent buffer (5 Hz × 12 ch × 60 s = 300 samples) */
+    int16_t pld_buf[300][12];
     uint32_t pld_buf_count;
 
     /* events: simple JSON line file, flushed with data */
@@ -124,16 +133,20 @@ static void make_session_id(char *out, size_t out_len)
              tm.tm_hour, tm.tm_min);
 }
 
-static void write_snt_header(FILE *f, uint16_t rate, uint16_t ch, uint16_t rec_size)
+static void write_snt_header(FILE *f, uint8_t tier, uint16_t rate_hz,
+                             uint8_t n_ch, int64_t start_epoch_ms)
 {
     snt_header_t hdr = {
         .magic = SNT_MAGIC,
         .version = SNT_VERSION,
-        .sample_rate_hz = rate,
-        .channel_count = ch,
-        .record_size = rec_size,
-        .sample_count = 0,
+        .tier = tier,
+        .n_channels = n_ch,
+        .sample_bytes = 2,
+        .sample_hz_x10 = rate_hz * 10,
         .reserved = 0,
+        .start_epoch_ms = start_epoch_ms,
+        .sample_count = 0,
+        .reserved2 = 0,
     };
     fwrite(&hdr, 1, SNT_HEADER_SIZE, f);
 }
@@ -183,6 +196,7 @@ static void flush_brp(session_writer_t *s)
             if (pmn == INT16_MAX) { pmn = pmx = INT16_MIN; }
             int16_t mm[4] = { fmn, fmx, pmn, pmx };
             fwrite(mm, sizeof(int16_t), 4, s->brp.f_l1);
+            s->brp_mm_count++;
         }
     }
 
@@ -225,7 +239,7 @@ static void flush_all(session_writer_t *s)
 
     /* sync all files */
     if (s->brp.f_l0) { fflush(s->brp.f_l0); update_snt_header_sample_count(s->brp.f_l0, s->brp.sample_count); }
-    if (s->brp.f_l1) fflush(s->brp.f_l1);
+    if (s->brp.f_l1) { fflush(s->brp.f_l1); update_snt_header_sample_count(s->brp.f_l1, s->brp_mm_count); }
     if (s->sa2.f_l0) { fflush(s->sa2.f_l0); update_snt_header_sample_count(s->sa2.f_l0, s->sa2.sample_count); }
     if (s->pld.f_l0) { fflush(s->pld.f_l0); update_snt_header_sample_count(s->pld.f_l0, s->pld.sample_count); }
     if (s->f_events) fflush(s->f_events);
@@ -263,20 +277,20 @@ static void write_session_json(session_writer_t *s, const char *state)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "id", s->session_id);
 
-    time_t start = (time_t)(s->start_time_us / 1000000);
-    time_t end = (time_t)(s->end_time_us / 1000000);
-    cJSON_AddNumberToObject(root, "start_epoch_ms", (double)(start * 1000));
-    if (s->end_time_us > 0) {
-        cJSON_AddNumberToObject(root, "end_epoch_ms", (double)(end * 1000));
+    cJSON_AddNumberToObject(root, "start_epoch_ms", (double)s->start_epoch_ms);
+    if (s->end_epoch_ms > 0) {
+        cJSON_AddNumberToObject(root, "end_epoch_ms", (double)s->end_epoch_ms);
     }
 
     char iso_start[32], iso_end[32];
     struct tm tm;
+    time_t start = (time_t)(s->start_epoch_ms / 1000);
     localtime_r(&start, &tm);
     strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
     cJSON_AddStringToObject(root, "start_iso", iso_start);
 
-    if (s->end_time_us > 0) {
+    if (s->end_epoch_ms > 0) {
+        time_t end = (time_t)(s->end_epoch_ms / 1000);
         localtime_r(&end, &tm);
         strftime(iso_end, sizeof(iso_end), "%Y-%m-%dT%H:%M:%S", &tm);
         cJSON_AddStringToObject(root, "end_iso", iso_end);
@@ -284,8 +298,13 @@ static void write_session_json(session_writer_t *s, const char *state)
 
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "brp_samples", (double)s->brp.sample_count);
+    cJSON_AddNumberToObject(root, "brp_mm_samples", (double)s->brp_mm_count);
     cJSON_AddNumberToObject(root, "sa2_samples", (double)s->sa2.sample_count);
     cJSON_AddNumberToObject(root, "pld_samples", (double)s->pld.sample_count);
+
+    if (s->clock_drift_ms != 0) {
+        cJSON_AddNumberToObject(root, "clock_drift_ms", (double)s->clock_drift_ms);
+    }
 
     if (s_device_addr[0]) cJSON_AddStringToObject(root, "as11_device", s_device_addr);
     if (s_client_id[0]) cJSON_AddStringToObject(root, "as11_client_id", s_client_id);
@@ -379,29 +398,34 @@ session_writer_t *session_writer_start(void)
     }
 
     s->start_time_us = esp_timer_get_time();
+    s->start_epoch_ms = (int64_t)time(NULL) * 1000;
     s->active = true;
 
     /* Open files and write headers */
     char path[MAX_SESSION_DIR_LEN + 32];
+    int64_t start_epoch_ms = s->start_epoch_ms;
 
     snprintf(path, sizeof(path), "%s/brp.snt", s->dir);
     s->brp.f_l0 = fopen(path, "wb");
-    if (s->brp.f_l0) write_snt_header(s->brp.f_l0, 25, 2, 4);
+    if (s->brp.f_l0) write_snt_header(s->brp.f_l0, 0, 25, 2, start_epoch_ms);
 
     snprintf(path, sizeof(path), "%s/brp_mm.snt", s->dir);
     s->brp.f_l1 = fopen(path, "wb");
-    if (s->brp.f_l1) write_snt_header(s->brp.f_l1, 1, 4, 8);
+    if (s->brp.f_l1) write_snt_header(s->brp.f_l1, 1, 1, 4, start_epoch_ms);
 
     snprintf(path, sizeof(path), "%s/sa2.snt", s->dir);
     s->sa2.f_l0 = fopen(path, "wb");
-    if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 1, 2, 4);
+    if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 0, 5, 2, start_epoch_ms);
 
     snprintf(path, sizeof(path), "%s/pld.snt", s->dir);
     s->pld.f_l0 = fopen(path, "wb");
-    if (s->pld.f_l0) write_snt_header(s->pld.f_l0, 0, 12, 24);  /* rate 0 = variable */
+    if (s->pld.f_l0) write_snt_header(s->pld.f_l0, 0, 5, 12, start_epoch_ms);
 
-    snprintf(path, sizeof(path), "%s/events.ndjson", s->dir);
+    snprintf(path, sizeof(path), "%s/events.snt", s->dir);
     s->f_events = fopen(path, "w");
+    if (!s->f_events) {
+        ESP_LOGW(TAG, "failed to open events.snt (non-fatal)");
+    }
 
     if (!s->brp.f_l0 || !s->sa2.f_l0 || !s->pld.f_l0) {
         ESP_LOGE(TAG, "failed to open .snt files");
@@ -430,19 +454,44 @@ esp_err_t session_writer_stop(session_writer_t *s)
 
     s->active = false;
     s->end_time_us = esp_timer_get_time();
+    s->end_epoch_ms = (int64_t)time(NULL) * 1000;
+
+    /* Stop the AS11 data stream (no-op — stream continues between sessions) */
+    as11_ble_stop_stream();
 
     /* Final flush */
     flush_all(s);
 
-    /* Write session.json */
-    write_session_json(s, "completed");
+    /* Query AS11 clock at session stop for fresh drift measurement.
+     * This works because stop_task runs in a separate context from
+     * notif_proc_task, which can process the GetDateTime response. */
+    int64_t as11_ms = 0;
+    if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
+        s->clock_drift_ms = s->end_epoch_ms - as11_ms;
+        ESP_LOGI(TAG, "clock_drift_ms = %lld (stop-time, NTP=%lld AS11=%lld)",
+                 (long long)s->clock_drift_ms,
+                 (long long)s->end_epoch_ms,
+                 (long long)as11_ms);
+    } else {
+        int64_t drift = 0;
+        if (as11_ble_get_clock_drift(&drift) == ESP_OK) {
+            s->clock_drift_ms = drift;
+            ESP_LOGI(TAG, "clock_drift_ms = %lld (pre-stream fallback)",
+                     (long long)s->clock_drift_ms);
+        } else {
+            ESP_LOGW(TAG, "clock_drift_ms unavailable");
+        }
+    }
 
-    /* Close files */
-    if (s->brp.f_l0) fclose(s->brp.f_l0);
-    if (s->brp.f_l1) fclose(s->brp.f_l1);
-    if (s->sa2.f_l0) fclose(s->sa2.f_l0);
-    if (s->pld.f_l0) fclose(s->pld.f_l0);
-    if (s->f_events) fclose(s->f_events);
+    /* Close data files first to free file descriptors */
+    if (s->brp.f_l0) { fclose(s->brp.f_l0); s->brp.f_l0 = NULL; }
+    if (s->brp.f_l1) { fclose(s->brp.f_l1); s->brp.f_l1 = NULL; }
+    if (s->sa2.f_l0) { fclose(s->sa2.f_l0); s->sa2.f_l0 = NULL; }
+    if (s->pld.f_l0) { fclose(s->pld.f_l0); s->pld.f_l0 = NULL; }
+    if (s->f_events) { fclose(s->f_events); s->f_events = NULL; }
+
+    /* Write session.json (after closing data files to avoid FD exhaustion) */
+    write_session_json(s, "completed");
 
     ESP_LOGI(TAG, "=== SESSION STOPPED: %s ===", s->session_id);
     ESP_LOGI(TAG, "brp=%u sa2=%u pld=%u total samples",
@@ -525,8 +574,8 @@ static int16_t float_to_s16(double val)
  *   e.g. { "PatientFlow-100hz": [0.05, 0.03, ...], "MaskPressure-100hz": [...] }
  *
  * BRP (25 Hz): PatientFlow-100hz, MaskPressure-100hz
- * SA2 (1 Hz):  HeartRate, SpO2
- * PLD (0.5 Hz): MaskPressure-TwoSecond, InspiratoryPressure-TwoSecond,
+ * SA2 (5 Hz):  HeartRate, SpO2 (decimated: 1 sample per 200ms report)
+ * PLD (5 Hz): MaskPressure-TwoSecond, InspiratoryPressure-TwoSecond,
  *   ExpiratoryPressure-TwoSecond, Leak-50hz, RespiratoryRate-50hz,
  *   TidalVolume-50hz, MinuteVentilation-50hz, SnoreIndex-50hz, FlowLimitation-50hz
  */
@@ -541,6 +590,7 @@ static void parse_stream_data(session_writer_t *s, const cJSON *msg)
     if (!data || !cJSON_IsArray(data)) return;
 
     int n_items = cJSON_GetArraySize(data);
+    bool pld_record_started = false;
     for (int i = 0; i < n_items; i++) {
         cJSON *item = cJSON_GetArrayItem(data, i);
         if (!item || !cJSON_IsObject(item)) continue;
@@ -584,8 +634,10 @@ static void parse_stream_data(session_writer_t *s, const cJSON *msg)
                     }
                 }
             } else if (strcmp(name, "HeartRate") == 0) {
-                for (int j = 0; j < n_samples && s->sa2_buf_count < 60; j++) {
-                    cJSON *v = cJSON_GetArrayItem(child, j);
+                /* SA2: take only the last sample (value-held by device at 25 Hz,
+                 * updates at 1 Hz). One sample per 200ms report = 5 Hz. */
+                if (s->sa2_buf_count < 300) {
+                    cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
                     if (v && cJSON_IsNumber(v))
                         s->sa2_hr[s->sa2_buf_count] = float_to_s16(v->valuedouble);
                     else
@@ -593,18 +645,23 @@ static void parse_stream_data(session_writer_t *s, const cJSON *msg)
                     s->sa2_buf_count++;
                 }
             } else if (strcmp(name, "SpO2") == 0) {
-                for (int j = 0; j < n_samples; j++) {
-                    if (s->sa2_buf_count <= j && s->sa2_buf_count < 60) {
-                        s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
-                        s->sa2_buf_count++;
-                    }
-                    if (j < 60) {
-                        cJSON *v = cJSON_GetArrayItem(child, j);
-                        if (v && cJSON_IsNumber(v))
-                            s->sa2_spo2[j] = float_to_s16(v->valuedouble);
-                        else
-                            s->sa2_spo2[j] = INT16_MIN;
-                    }
+                /* SA2: fill spo2 for the current sample index */
+                if (s->sa2_buf_count > 0) {
+                    int idx = s->sa2_buf_count - 1;
+                    cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
+                    if (v && cJSON_IsNumber(v))
+                        s->sa2_spo2[idx] = float_to_s16(v->valuedouble);
+                    else
+                        s->sa2_spo2[idx] = INT16_MIN;
+                } else if (s->sa2_buf_count < 300) {
+                    /* SpO2 arrived before HeartRate — create the sample */
+                    s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
+                    cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
+                    if (v && cJSON_IsNumber(v))
+                        s->sa2_spo2[s->sa2_buf_count] = float_to_s16(v->valuedouble);
+                    else
+                        s->sa2_spo2[s->sa2_buf_count] = INT16_MIN;
+                    s->sa2_buf_count++;
                 }
             } else {
                 /* PLD channels: route to pld_buf by name index */
@@ -620,28 +677,33 @@ static void parse_stream_data(session_writer_t *s, const cJSON *msg)
                     if (strcmp(name, pld_names[k]) == 0) { ch_idx = k; break; }
                 }
                 if (ch_idx >= 0) {
-                    for (int j = 0; j < n_samples && j < 30; j++) {
-                        cJSON *v = cJSON_GetArrayItem(child, j);
+                    /* PLD: take only the last sample (value-held by device,
+                     * updates at 0.5 Hz). One sample per 200ms report = 5 Hz. */
+                    if (s->pld_buf_count < 300) {
+                        if (!pld_record_started) {
+                            /* First PLD channel for this notification — init record */
+                            for (int k = 0; k < 12; k++)
+                                s->pld_buf[s->pld_buf_count][k] = INT16_MIN;
+                            pld_record_started = true;
+                        }
+                        cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
                         if (v && cJSON_IsNumber(v))
-                            s->pld_buf[j][ch_idx] = float_to_s16(v->valuedouble);
-                        else
-                            s->pld_buf[j][ch_idx] = INT16_MIN;
-                        /* Fill unused channels with sentinel */
-                        for (int k = 9; k < 12; k++)
-                            s->pld_buf[j][k] = INT16_MIN;
+                            s->pld_buf[s->pld_buf_count][ch_idx] = float_to_s16(v->valuedouble);
                     }
-                    /* Update pld_buf_count to max samples seen */
-                    if (n_samples > (int)s->pld_buf_count)
-                        s->pld_buf_count = n_samples;
                 }
             }
         }
     }
 
+    /* Advance PLD record count once per notification (after all channels) */
+    if (pld_record_started) {
+        s->pld_buf_count++;
+    }
+
     /* Flush if buffers are getting full */
     if (s->brp_buf_count >= 1400) flush_brp(s);
-    if (s->sa2_buf_count >= 55) flush_sa2(s);
-    if (s->pld_buf_count >= 25) flush_pld(s);
+    if (s->sa2_buf_count >= 280) flush_sa2(s);
+    if (s->pld_buf_count >= 280) flush_pld(s);
 }
 
 /* Check if PatientFlow values are non-trivial (therapy active without event).
@@ -672,6 +734,191 @@ static bool stream_data_has_active_flow(const cJSON *msg)
     return false;
 }
 
+/* ── Fast-path StreamData parser (bypasses cJSON) ─────────────────── */
+
+/* Find a JSON string key `"key"` in json[0..len), return position after
+ * the colon following the key, or NULL if not found. */
+static const char *find_json_key(const char *json, int len, const char *key)
+{
+    int klen = strlen(key);
+    for (int i = 0; i + klen + 3 < len; i++) {
+        if (json[i] == '"') {
+            if (strncmp(json + i + 1, key, klen) == 0 && json[i + 1 + klen] == '"') {
+                /* Expect a colon after the closing quote (with optional whitespace) */
+                int j = i + 1 + klen + 1;
+                while (j < len && (json[j] == ' ' || json[j] == '\t')) j++;
+                if (j < len && json[j] == ':') {
+                    return json + j + 1;  /* position after colon */
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Parse a JSON number array starting at *p (pointing at '[' or first digit).
+ * Stores up to max_out doubles in out, returns count. Advances *p past the
+ * closing ']'. */
+static int parse_json_array(const char **p, const char *end, double *out, int max_out)
+{
+    const char *s = *p;
+    while (s < end && *s != '[') s++;
+    if (s >= end || *s != '[') { *p = s; return 0; }
+    s++;  /* skip '[' */
+    int count = 0;
+    while (s < end && *s != ']' && count < max_out) {
+        while (s < end && (*s == ' ' || *s == ',' || *s == '\t' || *s == '\n')) s++;
+        if (s >= end || *s == ']') break;
+        char *endptr;
+        out[count] = strtod(s, &endptr);
+        if (endptr == s) { s++; continue; }  /* skip unparseable */
+        count++;
+        s = endptr;
+    }
+    while (s < end && *s != ']') s++;
+    if (s < end && *s == ']') s++;
+    *p = s;
+    return count;
+}
+
+/* Fast-path: process StreamData from raw JSON without cJSON.
+ * Handles: display flow push, active-flow detection, sample routing. */
+void session_writer_on_stream_data_raw(const char *json, int len)
+{
+    session_writer_t *s = session_writer_get_active();
+
+    /* Push flow to display and detect active flow */
+    bool has_active_flow = false;
+    const char *end = json + len;
+
+    /* Find "PatientFlow-100hz" array */
+    const char *flow_key = find_json_key(json, len, "PatientFlow-100hz");
+    if (flow_key) {
+        const char *fp = flow_key;
+        double vals[32];
+        int n = parse_json_array(&fp, end, vals, 32);
+        for (int j = 0; j < n; j++) {
+            bsp_display_push_flow(vals[j]);
+            if (fabs(vals[j]) > 0.5) has_active_flow = true;
+        }
+    }
+
+    /* Edge case: auto-start session if flow is non-trivial and no session active */
+    if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped && has_active_flow) {
+        ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
+        bsp_display_set_therapy_active(true);
+        s = session_writer_start();
+    }
+
+    if (!s || !session_writer_is_active(s)) return;
+
+    /* Route samples to buffers — same logic as parse_stream_data but from raw JSON */
+    xSemaphoreTake(s->mutex, portMAX_DELAY);
+
+    bool pld_record_started = false;
+
+    /* BRP: PatientFlow */
+    {
+        const char *kp = find_json_key(json, len, "PatientFlow-100hz");
+        if (kp) {
+            double vals[32];
+            int n = parse_json_array(&kp, end, vals, 32);
+            for (int j = 0; j < n && s->brp_buf_count < 1500; j++) {
+                s->brp_flow[s->brp_buf_count] = float_to_s16(vals[j]);
+                s->brp_buf_count++;
+            }
+        }
+    }
+
+    /* BRP: MaskPressure-100hz (paired with flow) */
+    {
+        const char *kp = find_json_key(json, len, "MaskPressure-100hz");
+        if (kp) {
+            double vals[32];
+            int n = parse_json_array(&kp, end, vals, 32);
+            for (int j = 0; j < n; j++) {
+                if (s->brp_buf_count <= j) {
+                    if (s->brp_buf_count < 1500) {
+                        s->brp_flow[s->brp_buf_count] = INT16_MIN;
+                        s->brp_buf_count++;
+                    }
+                }
+                if (j < 1500) {
+                    s->brp_press[j] = float_to_s16(vals[j]);
+                }
+            }
+        }
+    }
+
+    /* SA2: HeartRate (take last sample) */
+    {
+        const char *kp = find_json_key(json, len, "HeartRate");
+        if (kp) {
+            double vals[32];
+            int n = parse_json_array(&kp, end, vals, 32);
+            if (n > 0 && s->sa2_buf_count < 300) {
+                s->sa2_hr[s->sa2_buf_count] = float_to_s16(vals[n - 1]);
+                s->sa2_buf_count++;
+            }
+        }
+    }
+
+    /* SA2: SpO2 (fill current index) */
+    {
+        const char *kp = find_json_key(json, len, "SpO2");
+        if (kp) {
+            double vals[32];
+            int n = parse_json_array(&kp, end, vals, 32);
+            if (n > 0) {
+                if (s->sa2_buf_count > 0) {
+                    s->sa2_spo2[s->sa2_buf_count - 1] = float_to_s16(vals[n - 1]);
+                } else if (s->sa2_buf_count < 300) {
+                    s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
+                    s->sa2_spo2[s->sa2_buf_count] = float_to_s16(vals[n - 1]);
+                    s->sa2_buf_count++;
+                }
+            }
+        }
+    }
+
+    /* PLD channels: take last sample of each */
+    {
+        static const char *pld_names[] = {
+            "MaskPressure-TwoSecond", "InspiratoryPressure-TwoSecond",
+            "ExpiratoryPressure-TwoSecond", "Leak-50hz",
+            "RespiratoryRate-50hz", "TidalVolume-50hz",
+            "MinuteVentilation-50hz", "SnoreIndex-50hz",
+            "FlowLimitation-50hz",
+        };
+        for (int k = 0; k < 9; k++) {
+            const char *kp = find_json_key(json, len, pld_names[k]);
+            if (kp) {
+                double vals[32];
+                int n = parse_json_array(&kp, end, vals, 32);
+                if (n > 0 && s->pld_buf_count < 300) {
+                    if (!pld_record_started) {
+                        for (int kk = 0; kk < 12; kk++)
+                            s->pld_buf[s->pld_buf_count][kk] = INT16_MIN;
+                        pld_record_started = true;
+                    }
+                    s->pld_buf[s->pld_buf_count][k] = float_to_s16(vals[n - 1]);
+                }
+            }
+        }
+    }
+
+    if (pld_record_started) {
+        s->pld_buf_count++;
+    }
+
+    /* Flush if buffers are getting full */
+    if (s->brp_buf_count >= 1400) flush_brp(s);
+    if (s->sa2_buf_count >= 280) flush_sa2(s);
+    if (s->pld_buf_count >= 280) flush_pld(s);
+
+    xSemaphoreGive(s->mutex);
+}
+
 /* Push PatientFlow samples from a StreamData notification to the display graph.
  * Called regardless of whether the session is fully started — the display
  * should show the breathing waveform as soon as therapy data arrives. */
@@ -699,7 +946,7 @@ static void stream_data_push_flow(const cJSON *msg)
     }
 }
 
-/* Write an event as a JSON line to events.ndjson */
+/* Write an event as a JSON line to events.snt */
 static void write_event(session_writer_t *s, const cJSON *msg)
 {
     if (!s || !s->f_events) return;
@@ -710,6 +957,17 @@ static void write_event(session_writer_t *s, const cJSON *msg)
         fputc('\n', s->f_events);
         free(json_str);
     }
+}
+
+/* Session stop runs in a dedicated task so that notif_proc_task is free to
+ * process the GetDateTime RPC response while session_writer_stop blocks. */
+static void stop_task(void *arg)
+{
+    session_writer_t *s = (session_writer_t *)arg;
+    if (s) {
+        session_writer_stop(s);
+    }
+    vTaskDelete(NULL);
 }
 
 void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
@@ -737,7 +995,9 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             bsp_display_set_therapy_active(false);
             if (s && s->active) {
                 write_event(s, msg);
-                session_writer_stop(s);
+                /* Run stop in a separate task so notif_proc_task can process
+                 * the GetDateTime RPC response while session_writer_stop blocks. */
+                xTaskCreate(stop_task, "session_stop", 8192, s, 5, NULL);
                 s = NULL;
             }
         }
@@ -819,15 +1079,26 @@ void session_writer_recover(void)
          * (which is ~7KB and would overflow the stack) */
         char path[330];
 
-        /* Read sample counts from .snt headers */
-        uint32_t brp_samples = 0, sa2_samples = 0, pld_samples = 0;
+        /* Read sample counts and start_epoch_ms from .snt headers */
+        uint32_t brp_samples = 0, sa2_samples = 0, pld_samples = 0, brp_mm_samples = 0;
+        int64_t start_epoch_ms = 0;
         snt_header_t hdr;
 
         snprintf(path, sizeof(path), "%s/brp.snt", session_path);
         FILE *f = fopen(path, "rb");
         if (f) {
-            if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
+            if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC) {
                 brp_samples = hdr.sample_count;
+                start_epoch_ms = hdr.start_epoch_ms;
+            }
+            fclose(f);
+        }
+
+        snprintf(path, sizeof(path), "%s/brp_mm.snt", session_path);
+        f = fopen(path, "rb");
+        if (f) {
+            if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
+                brp_mm_samples = hdr.sample_count;
             fclose(f);
         }
 
@@ -851,9 +1122,24 @@ void session_writer_recover(void)
         f = fopen(json_path, "w");
         if (f) {
             fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
-                       "\"brp_samples\":%u,\"sa2_samples\":%u,\"pld_samples\":%u",
+                       "\"start_epoch_ms\":%lld,"
+                       "\"brp_samples\":%u,\"brp_mm_samples\":%u,"
+                       "\"sa2_samples\":%u,\"pld_samples\":%u",
                     ent->d_name,
-                    (unsigned)brp_samples, (unsigned)sa2_samples, (unsigned)pld_samples);
+                    (long long)start_epoch_ms,
+                    (unsigned)brp_samples, (unsigned)brp_mm_samples,
+                    (unsigned)sa2_samples, (unsigned)pld_samples);
+
+            /* Add start_iso if we have a valid epoch */
+            if (start_epoch_ms > 0) {
+                time_t start = (time_t)(start_epoch_ms / 1000);
+                struct tm tm;
+                localtime_r(&start, &tm);
+                char iso_start[32];
+                strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
+                fprintf(f, ",\"start_iso\":\"%s\"", iso_start);
+            }
+
             if (s_device_addr[0]) fprintf(f, ",\"as11_device\":\"%s\"", s_device_addr);
             if (s_client_id[0]) fprintf(f, ",\"as11_client_id\":\"%s\"", s_client_id);
             fprintf(f, "}\n");

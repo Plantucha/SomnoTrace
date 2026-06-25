@@ -5,6 +5,9 @@
 # Target chip
 CONFIG_IDF_TARGET="esp32s3"
 
+# CPU: run at 240 MHz for faster BLE notification processing
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
 # PSRAM: ESP32-S3R8 has 8 MB octal SPI RAM. The app runs Wi-Fi + BLE + SD/FATFS
 # + HTTP + a 240x240 LCD framebuffer concurrently, which exhausts the ~290 KB
 # internal RAM and makes the Wi-Fi SoftAP beacon / SDMMC DMA allocations fail.
@@ -59,9 +62,10 @@ CONFIG_BT_NIMBLE_GATT_SERVER=y
 
 # WiFi + BLE coexistence
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
-CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=24
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=64
 CONFIG_BT_NIMBLE_MSYS1_BLOCK_SIZE=256
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=64
 # CONFIG_BT_NIMBLE_SECURITY_ENABLE is not set
 # CONFIG_BT_NIMBLE_DEBUG is not set
 # CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG is not set
@@ -81,11 +85,12 @@ CONFIG_FATFS_FS_LOCK=0
 CONFIG_FATFS_USE_LABEL=y
 CONFIG_FATFS_SECTOR_512=y
 
-# mbedTLS: disable hardware AES — the ESP32-S3 AES accelerator intermittently
-# fails (MBEDTLS_ERR_PLATFORM_HW_ACCEL_FAILED) on larger payloads (>256 bytes)
-# when BLE + Wi-Fi coexistence is active. Software AES is fast enough for our
-# RPC encryption use case.
-CONFIG_MBEDTLS_HARDWARE_AES=n
+# mbedTLS: hardware AES — re-enabled for faster BLE notification decryption.
+# Previously disabled due to MBEDTLS_ERR_PLATFORM_HW_ACCEL_FAILED on >256 byte
+# payloads with BLE+WiFi coexistence. Testing with 240 MHz CPU + offloaded
+# notification processing should resolve timing issues. If failures recur,
+# set to n and fall back to software AES.
+CONFIG_MBEDTLS_HARDWARE_AES=y
 
 # NTP time sync: parse DHCP option 42 for NTP servers, allow multiple servers
 # (DHCP-provided + fallback pools). SNTP poll mode re-syncs every hour.
