@@ -96,6 +96,7 @@ struct session_writer {
 
     /* recent buffer: holds data between flushes */
     SemaphoreHandle_t mutex;
+    TaskHandle_t flush_task_handle;  /* flush task for this session */
 
     /* BRP recent buffer (largest, 25 Hz × 2 ch × 60 s = 3000 samples) */
     int16_t brp_flow[1500];
@@ -438,7 +439,7 @@ session_writer_t *session_writer_start(void)
     xSemaphoreGive(s_active_mutex);
 
     /* Start flush task */
-    xTaskCreate(flush_task, "session_flush", FLUSH_TASK_STACK, s, 5, NULL);
+    xTaskCreate(flush_task, "session_flush", FLUSH_TASK_STACK, s, 5, &s->flush_task_handle);
 
     ESP_LOGI(TAG, "=== SESSION STARTED: %s ===", s->session_id);
     ESP_LOGI(TAG, "dir: %s", s->dir);
@@ -450,38 +451,43 @@ esp_err_t session_writer_stop(session_writer_t *s)
 {
     if (!s) return ESP_OK;
 
-    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
-
-    s->active = false;
-    s->end_time_us = esp_timer_get_time();
-    s->end_epoch_ms = (int64_t)time(NULL) * 1000;
-
-    /* Stop the AS11 data stream (no-op — stream continues between sessions) */
-    as11_ble_stop_stream();
-
-    /* Final flush */
-    flush_all(s);
-
-    /* Query AS11 clock at session stop for fresh drift measurement.
-     * This works because stop_task runs in a separate context from
-     * notif_proc_task, which can process the GetDateTime response. */
+    /* Query AS11 clock BEFORE taking s_active_mutex.
+     * This blocks on the RPC response, which is processed by notif_proc_task.
+     * If we held s_active_mutex here, a TherapyStart in notif_proc_task would
+     * block on the mutex and be unable to process the GetDateTime response. */
+    int64_t end_epoch_ms = (int64_t)time(NULL) * 1000;
     int64_t as11_ms = 0;
+    int64_t clock_drift_ms = 0;
+    bool have_drift = false;
+
     if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
-        s->clock_drift_ms = s->end_epoch_ms - as11_ms;
+        clock_drift_ms = end_epoch_ms - as11_ms;
+        have_drift = true;
         ESP_LOGI(TAG, "clock_drift_ms = %lld (stop-time, NTP=%lld AS11=%lld)",
-                 (long long)s->clock_drift_ms,
-                 (long long)s->end_epoch_ms,
+                 (long long)clock_drift_ms,
+                 (long long)end_epoch_ms,
                  (long long)as11_ms);
     } else {
         int64_t drift = 0;
         if (as11_ble_get_clock_drift(&drift) == ESP_OK) {
-            s->clock_drift_ms = drift;
+            clock_drift_ms = drift;
+            have_drift = true;
             ESP_LOGI(TAG, "clock_drift_ms = %lld (pre-stream fallback)",
-                     (long long)s->clock_drift_ms);
+                     (long long)clock_drift_ms);
         } else {
             ESP_LOGW(TAG, "clock_drift_ms unavailable");
         }
     }
+
+    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
+
+    s->active = false;
+    s->end_time_us = esp_timer_get_time();
+    s->end_epoch_ms = end_epoch_ms;
+    if (have_drift) s->clock_drift_ms = clock_drift_ms;
+
+    /* Final flush */
+    flush_all(s);
 
     /* Close data files first to free file descriptors */
     if (s->brp.f_l0) { fclose(s->brp.f_l0); s->brp.f_l0 = NULL; }
@@ -500,6 +506,20 @@ esp_err_t session_writer_stop(session_writer_t *s)
              (unsigned)s->pld.sample_count);
 
     if (s_active == s) s_active = NULL;
+
+    /* Wait for flush_task to exit before destroying shared resources.
+     * flush_task checks s->active each loop; once false, it calls vTaskDelete. */
+    if (s->flush_task_handle) {
+        /* Give flush_task time to observe s->active == false and exit */
+        vTaskDelay(pdMS_TO_TICKS(100));
+        /* If still running, wait a bit more */
+        int wait = 0;
+        while (eTaskGetState(s->flush_task_handle) != eDeleted && wait < 20) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            wait++;
+        }
+        s->flush_task_handle = NULL;
+    }
 
     if (s->mutex) vSemaphoreDelete(s->mutex);
     free(s);
@@ -997,7 +1017,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                 write_event(s, msg);
                 /* Run stop in a separate task so notif_proc_task can process
                  * the GetDateTime RPC response while session_writer_stop blocks. */
-                xTaskCreate(stop_task, "session_stop", 8192, s, 5, NULL);
+                xTaskCreate(stop_task, "session_stop", 8192, s, 15, NULL);
                 s = NULL;
             }
         }
