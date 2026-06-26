@@ -716,8 +716,8 @@ static void handle_notify(const uint8_t *data, int len)
     memcpy(s_rx_buf + s_rx_len, data, len);
     s_rx_len += len;
 
-    static uint8_t payload[1024];
-    static uint8_t decrypted[1024];
+    static uint8_t payload[RX_BUF_MAX];
+    static uint8_t decrypted[RX_BUF_MAX];
     uint16_t vcid;
     int n;
     while ((n = fig_take_packet(payload, sizeof(payload) - 1, &vcid)) >= 0) {
