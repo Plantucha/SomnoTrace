@@ -794,35 +794,37 @@ static void handle_notify(const uint8_t *data, int len)
                         /* Base64-decode the fragment data.
                          * An empty base64 string (dec_len=0) is valid —
                          * it means the fragment has no payload (e.g. the
-                         * device sent a fragment with only a status field). */
+                         * device sent a fragment with only a status field).
+                         * In that case we skip decoding but MUST still fall
+                         * through to the status check below — otherwise the
+                         * collector semaphore is never signaled and the pull
+                         * times out. */
                         const char *b64 = data_j->valuestring;
                         size_t b64_len = strlen(b64);
-                        if (b64_len == 0) {
-                            /* Empty data — skip but don't warn */
-                            continue;
-                        }
-                        size_t dec_max = (b64_len / 4) * 3 + 4;
-                        uint8_t *frag = malloc(dec_max);
-                        if (frag) {
-                            size_t dec_len = 0;
-                            int rc = mbedtls_base64_decode(
-                                frag, dec_max, &dec_len,
-                                (const unsigned char *)b64, b64_len);
-                            if (rc == 0 && dec_len > 0) {
-                                int idx = s_spool_collector->frag_count++;
-                                s_spool_collector->frags[idx].seq =
-                                    seq_j ? seq_j->valueint : idx;
-                                s_spool_collector->frags[idx].data = frag;
-                                s_spool_collector->frags[idx].len = (int)dec_len;
-                                ESP_LOGI(TAG, "spool frag %d: seq=%d len=%d",
-                                         idx, s_spool_collector->frags[idx].seq,
-                                         (int)dec_len);
-                            } else if (rc != 0) {
-                                ESP_LOGW(TAG, "base64 decode failed rc=%d", rc);
-                                free(frag);
-                            } else {
-                                /* rc == 0 but dec_len == 0 — empty payload */
-                                free(frag);
+                        if (b64_len > 0) {
+                            size_t dec_max = (b64_len / 4) * 3 + 4;
+                            uint8_t *frag = malloc(dec_max);
+                            if (frag) {
+                                size_t dec_len = 0;
+                                int rc = mbedtls_base64_decode(
+                                    frag, dec_max, &dec_len,
+                                    (const unsigned char *)b64, b64_len);
+                                if (rc == 0 && dec_len > 0) {
+                                    int idx = s_spool_collector->frag_count++;
+                                    s_spool_collector->frags[idx].seq =
+                                        seq_j ? seq_j->valueint : idx;
+                                    s_spool_collector->frags[idx].data = frag;
+                                    s_spool_collector->frags[idx].len = (int)dec_len;
+                                    ESP_LOGI(TAG, "spool frag %d: seq=%d len=%d",
+                                             idx, s_spool_collector->frags[idx].seq,
+                                             (int)dec_len);
+                                } else if (rc != 0) {
+                                    ESP_LOGW(TAG, "base64 decode failed rc=%d", rc);
+                                    free(frag);
+                                } else {
+                                    /* rc == 0 but dec_len == 0 — empty payload */
+                                    free(frag);
+                                }
                             }
                         }
                     }
@@ -2422,6 +2424,9 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
                  coll.frag_count);
         vSemaphoreDelete(coll.sem);
         s_spool_collector = NULL;
+        /* Clear any stale RPC response state so subsequent RPCs
+         * don't pick up a leftover response from the timed-out pull. */
+        clear_response();
         return ESP_FAIL;
     }
 
