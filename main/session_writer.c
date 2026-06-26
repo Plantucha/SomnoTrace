@@ -25,6 +25,8 @@
 #include "sd_storage.h"
 #include "bsp_display.h"
 #include "as11_ble.h"
+#include "post_therapy.h"
+#include "edf_gen.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -866,14 +868,110 @@ static void write_event(session_writer_t *s, const cJSON *msg)
     }
 }
 
+/* ── EDF generation task ──────────────────────────────────────────────
+ *
+ * EDF generation is pure CPU + SD-card I/O — no BLE interaction needed.
+ * It runs in a dedicated task pinned to core 1 (the core not running the
+ * NimBLE host / notif_proc_task) at low priority (5, below notif_proc's 10)
+ * so it never blocks or delays stream notification processing.
+ *
+ * If a new therapy session starts while EDF generation is still running,
+ * stream data continues to flow through notif_proc_task on core 0 without
+ * any interference.  The EDF task simply reads from the completed session's
+ * files and writes to /somnotrace/EDF/ — no shared state with the live
+ * session writer.
+ *
+ * The task allocates its own stack (16KB) and self-deletes when done. */
+typedef struct {
+    char     session_dir[MAX_SESSION_DIR_LEN];
+    char     session_id[16];
+    int64_t  start_epoch_ms;
+    int64_t  end_epoch_ms;
+    int64_t  clock_drift_ms;
+} edf_task_args_t;
+
+static void edf_task(void *arg)
+{
+    edf_task_args_t *a = (edf_task_args_t *)arg;
+    if (a) {
+        edf_gen_generate(a->session_dir, a->session_id,
+                         a->start_epoch_ms, a->end_epoch_ms,
+                         a->clock_drift_ms);
+        free(a);
+    }
+    vTaskDelete(NULL);
+}
+
 /* Session stop runs in a dedicated task so that notif_proc_task is free to
- * process the GetDateTime RPC response while session_writer_stop blocks. */
+ * process the GetDateTime RPC response while session_writer_stop blocks.
+ *
+ * After session_writer_stop() finalises the stream .snt files, this task
+ * runs the post-therapy data collection pipeline:
+ *
+ *   1. session_writer_stop()  — final flush, close .snt files, write session.json
+ *   2. post_therapy_collect() — pull Summary + TherapyEvents spools + Get RPC
+ *                               → save to post-therapy/ subfolder
+ *   3. edf_gen_generate()     — launched as a SEPARATE task on core 1
+ *                               (see edf_task above) so it does NOT block
+ *                               notif_proc_task from processing stream
+ *                               notifications if a new therapy starts.
+ *
+ * Steps 1 and 2 run in stop_task (needs BLE for spool pulls).
+ * Step 3 is dispatched to edf_task and stop_task exits immediately,
+ * freeing the high-priority slot for notif_proc_task. */
 static void stop_task(void *arg)
 {
     session_writer_t *s = (session_writer_t *)arg;
-    if (s) {
-        session_writer_stop(s);
+    if (!s) {
+        vTaskDelete(NULL);
+        return;
     }
+
+    /* Capture session metadata before session_writer_stop() frees s */
+    char session_dir[MAX_SESSION_DIR_LEN];
+    char session_id[16];
+    int64_t start_epoch_ms = s->start_epoch_ms;
+    int64_t end_epoch_ms = s->end_epoch_ms;
+    int64_t clock_drift_ms = s->clock_drift_ms;
+
+    strlcpy(session_dir, s->dir, sizeof(session_dir));
+    strlcpy(session_id, s->session_id, sizeof(session_id));
+
+    /* Step 1: Finalise stream data (flush, close files, write session.json) */
+    session_writer_stop(s);
+
+    /* Step 2: Post-therapy data collection (spool pulls + Get RPC).
+     * This pulls Summary and TherapyEvents spools from the AS11 and
+     * queries device identification/settings via Get RPC.  All data
+     * is saved to the post-therapy/ subfolder inside the session directory.
+     * This step blocks on BLE RPC responses (semaphores), allowing
+     * notif_proc_task to run between RPCs.  May take 10-30 seconds. */
+    ESP_LOGI(TAG, "stop_task: starting post-therapy collection");
+    post_therapy_collect(session_dir, start_epoch_ms, clock_drift_ms);
+
+    /* Step 3: Launch EDF generation on core 1 (async, non-blocking).
+     * EDF generation is CPU/SD-bound only — no BLE needed.  Running it
+     * on core 1 at low priority ensures notif_proc_task on core 0 can
+     * continue processing stream notifications without any interference. */
+    edf_task_args_t *edf_args = malloc(sizeof(edf_task_args_t));
+    if (edf_args) {
+        strlcpy(edf_args->session_dir, session_dir, sizeof(edf_args->session_dir));
+        strlcpy(edf_args->session_id, session_id, sizeof(edf_args->session_id));
+        edf_args->start_epoch_ms = start_epoch_ms;
+        edf_args->end_epoch_ms = end_epoch_ms;
+        edf_args->clock_drift_ms = clock_drift_ms;
+
+        /* Pin to core 1 (core 0 runs NimBLE host + notif_proc_task).
+         * Priority 5 < notif_proc's 10 so it never preempts stream processing.
+         * Stack 16KB for protobuf decode + cJSON + file I/O. */
+        xTaskCreatePinnedToCore(edf_task, "edf_gen", 16384, edf_args, 5, NULL, 1);
+        ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1");
+    } else {
+        ESP_LOGE(TAG, "stop_task: failed to allocate edf_task args, EDF skipped");
+    }
+
+    /* stop_task exits — notif_proc_task is now free to process any
+     * new therapy notifications without competition from this task. */
     vTaskDelete(NULL);
 }
 
@@ -903,7 +1001,10 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             if (s && s->active) {
                 write_event(s, msg);
                 /* Run stop in a separate task so notif_proc_task can process
-                 * the GetDateTime RPC response while session_writer_stop blocks. */
+                 * the GetDateTime RPC response while session_writer_stop blocks.
+                 * Stack 8KB: stop_task does session finalisation + post-therapy
+                 * spool pulls (BLE I/O, not CPU-heavy).  EDF generation runs
+                 * in a separate task on core 1 (see edf_task). */
                 xTaskCreate(stop_task, "session_stop", 8192, s, 15, NULL);
                 s = NULL;
             }

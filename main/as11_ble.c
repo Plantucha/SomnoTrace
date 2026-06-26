@@ -63,6 +63,7 @@
 #include "mbedtls/bignum.h"
 #include "mbedtls/aes.h"
 #include "mbedtls/md.h"
+#include "mbedtls/base64.h"
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -165,6 +166,34 @@ typedef struct {
 } notif_item_t;
 static QueueHandle_t s_notif_queue = NULL;
 static TaskHandle_t  s_notif_task  = NULL;
+
+/* ── Spool fragment collector ────────────────────────────────────────
+ * When a spool pull is in progress, s_spool_collector is non-NULL and
+ * handle_notify() routes SpoolFragment notifications to it instead of
+ * the normal notification dispatch.  This is set/cleared only by
+ * as11_ble_spool_pull() which runs in the same notif_proc_task context
+ * (via stop_task → post_therapy), so no extra locking is needed — the
+ * collector pointer is written before PullSpoolFragments is sent and
+ * cleared after the last fragment is received. */
+#define SPOOL_MAX_FRAGS   32
+#define SPOOL_FRAG_MAX    2808          /* matches AS11 max fragment size */
+
+typedef struct {
+    int      seq;
+    uint8_t *data;
+    int      len;
+} spool_frag_t;
+
+typedef struct {
+    spool_frag_t frags[SPOOL_MAX_FRAGS];
+    int      frag_count;
+    char     status[32];                /* SPOOL_INCOMPLETE / SPOOL_COMPLETE / ... */
+    char     next_addr_json[256];       /* nextSpoolAddress for multi-round pulls */
+    bool     done;                      /* set when status != SPOOL_INCOMPLETE */
+    SemaphoreHandle_t sem;              /* given when done */
+} spool_collector_t;
+
+static spool_collector_t *s_spool_collector = NULL;
 
 /* Encrypted session state (set after reconnect or pairing). */
 static uint8_t s_session_key[32];       /* AES-256 key */
@@ -745,9 +774,76 @@ static void handle_notify(const uint8_t *data, int len)
         cJSON *id = cJSON_GetObjectItem(msg, "id");
         cJSON *method = cJSON_GetObjectItem(msg, "method");
         if (method && !id) {
-            /* Notification (e.g. HeartBeat, therapy events, data).
-             * Forward to session writer for therapy detection and data logging. */
             const char *m = method->valuestring ? method->valuestring : "?";
+
+            /* SpoolFragment interception: when a spool pull is in progress,
+             * route SpoolFragment notifications to the collector instead of
+             * the normal notification dispatch.  The collector buffers
+             * decoded base64 fragments and signals completion when the
+             * device reports SPOOL_COMPLETE or SPOOL_COMPLETE_MORE_DATA_PENDING. */
+            if (s_spool_collector && strcmp(m, "SpoolFragment") == 0) {
+                cJSON *params = cJSON_GetObjectItem(msg, "params");
+                if (params) {
+                    cJSON *seq_j = cJSON_GetObjectItem(params, "seq");
+                    cJSON *data_j = cJSON_GetObjectItem(params, "data");
+                    cJSON *status_j = cJSON_GetObjectItem(params, "status");
+
+                    if (data_j && cJSON_IsString(data_j) &&
+                        s_spool_collector->frag_count < SPOOL_MAX_FRAGS) {
+
+                        /* Base64-decode the fragment data */
+                        const char *b64 = data_j->valuestring;
+                        size_t b64_len = strlen(b64);
+                        size_t dec_max = (b64_len / 4) * 3 + 4;
+                        uint8_t *frag = malloc(dec_max);
+                        if (frag) {
+                            size_t dec_len = 0;
+                            int rc = mbedtls_base64_decode(
+                                frag, dec_max, &dec_len,
+                                (const unsigned char *)b64, b64_len);
+                            if (rc == 0 && dec_len > 0) {
+                                int idx = s_spool_collector->frag_count++;
+                                s_spool_collector->frags[idx].seq =
+                                    seq_j ? seq_j->valueint : idx;
+                                s_spool_collector->frags[idx].data = frag;
+                                s_spool_collector->frags[idx].len = (int)dec_len;
+                                ESP_LOGI(TAG, "spool frag %d: seq=%d len=%d",
+                                         idx, s_spool_collector->frags[idx].seq,
+                                         (int)dec_len);
+                            } else {
+                                ESP_LOGW(TAG, "base64 decode failed rc=%d", rc);
+                                free(frag);
+                            }
+                        }
+                    }
+
+                    /* Check completion status */
+                    if (status_j && cJSON_IsString(status_j)) {
+                        strlcpy(s_spool_collector->status,
+                                status_j->valuestring,
+                                sizeof(s_spool_collector->status));
+                        /* Capture nextSpoolAddress for multi-round pulls */
+                        cJSON *next_j = cJSON_GetObjectItem(params, "nextSpoolAddress");
+                        if (next_j) {
+                            char *ns = cJSON_PrintUnformatted(next_j);
+                            if (ns) {
+                                strlcpy(s_spool_collector->next_addr_json, ns,
+                                        sizeof(s_spool_collector->next_addr_json));
+                                free(ns);
+                            }
+                        }
+                        if (strcmp(status_j->valuestring, "SPOOL_INCOMPLETE") != 0) {
+                            s_spool_collector->done = true;
+                            xSemaphoreGive(s_spool_collector->sem);
+                        }
+                    }
+                }
+                cJSON_Delete(msg);
+                continue;
+            }
+
+            /* Normal notification (HeartBeat, therapy events, data).
+             * Forward to session writer for therapy detection and data logging. */
             ESP_LOGD(TAG, "notification: %s", m);
             session_writer_on_notification(session_writer_get_active(), msg);
             cJSON_Delete(msg);
@@ -2209,4 +2305,295 @@ esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
 
     cJSON_Delete(resp);
     return ret;
+}
+
+/* ── Spool RPC ────────────────────────────────────────────────────────
+ *
+ * Post-therapy data collection.  The AS11 stores session summaries, event
+ * logs, and other data in internal "spools" accessed via the StartSpool /
+ * PullSpoolFragments RPC cycle.  SpoolFragment notifications arrive
+ * asynchronously on the same BLE characteristic as StreamData and RPC
+ * responses; handle_notify() intercepts them when s_spool_collector is set.
+ *
+ * The pull function runs in the notif_proc_task context (via stop_task →
+ * post_therapy), which is the same task that processes notifications.  This
+ * is intentional: it allows SpoolFragment notifications to be handled
+ * synchronously while we wait on the collector semaphore.
+ *
+ * Multi-round pulls: if the device returns SPOOL_COMPLETE_MORE_DATA_PENDING,
+ * the last fragment includes a nextSpoolAddress JSON object.  We loop with
+ * that address for the next StartSpool call, appending data from each round.
+ */
+
+/* Fragment comparison for qsort (sort by seq ascending). */
+static int frag_cmp(const void *a, const void *b)
+{
+    const spool_frag_t *fa = (const spool_frag_t *)a;
+    const spool_frag_t *fb = (const spool_frag_t *)b;
+    return fa->seq - fb->seq;
+}
+
+/* One round of StartSpool → PullSpoolFragments → collect → concatenate.
+ * Returns ESP_OK and sets *round_data / *round_len.  If the status was
+ * SPOOL_COMPLETE_MORE_DATA_PENDING, *next_addr_out is set to the
+ * nextSpoolAddress JSON string (caller uses it for the next round).
+ * Otherwise *next_addr_out is set to empty string. */
+static esp_err_t spool_one_round(const char *spool_addr_json,
+                                 uint8_t **round_data, size_t *round_len,
+                                 char *next_addr_out, size_t next_addr_max)
+{
+    *round_data = NULL;
+    *round_len = 0;
+    next_addr_out[0] = '\0';
+
+    /* Set up collector before sending RPCs so we don't miss fragments. */
+    spool_collector_t coll = {0};
+    coll.sem = xSemaphoreCreateBinary();
+    if (!coll.sem) return ESP_ERR_NO_MEM;
+    s_spool_collector = &coll;
+
+    /* 1. StartSpool RPC */
+    char rpc[512];
+    snprintf(rpc, sizeof(rpc),
+             "{\"id\":30,\"jsonrpc\":\"1.0\",\"method\":\"StartSpool\","
+             "\"params\":{\"spoolAddress\":%s,\"maxSpoolSize\":100000}}",
+             spool_addr_json);
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGE(TAG, "spool: StartSpool send failed");
+        vSemaphoreDelete(coll.sem);
+        s_spool_collector = NULL;
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = wait_response(10000);
+    if (!resp) {
+        ESP_LOGE(TAG, "spool: StartSpool timeout");
+        vSemaphoreDelete(coll.sem);
+        s_spool_collector = NULL;
+        return ESP_FAIL;
+    }
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    cJSON *spool_id_j = result ? cJSON_GetObjectItem(result, "spoolId") : NULL;
+    if (!spool_id_j || !cJSON_IsNumber(spool_id_j)) {
+        char *s = cJSON_Print(resp);
+        ESP_LOGE(TAG, "spool: StartSpool bad response: %s", s ? s : "?");
+        if (s) free(s);
+        cJSON_Delete(resp);
+        vSemaphoreDelete(coll.sem);
+        s_spool_collector = NULL;
+        return ESP_FAIL;
+    }
+    int spool_id = spool_id_j->valueint;
+    cJSON_Delete(resp);
+    ESP_LOGI(TAG, "spool: StartSpool ok, spoolId=%d", spool_id);
+
+    /* 2. PullSpoolFragments RPC — triggers SpoolFragment notifications */
+    snprintf(rpc, sizeof(rpc),
+             "{\"id\":31,\"jsonrpc\":\"1.0\",\"method\":\"PullSpoolFragments\","
+             "\"params\":{\"spoolId\":%d,\"maxFragmentSize\":2808,\"maxNotifications\":0}}",
+             spool_id);
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGE(TAG, "spool: PullSpoolFragments send failed");
+        vSemaphoreDelete(coll.sem);
+        s_spool_collector = NULL;
+        return ESP_FAIL;
+    }
+
+    /* The PullSpoolFragments response is an ack; fragments arrive as
+     * separate SpoolFragment notifications.  Wait for the collector. */
+    resp = wait_response(5000);
+    if (resp) cJSON_Delete(resp);  /* ack response, not needed */
+
+    /* 3. Wait for all fragments to arrive */
+    if (xSemaphoreTake(coll.sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        ESP_LOGE(TAG, "spool: fragment collection timeout (%d frags received)",
+                 coll.frag_count);
+        vSemaphoreDelete(coll.sem);
+        s_spool_collector = NULL;
+        return ESP_FAIL;
+    }
+
+    /* Clear collector before processing (new fragments would be lost) */
+    s_spool_collector = NULL;
+    vSemaphoreDelete(coll.sem);
+
+    ESP_LOGI(TAG, "spool: collected %d fragments, status=%s",
+             coll.frag_count, coll.status);
+
+    /* 4. Sort fragments by seq and concatenate */
+    if (coll.frag_count == 0) {
+        return ESP_OK;  /* empty spool — valid (e.g. no events) */
+    }
+
+    qsort(coll.frags, coll.frag_count, sizeof(spool_frag_t), frag_cmp);
+
+    size_t total = 0;
+    for (int i = 0; i < coll.frag_count; i++) {
+        total += coll.frags[i].len;
+    }
+
+    uint8_t *data = malloc(total);
+    if (!data) {
+        ESP_LOGE(TAG, "spool: malloc %u failed", (unsigned)total);
+        for (int i = 0; i < coll.frag_count; i++) free(coll.frags[i].data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t offset = 0;
+    for (int i = 0; i < coll.frag_count; i++) {
+        memcpy(data + offset, coll.frags[i].data, coll.frags[i].len);
+        offset += coll.frags[i].len;
+        free(coll.frags[i].data);
+    }
+
+    *round_data = data;
+    *round_len = total;
+
+    /* Check for multi-round continuation */
+    if (strcmp(coll.status, "SPOOL_COMPLETE_MORE_DATA_PENDING") == 0 &&
+        coll.next_addr_json[0]) {
+        strlcpy(next_addr_out, coll.next_addr_json, next_addr_max);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
+                              uint8_t **out_data, size_t *out_len)
+{
+    if (!spool_type || !from_dt || !out_data || !out_len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_session_encrypted) {
+        ESP_LOGW(TAG, "spool_pull: no encrypted session");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *out_data = NULL;
+    *out_len = 0;
+
+    /* Build initial spool address JSON:
+     * {"<spool_type>":{"fromDateTime":"<from_dt>"}} */
+    char addr_json[256];
+    snprintf(addr_json, sizeof(addr_json),
+             "{\"%s\":{\"fromDateTime\":\"%s\"}}",
+             spool_type, from_dt);
+
+    /* Accumulate data across multiple rounds */
+    uint8_t *all_data = NULL;
+    size_t all_len = 0;
+    int round = 0;
+
+    while (addr_json[0]) {
+        round++;
+        ESP_LOGI(TAG, "spool_pull: round %d for %s", round, spool_type);
+
+        uint8_t *round_data = NULL;
+        size_t round_len = 0;
+        char next_addr[256] = {0};
+
+        esp_err_t ret = spool_one_round(addr_json, &round_data, &round_len,
+                                        next_addr, sizeof(next_addr));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "spool_pull: round %d failed", round);
+            free(all_data);
+            free(round_data);
+            return ret;
+        }
+
+        if (round_data && round_len > 0) {
+            /* Append to accumulated data */
+            uint8_t *new_data = realloc(all_data, all_len + round_len);
+            if (!new_data) {
+                ESP_LOGE(TAG, "spool_pull: realloc %u failed",
+                         (unsigned)(all_len + round_len));
+                free(all_data);
+                free(round_data);
+                return ESP_ERR_NO_MEM;
+            }
+            memcpy(new_data + all_len, round_data, round_len);
+            all_data = new_data;
+            all_len += round_len;
+        }
+        free(round_data);
+
+        /* Continue with nextSpoolAddress or stop */
+        if (next_addr[0]) {
+            strlcpy(addr_json, next_addr, sizeof(addr_json));
+        } else {
+            break;  /* SPOOL_COMPLETE — done */
+        }
+
+        if (round >= 10) {
+            ESP_LOGW(TAG, "spool_pull: too many rounds (%d), stopping", round);
+            break;
+        }
+    }
+
+    *out_data = all_data;
+    *out_len = all_len;
+    ESP_LOGI(TAG, "spool_pull: %s done, %u bytes in %d round(s)",
+             spool_type, (unsigned)all_len, round);
+    return ESP_OK;
+}
+
+cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
+{
+    if (!keys || n_keys <= 0) return NULL;
+    if (!s_session_encrypted) {
+        ESP_LOGW(TAG, "get_values: no encrypted session");
+        return NULL;
+    }
+
+    /* Build JSON params array: ["key1","key2",...] */
+    /* Worst case: each key is ~40 chars, plus quotes and comma */
+    size_t buf_size = n_keys * 48 + 64;
+    char *params = malloc(buf_size);
+    if (!params) return NULL;
+
+    size_t pos = 0;
+    pos += snprintf(params + pos, buf_size - pos, "[");
+    for (int i = 0; i < n_keys; i++) {
+        if (i > 0) pos += snprintf(params + pos, buf_size - pos, ",");
+        pos += snprintf(params + pos, buf_size - pos, "\"%s\"", keys[i]);
+    }
+    pos += snprintf(params + pos, buf_size - pos, "]");
+
+    /* Build full RPC */
+    char rpc[512];
+    snprintf(rpc, sizeof(rpc),
+             "{\"id\":40,\"jsonrpc\":\"1.0\",\"method\":\"Get\",\"params\":%s}",
+             params);
+    free(params);
+
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGW(TAG, "get_values: send failed");
+        return NULL;
+    }
+
+    cJSON *resp = wait_response(10000);
+    if (!resp) {
+        ESP_LOGW(TAG, "get_values: timeout");
+        return NULL;
+    }
+
+    cJSON *err = cJSON_GetObjectItem(resp, "error");
+    if (err) {
+        char *s = cJSON_Print(err);
+        ESP_LOGW(TAG, "get_values: RPC error: %s", s ? s : "?");
+        if (s) free(s);
+        cJSON_Delete(resp);
+        return NULL;
+    }
+
+    /* Return the result object (caller frees) */
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    if (result) {
+        result = cJSON_DetachItemFromObject(resp, "result");
+    }
+    cJSON_Delete(resp);
+    return result;
 }

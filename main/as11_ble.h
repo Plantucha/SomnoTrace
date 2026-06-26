@@ -95,3 +95,32 @@ esp_err_t as11_ble_get_clock_drift(int64_t *out_drift_ms);
  * Returns ESP_OK and stores epoch milliseconds in *out_epoch_ms.
  * Requires an active encrypted BLE session with available ACL buffers. */
 esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms);
+
+/* ── Spool RPC ────────────────────────────────────────────────────────
+ * Post-therapy spool data collection.  The AS11 stores session summaries,
+ * event logs, and other data in internal "spools" that are retrieved via
+ * the StartSpool / PullSpoolFragments RPC cycle.  SpoolFragment
+ * notifications arrive asynchronously on the same BLE characteristic as
+ * StreamData and RPC responses.
+ *
+ * as11_ble_spool_pull() handles the full cycle: StartSpool →
+ * PullSpoolFragments → collect SpoolFragment notifications → reassemble.
+ * Multi-round pulls (SPOOL_COMPLETE_MORE_DATA_PENDING) are handled
+ * automatically by looping with the nextSpoolAddress from the last
+ * fragment.
+ *
+ * Returns ESP_OK on success.  *out_data is heap-allocated; caller frees.
+ * Parameters:
+ *   spool_type  - e.g. "Summary", "TherapyEvents-RespiratoryEvents"
+ *   from_dt     - ISO-8601 start time, e.g. "2026-06-25T00:00:00.000Z"
+ *   out_data    - receives malloc'd buffer with raw protobuf bytes
+ *   out_len     - receives buffer length
+ */
+esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
+                              uint8_t **out_data, size_t *out_len);
+
+/* Send a Get RPC for multiple variable names (encrypted).
+ * Returns a cJSON result object (caller must cJSON_Delete) or NULL.
+ * The result is the "result" object from the RPC response, mapping
+ * variable names to their values. */
+cJSON *as11_ble_get_values(const char *const *keys, int n_keys);
