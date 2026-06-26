@@ -968,14 +968,15 @@ static void stop_task(void *arg)
 
         /* Pin to core 1 (core 0 runs NimBLE host + notif_proc_task).
          * Priority 5 < notif_proc's 10 so it never preempts stream processing.
-         * Stack 20KB: STR.edf generation needs ~8KB for 134 signal defs +
-         * summary context + path buffers, plus cJSON overhead. */
+         * Stack 6KB: heavy arrays (summary_ctx_t, str_sigs, str_values) are
+         * heap-allocated in PSRAM, so the task stack only needs room for
+         * function call depth + path buffers + cJSON overhead. */
         TaskHandle_t edf_handle = NULL;
-        BaseType_t rc = xTaskCreatePinnedToCore(edf_task, "edf_gen", 20480,
+        BaseType_t rc = xTaskCreatePinnedToCore(edf_task, "edf_gen", 6144,
                                                  edf_args, 5, &edf_handle, 1);
         if (rc == pdPASS) {
             ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1 (stack=%u)",
-                     20480);
+                     6144);
         } else {
             ESP_LOGE(TAG, "stop_task: xTaskCreatePinnedToCore failed rc=%d "
                      "(heap free=%u)", (int)rc, (unsigned)esp_get_free_heap_size());

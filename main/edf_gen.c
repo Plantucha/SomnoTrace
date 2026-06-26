@@ -492,17 +492,22 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         return ESP_FAIL;
     }
 
-    /* Calculate samples per record per signal */
+    /* Calculate samples per record per signal.
+     * Heap-allocated to avoid VLA stack usage. */
     int hz_x10 = hdr.sample_hz_x10;
-    int samples_per_sec_x10 = hz_x10;
-    /* 60-second records → samples_per_record = hz * 60 */
-    int spr[n_signals];
+    int *spr = malloc(n_signals * sizeof(int));
+    edf_signal_def_t *sig = malloc(n_signals * sizeof(edf_signal_def_t));
+    if (!spr || !sig) {
+        ESP_LOGE(TAG, "malloc spr/sig failed");
+        free(spr); free(sig);
+        fclose(snt);
+        return ESP_ERR_NO_MEM;
+    }
     for (int i = 0; i < n_signals; i++) {
-        spr[i] = (samples_per_sec_x10 * 60) / 10;
+        spr[i] = (hz_x10 * 60) / 10;
     }
 
     /* Update signal defs with correct samples_per_record */
-    edf_signal_def_t sig[n_signals];
     for (int i = 0; i < n_signals; i++) {
         sig[i] = signals[i];
         sig[i].samples_per_record = spr[i];
@@ -514,6 +519,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     if (total_records <= 0) {
         ESP_LOGW(TAG, "%s: no complete records (samples=%u spr=%d)",
                  snt_path, total_samples, spr[0]);
+        free(spr); free(sig);
         fclose(snt);
         return ESP_FAIL;
     }
@@ -535,6 +541,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                         "EDF", sig, n_signals);
     if (header_bytes < 0) {
         ESP_LOGE(TAG, "edf_write_header failed for %s", edf_path);
+        free(spr); free(sig);
         fclose(edf);
         fclose(snt);
         return ESP_FAIL;
@@ -556,8 +563,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     int16_t *record_buf = malloc(record_bytes);   /* de-interleaved output */
     if (!raw || !record_buf) {
         ESP_LOGE(TAG, "malloc record buffers failed");
-        free(raw);
-        free(record_buf);
+        free(raw); free(record_buf); free(spr); free(sig);
         fclose(edf);
         fclose(snt);
         return ESP_ERR_NO_MEM;
@@ -588,6 +594,8 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
 
     free(raw);
     free(record_buf);
+    free(spr);
+    free(sig);
 
     /* Finalise CRC in patient ID */
     edf_finalise_crc(edf, header_bytes);
@@ -752,8 +760,20 @@ static esp_err_t generate_str_edf(const char *edf_dir,
 {
     /* Parse the Summary protobuf to extract session statistics.
      * The top-level message has repeated field-2 wrappers, each containing
-     * a session summary record.  We take the first (or most recent) record. */
-    summary_ctx_t ctx = {0};
+     * a session summary record.  We take the first (or most recent) record.
+     *
+     * Large structs are heap-allocated to keep the task stack small
+     * (summary_ctx_t is ~5KB, str_sigs is ~6KB, str_values is 268B).
+     * These will be placed in PSRAM by the heap allocator since they
+     * exceed CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16KB total). */
+    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
+    int16_t *str_values = calloc(STR_SIGNAL_COUNT, sizeof(int16_t));
+    edf_signal_def_t *str_sigs = calloc(STR_SIGNAL_COUNT, sizeof(edf_signal_def_t));
+    if (!ctx || !str_values || !str_sigs) {
+        ESP_LOGE(TAG, "STR.edf: malloc failed for ctx/values/sigs");
+        free(ctx); free(str_values); free(str_sigs);
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Find field-2 wrapper records */
     bool found_record = false;
@@ -772,7 +792,7 @@ static esp_err_t generate_str_edf(const char *edf_dir,
             if (pos + flen > summary_len) break;
 
             /* Parse this record */
-            pb_iter(summary_data + pos, (size_t)flen, summary_field_cb, &ctx);
+            pb_iter(summary_data + pos, (size_t)flen, summary_field_cb, ctx);
             found_record = true;
             pos += flen;
             /* Use the first record for now */
@@ -800,10 +820,9 @@ static esp_err_t generate_str_edf(const char *edf_dir,
     /* Build the 134-field STR record.
      * Many fields come from the Summary spool; settings fields come from
      * settings.json (obtained via Get RPC).  We use settings_json as the
-     * primary source for settings, falling back to Summary spool if needed. */
-
-    int16_t str_values[STR_SIGNAL_COUNT];
-    memset(str_values, 0, sizeof(str_values));
+     * primary source for settings, falling back to Summary spool if needed.
+     *
+     * str_values is already heap-allocated and zeroed above. */
 
     /* Session header [0-3]: Date, MaskOn, MaskOff, MaskEvents
      * These are timestamps — we use the session start/end times. */
@@ -813,8 +832,8 @@ static esp_err_t generate_str_edf(const char *edf_dir,
     str_values[3] = 0;  /* MaskEvents */
 
     /* Session core [4-5] */
-    str_values[4] = get_scalar(&ctx, SUM_F_DURATION_MIN, 0);  /* PPD: Duration */
-    int mode_raw = get_scalar(&ctx, SUM_F_SESSION_MODE, 0);
+    str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);  /* PPD: Duration */
+    int mode_raw = get_scalar(ctx, SUM_F_SESSION_MODE, 0);
     /* Apply enum export map for Mode */
     if (mode_raw >= 0 && mode_raw < (int)(sizeof(MODE_MAP) / sizeof(MODE_MAP[0]))) {
         str_values[5] = MODE_MAP[mode_raw];  /* MOP: Mode */
@@ -831,75 +850,74 @@ static esp_err_t generate_str_edf(const char *edf_dir,
      * to be filled from settings.json in a future enhancement. */
 
     /* Environment and oximetry stats [78-91] */
-    str_values[78] = get_metric(&ctx, SUM_F_BLOWER_PRESS, 3, 0);   /* BP9: 95th */
-    str_values[79] = get_metric(&ctx, SUM_F_BLOWER_PRESS, 1, 0);   /* BP5: 5th */
-    str_values[80] = get_metric(&ctx, SUM_F_RESP_FLOW, 3, 0);      /* R95: 95th */
-    str_values[81] = get_metric(&ctx, SUM_F_RESP_FLOW, 1, 0);      /* RFM: 5th */
-    str_values[82] = get_metric(&ctx, SUM_F_BLOWER_FLOW, 2, 0);    /* BFM: 50th */
-    str_values[83] = get_metric(&ctx, SUM_F_AMB_HUMID, 2, 0);      /* AUM: 50th */
-    str_values[84] = get_metric(&ctx, SUM_F_HUM_TEMP, 2, 0);       /* HHE: 50th */
-    str_values[85] = get_metric(&ctx, SUM_F_HTUBE_TEMP, 2, 0);     /* HTE: 50th */
-    str_values[86] = get_metric(&ctx, SUM_F_HTUBE_POWER, 2, 0);    /* AHM: 50th */
-    str_values[87] = get_metric(&ctx, SUM_F_HUM_POWER, 2, 0);      /* APM: 50th */
-    str_values[88] = get_metric(&ctx, SUM_F_SPO2, 2, 0);           /* SOM: 50th */
-    str_values[89] = get_metric(&ctx, SUM_F_SPO2, 3, 0);           /* SO9: 95th */
-    str_values[90] = get_metric(&ctx, SUM_F_SPO2, 4, 0);           /* SOX: 100th */
-    str_values[91] = get_scalar(&ctx, SUM_F_SAU, 0);               /* SAU: SpO2Thresh */
+    str_values[78] = get_metric(ctx, SUM_F_BLOWER_PRESS, 3, 0);   /* BP9: 95th */
+    str_values[79] = get_metric(ctx, SUM_F_BLOWER_PRESS, 1, 0);   /* BP5: 5th */
+    str_values[80] = get_metric(ctx, SUM_F_RESP_FLOW, 3, 0);      /* R95: 95th */
+    str_values[81] = get_metric(ctx, SUM_F_RESP_FLOW, 1, 0);      /* RFM: 5th */
+    str_values[82] = get_metric(ctx, SUM_F_BLOWER_FLOW, 2, 0);    /* BFM: 50th */
+    str_values[83] = get_metric(ctx, SUM_F_AMB_HUMID, 2, 0);      /* AUM: 50th */
+    str_values[84] = get_metric(ctx, SUM_F_HUM_TEMP, 2, 0);       /* HHE: 50th */
+    str_values[85] = get_metric(ctx, SUM_F_HTUBE_TEMP, 2, 0);     /* HTE: 50th */
+    str_values[86] = get_metric(ctx, SUM_F_HTUBE_POWER, 2, 0);    /* AHM: 50th */
+    str_values[87] = get_metric(ctx, SUM_F_HUM_POWER, 2, 0);      /* APM: 50th */
+    str_values[88] = get_metric(ctx, SUM_F_SPO2, 2, 0);           /* SOM: 50th */
+    str_values[89] = get_metric(ctx, SUM_F_SPO2, 3, 0);           /* SO9: 95th */
+    str_values[90] = get_metric(ctx, SUM_F_SPO2, 4, 0);           /* SOX: 100th */
+    str_values[91] = get_scalar(ctx, SUM_F_SAU, 0);               /* SAU: SpO2Thresh */
 
     /* Bilevel/ventilation summary stats [92-124] */
-    str_values[92] = get_scalar(&ctx, SUM_F_SPONT_TRIG, 0);   /* VSR */
-    str_values[93] = get_scalar(&ctx, SUM_F_SPONT_CYC, 0);    /* VCR */
-    str_values[94] = get_metric(&ctx, SUM_F_MEAN_MASK_PRESS, 2, 0);  /* MSP: 50th */
-    str_values[95] = get_metric(&ctx, SUM_F_MEAN_MASK_PRESS, 3, 0);  /* PM9: 95th */
-    str_values[96] = get_metric(&ctx, SUM_F_MEAN_MASK_PRESS, 4, 0);  /* PMA: 100th */
-    str_values[97] = get_metric(&ctx, SUM_F_INSP_PRESS, 2, 0);       /* PIM: 50th */
-    str_values[98] = get_metric(&ctx, SUM_F_INSP_PRESS, 3, 0);       /* PI9: 95th */
-    str_values[99] = get_metric(&ctx, SUM_F_INSP_PRESS, 4, 0);       /* PIA: 100th */
-    str_values[100] = get_metric(&ctx, SUM_F_EXP_PRESS, 2, 0);       /* PEM: 50th */
-    str_values[101] = get_metric(&ctx, SUM_F_EXP_PRESS, 3, 0);       /* PE9: 95th */
-    str_values[102] = get_metric(&ctx, SUM_F_EXP_PRESS, 4, 0);       /* PEA: 100th */
-    str_values[103] = get_metric(&ctx, SUM_F_LEAK, 2, 0);            /* LKM: 50th */
-    str_values[104] = get_metric(&ctx, SUM_F_LEAK, 3, 0);            /* LK9: 95th */
-    str_values[105] = get_metric(&ctx, SUM_F_LEAK, 4, 0);            /* LK7: 70th */
+    str_values[92] = get_scalar(ctx, SUM_F_SPONT_TRIG, 0);   /* VSR */
+    str_values[93] = get_scalar(ctx, SUM_F_SPONT_CYC, 0);    /* VCR */
+    str_values[94] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 2, 0);  /* MSP: 50th */
+    str_values[95] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 3, 0);  /* PM9: 95th */
+    str_values[96] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 4, 0);  /* PMA: 100th */
+    str_values[97] = get_metric(ctx, SUM_F_INSP_PRESS, 2, 0);       /* PIM: 50th */
+    str_values[98] = get_metric(ctx, SUM_F_INSP_PRESS, 3, 0);       /* PI9: 95th */
+    str_values[99] = get_metric(ctx, SUM_F_INSP_PRESS, 4, 0);       /* PIA: 100th */
+    str_values[100] = get_metric(ctx, SUM_F_EXP_PRESS, 2, 0);       /* PEM: 50th */
+    str_values[101] = get_metric(ctx, SUM_F_EXP_PRESS, 3, 0);       /* PE9: 95th */
+    str_values[102] = get_metric(ctx, SUM_F_EXP_PRESS, 4, 0);       /* PEA: 100th */
+    str_values[103] = get_metric(ctx, SUM_F_LEAK, 2, 0);            /* LKM: 50th */
+    str_values[104] = get_metric(ctx, SUM_F_LEAK, 3, 0);            /* LK9: 95th */
+    str_values[105] = get_metric(ctx, SUM_F_LEAK, 4, 0);            /* LK7: 70th */
     /* Note: field 14 (Leak) sub-field 3 is 70th percentile, not 95th.
      * Sub-field 5 is 100th.  We need to be more precise here. */
-    str_values[106] = get_metric(&ctx, SUM_F_LEAK, 5, 0);            /* LMX: 100th */
-    str_values[107] = get_metric(&ctx, SUM_F_MIN_VENT, 2, 0);        /* VTM: 50th */
-    str_values[108] = get_metric(&ctx, SUM_F_MIN_VENT, 3, 0);        /* VT9: 95th */
-    str_values[109] = get_metric(&ctx, SUM_F_MIN_VENT, 4, 0);        /* VTA: 100th */
-    str_values[110] = get_metric(&ctx, SUM_F_RESP_RATE, 2, 0);       /* RRM: 50th */
-    str_values[111] = get_metric(&ctx, SUM_F_RESP_RATE, 3, 0);       /* RR9: 95th */
-    str_values[112] = get_metric(&ctx, SUM_F_RESP_RATE, 4, 0);       /* RRA: 100th */
-    str_values[113] = get_metric(&ctx, SUM_F_TIDAL_VOL, 2, 0);       /* TVM: 50th */
-    str_values[114] = get_metric(&ctx, SUM_F_TIDAL_VOL, 3, 0);       /* TV9: 95th */
-    str_values[115] = get_metric(&ctx, SUM_F_TIDAL_VOL, 4, 0);       /* TVA: 100th */
-    str_values[116] = get_metric(&ctx, SUM_F_TGT_VENT, 2, 0);        /* VAM: 50th */
-    str_values[117] = get_metric(&ctx, SUM_F_TGT_VENT, 3, 0);        /* VA9: 95th */
-    str_values[118] = get_metric(&ctx, SUM_F_TGT_VENT, 4, 0);        /* VAA: 100th */
-    str_values[119] = get_metric(&ctx, SUM_F_IE_RATIO, 2, 0);        /* IEM: 50th */
-    str_values[120] = get_metric(&ctx, SUM_F_IE_RATIO, 3, 0);        /* IE9: 95th */
-    str_values[121] = get_metric(&ctx, SUM_F_IE_RATIO, 4, 0);        /* IEA: 100th */
-    str_values[122] = get_metric(&ctx, SUM_F_INSP_DUR, 2, 0);        /* ISM: 50th */
-    str_values[123] = get_metric(&ctx, SUM_F_INSP_DUR, 3, 0);        /* IS9: 95th */
-    str_values[124] = get_metric(&ctx, SUM_F_INSP_DUR, 4, 0);        /* ISA: 100th */
+    str_values[106] = get_metric(ctx, SUM_F_LEAK, 5, 0);            /* LMX: 100th */
+    str_values[107] = get_metric(ctx, SUM_F_MIN_VENT, 2, 0);        /* VTM: 50th */
+    str_values[108] = get_metric(ctx, SUM_F_MIN_VENT, 3, 0);        /* VT9: 95th */
+    str_values[109] = get_metric(ctx, SUM_F_MIN_VENT, 4, 0);        /* VTA: 100th */
+    str_values[110] = get_metric(ctx, SUM_F_RESP_RATE, 2, 0);       /* RRM: 50th */
+    str_values[111] = get_metric(ctx, SUM_F_RESP_RATE, 3, 0);       /* RR9: 95th */
+    str_values[112] = get_metric(ctx, SUM_F_RESP_RATE, 4, 0);       /* RRA: 100th */
+    str_values[113] = get_metric(ctx, SUM_F_TIDAL_VOL, 2, 0);       /* TVM: 50th */
+    str_values[114] = get_metric(ctx, SUM_F_TIDAL_VOL, 3, 0);       /* TV9: 95th */
+    str_values[115] = get_metric(ctx, SUM_F_TIDAL_VOL, 4, 0);       /* TVA: 100th */
+    str_values[116] = get_metric(ctx, SUM_F_TGT_VENT, 2, 0);        /* VAM: 50th */
+    str_values[117] = get_metric(ctx, SUM_F_TGT_VENT, 3, 0);        /* VA9: 95th */
+    str_values[118] = get_metric(ctx, SUM_F_TGT_VENT, 4, 0);        /* VAA: 100th */
+    str_values[119] = get_metric(ctx, SUM_F_IE_RATIO, 2, 0);        /* IEM: 50th */
+    str_values[120] = get_metric(ctx, SUM_F_IE_RATIO, 3, 0);        /* IE9: 95th */
+    str_values[121] = get_metric(ctx, SUM_F_IE_RATIO, 4, 0);        /* IEA: 100th */
+    str_values[122] = get_metric(ctx, SUM_F_INSP_DUR, 2, 0);        /* ISM: 50th */
+    str_values[123] = get_metric(ctx, SUM_F_INSP_DUR, 3, 0);        /* IS9: 95th */
+    str_values[124] = get_metric(ctx, SUM_F_INSP_DUR, 4, 0);        /* ISA: 100th */
 
     /* Indices and CSR [125-132] */
-    str_values[125] = get_scalar(&ctx, SUM_F_AHI, 0);    /* AHI */
-    str_values[126] = get_scalar(&ctx, SUM_F_HI, 0);     /* HSC: HI */
-    str_values[127] = get_scalar(&ctx, SUM_F_AI, 0);     /* ASC: AI */
-    str_values[128] = get_scalar(&ctx, SUM_F_OAI, 0);    /* CSC: OAI */
-    str_values[129] = get_scalar(&ctx, SUM_F_CAI, 0);    /* OSC: CAI */
-    str_values[130] = get_scalar(&ctx, SUM_F_UAI, 0);    /* USC: UAI */
-    str_values[131] = get_scalar(&ctx, SUM_F_RIN, 0);    /* RCC: RIN */
-    str_values[132] = get_scalar(&ctx, SUM_F_CSR, 0);    /* CSD: CSR */
+    str_values[125] = get_scalar(ctx, SUM_F_AHI, 0);    /* AHI */
+    str_values[126] = get_scalar(ctx, SUM_F_HI, 0);     /* HSC: HI */
+    str_values[127] = get_scalar(ctx, SUM_F_AI, 0);     /* ASC: AI */
+    str_values[128] = get_scalar(ctx, SUM_F_OAI, 0);    /* CSC: OAI */
+    str_values[129] = get_scalar(ctx, SUM_F_CAI, 0);    /* OSC: CAI */
+    str_values[130] = get_scalar(ctx, SUM_F_UAI, 0);    /* USC: UAI */
+    str_values[131] = get_scalar(ctx, SUM_F_RIN, 0);    /* RCC: RIN */
+    str_values[132] = get_scalar(ctx, SUM_F_CSR, 0);    /* CSD: CSR */
 
     /* Tail [133]: Crc16 — computed during EDF write */
 
     /* Build STR.edf signal definitions.
      * All 134 signals have the same physical/digital range since they're
      * all int16 values.  The labels and units vary per signal. */
-    edf_signal_def_t str_sigs[STR_SIGNAL_COUNT];
-    memset(str_sigs, 0, sizeof(str_sigs));
+    /* str_sigs already heap-allocated and zeroed above */
 
     /* Set common defaults for all STR signals */
     for (int i = 0; i < STR_SIGNAL_COUNT; i++) {
@@ -990,6 +1008,9 @@ static esp_err_t generate_str_edf(const char *edf_dir,
     /* TODO: generate CSL.edf from CSR interval data if available */
     ESP_LOGI(TAG, "CSL.edf: not generated (CSR annotations not yet implemented)");
 
+    free(ctx);
+    free(str_values);
+    free(str_sigs);
     return ESP_OK;
 }
 
