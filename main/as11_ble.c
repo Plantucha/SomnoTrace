@@ -293,7 +293,7 @@ static int aes_cbc_encrypt(const uint8_t *key, const uint8_t *plaintext,
     int framed_len = 2 + plen;
     int pad_len = (16 - framed_len % 16) % 16;
     int padded_len = framed_len + pad_len;
-    ESP_LOGI(TAG, "aes_cbc_encrypt: plen=%d framed=%d pad=%d padded=%d out_max=%d",
+    ESP_LOGD(TAG, "aes_cbc_encrypt: plen=%d framed=%d pad=%d padded=%d out_max=%d",
              plen, framed_len, pad_len, padded_len, out_max);
     if (16 + padded_len > out_max) {
         ESP_LOGE(TAG, "aes_cbc_encrypt: output too large: %d > %d", 16 + padded_len, out_max);
@@ -1852,19 +1852,22 @@ static void reconnect_task(void *arg)
     }
 
     /* ---- Start data stream (encrypted) ----
-     * BRP: PatientFlow + MaskPressure @ 40ms (25 Hz)
-     * PLD: 9 channels @ 2000ms (0.5 Hz)
-     * SA2: HeartRate + SpO2 @ 1000ms (1 Hz)
-     * StartStream applies one sampleIntervalMs to all, so use 40ms. */
-    rpc = malloc(800);
-    snprintf(rpc, 800,
+     * Uses short tags matching STREAM_EDF_ALIASES in as11_rpc_vars.py:
+     *   BRP: _RFL, _MKP  (40ms natural interval = 25 Hz)
+     *   PLD: 12 channels (2000ms natural interval = 0.5 Hz)
+     *   SA2: _HRT, _SAO  (1000ms natural interval = 1 Hz)
+     * AS11 normalizes short tags to long names in StreamData notifications.
+     * Unsupported signals return valid:false in the StartStream response.
+     * sampleIntervalMs:40 applies to all; reportIntervalMs:200 gives 5 reports/s. */
+    rpc = malloc(600);
+    snprintf(rpc, 600,
              "{\"id\":14,\"jsonrpc\":\"1.0\",\"method\":\"StartStream\","
              "\"params\":{\"dataIds\":["
-             "\"PatientFlow-100hz\",\"MaskPressure-100hz\","
-             "\"MaskPressure-TwoSecond\",\"InspiratoryPressure-TwoSecond\","
-             "\"ExpiratoryPressure-TwoSecond\",\"Leak-50hz\",\"RespiratoryRate-50hz\","
-             "\"TidalVolume-50hz\",\"MinuteVentilation-50hz\",\"SnoreIndex-50hz\","
-             "\"FlowLimitation-50hz\",\"HeartRate\",\"SpO2\""
+             "\"_RFL\",\"_MKP\","
+             "\"_MKF\",\"_MKI\",\"_MKE\",\"_LKF\","
+             "\"_RR2\",\"_TD2\",\"_MV2\",\"_TGT\",\"_IE2\","
+             "\"_SNI\",\"_FFL\",\"_INT\","
+             "\"_HRT\",\"_SAO\""
              "],\"sampleIntervalMs\":40,\"reportIntervalMs\":200}}");
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {
@@ -1872,7 +1875,10 @@ static void reconnect_task(void *arg)
     } else {
         resp = wait_response(10000);
         if (resp) {
-            ESP_LOGI(TAG, "reconnect: StartStream response received");
+            char *resp_str = cJSON_PrintUnformatted(resp);
+            ESP_LOGI(TAG, "reconnect: StartStream response: %s",
+                     resp_str ? resp_str : "(null)");
+            if (resp_str) free(resp_str);
             cJSON_Delete(resp);
         } else {
             ESP_LOGW(TAG, "reconnect: StartStream timeout (non-fatal)");

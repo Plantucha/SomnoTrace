@@ -79,8 +79,11 @@ cJSON *as11_ble_get_paired_info(void);
 /* Erase stored pairing credentials from NVS. */
 esp_err_t as11_ble_forget(void);
 
-/* Stop the AS11 data stream (sends StartStream with empty dataIds).
- * Call before as11_ble_get_datetime() to free BLE buffers. */
+/* Stop the AS11 data stream. Currently a no-op — the stream continues
+ * between sessions and is restarted on next reconnect. Stopping via
+ * StartStream with empty dataIds or CCCD write would block RPC responses
+ * (which arrive as notifications on the same characteristic).
+ * Call before as11_ble_get_datetime() to free BLE buffers (future use). */
 esp_err_t as11_ble_stop_stream(void);
 
 /* Compute clock drift from AS11 clock captured before stream start.

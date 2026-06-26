@@ -86,9 +86,9 @@ struct session_writer {
     int64_t  end_epoch_ms;        /* NTP epoch ms at session stop */
     bool     active;
 
-    stream_files_t brp;     /* 25 Hz, 2 ch: flow + mask_pressure */
-    stream_files_t sa2;     /* 5 Hz, 2 ch: heart_rate + spo2 (decimated from 25 Hz) */
-    stream_files_t pld;     /* 5 Hz, 12 ch (decimated from 25 Hz) */
+    stream_files_t brp;     /* 25 Hz, 2 ch: flow + mask_pressure (40ms natural) */
+    stream_files_t sa2;     /* 5 Hz, 2 ch: heart_rate + spo2 (1 Hz natural, 5 Hz stored) */
+    stream_files_t pld;     /* 0.5 Hz, 12 ch (0.5 Hz natural, decimated from 5 Hz report) */
     FILE    *f_events;
     uint32_t brp_mm_count;  /* L1 MinMax records written */
 
@@ -108,9 +108,10 @@ struct session_writer {
     int16_t sa2_spo2[300];
     uint32_t sa2_buf_count;
 
-    /* PLD recent buffer (5 Hz × 12 ch × 60 s = 300 samples) */
+    /* PLD recent buffer (0.5 Hz × 12 ch × 60 s = 30 samples) */
     int16_t pld_buf[300][12];
     uint32_t pld_buf_count;
+    uint8_t pld_countdown;     /* decimation: write PLD every 10th notification */
 
     /* events: simple JSON line file, flushed with data */
 };
@@ -134,7 +135,7 @@ static void make_session_id(char *out, size_t out_len)
              tm.tm_hour, tm.tm_min);
 }
 
-static void write_snt_header(FILE *f, uint8_t tier, uint16_t rate_hz,
+static void write_snt_header(FILE *f, uint8_t tier, uint16_t hz_x10,
                              uint8_t n_ch, int64_t start_epoch_ms)
 {
     snt_header_t hdr = {
@@ -143,7 +144,7 @@ static void write_snt_header(FILE *f, uint8_t tier, uint16_t rate_hz,
         .tier = tier,
         .n_channels = n_ch,
         .sample_bytes = 2,
-        .sample_hz_x10 = rate_hz * 10,
+        .sample_hz_x10 = hz_x10,
         .reserved = 0,
         .start_epoch_ms = start_epoch_ms,
         .sample_count = 0,
@@ -361,6 +362,8 @@ session_writer_t *session_writer_start(void)
         return NULL;
     }
 
+    s->pld_countdown = 1;  /* first notification writes PLD immediately */
+
     make_session_id(s->session_id, sizeof(s->session_id));
 
     /* Try to create the session directory. If it already exists (same-minute
@@ -409,19 +412,19 @@ session_writer_t *session_writer_start(void)
 
     snprintf(path, sizeof(path), "%s/brp.snt", s->dir);
     s->brp.f_l0 = fopen(path, "wb");
-    if (s->brp.f_l0) write_snt_header(s->brp.f_l0, 0, 25, 2, start_epoch_ms);
+    if (s->brp.f_l0) write_snt_header(s->brp.f_l0, 0, 250, 2, start_epoch_ms);  /* 25 Hz */
 
     snprintf(path, sizeof(path), "%s/brp_mm.snt", s->dir);
     s->brp.f_l1 = fopen(path, "wb");
-    if (s->brp.f_l1) write_snt_header(s->brp.f_l1, 1, 1, 4, start_epoch_ms);
+    if (s->brp.f_l1) write_snt_header(s->brp.f_l1, 1, 10, 4, start_epoch_ms);  /* 1 Hz */
 
     snprintf(path, sizeof(path), "%s/sa2.snt", s->dir);
     s->sa2.f_l0 = fopen(path, "wb");
-    if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 0, 5, 2, start_epoch_ms);
+    if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 0, 50, 2, start_epoch_ms);  /* 5 Hz */
 
     snprintf(path, sizeof(path), "%s/pld.snt", s->dir);
     s->pld.f_l0 = fopen(path, "wb");
-    if (s->pld.f_l0) write_snt_header(s->pld.f_l0, 0, 5, 12, start_epoch_ms);
+    if (s->pld.f_l0) write_snt_header(s->pld.f_l0, 0, 5, 12, start_epoch_ms);  /* 0.5 Hz */
 
     snprintf(path, sizeof(path), "%s/events.snt", s->dir);
     s->f_events = fopen(path, "w");
@@ -581,223 +584,95 @@ static bool check_event_notification(const cJSON *msg, bool *out_start, bool *ou
     return *out_start || *out_stop;
 }
 
-/* Convert a float sample to int16_t with clamping.
- * AS11 sends flow in L/min, pressure in cmH2O, etc. as floats.
- * We scale by 100 to preserve 2 decimal places in int16_t. */
-static int16_t float_to_s16(double val)
-{
-    double scaled = val * 100.0;
-    if (scaled > 32767.0) return 32767;
-    if (scaled < -32768.0) return -32768;
-    return (int16_t)scaled;
-}
-
-/* Parse a StreamData notification and route samples to the correct stream buffers.
- * StreamData format:
- *   params.data[] = array of objects, each { "StreamName": [samples] }
- *   e.g. { "PatientFlow-100hz": [0.05, 0.03, ...], "MaskPressure-100hz": [...] }
- *
- * BRP (25 Hz): PatientFlow-100hz, MaskPressure-100hz
- * SA2 (5 Hz):  HeartRate, SpO2 (decimated: 1 sample per 200ms report)
- * PLD (5 Hz): MaskPressure-TwoSecond, InspiratoryPressure-TwoSecond,
- *   ExpiratoryPressure-TwoSecond, Leak-50hz, RespiratoryRate-50hz,
- *   TidalVolume-50hz, MinuteVentilation-50hz, SnoreIndex-50hz, FlowLimitation-50hz
- */
-static void parse_stream_data(session_writer_t *s, const cJSON *msg)
-{
-    if (!s || !s->active) return;
-
-    cJSON *params = cJSON_GetObjectItem(msg, "params");
-    if (!params) return;
-
-    cJSON *data = cJSON_GetObjectItem(params, "data");
-    if (!data || !cJSON_IsArray(data)) return;
-
-    int n_items = cJSON_GetArraySize(data);
-    bool pld_record_started = false;
-    for (int i = 0; i < n_items; i++) {
-        cJSON *item = cJSON_GetArrayItem(data, i);
-        if (!item || !cJSON_IsObject(item)) continue;
-
-        cJSON *child = NULL;
-        cJSON_ArrayForEach(child, item) {
-            const char *name = child->string;
-            if (!name || !cJSON_IsArray(child)) continue;
-
-            int n_samples = cJSON_GetArraySize(child);
-            if (n_samples <= 0) continue;
-
-            /* Route to the correct buffer based on stream name */
-            if (strcmp(name, "PatientFlow-100hz") == 0) {
-                for (int j = 0; j < n_samples && s->brp_buf_count < 1500; j++) {
-                    cJSON *v = cJSON_GetArrayItem(child, j);
-                    if (v && cJSON_IsNumber(v)) {
-                        s->brp_flow[s->brp_buf_count] = float_to_s16(v->valuedouble);
-                    } else {
-                        s->brp_flow[s->brp_buf_count] = INT16_MIN;
-                    }
-                    s->brp_buf_count++;
-                }
-            } else if (strcmp(name, "MaskPressure-100hz") == 0) {
-                /* BRP pressure is paired with flow — fill the same index */
-                for (int j = 0; j < n_samples; j++) {
-                    /* Ensure brp_buf_count is at least j+1 (flow should arrive first) */
-                    if (s->brp_buf_count <= j) {
-                        /* Flow wasn't seen yet or fewer samples — pad with sentinel */
-                        if (s->brp_buf_count < 1500) {
-                            s->brp_flow[s->brp_buf_count] = INT16_MIN;
-                            s->brp_buf_count++;
-                        }
-                    }
-                    if (j < 1500) {
-                        cJSON *v = cJSON_GetArrayItem(child, j);
-                        if (v && cJSON_IsNumber(v))
-                            s->brp_press[j] = float_to_s16(v->valuedouble);
-                        else
-                            s->brp_press[j] = INT16_MIN;
-                    }
-                }
-            } else if (strcmp(name, "HeartRate") == 0) {
-                /* SA2: take only the last sample (value-held by device at 25 Hz,
-                 * updates at 1 Hz). One sample per 200ms report = 5 Hz. */
-                if (s->sa2_buf_count < 300) {
-                    cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
-                    if (v && cJSON_IsNumber(v))
-                        s->sa2_hr[s->sa2_buf_count] = float_to_s16(v->valuedouble);
-                    else
-                        s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
-                    s->sa2_buf_count++;
-                }
-            } else if (strcmp(name, "SpO2") == 0) {
-                /* SA2: fill spo2 for the current sample index */
-                if (s->sa2_buf_count > 0) {
-                    int idx = s->sa2_buf_count - 1;
-                    cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
-                    if (v && cJSON_IsNumber(v))
-                        s->sa2_spo2[idx] = float_to_s16(v->valuedouble);
-                    else
-                        s->sa2_spo2[idx] = INT16_MIN;
-                } else if (s->sa2_buf_count < 300) {
-                    /* SpO2 arrived before HeartRate — create the sample */
-                    s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
-                    cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
-                    if (v && cJSON_IsNumber(v))
-                        s->sa2_spo2[s->sa2_buf_count] = float_to_s16(v->valuedouble);
-                    else
-                        s->sa2_spo2[s->sa2_buf_count] = INT16_MIN;
-                    s->sa2_buf_count++;
-                }
-            } else {
-                /* PLD channels: route to pld_buf by name index */
-                static const char *pld_names[] = {
-                    "MaskPressure-TwoSecond", "InspiratoryPressure-TwoSecond",
-                    "ExpiratoryPressure-TwoSecond", "Leak-50hz",
-                    "RespiratoryRate-50hz", "TidalVolume-50hz",
-                    "MinuteVentilation-50hz", "SnoreIndex-50hz",
-                    "FlowLimitation-50hz",
-                };
-                int ch_idx = -1;
-                for (int k = 0; k < 9; k++) {
-                    if (strcmp(name, pld_names[k]) == 0) { ch_idx = k; break; }
-                }
-                if (ch_idx >= 0) {
-                    /* PLD: take only the last sample (value-held by device,
-                     * updates at 0.5 Hz). One sample per 200ms report = 5 Hz. */
-                    if (s->pld_buf_count < 300) {
-                        if (!pld_record_started) {
-                            /* First PLD channel for this notification — init record */
-                            for (int k = 0; k < 12; k++)
-                                s->pld_buf[s->pld_buf_count][k] = INT16_MIN;
-                            pld_record_started = true;
-                        }
-                        cJSON *v = cJSON_GetArrayItem(child, n_samples - 1);
-                        if (v && cJSON_IsNumber(v))
-                            s->pld_buf[s->pld_buf_count][ch_idx] = float_to_s16(v->valuedouble);
-                    }
-                }
-            }
-        }
-    }
-
-    /* Advance PLD record count once per notification (after all channels) */
-    if (pld_record_started) {
-        s->pld_buf_count++;
-    }
-
-    /* Flush if buffers are getting full */
-    if (s->brp_buf_count >= 1400) flush_brp(s);
-    if (s->sa2_buf_count >= 280) flush_sa2(s);
-    if (s->pld_buf_count >= 280) flush_pld(s);
-}
-
-/* Check if PatientFlow values are non-trivial (therapy active without event).
- * Used for reboot-mid-therapy detection.
- * Threshold: any sample with absolute value > 0.5 L/min indicates real therapy. */
-static bool stream_data_has_active_flow(const cJSON *msg)
-{
-    cJSON *params = cJSON_GetObjectItem(msg, "params");
-    if (!params) return false;
-    cJSON *data = cJSON_GetObjectItem(params, "data");
-    if (!data || !cJSON_IsArray(data)) return false;
-
-    int n = cJSON_GetArraySize(data);
-    for (int i = 0; i < n; i++) {
-        cJSON *item = cJSON_GetArrayItem(data, i);
-        if (!item) continue;
-        cJSON *flow = cJSON_GetObjectItem(item, "PatientFlow-100hz");
-        if (flow && cJSON_IsArray(flow)) {
-            int ns = cJSON_GetArraySize(flow);
-            for (int j = 0; j < ns; j++) {
-                cJSON *v = cJSON_GetArrayItem(flow, j);
-                if (v && cJSON_IsNumber(v) && fabs(v->valuedouble) > 0.5) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
 /* ── Fast-path StreamData parser (bypasses cJSON) ─────────────────── */
 
-/* Find a JSON string key `"key"` in json[0..len), return position after
- * the colon following the key, or NULL if not found. */
-static const char *find_json_key(const char *json, int len, const char *key)
-{
-    int klen = strlen(key);
-    for (int i = 0; i + klen + 3 < len; i++) {
-        if (json[i] == '"') {
-            if (strncmp(json + i + 1, key, klen) == 0 && json[i + 1 + klen] == '"') {
-                /* Expect a colon after the closing quote (with optional whitespace) */
-                int j = i + 1 + klen + 1;
-                while (j < len && (json[j] == ' ' || json[j] == '\t')) j++;
-                if (j < len && json[j] == ':') {
-                    return json + j + 1;  /* position after colon */
-                }
-            }
-        }
-    }
-    return NULL;
-}
+/* Stream key identifiers — index into results arrays.
+ * Order matches the pld_names layout for PLD channels (0-11). */
+enum {
+    KEY_PATIENT_FLOW = 0,
+    KEY_MASK_PRESSURE,
+    KEY_MASK_PRESSURE_2S,
+    KEY_INSP_PRESSURE_2S,
+    KEY_EXPR_PRESSURE_2S,
+    KEY_LEAK,
+    KEY_RR2,
+    KEY_TD2,
+    KEY_MV2,
+    KEY_TGT,
+    KEY_IE2,
+    KEY_SNI,
+    KEY_FFL,
+    KEY_INT,
+    KEY_HEART_RATE,
+    KEY_SPO2,
+    KEY_COUNT
+};
 
-/* Parse a JSON number array starting at *p (pointing at '[' or first digit).
- * Stores up to max_out doubles in out, returns count. Advances *p past the
- * closing ']'. */
-static int parse_json_array(const char **p, const char *end, double *out, int max_out)
+/* Key lookup table — name, pre-computed length, key id.
+ * Sorted by length for bucket-matching in the single-pass scanner. */
+typedef struct { const char *name; int len; int id; } key_entry_t;
+static const key_entry_t s_keys[] = {
+    {"SpO2",                          4,  KEY_SPO2},
+    {"Leak",                          4,  KEY_LEAK},
+    {"_RR2",                          4,  KEY_RR2},
+    {"_TD2",                          4,  KEY_TD2},
+    {"_MV2",                          4,  KEY_MV2},
+    {"_TGT",                          4,  KEY_TGT},
+    {"_IE2",                          4,  KEY_IE2},
+    {"HeartRate",                     9,  KEY_HEART_RATE},
+    {"SnoreIndex",                   10,  KEY_SNI},
+    {"PatientFlow",                  11,  KEY_PATIENT_FLOW},
+    {"MaskPressure",                 12,  KEY_MASK_PRESSURE},
+    {"FlowLimitation",               14,  KEY_FFL},
+    {"InspiratoryDuration",          19,  KEY_INT},
+    {"MaskPressure-TwoSecond",       22,  KEY_MASK_PRESSURE_2S},
+    {"ExpiratoryPressure-TwoSecond", 28,  KEY_EXPR_PRESSURE_2S},
+    {"InspiratoryPressure-TwoSecond",29,  KEY_INSP_PRESSURE_2S},
+};
+#define N_KEYS (int)(sizeof(s_keys) / sizeof(s_keys[0]))
+
+/* Parse a JSON number array, scaling values by 100 into int16_t.
+ * null values become INT16_MIN. No strtod, no double arithmetic.
+ * Returns count of values parsed. Advances *p past closing ']'. */
+static int parse_scaled_array(const char **p, const char *end, int16_t *out, int max_out)
 {
     const char *s = *p;
     while (s < end && *s != '[') s++;
     if (s >= end || *s != '[') { *p = s; return 0; }
-    s++;  /* skip '[' */
+    s++;
     int count = 0;
     while (s < end && *s != ']' && count < max_out) {
         while (s < end && (*s == ' ' || *s == ',' || *s == '\t' || *s == '\n')) s++;
         if (s >= end || *s == ']') break;
-        char *endptr;
-        out[count] = strtod(s, &endptr);
-        if (endptr == s) { s++; continue; }  /* skip unparseable */
-        count++;
-        s = endptr;
+
+        if (s + 3 < end && s[0] == 'n' && s[1] == 'u' && s[2] == 'l' && s[3] == 'l') {
+            out[count++] = INT16_MIN;
+            s += 4;
+            continue;
+        }
+
+        bool neg = false;
+        if (s < end && (*s == '-' || *s == '+')) { neg = (*s == '-'); s++; }
+
+        long ip = 0;
+        while (s < end && *s >= '0' && *s <= '9') { ip = ip * 10 + (*s - '0'); s++; }
+
+        int frac = 0, fd = 0;
+        if (s < end && *s == '.') {
+            s++;
+            while (s < end && *s >= '0' && *s <= '9') {
+                if (fd < 2) { frac = frac * 10 + (*s - '0'); fd++; }
+                s++;
+            }
+        }
+
+        long scaled = ip * 100;
+        if (fd == 1) scaled += frac * 10;
+        else if (fd == 2) scaled += frac;
+        if (neg) scaled = -scaled;
+        if (scaled > 32767) scaled = 32767;
+        if (scaled < -32768) scaled = -32768;
+        out[count++] = (int16_t)scaled;
     }
     while (s < end && *s != ']') s++;
     if (s < end && *s == ']') s++;
@@ -805,26 +680,109 @@ static int parse_json_array(const char **p, const char *end, double *out, int ma
     return count;
 }
 
-/* Fast-path: process StreamData from raw JSON without cJSON.
- * Handles: display flow push, active-flow detection, sample routing. */
+/* Match a key of known length against the key table.
+ * Returns key id or -1 if no match. Keys are grouped by length
+ * in s_keys, so we only compare against same-length entries. */
+static int match_key(const char *key, int klen)
+{
+    for (int i = 0; i < N_KEYS; i++) {
+        if (s_keys[i].len != klen) continue;
+        if (strncmp(key, s_keys[i].name, klen) == 0) return s_keys[i].id;
+    }
+    return -1;
+}
+
+/* Fast-path: process StreamData from raw JSON in a single linear pass.
+ *
+ * StartStream sends short tags (_RFL, _MKP, _MKF, etc.) but the AS11
+ * normalizes them to long names in StreamData (per rpc_streams.md):
+ *   _RFL → PatientFlow, _MKP → MaskPressure
+ *   _MKF → MaskPressure-TwoSecond, _MKI → InspiratoryPressure-TwoSecond, etc.
+ *   _RR2, _TD2, _MV2, _TGT, _IE2 have no long name — echoed as-is.
+ *   _HRT → HeartRate, _SAO → SpO2
+ *
+ * Single-pass: walks the JSON once, matching keys by length-bucketed
+ * comparison. Values are parsed directly to scaled int16_t (×100),
+ * avoiding strtod and double arithmetic entirely. */
 void session_writer_on_stream_data_raw(const char *json, int len)
 {
     session_writer_t *s = session_writer_get_active();
 
-    /* Push flow to display and detect active flow */
-    bool has_active_flow = false;
-    const char *end = json + len;
+    /* One-time log of raw StreamData for key-name verification */
+    static bool s_first_logged = false;
+    if (!s_first_logged) {
+        s_first_logged = true;
+        int log_len = len < 400 ? len : 400;
+        ESP_LOGI(TAG, "StreamData first notification (first %d bytes): %.*s",
+                 log_len, log_len, json);
+    }
 
-    /* Find "PatientFlow-100hz" array */
-    const char *flow_key = find_json_key(json, len, "PatientFlow-100hz");
-    if (flow_key) {
-        const char *fp = flow_key;
-        double vals[32];
-        int n = parse_json_array(&fp, end, vals, 32);
-        for (int j = 0; j < n; j++) {
-            bsp_display_push_flow(vals[j]);
-            if (fabs(vals[j]) > 0.5) has_active_flow = true;
+    const char *end = json + len;
+    const char *p = json;
+
+    /* Parsed results — filled during single-pass scan */
+    int16_t flow_vals[32];  int flow_n = 0;
+    int16_t press_vals[32]; int press_n = 0;
+    int16_t pld_vals[12] = {0}; bool pld_found[12] = {false};
+    int16_t hr_val = 0;     bool hr_found = false;
+    int16_t spo2_val = 0;   bool spo2_found = false;
+
+    /* Single-pass scan: walk JSON, extract all key→array pairs */
+    while (p < end) {
+        while (p < end && *p != '"') p++;
+        if (p >= end) break;
+        p++; /* skip opening quote */
+        const char *key_start = p;
+        while (p < end && *p != '"') p++;
+        if (p >= end) break;
+        int klen = p - key_start;
+        p++; /* skip closing quote */
+
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p >= end || *p != ':') continue;
+        p++;
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p >= end || *p != '[') continue;
+
+        int id = match_key(key_start, klen);
+        if (id < 0) continue;
+
+        int16_t vals[32];
+        int n = parse_scaled_array(&p, end, vals, 32);
+        if (n <= 0) continue;
+
+        switch (id) {
+        case KEY_PATIENT_FLOW:
+            memcpy(flow_vals, vals, n * sizeof(int16_t));
+            flow_n = n;
+            break;
+        case KEY_MASK_PRESSURE:
+            memcpy(press_vals, vals, n * sizeof(int16_t));
+            press_n = n;
+            break;
+        case KEY_HEART_RATE:
+            hr_val = vals[n - 1];
+            hr_found = true;
+            break;
+        case KEY_SPO2:
+            spo2_val = vals[n - 1];
+            spo2_found = true;
+            break;
+        default:
+            if (id >= KEY_MASK_PRESSURE_2S && id <= KEY_INT) {
+                int pld_idx = id - KEY_MASK_PRESSURE_2S;
+                pld_vals[pld_idx] = vals[n - 1];
+                pld_found[pld_idx] = true;
+            }
+            break;
         }
+    }
+
+    /* PatientFlow: push to display, detect active flow */
+    bool has_active_flow = false;
+    for (int j = 0; j < flow_n; j++) {
+        bsp_display_push_flow(flow_vals[j] / 100.0f);
+        if (abs(flow_vals[j]) > 50) has_active_flow = true;
     }
 
     /* Edge case: auto-start session if flow is non-trivial and no session active */
@@ -836,103 +794,55 @@ void session_writer_on_stream_data_raw(const char *json, int len)
 
     if (!s || !session_writer_is_active(s)) return;
 
-    /* Route samples to buffers — same logic as parse_stream_data but from raw JSON */
     xSemaphoreTake(s->mutex, portMAX_DELAY);
 
-    bool pld_record_started = false;
+    /* BRP: PatientFlow + MaskPressure (25 Hz, 40ms natural interval) */
+    for (int j = 0; j < flow_n && s->brp_buf_count < 1500; j++) {
+        s->brp_flow[s->brp_buf_count] = flow_vals[j];
+        s->brp_buf_count++;
+    }
 
-    /* BRP: PatientFlow */
-    {
-        const char *kp = find_json_key(json, len, "PatientFlow-100hz");
-        if (kp) {
-            double vals[32];
-            int n = parse_json_array(&kp, end, vals, 32);
-            for (int j = 0; j < n && s->brp_buf_count < 1500; j++) {
-                s->brp_flow[s->brp_buf_count] = float_to_s16(vals[j]);
+    for (int j = 0; j < press_n; j++) {
+        if (s->brp_buf_count <= j) {
+            if (s->brp_buf_count < 1500) {
+                s->brp_flow[s->brp_buf_count] = INT16_MIN;
                 s->brp_buf_count++;
             }
         }
-    }
-
-    /* BRP: MaskPressure-100hz (paired with flow) */
-    {
-        const char *kp = find_json_key(json, len, "MaskPressure-100hz");
-        if (kp) {
-            double vals[32];
-            int n = parse_json_array(&kp, end, vals, 32);
-            for (int j = 0; j < n; j++) {
-                if (s->brp_buf_count <= j) {
-                    if (s->brp_buf_count < 1500) {
-                        s->brp_flow[s->brp_buf_count] = INT16_MIN;
-                        s->brp_buf_count++;
-                    }
-                }
-                if (j < 1500) {
-                    s->brp_press[j] = float_to_s16(vals[j]);
-                }
-            }
+        if (j < 1500) {
+            s->brp_press[j] = press_vals[j];
         }
     }
 
-    /* SA2: HeartRate (take last sample) */
-    {
-        const char *kp = find_json_key(json, len, "HeartRate");
-        if (kp) {
-            double vals[32];
-            int n = parse_json_array(&kp, end, vals, 32);
-            if (n > 0 && s->sa2_buf_count < 300) {
-                s->sa2_hr[s->sa2_buf_count] = float_to_s16(vals[n - 1]);
-                s->sa2_buf_count++;
-            }
+    /* SA2: HeartRate + SpO2 (1 Hz natural interval, one sample per 200ms report = 5 Hz) */
+    if (hr_found && s->sa2_buf_count < 300) {
+        s->sa2_hr[s->sa2_buf_count] = hr_val;
+        s->sa2_buf_count++;
+    }
+    if (spo2_found) {
+        if (s->sa2_buf_count > 0) {
+            s->sa2_spo2[s->sa2_buf_count - 1] = spo2_val;
+        } else if (s->sa2_buf_count < 300) {
+            s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
+            s->sa2_spo2[s->sa2_buf_count] = spo2_val;
+            s->sa2_buf_count++;
         }
     }
 
-    /* SA2: SpO2 (fill current index) */
-    {
-        const char *kp = find_json_key(json, len, "SpO2");
-        if (kp) {
-            double vals[32];
-            int n = parse_json_array(&kp, end, vals, 32);
-            if (n > 0) {
-                if (s->sa2_buf_count > 0) {
-                    s->sa2_spo2[s->sa2_buf_count - 1] = float_to_s16(vals[n - 1]);
-                } else if (s->sa2_buf_count < 300) {
-                    s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
-                    s->sa2_spo2[s->sa2_buf_count] = float_to_s16(vals[n - 1]);
-                    s->sa2_buf_count++;
-                }
-            }
+    /* PLD: 12 channels, all 0.5 Hz (2s natural interval).
+     * Decimate to 0.5 Hz — write every 10th notification (5 Hz / 10 = 0.5 Hz).
+     * Unsupported signals are absent from StreamData — channels stay INT16_MIN. */
+    if (--s->pld_countdown == 0) {
+        s->pld_countdown = 10;
+        bool any_found = false;
+        for (int k = 0; k < 12; k++) {
+            if (pld_found[k]) { any_found = true; break; }
         }
-    }
-
-    /* PLD channels: take last sample of each */
-    {
-        static const char *pld_names[] = {
-            "MaskPressure-TwoSecond", "InspiratoryPressure-TwoSecond",
-            "ExpiratoryPressure-TwoSecond", "Leak-50hz",
-            "RespiratoryRate-50hz", "TidalVolume-50hz",
-            "MinuteVentilation-50hz", "SnoreIndex-50hz",
-            "FlowLimitation-50hz",
-        };
-        for (int k = 0; k < 9; k++) {
-            const char *kp = find_json_key(json, len, pld_names[k]);
-            if (kp) {
-                double vals[32];
-                int n = parse_json_array(&kp, end, vals, 32);
-                if (n > 0 && s->pld_buf_count < 300) {
-                    if (!pld_record_started) {
-                        for (int kk = 0; kk < 12; kk++)
-                            s->pld_buf[s->pld_buf_count][kk] = INT16_MIN;
-                        pld_record_started = true;
-                    }
-                    s->pld_buf[s->pld_buf_count][k] = float_to_s16(vals[n - 1]);
-                }
-            }
+        if (any_found && s->pld_buf_count < 300) {
+            for (int k = 0; k < 12; k++)
+                s->pld_buf[s->pld_buf_count][k] = pld_found[k] ? pld_vals[k] : INT16_MIN;
+            s->pld_buf_count++;
         }
-    }
-
-    if (pld_record_started) {
-        s->pld_buf_count++;
     }
 
     /* Flush if buffers are getting full */
@@ -941,33 +851,6 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     if (s->pld_buf_count >= 280) flush_pld(s);
 
     xSemaphoreGive(s->mutex);
-}
-
-/* Push PatientFlow samples from a StreamData notification to the display graph.
- * Called regardless of whether the session is fully started — the display
- * should show the breathing waveform as soon as therapy data arrives. */
-static void stream_data_push_flow(const cJSON *msg)
-{
-    cJSON *params = cJSON_GetObjectItem(msg, "params");
-    if (!params) return;
-    cJSON *data = cJSON_GetObjectItem(params, "data");
-    if (!data || !cJSON_IsArray(data)) return;
-
-    int n = cJSON_GetArraySize(data);
-    for (int i = 0; i < n; i++) {
-        cJSON *item = cJSON_GetArrayItem(data, i);
-        if (!item) continue;
-        cJSON *flow = cJSON_GetObjectItem(item, "PatientFlow-100hz");
-        if (flow && cJSON_IsArray(flow)) {
-            int ns = cJSON_GetArraySize(flow);
-            for (int j = 0; j < ns; j++) {
-                cJSON *v = cJSON_GetArrayItem(flow, j);
-                if (v && cJSON_IsNumber(v)) {
-                    bsp_display_push_flow(v->valuedouble);
-                }
-            }
-        }
-    }
 }
 
 /* Write an event as a JSON line to events.snt */
@@ -1041,30 +924,9 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         return;
     }
 
-    /* Handle StreamData: route samples to buffers */
-    if (strcmp(method_str, "StreamData") == 0) {
-        /* Push flow samples to display graph regardless of session state */
-        stream_data_push_flow(msg);
-
-        /* Edge case: if no session active but flow is non-trivial,
-         * therapy may have started before reboot — auto-start a session.
-         * Skip if we recently saw a TherapyStop (residual flow after stop). */
-        if (!s || !s->active) {
-            if (!s_therapy_stopped && stream_data_has_active_flow(msg)) {
-                ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
-                bsp_display_set_therapy_active(true);
-                s = session_writer_start();
-            }
-        }
-        if (s && s->active) {
-            xSemaphoreTake(s->mutex, portMAX_DELAY);
-            parse_stream_data(s, msg);
-            xSemaphoreGive(s->mutex);
-        }
-        return;
-    }
-
-    /* Other notifications: write as events if session active */
+    /* StreamData is handled by the fast-path (session_writer_on_stream_data_raw)
+     * in as11_ble.c before cJSON parse. If we reach here, it's a non-StreamData
+     * notification — write as event if session active. */
     if (s && s->active) {
         write_event(s, msg);
     }
