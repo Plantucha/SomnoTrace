@@ -513,12 +513,21 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         sig[i].samples_per_record = spr[i];
     }
 
-    /* Total samples (per channel) and record count */
+    /* Total samples (per channel) and record count.
+     * EDF records are 60 seconds each.  If the session is shorter than
+     * 60 seconds, we still write 1 record with zero-padding to fill the
+     * remaining samples — EDF requires all records to have the same
+     * sample count. */
     uint32_t total_samples = hdr.sample_count;
     int total_records = total_samples / spr[0];
-    if (total_records <= 0) {
-        ESP_LOGW(TAG, "%s: no complete records (samples=%u spr=%d)",
+    if (total_samples > 0 && total_records == 0) {
+        /* Partial record: round up to 1 */
+        total_records = 1;
+        ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), writing 1 padded record",
                  snt_path, total_samples, spr[0]);
+    }
+    if (total_records <= 0) {
+        ESP_LOGW(TAG, "%s: no data (samples=%u)", snt_path, total_samples);
         free(spr); free(sig);
         fclose(snt);
         return ESP_FAIL;
@@ -570,16 +579,35 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     }
 
     for (int rec = 0; rec < total_records; rec++) {
-        /* Read one record's worth of interleaved samples */
-        if (fread(raw, 1, record_bytes, snt) != record_bytes) {
-            ESP_LOGW(TAG, "short read at record %d, stopping", rec);
-            break;
+        /* Read one record's worth of interleaved samples from .snt.
+         * The last record may be partial (short session) — zero-pad
+         * the record buffer for any missing samples. */
+        memset(raw, 0, record_bytes);
+        size_t avail = record_bytes;
+        /* For the last record, only read what's available */
+        if (rec == total_records - 1) {
+            uint32_t remaining = total_samples - (uint32_t)rec * spr[0];
+            if (remaining < (uint32_t)samples_per_record) {
+                avail = remaining * n_signals * sizeof(int16_t);
+            }
+        }
+        if (avail > 0) {
+            if (fread(raw, 1, avail, snt) != avail) {
+                ESP_LOGW(TAG, "short read at record %d, stopping", rec);
+                break;
+            }
         }
 
-        /* De-interleave: [ch0_s0, ch1_s0, ...] → [ch0_all, ch1_all, ...] */
+        /* De-interleave: [ch0_s0, ch1_s0, ...] → [ch0_all, ch1_all, ...]
+         * Samples beyond available data remain zero (from memset above). */
+        int avail_samples = (int)(avail / (n_signals * sizeof(int16_t)));
         for (int ch = 0; ch < n_signals; ch++) {
             for (int s = 0; s < samples_per_record; s++) {
-                record_buf[ch * samples_per_record + s] = raw[s * n_signals + ch];
+                if (s < avail_samples) {
+                    record_buf[ch * samples_per_record + s] = raw[s * n_signals + ch];
+                } else {
+                    record_buf[ch * samples_per_record + s] = 0;
+                }
             }
         }
 

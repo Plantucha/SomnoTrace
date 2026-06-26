@@ -43,6 +43,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "session";
@@ -348,8 +349,10 @@ session_writer_t *session_writer_start(void)
 
     xSemaphoreTake(s_active_mutex, portMAX_DELAY);
     if (s_active) {
+        session_writer_t *prev = s_active;
         ESP_LOGW(TAG, "session already active, stopping previous");
-        session_writer_stop(s_active);
+        session_writer_stop(prev);
+        free(prev);
     }
 
     session_writer_t *s = calloc(1, sizeof(session_writer_t));
@@ -438,6 +441,7 @@ session_writer_t *session_writer_start(void)
     if (!s->brp.f_l0 || !s->sa2.f_l0 || !s->pld.f_l0) {
         ESP_LOGE(TAG, "failed to open .snt files");
         session_writer_stop(s);
+        free(s);
         xSemaphoreGive(s_active_mutex);
         return NULL;
     }
@@ -532,7 +536,10 @@ esp_err_t session_writer_stop(session_writer_t *s)
     if (s_active == s) s_active = NULL;
 
     if (s->mutex) vSemaphoreDelete(s->mutex);
-    free(s);
+    /* NOTE: s is NOT freed here — the caller (stop_task) needs to read
+     * s->clock_drift_ms and s->start_epoch_ms after this function returns.
+     * The caller is responsible for calling free(s). */
+    s->mutex = NULL;  /* prevent double-delete */
 
     xSemaphoreGive(s_active_mutex);
     return ESP_OK;
@@ -891,6 +898,12 @@ typedef struct {
     int64_t  clock_drift_ms;
 } edf_task_args_t;
 
+/* Cleanup pointers for the previous edf_task's PSRAM stack and TCB.
+ * edf_task cannot free its own stack (it's running on it), so we save
+ * the pointers here and free them the next time stop_task runs. */
+static StackType_t *s_prev_edf_stack = NULL;
+static StaticTask_t *s_prev_edf_tcb = NULL;
+
 static void edf_task(void *arg)
 {
     ESP_LOGI(TAG, "edf_task: started on core %d", xPortGetCoreID());
@@ -932,18 +945,27 @@ static void stop_task(void *arg)
         return;
     }
 
-    /* Capture session metadata before session_writer_stop() frees s */
+    /* Capture session metadata before session_writer_stop() frees s.
+     * NOTE: clock_drift_ms is set INSIDE session_writer_stop() (from the
+     * GetDateTime RPC), so we capture it AFTER the call.  session_writer_stop()
+     * does not free s — we do it here after reading the drift. */
     char session_dir[MAX_SESSION_DIR_LEN];
     char session_id[16];
-    int64_t start_epoch_ms = s->start_epoch_ms;
-    int64_t end_epoch_ms = s->end_epoch_ms;
-    int64_t clock_drift_ms = s->clock_drift_ms;
 
     strlcpy(session_dir, s->dir, sizeof(session_dir));
     strlcpy(session_id, s->session_id, sizeof(session_id));
 
-    /* Step 1: Finalise stream data (flush, close files, write session.json) */
+    /* Step 1: Finalise stream data (flush, close files, write session.json).
+     * This also queries AS11 clock and sets s->clock_drift_ms. */
     session_writer_stop(s);
+
+    /* Now capture the values that session_writer_stop() set */
+    int64_t start_epoch_ms = s->start_epoch_ms;
+    int64_t end_epoch_ms = s->end_epoch_ms;
+    int64_t clock_drift_ms = s->clock_drift_ms;
+
+    /* Free the session writer struct — we have everything we need */
+    free(s);
 
     /* Step 2: Post-therapy data collection (spool pulls + Get RPC).
      * This pulls Summary and TherapyEvents spools from the AS11 and
@@ -966,21 +988,55 @@ static void stop_task(void *arg)
         edf_args->end_epoch_ms = end_epoch_ms;
         edf_args->clock_drift_ms = clock_drift_ms;
 
-        /* Pin to core 1 (core 0 runs NimBLE host + notif_proc_task).
-         * Priority 5 < notif_proc's 10 so it never preempts stream processing.
-         * Stack 6KB: heavy arrays (summary_ctx_t, str_sigs, str_values) are
-         * heap-allocated in PSRAM, so the task stack only needs room for
-         * function call depth + path buffers + cJSON overhead. */
-        TaskHandle_t edf_handle = NULL;
-        BaseType_t rc = xTaskCreatePinnedToCore(edf_task, "edf_gen", 6144,
-                                                 edf_args, 5, &edf_handle, 1);
-        if (rc == pdPASS) {
-            ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1 (stack=%u)",
-                     6144);
+        /* Free the previous edf_task's PSRAM stack and TCB.
+         * The previous task has completed and self-deleted by now
+         * (it ran during the previous session's stop, which was
+         * at least seconds ago).  We can't free our own stack, but
+         * we can free the previous one. */
+        if (s_prev_edf_stack) {
+            free(s_prev_edf_stack);
+            s_prev_edf_stack = NULL;
+        }
+        if (s_prev_edf_tcb) {
+            free(s_prev_edf_tcb);
+            s_prev_edf_tcb = NULL;
+        }
+
+        /* Allocate task stack from PSRAM (8MB) instead of internal SRAM (~270KB).
+         * Internal SRAM is shared with Wi-Fi/BLE DMA buffers and gets fragmented
+         * over time, causing xTaskCreatePinnedToCore to fail even with 8MB total
+         * free heap.  PSRAM stacks are supported on ESP32-S3 with
+         * CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y.
+         *
+         * The StaticTask_t (TCB) must be in internal RAM (FreeRTOS requirement).
+         * The stack and TCB are freed by the NEXT stop_task invocation. */
+        const uint32_t edf_stack_size = 10240;
+        StackType_t *edf_stack = heap_caps_malloc(edf_stack_size, MALLOC_CAP_SPIRAM);
+        StaticTask_t *edf_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+
+        if (edf_stack && edf_tcb) {
+            s_prev_edf_stack = edf_stack;
+            s_prev_edf_tcb = edf_tcb;
+            TaskHandle_t edf_handle = xTaskCreateStaticPinnedToCore(
+                edf_task, "edf_gen", edf_stack_size, edf_args, 5,
+                edf_stack, edf_tcb, 1);
+            if (edf_handle) {
+                ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1 "
+                         "(stack=%u PSRAM, internal_free=%u)",
+                         (unsigned)edf_stack_size,
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            } else {
+                ESP_LOGE(TAG, "stop_task: xTaskCreateStaticPinnedToCore failed");
+                free(edf_stack); free(edf_tcb);
+                s_prev_edf_stack = NULL; s_prev_edf_tcb = NULL;
+                free(edf_args);
+            }
         } else {
-            ESP_LOGE(TAG, "stop_task: xTaskCreatePinnedToCore failed rc=%d "
-                     "(heap free=%u)", (int)rc, (unsigned)esp_get_free_heap_size());
-            free(edf_args);
+            ESP_LOGE(TAG, "stop_task: malloc failed for edf stack/tcb "
+                     "(PSRAM free=%u, internal free=%u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            free(edf_stack); free(edf_tcb); free(edf_args);
         }
     } else {
         ESP_LOGE(TAG, "stop_task: failed to allocate edf_task args, EDF skipped");
