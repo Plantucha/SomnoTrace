@@ -273,8 +273,17 @@ static int edf_write_header(FILE *f, const char *patient_id,
      * first all labels, then all transducer types, etc. */
 
     int total = total_signals;
-    char sigblock[256 * 16];  /* max 16 signals */
-    memset(sigblock, ' ', sizeof(sigblock));
+    /* Signal header blocks: 256 bytes per signal.  STR.edf has 135 signals
+     * (134 data + Crc16) = 34,560 bytes — too large for stack allocation.
+     * Use heap allocation to handle any signal count. */
+    size_t sigblock_size = 256 * total;
+    char *sigblock = malloc(sigblock_size);
+    if (!sigblock) {
+        ESP_LOGE(TAG, "edf_write_header: malloc sigblock %u failed",
+                 (unsigned)sigblock_size);
+        return -1;
+    }
+    memset(sigblock, ' ', sigblock_size);
 
     /* For each metadata field, write all signals' values */
     /* Field 1: label (16 chars each) */
@@ -352,6 +361,7 @@ static int edf_write_header(FILE *f, const char *patient_id,
     /* Write signal header blocks */
     fwrite(sigblock, 1, 256 * total, f);
 
+    free(sigblock);
     return header_bytes;
 }
 
@@ -523,76 +533,60 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                         start_date, start_time,
                                         total_records, record_dur,
                                         "EDF", sig, n_signals);
+    if (header_bytes < 0) {
+        ESP_LOGE(TAG, "edf_write_header failed for %s", edf_path);
+        fclose(edf);
+        fclose(snt);
+        return ESP_FAIL;
+    }
 
     /* Read .snt data and write EDF records.
      * Each EDF record = 60 seconds of data.
-     * For each record: write all samples for signal 0, then signal 1, etc.
-     * Then write Crc16 (little-endian CRC16 of the record's signal data). */
+     * .snt format stores interleaved int16: [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]
+     * EDF format stores all samples for signal 0, then all for signal 1, etc.
+     * Then Crc16 (CRC16-CCITT-FALSE of the record's signal data, as int16).
+     *
+     * Optimisation: allocate raw + de-interleaved buffers once (outside the
+     * loop) to avoid per-record malloc/free churn on the heap. */
     int samples_per_record = spr[0];  /* same for all signals in our files */
     int record_data_samples = samples_per_record * n_signals;
-    int16_t *record_buf = malloc(record_data_samples * sizeof(int16_t));
-    if (!record_buf) {
-        ESP_LOGE(TAG, "malloc record_buf failed");
+    size_t record_bytes = record_data_samples * sizeof(int16_t);
+
+    int16_t *raw = malloc(record_bytes);          /* interleaved input */
+    int16_t *record_buf = malloc(record_bytes);   /* de-interleaved output */
+    if (!raw || !record_buf) {
+        ESP_LOGE(TAG, "malloc record buffers failed");
+        free(raw);
+        free(record_buf);
         fclose(edf);
         fclose(snt);
         return ESP_ERR_NO_MEM;
     }
 
     for (int rec = 0; rec < total_records; rec++) {
-        /* Read one record's worth of interleaved samples from .snt */
-        /* .snt format: [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...] */
-        int16_t *interleaved = malloc(samples_per_record * n_signals * sizeof(int16_t));
-        if (!interleaved) {
-            ESP_LOGE(TAG, "malloc interleaved failed at record %d", rec);
-            break;
-        }
-
-        size_t to_read = samples_per_record * n_signals * sizeof(int16_t);
-        if (fread(interleaved, 1, to_read, snt) != to_read) {
+        /* Read one record's worth of interleaved samples */
+        if (fread(raw, 1, record_bytes, snt) != record_bytes) {
             ESP_LOGW(TAG, "short read at record %d, stopping", rec);
-            free(interleaved);
-            break;
-        }
-        free(interleaved);
-
-        /* Rewind to the start of this record and re-read for de-interleaving */
-        long rec_offset = sizeof(snt_header_t) +
-                          (long)rec * samples_per_record * n_signals * sizeof(int16_t);
-        fseek(snt, rec_offset, SEEK_SET);
-
-        /* De-interleave: read all samples for each signal in order */
-        /* Read the full interleaved block, then de-interleave */
-        int16_t *raw = malloc(samples_per_record * n_signals * sizeof(int16_t));
-        if (!raw) break;
-        if (fread(raw, 1, to_read, snt) != to_read) {
-            free(raw);
             break;
         }
 
-        int16_t *out = record_buf;
+        /* De-interleave: [ch0_s0, ch1_s0, ...] → [ch0_all, ch1_all, ...] */
         for (int ch = 0; ch < n_signals; ch++) {
             for (int s = 0; s < samples_per_record; s++) {
-                out[ch * samples_per_record + s] = raw[s * n_signals + ch];
+                record_buf[ch * samples_per_record + s] = raw[s * n_signals + ch];
             }
         }
-        free(raw);
 
         /* Write de-interleaved signal data to EDF */
         fwrite(record_buf, sizeof(int16_t), record_data_samples, edf);
 
-        /* Compute CRC16 over the signal data bytes */
-        uint16_t crc = crc16_ccitt((uint8_t *)record_buf,
-                                   record_data_samples * sizeof(int16_t));
-        /* Write Crc16 as little-endian int16 */
-        int16_t crc_le = (int16_t)((crc & 0xFF) << 8 | (crc >> 8));
-        /* Actually, EDF Crc16 is stored as a regular int16 signal sample.
-         * The CRC16 value is stored as-is (not byte-swapped) since EDF
-         * uses 16-bit two's complement samples.  We store the CRC16 value
-         * directly as a signed 16-bit integer. */
-        crc_le = (int16_t)crc;
-        fwrite(&crc_le, sizeof(int16_t), 1, edf);
+        /* Compute CRC16 over the signal data bytes and write as int16 */
+        uint16_t crc = crc16_ccitt((uint8_t *)record_buf, record_bytes);
+        int16_t crc_val = (int16_t)crc;
+        fwrite(&crc_val, sizeof(int16_t), 1, edf);
     }
 
+    free(raw);
     free(record_buf);
 
     /* Finalise CRC in patient ID */
@@ -965,6 +959,11 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                                         1,  /* 1 data record */
                                         "86400.00",
                                         "EDF", str_sigs, STR_SIGNAL_COUNT);
+    if (header_bytes < 0) {
+        ESP_LOGE(TAG, "STR.edf: edf_write_header failed");
+        fclose(edf);
+        return ESP_FAIL;
+    }
 
     /* Write the single data record: 134 int16 values + Crc16 */
     /* Compute CRC16 over the 134 signal values */
@@ -1128,6 +1127,11 @@ static esp_err_t generate_eve_edf(const char *edf_dir,
                                         start_date, start_time,
                                         total_records, "0.00",
                                         "EDF+D", eve_sigs, 1);
+    if (header_bytes < 0) {
+        ESP_LOGE(TAG, "EVE.edf: edf_write_header failed");
+        fclose(edf);
+        return ESP_FAIL;
+    }
 
     /* Write data records */
     /* Record 0: "Recording starts" marker */

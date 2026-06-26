@@ -791,9 +791,16 @@ static void handle_notify(const uint8_t *data, int len)
                     if (data_j && cJSON_IsString(data_j) &&
                         s_spool_collector->frag_count < SPOOL_MAX_FRAGS) {
 
-                        /* Base64-decode the fragment data */
+                        /* Base64-decode the fragment data.
+                         * An empty base64 string (dec_len=0) is valid —
+                         * it means the fragment has no payload (e.g. the
+                         * device sent a fragment with only a status field). */
                         const char *b64 = data_j->valuestring;
                         size_t b64_len = strlen(b64);
+                        if (b64_len == 0) {
+                            /* Empty data — skip but don't warn */
+                            continue;
+                        }
                         size_t dec_max = (b64_len / 4) * 3 + 4;
                         uint8_t *frag = malloc(dec_max);
                         if (frag) {
@@ -810,8 +817,11 @@ static void handle_notify(const uint8_t *data, int len)
                                 ESP_LOGI(TAG, "spool frag %d: seq=%d len=%d",
                                          idx, s_spool_collector->frags[idx].seq,
                                          (int)dec_len);
-                            } else {
+                            } else if (rc != 0) {
                                 ESP_LOGW(TAG, "base64 decode failed rc=%d", rc);
+                                free(frag);
+                            } else {
+                                /* rc == 0 but dec_len == 0 — empty payload */
                                 free(frag);
                             }
                         }

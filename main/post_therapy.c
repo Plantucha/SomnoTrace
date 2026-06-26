@@ -127,105 +127,34 @@ static esp_err_t collect_spool(const char *dir, const char *spool_type,
 /* ── Device identification via Get RPC ──────────────────────────────── */
 
 /* Device identity fields needed for EDF headers and Identification.json.
- * These are obtained via the Get RPC with short-name keys.
- * The AS11 Get RPC accepts short names (3-char tags) or full names. */
+ * This list matches the Python reference QUERY_VARS in capture_data.py.
+ * The AS11 Get RPC accepts these as a single batch. */
 static const char *const IDENTITY_KEYS[] = {
+    "UniversalIdentifier",
     "SerialNumber",
-    "PlatformIdentifier",
-    "VariantIdentifier",
     "ProductCode",
     "ProductName",
-    "ApplicationIdentifier",
-    "BootloaderIdentifier",
-    "ConfigurationIdentifier",
-    "HardwareIdentifier",
-    "UniversalIdentifier",
-    "FdaUniqueDeviceIdentifier",
     "ProductGeographicIdentifier",
+    "HardwareIdentifier",
+    "BootloaderIdentifier",
+    "ApplicationIdentifier",
+    "ConfigurationIdentifier",
+    "PlatformIdentifier",
+    "VariantIdentifier",
     "RegionIdentifier",
     "ProfileVariantIdentifier",
     "DataVersionIdentifier",
     "DataModelVersionIdentifier",
 };
 
-/* Current therapy settings needed for STR.edf settings rows and SETTINGS/.
- * These are the active configuration values at the time of the Get RPC
- * (immediately post-therapy).  For most users, settings don't change
- * between therapy and post-therapy, so this is equivalent to session-time
- * settings.  The Summary spool also contains settings, but the Get RPC
- * gives us a cleaner key-value mapping. */
+/* Therapy settings are fetched via the "SettingProfiles" subtree target.
+ * The AS11 Get RPC supports subtree targets — passing "SettingProfiles"
+ * returns the entire settings tree in one call, which is far more efficient
+ * and reliable than listing 60+ individual variable names (which causes
+ * "Invalid Params" errors).  This matches the Python reference code in
+ * capture_data.py. */
 static const char *const SETTINGS_KEYS[] = {
-    "ActiveTherapyProfile",
-    "Cpap-StartPressure",
-    "Cpap-SetPressure",
-    "AutoSet-StartPressure",
-    "AutoSet-MaxPressure",
-    "AutoSet-MinPressure",
-    "HerAuto-StartPressure",
-    "HerAuto-MaxPressure",
-    "HerAuto-MinPressure",
-    "VAuto-StartPressure",
-    "VAuto-MaxInspiratoryPressure",
-    "VAuto-MinExpiratoryPressure",
-    "VAuto-SetPressureSupport",
-    "VAuto-SetMaxInspiratoryTime",
-    "VAuto-SetMinInspiratoryTime",
-    "VAuto-TriggerSensitivity",
-    "VAuto-CycleSensitivity",
-    "Spont-StartPressure",
-    "Spont-TargetInspiratoryPressure",
-    "Spont-TargetExpiratoryPressure",
-    "Spont-EasyBreatheEnable",
-    "Spont-RespiratoryRateEnable",
-    "Spont-SetMaxInspiratoryTime",
-    "Spont-SetMinInspiratoryTime",
-    "Spont-RiseTimeEnable",
-    "Spont-RiseTime",
-    "Spont-TriggerSensitivity",
-    "Spont-CycleSensitivity",
-    "ST-StartPressure",
-    "ST-TargetInspiratoryPressure",
-    "ST-TargetExpiratoryPressure",
-    "ST-SetRespiratoryRate",
-    "ST-SetMaxInspiratoryTime",
-    "ST-SetMinInspiratoryTime",
-    "ST-RiseTimeEnable",
-    "ST-RiseTime",
-    "ST-TriggerSensitivity",
-    "ST-CycleSensitivity",
-    "Timed-StartPressure",
-    "Timed-TargetInspiratoryPressure",
-    "Timed-TargetExpiratoryPressure",
-    "Timed-SetRespiratoryRate",
-    "Timed-SetInspiratoryTime",
-    "Timed-RiseTimeEnable",
-    "Timed-RiseTime",
-    "ASV-StartPressure",
-    "ASV-TargetExpiratoryPressure",
-    "ASV-MaxPressureSupport",
-    "ASV-MinPressureSupport",
-    "ASVAuto-StartPressure",
-    "ASVAuto-MaxExpiratoryPressure",
-    "ASVAuto-MinExpiratoryPressure",
-    "ASVAuto-MaxPressureSupport",
-    "ASVAuto-MinPressureSupport",
-    "AutoSetComfort",
-    "RampEnable",
-    "RampTime",
-    "EprEnablePatientAccess",
-    "EprEnable",
-    "EprPressure",
-    "EprType",
-    "SmartStart",
-    "PatientView",
-    "AntiBacterialFilter",
-    "MaskType",
-    "TubeType",
-    "ClimateControl",
-    "HumidifierSettingEnable",
-    "HumidifierLevel",
-    "HeatedTubeSettingEnable",
-    "HeatedTubeTemperature",
+    "SettingProfiles",
 };
 
 static esp_err_t collect_identification(const char *dir)
