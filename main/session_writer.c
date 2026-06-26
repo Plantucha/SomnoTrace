@@ -892,13 +892,17 @@ typedef struct {
 
 static void edf_task(void *arg)
 {
+    ESP_LOGI(TAG, "edf_task: started on core %d", xPortGetCoreID());
     edf_task_args_t *a = (edf_task_args_t *)arg;
     if (a) {
         edf_gen_generate(a->session_dir, a->session_id,
                          a->start_epoch_ms, a->end_epoch_ms,
                          a->clock_drift_ms);
         free(a);
+    } else {
+        ESP_LOGE(TAG, "edf_task: NULL args");
     }
+    ESP_LOGI(TAG, "edf_task: done");
     vTaskDelete(NULL);
 }
 
@@ -963,8 +967,9 @@ static void stop_task(void *arg)
 
         /* Pin to core 1 (core 0 runs NimBLE host + notif_proc_task).
          * Priority 5 < notif_proc's 10 so it never preempts stream processing.
-         * Stack 16KB for protobuf decode + cJSON + file I/O. */
-        xTaskCreatePinnedToCore(edf_task, "edf_gen", 16384, edf_args, 5, NULL, 1);
+         * Stack 24KB: STR.edf generation needs ~8KB for 134 signal defs +
+         * summary context + path buffers, plus cJSON overhead. */
+        xTaskCreatePinnedToCore(edf_task, "edf_gen", 24576, edf_args, 5, NULL, 1);
         ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1");
     } else {
         ESP_LOGE(TAG, "stop_task: failed to allocate edf_task args, EDF skipped");
