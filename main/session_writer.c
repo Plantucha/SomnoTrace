@@ -42,6 +42,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "cJSON.h"
 
 static const char *TAG = "session";
@@ -967,10 +968,19 @@ static void stop_task(void *arg)
 
         /* Pin to core 1 (core 0 runs NimBLE host + notif_proc_task).
          * Priority 5 < notif_proc's 10 so it never preempts stream processing.
-         * Stack 24KB: STR.edf generation needs ~8KB for 134 signal defs +
+         * Stack 20KB: STR.edf generation needs ~8KB for 134 signal defs +
          * summary context + path buffers, plus cJSON overhead. */
-        xTaskCreatePinnedToCore(edf_task, "edf_gen", 24576, edf_args, 5, NULL, 1);
-        ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1");
+        TaskHandle_t edf_handle = NULL;
+        BaseType_t rc = xTaskCreatePinnedToCore(edf_task, "edf_gen", 20480,
+                                                 edf_args, 5, &edf_handle, 1);
+        if (rc == pdPASS) {
+            ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1 (stack=%u)",
+                     20480);
+        } else {
+            ESP_LOGE(TAG, "stop_task: xTaskCreatePinnedToCore failed rc=%d "
+                     "(heap free=%u)", (int)rc, (unsigned)esp_get_free_heap_size());
+            free(edf_args);
+        }
     } else {
         ESP_LOGE(TAG, "stop_task: failed to allocate edf_task args, EDF skipped");
     }
