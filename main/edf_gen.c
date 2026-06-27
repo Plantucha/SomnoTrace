@@ -488,14 +488,17 @@ static esp_err_t snt_read_header(FILE *f, snt_header_t *hdr)
  *   start_date  - "dd.mm.yy"
  *   start_time  - "hh.mm.ss"
  *   signals     - signal definitions (without Crc16)
- *   n_signals   - number of signals
+ *   n_signals   - number of EDF signals
  *   record_dur  - "60.00"
+ *   channel_map - array mapping EDF signal index → .snt channel index,
+ *                 or NULL if n_signals == snt n_channels (1:1 mapping)
  */
 static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                     const char *patient_id, const char *recording_id,
                                     const char *start_date, const char *start_time,
                                     const edf_signal_def_t *signals, int n_signals,
-                                    const char *record_dur)
+                                    const char *record_dur,
+                                    const int *channel_map)
 {
     FILE *snt = fopen(snt_path, "rb");
     if (!snt) {
@@ -509,9 +512,22 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         return ESP_FAIL;
     }
 
-    if (hdr.n_channels != n_signals) {
+    /* Validate channel mapping.
+     * If channel_map is provided, .snt n_channels must be >= max mapped index+1.
+     * If channel_map is NULL, require .snt n_channels == n_signals (1:1). */
+    int snt_channels = hdr.n_channels;
+    if (channel_map) {
+        for (int i = 0; i < n_signals; i++) {
+            if (channel_map[i] >= snt_channels) {
+                ESP_LOGE(TAG, "%s: channel_map[%d]=%d >= snt n_channels=%d",
+                         snt_path, i, channel_map[i], snt_channels);
+                fclose(snt);
+                return ESP_FAIL;
+            }
+        }
+    } else if (snt_channels != n_signals) {
         ESP_LOGE(TAG, "%s: channel count mismatch: snt=%d edf=%d",
-                 snt_path, hdr.n_channels, n_signals);
+                 snt_path, snt_channels, n_signals);
         fclose(snt);
         return ESP_FAIL;
     }
@@ -592,8 +608,10 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     int record_data_samples = samples_per_record * n_signals;
     size_t record_bytes = record_data_samples * sizeof(int16_t);
 
-    int16_t *raw = malloc(record_bytes);          /* interleaved input */
-    int16_t *record_buf = malloc(record_bytes);   /* de-interleaved output */
+    /* Raw buffer must hold snt_channels per sample (interleaved) */
+    size_t raw_record_bytes = samples_per_record * snt_channels * sizeof(int16_t);
+    int16_t *raw = malloc(raw_record_bytes);          /* interleaved input */
+    int16_t *record_buf = malloc(record_bytes);       /* de-interleaved output */
     if (!raw || !record_buf) {
         ESP_LOGE(TAG, "malloc record buffers failed");
         free(raw); free(record_buf); free(spr); free(sig);
@@ -606,13 +624,13 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         /* Read one record's worth of interleaved samples from .snt.
          * The last record may be partial (short session) — zero-pad
          * the record buffer for any missing samples. */
-        memset(raw, 0, record_bytes);
-        size_t avail = record_bytes;
+        memset(raw, 0, raw_record_bytes);
+        size_t avail = raw_record_bytes;
         /* For the last record, only read what's available */
         if (rec == total_records - 1) {
             uint32_t remaining = total_samples - (uint32_t)rec * spr[0];
             if (remaining < (uint32_t)samples_per_record) {
-                avail = remaining * n_signals * sizeof(int16_t);
+                avail = remaining * snt_channels * sizeof(int16_t);
             }
         }
         if (avail > 0) {
@@ -623,12 +641,14 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         }
 
         /* De-interleave: [ch0_s0, ch1_s0, ...] → [ch0_all, ch1_all, ...]
-         * Samples beyond available data remain zero (from memset above). */
-        int avail_samples = (int)(avail / (n_signals * sizeof(int16_t)));
+         * Samples beyond available data remain zero (from memset above).
+         * If channel_map is provided, select only the mapped channels. */
+        int avail_samples = (int)(avail / (snt_channels * sizeof(int16_t)));
         for (int ch = 0; ch < n_signals; ch++) {
+            int snt_ch = channel_map ? channel_map[ch] : ch;
             for (int s = 0; s < samples_per_record; s++) {
                 if (s < avail_samples) {
-                    record_buf[ch * samples_per_record + s] = raw[s * n_signals + ch];
+                    record_buf[ch * samples_per_record + s] = raw[s * snt_channels + snt_ch];
                 } else {
                     record_buf[ch * samples_per_record + s] = 0;
                 }
@@ -1343,10 +1363,16 @@ static esp_err_t generate_identification(const char *edf_dir,
         return ESP_FAIL;
     }
 
-    /* Helper to get a string field from the flat JSON */
+    /* Helper to get a string field from the flat JSON (handles both string and number types) */
     const char *get_str(const cJSON *obj, const char *key) {
         cJSON *j = cJSON_GetObjectItem(obj, key);
-        return (j && cJSON_IsString(j)) ? j->valuestring : "";
+        if (j && cJSON_IsString(j)) return j->valuestring;
+        if (j && cJSON_IsNumber(j)) {
+            static char num_buf[32];
+            snprintf(num_buf, sizeof(num_buf), "%d", j->valueint);
+            return num_buf;
+        }
+        return "";
     }
 
     /* Build nested Product object */
@@ -1409,9 +1435,13 @@ static esp_err_t generate_identification(const char *edf_dir,
     cJSON *fg = cJSON_CreateObject();
     cJSON_AddItemToObject(fg, "IdentificationProfiles", profiles);
 
+    /* Build root: {"FlowGenerator":{"IdentificationProfiles":{...}}} */
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "FlowGenerator", fg);
+
     /* Render as compact JSON (no whitespace) */
-    char *json_str = cJSON_PrintUnformatted(fg);
-    cJSON_Delete(fg);
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
     cJSON_Delete(ident);
 
     if (!json_str) {
@@ -1528,9 +1558,15 @@ static void format_recording_id(char *out, size_t out_len,
         j = cJSON_GetObjectItem(ident, "SerialNumber");
         if (j && cJSON_IsString(j)) srn = j->valuestring;
         j = cJSON_GetObjectItem(ident, "PlatformIdentifier");
-        if (j && cJSON_IsString(j)) mid = j->valuestring;
+        if (j) {
+            if (cJSON_IsString(j)) mid = j->valuestring;
+            else if (cJSON_IsNumber(j)) { static char mid_buf[16]; snprintf(mid_buf, sizeof(mid_buf), "%d", j->valueint); mid = mid_buf; }
+        }
         j = cJSON_GetObjectItem(ident, "VariantIdentifier");
-        if (j && cJSON_IsString(j)) vid = j->valuestring;
+        if (j) {
+            if (cJSON_IsString(j)) vid = j->valuestring;
+            else if (cJSON_IsNumber(j)) { static char vid_buf[16]; snprintf(vid_buf, sizeof(vid_buf), "%d", j->valueint); vid = vid_buf; }
+        }
     }
 
     snprintf(out, out_len,
@@ -1667,7 +1703,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .prefilter = "", .samples_per_record = 1500 },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, brp_sigs, 2, "60.00") != ESP_OK) {
+                               start_date, start_time, brp_sigs, 2, "60.00", NULL) != ESP_OK) {
             errors++;
         }
     }
@@ -1689,7 +1725,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .prefilter = "", .samples_per_record = 60 },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, sa2_sigs, 2, "60.00") != ESP_OK) {
+                               start_date, start_time, sa2_sigs, 2, "60.00", NULL) != ESP_OK) {
             errors++;
         }
     }
@@ -1738,8 +1774,14 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .dig_min = 0, .dig_max = 100,
               .prefilter = "", .samples_per_record = 30 },
         };
+        /* PLD .snt has 12 channels but AS11 EDF (VID=3) only has 9.
+         * Channel order in .snt: 0=MaskPress, 1=Press, 2=EprPress, 3=Leak,
+         * 4=RespRate, 5=TidVol, 6=MinVent, 7=TgtVent, 8=IERatio,
+         * 9=Snore, 10=FlowLim, 11=Ti
+         * EDF drops TgtVent(7), IERatio(8), Ti(11). */
+        static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, pld_sigs, 9, "60.00") != ESP_OK) {
+                               start_date, start_time, pld_sigs, 9, "60.00", pld_ch_map) != ESP_OK) {
             errors++;
         }
     }
