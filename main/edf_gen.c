@@ -38,15 +38,15 @@
 static const char *TAG = "edf_gen";
 
 /* ════════════════════════════════════════════════════════════════════
- *  Section 1: CRC16-CCITT-FALSE
+ *  Section 1: CRC functions
  * ════════════════════════════════════════════════════════════════════
  *
- * Used for:
- *  - EDF patient ID CRC words
- *  - Crc16 signal in every EDF data record (little-endian)
- *  - Identification.crc file
- *
+ * CRC16-CCITT-FALSE: used for EDF patient ID CRC words and the Crc16
+ * signal in every EDF data record.
  * Polynomial 0x1021, init 0xFFFF, no final XOR (CCITT-FALSE variant).
+ *
+ * CRC-32 (IEEE 802.3): used for Identification.crc file.
+ * Polynomial 0xEDB88320 (reflected), init 0xFFFFFFFF, xorout 0xFFFFFFFF.
  */
 
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
@@ -62,6 +62,21 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
         }
     }
     return crc;
+}
+
+static uint32_t crc32_ieee(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xEDB88320;
+            else
+                crc >>= 1;
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -307,7 +322,7 @@ static int edf_write_header(FILE *f, const char *patient_id,
     offset = total * (16 + 80 + 8);
     for (int i = 0; i < n_signals; i++) {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f", signals[i].phys_min);
+        snprintf(buf, sizeof(buf), "%.2f", signals[i].phys_min);
         edf_write_field(sigblock + offset + i * 8, 8, buf);
     }
     edf_write_field(sigblock + offset + n_signals * 8, 8, "-32768.0");
@@ -375,12 +390,18 @@ static int edf_write_header(FILE *f, const char *patient_id,
  */
 static void edf_finalise_crc(FILE *f, int header_bytes)
 {
-    /* Read the entire header back into memory */
+    /* Read the entire header back into memory.
+     * The file must have been opened with "w+b" (read+write) mode. */
     uint8_t *hdr = malloc(header_bytes);
-    if (!hdr) return;
+    if (!hdr) {
+        ESP_LOGE(TAG, "edf_finalise_crc: malloc(%d) failed", header_bytes);
+        return;
+    }
 
     fseek(f, 0, SEEK_SET);
     if (fread(hdr, 1, header_bytes, f) != (size_t)header_bytes) {
+        ESP_LOGE(TAG, "edf_finalise_crc: fread header failed (header_bytes=%d)",
+                 header_bytes);
         free(hdr);
         return;
     }
@@ -390,6 +411,8 @@ static void edf_finalise_crc(FILE *f, int header_bytes)
 
     /* Second CRC: bytes 0x100..header_bytes-1 (all signal header blocks) */
     uint16_t crc2 = crc16_ccitt(hdr + 256, header_bytes - 256);
+
+    ESP_LOGI(TAG, "edf_finalise_crc: H1=%04X H2=%04X", crc1, crc2);
 
     /* Write the CRC values into the patient ID field at offset 0x08.
      * Format: "X X X X AAAA BBBB" (uppercase hex, left-aligned, space-padded to 80).
@@ -404,6 +427,7 @@ static void edf_finalise_crc(FILE *f, int header_bytes)
 
     fseek(f, 8, SEEK_SET);  /* patient ID starts at offset 0x08 */
     fwrite(pid, 1, 80, f);
+    fflush(f);
 
     free(hdr);
 }
@@ -537,7 +561,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
              snt_path, edf_path, total_samples, total_records, n_signals);
 
     /* Create EDF file and write header */
-    FILE *edf = fopen(edf_path, "wb");
+    FILE *edf = fopen(edf_path, "w+b");
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", edf_path, strerror(errno));
         fclose(snt);
@@ -994,7 +1018,7 @@ static esp_err_t generate_str_edf(const char *edf_dir,
     char path[300];
     snprintf(path, sizeof(path), "%s/STR.edf", edf_dir);
 
-    FILE *edf = fopen(path, "wb");
+    FILE *edf = fopen(path, "w+b");
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
         return ESP_FAIL;
@@ -1100,14 +1124,15 @@ static const char *event_label_map(const char *rpc_type)
     return NULL;  /* unknown event type — skip */
 }
 
-static esp_err_t generate_eve_edf(const char *edf_dir,
+static esp_err_t generate_eve_edf(const char *edf_path,
                                   const uint8_t *events_data, size_t events_len,
                                   int64_t session_start_ms, int64_t clock_drift_ms,
                                   const char *patient_id, const char *recording_id,
                                   const char *start_date, const char *start_time)
 {
-    char path[300];
-    snprintf(path, sizeof(path), "%s/EVE.edf", edf_dir);
+    char path[350];
+    strncpy(path, edf_path, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
 
     /* Parse events from the protobuf spool data.
      * The spool contains repeated event records, each a protobuf message
@@ -1166,7 +1191,7 @@ static esp_err_t generate_eve_edf(const char *edf_dir,
     eve_sigs[0].prefilter = "";
     eve_sigs[0].samples_per_record = 31;  /* 62 bytes / 2 bytes per sample */
 
-    FILE *edf = fopen(path, "wb");
+    FILE *edf = fopen(path, "w+b");
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
         return ESP_FAIL;
@@ -1299,50 +1324,126 @@ static esp_err_t generate_eve_edf(const char *edf_dir,
  *  Section 8: Identification.json + .crc generation
  * ════════════════════════════════════════════════════════════════════ */
 
+/* Forward declaration — read_json_file is defined in Section 9. */
+static cJSON *read_json_file(const char *path);
+
 static esp_err_t generate_identification(const char *edf_dir,
                                          const char *ident_json_path)
 {
-    /* Read the identification.json from post-therapy/ and copy it
-     * to the EDF output directory.  Also compute the CRC16. */
-    FILE *f = fopen(ident_json_path, "r");
-    if (!f) {
+    /* Read the flat identification.json from post-therapy/ and restructure
+     * it into the nested AS11 format:
+     *   {"FlowGenerator":{"IdentificationProfiles":{
+     *     "Product":{...},"Hardware":{...},"Software":{...}
+     *   }}}
+     * Also compute CRC-32 of the JSON bytes and write as 4-byte binary LE. */
+
+    cJSON *ident = read_json_file(ident_json_path);
+    if (!ident) {
         ESP_LOGW(TAG, "identification.json not found: %s", ident_json_path);
         return ESP_FAIL;
     }
 
-    /* Read the entire file */
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *json_str = malloc(fsize + 1);
-    if (!json_str) {
-        fclose(f);
-        return ESP_ERR_NO_MEM;
+    /* Helper to get a string field from the flat JSON */
+    const char *get_str(const cJSON *obj, const char *key) {
+        cJSON *j = cJSON_GetObjectItem(obj, key);
+        return (j && cJSON_IsString(j)) ? j->valuestring : "";
     }
-    fread(json_str, 1, fsize, f);
-    json_str[fsize] = '\0';
-    fclose(f);
+
+    /* Build nested Product object */
+    cJSON *product = cJSON_CreateObject();
+    cJSON_AddStringToObject(product, "UniversalIdentifier",
+        get_str(ident, "UniversalIdentifier"));
+    cJSON_AddStringToObject(product, "SerialNumber",
+        get_str(ident, "SerialNumber"));
+    cJSON_AddStringToObject(product, "SerialNumberVerificationCode", "");
+    cJSON_AddStringToObject(product, "ProductCode",
+        get_str(ident, "ProductCode"));
+
+    /* ProductName: remove spaces (AS11 stores "AirSense11AutoSet" not "AirSense 11 AutoSet") */
+    char pname[64];
+    const char *pn_src = get_str(ident, "ProductName");
+    int pni = 0;
+    for (int i = 0; pn_src[i] && pni < (int)sizeof(pname) - 1; i++) {
+        if (pn_src[i] != ' ') pname[pni++] = pn_src[i];
+    }
+    pname[pni] = '\0';
+    cJSON_AddStringToObject(product, "ProductName", pname);
+
+    cJSON_AddStringToObject(product, "FdaUniqueDeviceIdentifier", "");
+    cJSON_AddStringToObject(product, "ProductGeographicIdentifier",
+        get_str(ident, "ProductGeographicIdentifier"));
+
+    /* Build Hardware object */
+    cJSON *hardware = cJSON_CreateObject();
+    cJSON_AddStringToObject(hardware, "HardwareIdentifier",
+        get_str(ident, "HardwareIdentifier"));
+
+    /* Build Software object */
+    cJSON *software = cJSON_CreateObject();
+    cJSON_AddStringToObject(software, "BootloaderIdentifier",
+        get_str(ident, "BootloaderIdentifier"));
+    cJSON_AddStringToObject(software, "ApplicationIdentifier",
+        get_str(ident, "ApplicationIdentifier"));
+    cJSON_AddStringToObject(software, "ConfigurationIdentifier",
+        get_str(ident, "ConfigurationIdentifier"));
+    cJSON_AddStringToObject(software, "PlatformIdentifier",
+        get_str(ident, "PlatformIdentifier"));
+    cJSON_AddStringToObject(software, "VariantIdentifier",
+        get_str(ident, "VariantIdentifier"));
+    cJSON_AddStringToObject(software, "RegionIdentifier",
+        get_str(ident, "RegionIdentifier"));
+    cJSON_AddStringToObject(software, "ProfileVariationIdentifier",
+        get_str(ident, "ProfileVariantIdentifier"));
+    cJSON_AddStringToObject(software, "DataVersionIdentifier",
+        get_str(ident, "DataVersionIdentifier"));
+    cJSON_AddStringToObject(software, "DataModelVersionIdentifier",
+        get_str(ident, "DataModelVersionIdentifier"));
+
+    /* Build IdentificationProfiles */
+    cJSON *profiles = cJSON_CreateObject();
+    cJSON_AddItemToObject(profiles, "Product", product);
+    cJSON_AddItemToObject(profiles, "Hardware", hardware);
+    cJSON_AddItemToObject(profiles, "Software", software);
+
+    /* Build FlowGenerator wrapper */
+    cJSON *fg = cJSON_CreateObject();
+    cJSON_AddItemToObject(fg, "IdentificationProfiles", profiles);
+
+    /* Render as compact JSON (no whitespace) */
+    char *json_str = cJSON_PrintUnformatted(fg);
+    cJSON_Delete(fg);
+    cJSON_Delete(ident);
+
+    if (!json_str) {
+        ESP_LOGE(TAG, "generate_identification: cJSON_PrintUnformatted failed");
+        return ESP_FAIL;
+    }
 
     /* Write Identification.json to EDF dir */
     char path[300];
     snprintf(path, sizeof(path), "%s/Identification.json", edf_dir);
-    f = fopen(path, "w");
+    FILE *f = fopen(path, "w");
     if (f) {
         fputs(json_str, f);
         fclose(f);
-        ESP_LOGI(TAG, "wrote %s", path);
+        ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)strlen(json_str));
     }
 
-    /* Compute CRC16 and write Identification.crc
-     * The CRC is CRC16-CCITT-FALSE of the JSON file contents.
-     * The .crc file contains the CRC as a decimal number. */
-    uint16_t crc = crc16_ccitt((const uint8_t *)json_str, fsize);
+    /* Compute CRC-32 and write as 4-byte binary little-endian */
+    size_t json_len = strlen(json_str);
+    uint32_t crc = crc32_ieee((const uint8_t *)json_str, json_len);
     snprintf(path, sizeof(path), "%s/Identification.crc", edf_dir);
-    f = fopen(path, "w");
+    f = fopen(path, "wb");
     if (f) {
-        fprintf(f, "%u\n", (unsigned)crc);
+        uint8_t crc_bytes[4] = {
+            (uint8_t)(crc & 0xFF),
+            (uint8_t)((crc >> 8) & 0xFF),
+            (uint8_t)((crc >> 16) & 0xFF),
+            (uint8_t)((crc >> 24) & 0xFF),
+        };
+        fwrite(crc_bytes, 1, 4, f);
         fclose(f);
-        ESP_LOGI(TAG, "wrote %s (crc=%u)", path, (unsigned)crc);
+        ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", path, (unsigned)crc);
     }
 
     free(json_str);
@@ -1396,7 +1497,7 @@ static void format_edf_datetime(int64_t epoch_ms,
 {
     time_t t = (time_t)(epoch_ms / 1000);
     struct tm tm;
-    gmtime_r(&t, &tm);
+    localtime_r(&t, &tm);
     snprintf(date_out, date_len, "%02d.%02d.%02d",
              tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
     snprintf(time_out, time_len, "%02d.%02d.%02d",
@@ -1411,7 +1512,7 @@ static void format_recording_id(char *out, size_t out_len,
 {
     time_t t = (time_t)(epoch_ms / 1000);
     struct tm tm;
-    gmtime_r(&t, &tm);
+    localtime_r(&t, &tm);
 
     static const char *month_names[] = {
         "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
@@ -1436,6 +1537,34 @@ static void format_recording_id(char *out, size_t out_len,
              "Startdate %02d-%s-%04d X X X SRN=%s MID=%s VID=%s",
              tm.tm_mday, month_names[tm.tm_mon % 12],
              tm.tm_year + 1900, srn, mid, vid);
+}
+
+/* Compute the noon-based day folder (YYYYMMDD) for a session timestamp.
+ * AS11 groups sessions by a day window that starts at noon, so sessions
+ * before noon belong to the previous day's folder. */
+static void noon_day_folder(int64_t epoch_ms, char *out, size_t out_len)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    if (tm.tm_hour < 12) {
+        /* Before noon — belongs to previous day */
+        t -= 86400;
+        localtime_r(&t, &tm);
+    }
+    snprintf(out, out_len, "%04d%02d%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+}
+
+/* Format a session timestamp prefix: YYYYMMDD_HHMMSS */
+static void session_timestamp(int64_t epoch_ms, char *out, size_t out_len)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    snprintf(out, out_len, "%04d%02d%02d_%02d%02d%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
 esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
@@ -1466,6 +1595,19 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     char datalog_dir[200];
     snprintf(datalog_dir, sizeof(datalog_dir), "%s/DATALOG", edf_dir);
     mkdir(datalog_dir, 0775);
+
+    /* Create date subdirectory inside DATALOG (noon-based day folder).
+     * AS11 native layout: DATALOG/YYYYMMDD/YYYYMMDD_HHMMSS_TYPE.edf */
+    char day_folder[16];
+    noon_day_folder(start_epoch_ms, day_folder, sizeof(day_folder));
+
+    char day_dir[220];
+    snprintf(day_dir, sizeof(day_dir), "%s/%s", datalog_dir, day_folder);
+    mkdir(day_dir, 0775);
+
+    /* Session timestamp prefix for EDF filenames */
+    char ts_prefix[32];
+    session_timestamp(start_epoch_ms, ts_prefix, sizeof(ts_prefix));
 
     /* ── Load post-therapy data ── */
     char pt_dir[300];
@@ -1510,18 +1652,18 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
 
     /* ── Generate BRP.edf (25 Hz breath waveform) ── */
     {
-        char snt_path[300], edf_path[330];
+        char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/brp.snt", session_dir);
-        snprintf(edf_path, sizeof(edf_path), "%s/BRP.edf", datalog_dir);
+        snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, ts_prefix);
 
         edf_signal_def_t brp_sigs[] = {
-            { .label = "Flow.40ms", .transducer = "Flow",
-              .unit = "L/min", .phys_min = -32768.0, .phys_max = 32767.0,
-              .dig_min = -32768, .dig_max = 32767,
+            { .label = "Flow.40ms", .transducer = "",
+              .unit = "L/s", .phys_min = -2.0, .phys_max = 3.0,
+              .dig_min = -1000, .dig_max = 1500,
               .prefilter = "", .samples_per_record = 1500 },
-            { .label = "Press.40ms", .transducer = "Pressure",
-              .unit = "hPa", .phys_min = -32768.0, .phys_max = 32767.0,
-              .dig_min = -32768, .dig_max = 32767,
+            { .label = "Press.40ms", .transducer = "",
+              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
+              .dig_min = 0, .dig_max = 2000,
               .prefilter = "", .samples_per_record = 1500 },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
@@ -1532,18 +1674,18 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
 
     /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
     {
-        char snt_path[300], edf_path[330];
+        char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/sa2.snt", session_dir);
-        snprintf(edf_path, sizeof(edf_path), "%s/SA2.edf", datalog_dir);
+        snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, ts_prefix);
 
         edf_signal_def_t sa2_sigs[] = {
-            { .label = "Pulse.1s", .transducer = "Pulse",
-              .unit = "bpm", .phys_min = -32768.0, .phys_max = 32767.0,
-              .dig_min = -32768, .dig_max = 32767,
+            { .label = "Pulse.1s", .transducer = "",
+              .unit = "bpm", .phys_min = 0.0, .phys_max = 300.0,
+              .dig_min = 0, .dig_max = 300,
               .prefilter = "", .samples_per_record = 60 },
-            { .label = "SpO2.1s", .transducer = "Oximeter",
-              .unit = "%", .phys_min = -32768.0, .phys_max = 32767.0,
-              .dig_min = -32768, .dig_max = 32767,
+            { .label = "SpO2.1s", .transducer = "",
+              .unit = "%", .phys_min = 0.0, .phys_max = 100.0,
+              .dig_min = 0, .dig_max = 100,
               .prefilter = "", .samples_per_record = 60 },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
@@ -1554,37 +1696,59 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
 
     /* ── Generate PLD.edf (0.5 Hz per-breath stats) ── */
     {
-        char snt_path[300], edf_path[330];
+        char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/pld.snt", session_dir);
-        snprintf(edf_path, sizeof(edf_path), "%s/PLD.edf", datalog_dir);
+        snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, ts_prefix);
 
-        static const char *pld_labels[] = {
-            "MaskPress.2s", "Press.2s", "EprPress.2s", "Leak.2s",
-            "RespRate.2s", "TidVol.2s", "MinVent.2s", "TgtVent.2s",
-            "IERatio.2s", "Snore.2s", "FlowLim.2s", "Ti.2s",
+        edf_signal_def_t pld_sigs[] = {
+            { .label = "MaskPress.2s", .transducer = "",
+              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
+              .dig_min = 0, .dig_max = 2000,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "Press.2s", .transducer = "",
+              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 50.0,
+              .dig_min = 0, .dig_max = 2500,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "EprPress.2s", .transducer = "",
+              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 30.0,
+              .dig_min = 0, .dig_max = 1500,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "Leak.2s", .transducer = "",
+              .unit = "L/s", .phys_min = 0.0, .phys_max = 2.0,
+              .dig_min = 0, .dig_max = 100,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "RespRate.2s", .transducer = "",
+              .unit = "bpm", .phys_min = 0.0, .phys_max = 90.0,
+              .dig_min = 0, .dig_max = 450,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "TidVol.2s", .transducer = "",
+              .unit = "L", .phys_min = 0.0, .phys_max = 4.0,
+              .dig_min = 0, .dig_max = 200,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "MinVent.2s", .transducer = "",
+              .unit = "L/min", .phys_min = 0.0, .phys_max = 30.0,
+              .dig_min = 0, .dig_max = 240,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "Snore.2s", .transducer = "",
+              .unit = "", .phys_min = 0.0, .phys_max = 5.0,
+              .dig_min = 0, .dig_max = 250,
+              .prefilter = "", .samples_per_record = 30 },
+            { .label = "FlowLim.2s", .transducer = "",
+              .unit = "", .phys_min = 0.0, .phys_max = 1.0,
+              .dig_min = 0, .dig_max = 100,
+              .prefilter = "", .samples_per_record = 30 },
         };
-
-        edf_signal_def_t pld_sigs[12];
-        for (int i = 0; i < 12; i++) {
-            pld_sigs[i].label = pld_labels[i];
-            pld_sigs[i].transducer = "";
-            pld_sigs[i].unit = "";
-            pld_sigs[i].phys_min = -32768.0;
-            pld_sigs[i].phys_max = 32767.0;
-            pld_sigs[i].dig_min = -32768;
-            pld_sigs[i].dig_max = 32767;
-            pld_sigs[i].prefilter = "";
-            pld_sigs[i].samples_per_record = 30;  /* 0.5 Hz × 60s */
-        }
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, pld_sigs, 12, "60.00") != ESP_OK) {
+                               start_date, start_time, pld_sigs, 9, "60.00") != ESP_OK) {
             errors++;
         }
     }
 
-    /* ── Generate STR.edf from Summary spool ── */
+    /* ── Generate STR.edf from Summary spool ──
+     * STR.edf goes in the EDF root (not inside DATALOG/) — it is a daily
+     * cumulative file, not per-session. */
     if (summary_data && summary_len > 0) {
-        if (generate_str_edf(datalog_dir, summary_data, summary_len,
+        if (generate_str_edf(edf_dir, summary_data, summary_len,
                              patient_id, recording_id,
                              start_date, start_time, settings) != ESP_OK) {
             errors++;
@@ -1597,7 +1761,21 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* ── Generate EVE.edf from respiratory events spool ──
      * Event timestamps in the spool are in AS11 internal time.
      * clock_drift_ms is applied to convert them to NTP time. */
-    if (generate_eve_edf(datalog_dir, events_data, events_len,
+    char eve_path[350];
+    snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
+    if (generate_eve_edf(eve_path, events_data, events_len,
+                         start_epoch_ms, clock_drift_ms,
+                         patient_id, recording_id,
+                         start_date, start_time) != ESP_OK) {
+        errors++;
+    }
+
+    /* ── Generate CSL.edf (CSR event log) ──
+     * For sessions with no CSR events, CSL.edf is byte-identical to
+     * EVE.edf (contains only the "Recording starts" marker). */
+    char csl_path[350];
+    snprintf(csl_path, sizeof(csl_path), "%s/%s_CSL.edf", day_dir, ts_prefix);
+    if (generate_eve_edf(csl_path, events_data, events_len,
                          start_epoch_ms, clock_drift_ms,
                          patient_id, recording_id,
                          start_date, start_time) != ESP_OK) {
