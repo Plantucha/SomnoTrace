@@ -91,7 +91,7 @@ struct session_writer {
     bool     active;
 
     stream_files_t brp;     /* 25 Hz, 2 ch: flow + mask_pressure (40ms natural) */
-    stream_files_t sa2;     /* 5 Hz, 2 ch: heart_rate + spo2 (1 Hz natural, 5 Hz stored) */
+    stream_files_t sa2;     /* 1 Hz, 2 ch: heart_rate + spo2 (decimated from 5 Hz report) */
     stream_files_t pld;     /* 0.5 Hz, 12 ch (0.5 Hz natural, decimated from 5 Hz report) */
     FILE    *f_events;
     uint32_t brp_mm_count;  /* L1 MinMax records written */
@@ -107,10 +107,11 @@ struct session_writer {
     int16_t brp_press[1500];
     uint32_t brp_buf_count;     /* samples in buffer (per channel) */
 
-    /* SA2 recent buffer (5 Hz × 2 ch × 60 s = 300 samples) */
-    int16_t sa2_hr[300];
-    int16_t sa2_spo2[300];
+    /* SA2 recent buffer (1 Hz × 2 ch × 60 s = 60 samples) */
+    int16_t sa2_hr[60];
+    int16_t sa2_spo2[60];
     uint32_t sa2_buf_count;
+    uint8_t sa2_countdown;     /* decimation: write SA2 every 5th notification (5 Hz / 5 = 1 Hz) */
 
     /* PLD recent buffer (0.5 Hz × 12 ch × 60 s = 30 samples) */
     int16_t pld_buf[300][12];
@@ -184,22 +185,22 @@ static void flush_brp(session_writer_t *s)
         uint32_t n_sec = s->brp_buf_count / 25;
         for (uint32_t sec = 0; sec < n_sec; sec++) {
             uint32_t base = sec * 25;
-            int16_t fmn = INT16_MAX, fmx = INT16_MIN;
-            int16_t pmn = INT16_MAX, pmx = INT16_MIN;
+            int16_t fmn = INT16_MAX, fmx = -1;
+            int16_t pmn = INT16_MAX, pmx = -1;
             for (int j = 0; j < 25; j++) {
                 int16_t fv = s->brp_flow[base + j];
                 int16_t pv = s->brp_press[base + j];
-                if (fv != INT16_MIN) {
+                if (fv != -1) {
                     if (fv < fmn) fmn = fv;
                     if (fv > fmx) fmx = fv;
                 }
-                if (pv != INT16_MIN) {
+                if (pv != -1) {
                     if (pv < pmn) pmn = pv;
                     if (pv > pmx) pmx = pv;
                 }
             }
-            if (fmn == INT16_MAX) { fmn = fmx = INT16_MIN; }
-            if (pmn == INT16_MAX) { pmn = pmx = INT16_MIN; }
+            if (fmn == INT16_MAX) { fmn = fmx = -1; }
+            if (pmn == INT16_MAX) { pmn = pmx = -1; }
             int16_t mm[4] = { fmn, fmx, pmn, pmx };
             fwrite(mm, sizeof(int16_t), 4, s->brp.f_l1);
             s->brp_mm_count++;
@@ -369,6 +370,7 @@ session_writer_t *session_writer_start(void)
     }
 
     s->pld_countdown = 1;  /* first notification writes PLD immediately */
+    s->sa2_countdown = 1;  /* first notification writes SA2 immediately */
 
     make_session_id(s->session_id, sizeof(s->session_id));
 
@@ -426,7 +428,7 @@ session_writer_t *session_writer_start(void)
 
     snprintf(path, sizeof(path), "%s/sa2.snt", s->dir);
     s->sa2.f_l0 = fopen(path, "wb");
-    if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 0, 50, 2, start_epoch_ms);  /* 5 Hz */
+    if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 0, 10, 2, start_epoch_ms);  /* 1 Hz */
 
     snprintf(path, sizeof(path), "%s/pld.snt", s->dir);
     s->pld.f_l0 = fopen(path, "wb");
@@ -642,7 +644,7 @@ static const key_entry_t s_keys[] = {
 #define N_KEYS (int)(sizeof(s_keys) / sizeof(s_keys[0]))
 
 /* Parse a JSON number array, scaling values by 100 into int16_t.
- * null values become INT16_MIN. No strtod, no double arithmetic.
+ * null values become -1. No strtod, no double arithmetic.
  * Returns count of values parsed. Advances *p past closing ']'. */
 static int parse_scaled_array(const char **p, const char *end, int16_t *out, int max_out)
 {
@@ -656,7 +658,7 @@ static int parse_scaled_array(const char **p, const char *end, int16_t *out, int
         if (s >= end || *s == ']') break;
 
         if (s + 3 < end && s[0] == 'n' && s[1] == 'u' && s[2] == 'l' && s[3] == 'l') {
-            out[count++] = INT16_MIN;
+            out[count++] = -1;  /* null → -1 sentinel (matches AS11/OSCAR convention) */
             s += 4;
             continue;
         }
@@ -815,7 +817,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     for (int j = 0; j < press_n; j++) {
         if (s->brp_buf_count <= j) {
             if (s->brp_buf_count < 1500) {
-                s->brp_flow[s->brp_buf_count] = INT16_MIN;
+                s->brp_flow[s->brp_buf_count] = -1;  /* missing flow → -1 sentinel */
                 s->brp_buf_count++;
             }
         }
@@ -824,24 +826,23 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         }
     }
 
-    /* SA2: HeartRate + SpO2 (1 Hz natural interval, one sample per 200ms report = 5 Hz) */
-    if (hr_found && s->sa2_buf_count < 300) {
-        s->sa2_hr[s->sa2_buf_count] = hr_val;
-        s->sa2_buf_count++;
-    }
-    if (spo2_found) {
-        if (s->sa2_buf_count > 0) {
-            s->sa2_spo2[s->sa2_buf_count - 1] = spo2_val;
-        } else if (s->sa2_buf_count < 300) {
-            s->sa2_hr[s->sa2_buf_count] = INT16_MIN;
-            s->sa2_spo2[s->sa2_buf_count] = spo2_val;
+    /* SA2: HeartRate + SpO2 (1 Hz, decimated from 5 Hz notifications).
+     * Take every 5th notification to get 1 Hz. */
+    if (--s->sa2_countdown == 0) {
+        s->sa2_countdown = 5;
+        if (s->sa2_buf_count < 60) {
+            s->sa2_hr[s->sa2_buf_count] = hr_found ? hr_val : -1;
+            s->sa2_spo2[s->sa2_buf_count] = spo2_found ? spo2_val : -1;
             s->sa2_buf_count++;
         }
+    } else if (spo2_found && s->sa2_buf_count > 0) {
+        /* Update SpO2 for the most recent SA2 sample */
+        s->sa2_spo2[s->sa2_buf_count - 1] = spo2_val;
     }
 
     /* PLD: 12 channels, all 0.5 Hz (2s natural interval).
      * Decimate to 0.5 Hz — write every 10th notification (5 Hz / 10 = 0.5 Hz).
-     * Unsupported signals are absent from StreamData — channels stay INT16_MIN. */
+     * Unsupported signals are absent from StreamData — channels stay -1. */
     if (--s->pld_countdown == 0) {
         s->pld_countdown = 10;
         bool any_found = false;
@@ -850,14 +851,14 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         }
         if (any_found && s->pld_buf_count < 300) {
             for (int k = 0; k < 12; k++)
-                s->pld_buf[s->pld_buf_count][k] = pld_found[k] ? pld_vals[k] : INT16_MIN;
+                s->pld_buf[s->pld_buf_count][k] = pld_found[k] ? pld_vals[k] : -1;
             s->pld_buf_count++;
         }
     }
 
     /* Flush if buffers are getting full */
     if (s->brp_buf_count >= 1400) flush_brp(s);
-    if (s->sa2_buf_count >= 280) flush_sa2(s);
+    if (s->sa2_buf_count >= 55) flush_sa2(s);
     if (s->pld_buf_count >= 280) flush_pld(s);
 
     xSemaphoreGive(s->mutex);

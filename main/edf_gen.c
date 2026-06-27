@@ -288,8 +288,8 @@ static int edf_write_header(FILE *f, const char *patient_id,
      * first all labels, then all transducer types, etc. */
 
     int total = total_signals;
-    /* Signal header blocks: 256 bytes per signal.  STR.edf has 135 signals
-     * (134 data + Crc16) = 34,560 bytes — too large for stack allocation.
+    /* Signal header blocks: 256 bytes per signal.  STR.edf has 78 signals
+     * (77 data + Crc16) = 19,968 bytes — too large for stack allocation.
      * Use heap allocation to handle any signal count. */
     size_t sigblock_size = 256 * total;
     char *sigblock = malloc(sigblock_size);
@@ -532,8 +532,8 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         return ESP_FAIL;
     }
 
-    /* Calculate samples per record per signal.
-     * Heap-allocated to avoid VLA stack usage. */
+    /* Calculate samples per record per signal from the .snt capture rate.
+     * The .snt rate now matches the EDF rate (SA2 is decimated at capture time). */
     int hz_x10 = hdr.sample_hz_x10;
     int *spr = malloc(n_signals * sizeof(int));
     edf_signal_def_t *sig = malloc(n_signals * sizeof(edf_signal_def_t));
@@ -545,33 +545,20 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     }
     for (int i = 0; i < n_signals; i++) {
         spr[i] = (hz_x10 * 60) / 10;
-    }
-
-    /* Update signal defs with correct samples_per_record */
-    for (int i = 0; i < n_signals; i++) {
         sig[i] = signals[i];
         sig[i].samples_per_record = spr[i];
     }
 
     /* Total samples (per channel) and record count.
-     * EDF records are 60 seconds each.  If the session is shorter than
-     * 60 seconds, we still write 1 record with zero-padding to fill the
-     * remaining samples — EDF requires all records to have the same
-     * sample count. */
+     * EDF records are 60 seconds each.  Sessions shorter than 60 seconds
+     * produce 0 data records (header-only file), matching AS11 behaviour. */
     uint32_t total_samples = hdr.sample_count;
     int total_records = total_samples / spr[0];
     if (total_samples > 0 && total_records == 0) {
-        /* Partial record: round up to 1 */
-        total_records = 1;
-        ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), writing 1 padded record",
+        ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), writing 0 records",
                  snt_path, total_samples, spr[0]);
     }
-    if (total_records <= 0) {
-        ESP_LOGW(TAG, "%s: no data (samples=%u)", snt_path, total_samples);
-        free(spr); free(sig);
-        fclose(snt);
-        return ESP_FAIL;
-    }
+    if (total_records < 0) total_records = 0;
 
     ESP_LOGI(TAG, "converting %s → %s: %u samples, %d records, %d ch",
              snt_path, edf_path, total_samples, total_records, n_signals);
@@ -739,8 +726,12 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
  * Sub-field 2 = 50th percentile, 3 = 95th (or 70th for Leak), 4 = 100th (or 95th).
  * The exact mapping depends on the field — see _SUMMARY_SUBFIELDS in as11_spool.py. */
 
-/* STR.edf signal count: 134 data signals + 1 Crc16 = 135 total */
-#define STR_SIGNAL_COUNT  134
+/* STR.edf signal count for VID=3 (AutoSet):
+ * 77 data signals + 1 Crc16 = 78 total.
+ * Non-AutoSet variants would have additional signals (VAuto/Spont/ST/ASV settings,
+ * SpontTrig/Cyc, TgtVent/IERatio/Ti stats) — see edf_signals.md variant provenance. */
+#define STR_DATA_COUNT    77
+#define STR_SIGNAL_COUNT  78   /* includes Crc16 */
 
 /* STR enum export maps — some fields are remapped before writing to EDF.
  * From edf_signals.md "STR enum export maps" section. */
@@ -828,6 +819,7 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                                   const uint8_t *summary_data, size_t summary_len,
                                   const char *patient_id, const char *recording_id,
                                   const char *start_date, const char *start_time,
+                                  int64_t start_epoch_ms, int64_t end_epoch_ms,
                                   const cJSON *settings_json)
 {
     /* Parse the Summary protobuf to extract session statistics.
@@ -839,13 +831,15 @@ static esp_err_t generate_str_edf(const char *edf_dir,
      * These will be placed in PSRAM by the heap allocator since they
      * exceed CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16KB total). */
     summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
-    int16_t *str_values = calloc(STR_SIGNAL_COUNT, sizeof(int16_t));
-    edf_signal_def_t *str_sigs = calloc(STR_SIGNAL_COUNT, sizeof(edf_signal_def_t));
+    int16_t *str_values = malloc(STR_DATA_COUNT * sizeof(int16_t));
+    edf_signal_def_t *str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
     if (!ctx || !str_values || !str_sigs) {
         ESP_LOGE(TAG, "STR.edf: malloc failed for ctx/values/sigs");
         free(ctx); free(str_values); free(str_sigs);
         return ESP_ERR_NO_MEM;
     }
+    /* Initialise all STR values to -1 (sentinel for "no data") */
+    memset(str_values, 0xFF, STR_DATA_COUNT * sizeof(int16_t));
 
     /* Find field-2 wrapper records */
     bool found_record = false;
@@ -889,7 +883,7 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         /* Still write a minimal STR.edf with default values */
     }
 
-    /* Build the 134-field STR record.
+    /* Build the 77-field STR record for VID=3 (AutoSet).
      * Many fields come from the Summary spool; settings fields come from
      * settings.json (obtained via Get RPC).  We use settings_json as the
      * primary source for settings, falling back to Summary spool if needed.
@@ -897,142 +891,195 @@ static esp_err_t generate_str_edf(const char *edf_dir,
      * str_values is already heap-allocated and zeroed above. */
 
     /* Session header [0-3]: Date, MaskOn, MaskOff, MaskEvents
-     * These are timestamps — we use the session start/end times. */
-    str_values[0] = 0;  /* Date — not a signal, placeholder */
-    str_values[1] = 0;  /* MaskOn */
-    str_values[2] = 0;  /* MaskOff */
-    str_values[3] = 0;  /* MaskEvents */
+     * Date = days from Unix epoch (Jan 1, 1970) in local time (noon-based day)
+     * MaskOn/MaskOff = minutes from noon (noon-based day), up to 20 entries each
+     * MaskEvents = count of mask on/off events */
+    {
+        time_t start_t = (time_t)(start_epoch_ms / 1000);
+        time_t end_t = (time_t)(end_epoch_ms / 1000);
+        struct tm tm_start, tm_end;
+        localtime_r(&start_t, &tm_start);
+        localtime_r(&end_t, &tm_end);
+
+        /* Date: days from Unix epoch, using noon-based day.
+         * If session starts before noon, it belongs to the previous day. */
+        time_t noon_t = start_t;
+        if (tm_start.tm_hour < 12) {
+            noon_t -= 86400;
+        }
+        struct tm epoch_tm = { .tm_year=70, .tm_mon=0, .tm_mday=1,
+                               .tm_hour=0, .tm_min=0, .tm_sec=0 };
+        time_t epoch_t = mktime(&epoch_tm);
+        str_values[0] = (int16_t)((noon_t - epoch_t) / 86400);
+
+        /* Minutes from midnight, then subtract 720 (12*60) to get minutes from noon */
+        int start_min_from_noon = tm_start.tm_hour * 60 + tm_start.tm_min - 720;
+        int end_min_from_noon = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
+
+        /* If session spans midnight (before noon), add 1440 to make it positive */
+        if (start_min_from_noon < 0) start_min_from_noon += 1440;
+        if (end_min_from_noon < 0) end_min_from_noon += 1440;
+
+        /* MaskOn[0] = session start, rest = -1 (no additional mask-on events) */
+        str_values[1] = (int16_t)start_min_from_noon;
+        /* MaskOff[0] = session end, rest = -1 */
+        str_values[2] = (int16_t)end_min_from_noon;
+        /* MaskEvents: we track one mask-on/mask-off pair per session */
+        str_values[3] = 1;
+    }
 
     /* Session core [4-5] */
-    str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);  /* PPD: Duration */
+    str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);  /* Duration */
     int mode_raw = get_scalar(ctx, SUM_F_SESSION_MODE, 0);
     /* Apply enum export map for Mode */
     if (mode_raw >= 0 && mode_raw < (int)(sizeof(MODE_MAP) / sizeof(MODE_MAP[0]))) {
-        str_values[5] = MODE_MAP[mode_raw];  /* MOP: Mode */
+        str_values[5] = MODE_MAP[mode_raw];  /* Mode */
     } else {
         str_values[5] = mode_raw;
     }
 
-    /* Settings [6-77]: try settings.json first, then Summary spool.
-     * For now, we leave these as 0 if not in the Summary spool.
-     * The settings.json values are strings/numbers that need mapping
-     * to the STR.edf field indices.  This mapping is complex and depends
-     * on the active therapy mode.  For a first implementation, we
-     * populate what we can from the Summary spool and leave the rest
-     * to be filled from settings.json in a future enhancement. */
+    /* CPAP/AutoSet/HerAuto settings [6-13]: from settings.json (future) */
 
-    /* Environment and oximetry stats [78-91] */
-    str_values[78] = get_metric(ctx, SUM_F_BLOWER_PRESS, 3, 0);   /* BP9: 95th */
-    str_values[79] = get_metric(ctx, SUM_F_BLOWER_PRESS, 1, 0);   /* BP5: 5th */
-    str_values[80] = get_metric(ctx, SUM_F_RESP_FLOW, 3, 0);      /* R95: 95th */
-    str_values[81] = get_metric(ctx, SUM_F_RESP_FLOW, 1, 0);      /* RFM: 5th */
-    str_values[82] = get_metric(ctx, SUM_F_BLOWER_FLOW, 2, 0);    /* BFM: 50th */
-    str_values[83] = get_metric(ctx, SUM_F_AMB_HUMID, 2, 0);      /* AUM: 50th */
-    str_values[84] = get_metric(ctx, SUM_F_HUM_TEMP, 2, 0);       /* HHE: 50th */
-    str_values[85] = get_metric(ctx, SUM_F_HTUBE_TEMP, 2, 0);     /* HTE: 50th */
-    str_values[86] = get_metric(ctx, SUM_F_HTUBE_POWER, 2, 0);    /* AHM: 50th */
-    str_values[87] = get_metric(ctx, SUM_F_HUM_POWER, 2, 0);      /* APM: 50th */
-    str_values[88] = get_metric(ctx, SUM_F_SPO2, 2, 0);           /* SOM: 50th */
-    str_values[89] = get_metric(ctx, SUM_F_SPO2, 3, 0);           /* SO9: 95th */
-    str_values[90] = get_metric(ctx, SUM_F_SPO2, 4, 0);           /* SOX: 100th */
-    str_values[91] = get_scalar(ctx, SUM_F_SAU, 0);               /* SAU: SpO2Thresh */
+    /* Common comfort/settings [14-33]: from settings.json (future) */
 
-    /* Bilevel/ventilation summary stats [92-124] */
-    str_values[92] = get_scalar(ctx, SUM_F_SPONT_TRIG, 0);   /* VSR */
-    str_values[93] = get_scalar(ctx, SUM_F_SPONT_CYC, 0);    /* VCR */
-    str_values[94] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 2, 0);  /* MSP: 50th */
-    str_values[95] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 3, 0);  /* PM9: 95th */
-    str_values[96] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 4, 0);  /* PMA: 100th */
-    str_values[97] = get_metric(ctx, SUM_F_INSP_PRESS, 2, 0);       /* PIM: 50th */
-    str_values[98] = get_metric(ctx, SUM_F_INSP_PRESS, 3, 0);       /* PI9: 95th */
-    str_values[99] = get_metric(ctx, SUM_F_INSP_PRESS, 4, 0);       /* PIA: 100th */
-    str_values[100] = get_metric(ctx, SUM_F_EXP_PRESS, 2, 0);       /* PEM: 50th */
-    str_values[101] = get_metric(ctx, SUM_F_EXP_PRESS, 3, 0);       /* PE9: 95th */
-    str_values[102] = get_metric(ctx, SUM_F_EXP_PRESS, 4, 0);       /* PEA: 100th */
-    str_values[103] = get_metric(ctx, SUM_F_LEAK, 2, 0);            /* LKM: 50th */
-    str_values[104] = get_metric(ctx, SUM_F_LEAK, 3, 0);            /* LK9: 95th */
-    str_values[105] = get_metric(ctx, SUM_F_LEAK, 4, 0);            /* LK7: 70th */
-    /* Note: field 14 (Leak) sub-field 3 is 70th percentile, not 95th.
-     * Sub-field 5 is 100th.  We need to be more precise here. */
-    str_values[106] = get_metric(ctx, SUM_F_LEAK, 5, 0);            /* LMX: 100th */
-    str_values[107] = get_metric(ctx, SUM_F_MIN_VENT, 2, 0);        /* VTM: 50th */
-    str_values[108] = get_metric(ctx, SUM_F_MIN_VENT, 3, 0);        /* VT9: 95th */
-    str_values[109] = get_metric(ctx, SUM_F_MIN_VENT, 4, 0);        /* VTA: 100th */
-    str_values[110] = get_metric(ctx, SUM_F_RESP_RATE, 2, 0);       /* RRM: 50th */
-    str_values[111] = get_metric(ctx, SUM_F_RESP_RATE, 3, 0);       /* RR9: 95th */
-    str_values[112] = get_metric(ctx, SUM_F_RESP_RATE, 4, 0);       /* RRA: 100th */
-    str_values[113] = get_metric(ctx, SUM_F_TIDAL_VOL, 2, 0);       /* TVM: 50th */
-    str_values[114] = get_metric(ctx, SUM_F_TIDAL_VOL, 3, 0);       /* TV9: 95th */
-    str_values[115] = get_metric(ctx, SUM_F_TIDAL_VOL, 4, 0);       /* TVA: 100th */
-    str_values[116] = get_metric(ctx, SUM_F_TGT_VENT, 2, 0);        /* VAM: 50th */
-    str_values[117] = get_metric(ctx, SUM_F_TGT_VENT, 3, 0);        /* VA9: 95th */
-    str_values[118] = get_metric(ctx, SUM_F_TGT_VENT, 4, 0);        /* VAA: 100th */
-    str_values[119] = get_metric(ctx, SUM_F_IE_RATIO, 2, 0);        /* IEM: 50th */
-    str_values[120] = get_metric(ctx, SUM_F_IE_RATIO, 3, 0);        /* IE9: 95th */
-    str_values[121] = get_metric(ctx, SUM_F_IE_RATIO, 4, 0);        /* IEA: 100th */
-    str_values[122] = get_metric(ctx, SUM_F_INSP_DUR, 2, 0);        /* ISM: 50th */
-    str_values[123] = get_metric(ctx, SUM_F_INSP_DUR, 3, 0);        /* IS9: 95th */
-    str_values[124] = get_metric(ctx, SUM_F_INSP_DUR, 4, 0);        /* ISA: 100th */
+    /* Environment and oximetry stats [33-46] */
+    str_values[33] = get_metric(ctx, SUM_F_BLOWER_PRESS, 3, 0);   /* BlowPress.95 */
+    str_values[34] = get_metric(ctx, SUM_F_BLOWER_PRESS, 1, 0);   /* BlowPress.5 */
+    str_values[35] = get_metric(ctx, SUM_F_RESP_FLOW, 3, 0);      /* Flow.95 */
+    str_values[36] = get_metric(ctx, SUM_F_RESP_FLOW, 1, 0);      /* Flow.5 */
+    str_values[37] = get_metric(ctx, SUM_F_BLOWER_FLOW, 2, 0);    /* BlowFlow.50 */
+    str_values[38] = get_metric(ctx, SUM_F_AMB_HUMID, 2, 0);      /* AmbHumidity.50 */
+    str_values[39] = get_metric(ctx, SUM_F_HUM_TEMP, 2, 0);       /* HumTemp.50 */
+    str_values[40] = get_metric(ctx, SUM_F_HTUBE_TEMP, 2, 0);     /* HTubeTemp.50 */
+    str_values[41] = get_metric(ctx, SUM_F_HTUBE_POWER, 2, 0);    /* HTubePow.50 */
+    str_values[42] = get_metric(ctx, SUM_F_HUM_POWER, 2, 0);      /* HumPow.50 */
+    str_values[43] = get_metric(ctx, SUM_F_SPO2, 2, 0);           /* SpO2.50 */
+    str_values[44] = get_metric(ctx, SUM_F_SPO2, 3, 0);           /* SpO2.95 */
+    str_values[45] = get_metric(ctx, SUM_F_SPO2, 4, 0);           /* SpO2.Max */
+    str_values[46] = get_scalar(ctx, SUM_F_SAU, 0);               /* SpO2Thresh */
 
-    /* Indices and CSR [125-132] */
-    str_values[125] = get_scalar(ctx, SUM_F_AHI, 0);    /* AHI */
-    str_values[126] = get_scalar(ctx, SUM_F_HI, 0);     /* HSC: HI */
-    str_values[127] = get_scalar(ctx, SUM_F_AI, 0);     /* ASC: AI */
-    str_values[128] = get_scalar(ctx, SUM_F_OAI, 0);    /* CSC: OAI */
-    str_values[129] = get_scalar(ctx, SUM_F_CAI, 0);    /* OSC: CAI */
-    str_values[130] = get_scalar(ctx, SUM_F_UAI, 0);    /* USC: UAI */
-    str_values[131] = get_scalar(ctx, SUM_F_RIN, 0);    /* RCC: RIN */
-    str_values[132] = get_scalar(ctx, SUM_F_CSR, 0);    /* CSD: CSR */
+    /* Bilevel/ventilation summary stats [47-68] */
+    str_values[47] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 2, 0);  /* MaskPress.50 */
+    str_values[48] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 3, 0);  /* MaskPress.95 */
+    str_values[49] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 4, 0);  /* MaskPress.Max */
+    str_values[50] = get_metric(ctx, SUM_F_INSP_PRESS, 2, 0);       /* TgtIPAP.50 */
+    str_values[51] = get_metric(ctx, SUM_F_INSP_PRESS, 3, 0);       /* TgtIPAP.95 */
+    str_values[52] = get_metric(ctx, SUM_F_INSP_PRESS, 4, 0);       /* TgtIPAP.Max */
+    str_values[53] = get_metric(ctx, SUM_F_EXP_PRESS, 2, 0);        /* TgtEPAP.50 */
+    str_values[54] = get_metric(ctx, SUM_F_EXP_PRESS, 3, 0);        /* TgtEPAP.95 */
+    str_values[55] = get_metric(ctx, SUM_F_EXP_PRESS, 4, 0);        /* TgtEPAP.Max */
+    str_values[56] = get_metric(ctx, SUM_F_LEAK, 2, 0);             /* Leak.50 */
+    str_values[57] = get_metric(ctx, SUM_F_LEAK, 3, 0);             /* Leak.95 */
+    str_values[58] = get_metric(ctx, SUM_F_LEAK, 4, 0);             /* Leak.70 */
+    str_values[59] = get_metric(ctx, SUM_F_LEAK, 5, 0);             /* Leak.Max */
+    str_values[60] = get_metric(ctx, SUM_F_MIN_VENT, 2, 0);         /* MinVent.50 */
+    str_values[61] = get_metric(ctx, SUM_F_MIN_VENT, 3, 0);         /* MinVent.95 */
+    str_values[62] = get_metric(ctx, SUM_F_MIN_VENT, 4, 0);         /* MinVent.Max */
+    str_values[63] = get_metric(ctx, SUM_F_RESP_RATE, 2, 0);        /* RespRate.50 */
+    str_values[64] = get_metric(ctx, SUM_F_RESP_RATE, 3, 0);        /* RespRate.95 */
+    str_values[65] = get_metric(ctx, SUM_F_RESP_RATE, 4, 0);        /* RespRate.Max */
+    str_values[66] = get_metric(ctx, SUM_F_TIDAL_VOL, 2, 0);        /* TidVol.50 */
+    str_values[67] = get_metric(ctx, SUM_F_TIDAL_VOL, 3, 0);        /* TidVol.95 */
+    str_values[68] = get_metric(ctx, SUM_F_TIDAL_VOL, 4, 0);        /* TidVol.Max */
 
-    /* Tail [133]: Crc16 — computed during EDF write */
+    /* Indices and CSR [69-76] */
+    str_values[69] = get_scalar(ctx, SUM_F_AHI, 0);    /* AHI */
+    str_values[70] = get_scalar(ctx, SUM_F_HI, 0);     /* HI */
+    str_values[71] = get_scalar(ctx, SUM_F_AI, 0);     /* AI */
+    str_values[72] = get_scalar(ctx, SUM_F_OAI, 0);    /* OAI */
+    str_values[73] = get_scalar(ctx, SUM_F_CAI, 0);    /* CAI */
+    str_values[74] = get_scalar(ctx, SUM_F_UAI, 0);    /* UAI */
+    str_values[75] = get_scalar(ctx, SUM_F_RIN, 0);    /* RIN */
+    str_values[76] = get_scalar(ctx, SUM_F_CSR, 0);    /* CSR */
 
-    /* Build STR.edf signal definitions.
-     * All 134 signals have the same physical/digital range since they're
-     * all int16 values.  The labels and units vary per signal. */
-    /* str_sigs already heap-allocated and zeroed above */
-
-    /* Set common defaults for all STR signals */
-    for (int i = 0; i < STR_SIGNAL_COUNT; i++) {
-        str_sigs[i].phys_min = -32768.0;
-        str_sigs[i].phys_max = 32767.0;
-        str_sigs[i].dig_min = -32768;
-        str_sigs[i].dig_max = 32767;
-        str_sigs[i].samples_per_record = 1;
-        str_sigs[i].transducer = "";
-        str_sigs[i].prefilter = "";
-        str_sigs[i].unit = "";
-    }
-
-    /* Set labels for key signals (full label set would be 134 entries).
-     * For brevity, we use the short names from edf_signals.md. */
-    static const char *str_labels[] = {
-        "Date", "MaskOn", "MaskOff", "MaskEvents",
-        "PPD", "MOP",
-        "STP", "IPC", "STU", "MPA", "MPI", "HSP", "HMA", "HMI",
-        "XE0", "XE1", "XE2", "XE3", "XE4", "XE5", "XE6", "XE7",
-        "ZZ3", "ZZ1", "ZZ2", "ZZ4", "ZZ5", "ZZ7", "ZZ8", "ZZ9",
-        "Z10", "Z11", "Z12",
-        "XA3", "XA1", "XA2", "XA6", "XA7", "XA8", "XA9", "XAA",
-        "ZU1", "XAB",
-        "XB0", "XB1", "XB2", "XB4", "XB5", "XB6", "XB7",
-        "XC0", "XC1", "XC2", "XC3",
-        "XD0", "XD1", "XD2", "XD3", "XD4",
-        "AFC", "RMA", "RMT", "EPA", "EPX", "EPR", "EPT",
-        "SST", "ACC", "ABF", "MSK", "TBT", "CCO", "HMX", "HMS",
-        "HTX", "HTS", "ZHT", "HUC",
-        "BP9", "BP5", "R95", "RFM", "BFM", "AUM", "HHE", "HTE",
-        "AHM", "APM", "SOM", "SO9", "SOX", "SAU",
-        "VSR", "VCR", "MSP", "PM9", "PMA", "PIM", "PI9", "PIA",
-        "PEM", "PE9", "PEA", "LKM", "LK9", "LK7", "LMX",
-        "VTM", "VT9", "VTA", "RRM", "RR9", "RRA",
-        "TVM", "TV9", "TVA", "VAM", "VA9", "VAA",
-        "IEM", "IE9", "IEA", "ISM", "IS9", "ISA",
-        "AHI", "HSC", "ASC", "CSC", "OSC", "USC", "RCC", "CSD",
+    /* Build STR.edf signal definitions with per-signal metadata matching
+     * AS11 native VID=3 STR.edf (units, phys/dig ranges, samples_per_record). */
+    static const edf_signal_def_t str_signal_defs[STR_DATA_COUNT] = {
+        /* [0-3] Session header */
+        { .label="Date", .transducer="", .unit="", .phys_min=0.0, .phys_max=24836.0, .dig_min=0, .dig_max=24836, .prefilter="", .samples_per_record=1 },
+        { .label="MaskOn", .transducer="", .unit="MINUTES", .phys_min=0.0, .phys_max=1440.0, .dig_min=0, .dig_max=1440, .prefilter="", .samples_per_record=20 },
+        { .label="MaskOff", .transducer="", .unit="MINUTES", .phys_min=0.0, .phys_max=1440.0, .dig_min=0, .dig_max=1440, .prefilter="", .samples_per_record=20 },
+        { .label="MaskEvents", .transducer="", .unit="", .phys_min=0.0, .phys_max=255.0, .dig_min=0, .dig_max=255, .prefilter="", .samples_per_record=1 },
+        /* [4-5] Session core */
+        { .label="Duration", .transducer="", .unit="min.", .phys_min=0.0, .phys_max=1440.0, .dig_min=0, .dig_max=1440, .prefilter="", .samples_per_record=1 },
+        { .label="Mode", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        /* [6-13] CPAP/AutoSet settings */
+        { .label="S.C.StartPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.C.Press", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.A.StartPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.A.MaxPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.A.MinPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.AFH.StartPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.AFH.MaxPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.AFH.MinPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        /* [14-33] Common comfort/settings */
+        { .label="S.AS.Comfort", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.RampEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.RampTime", .transducer="", .unit="min.", .phys_min=5.0, .phys_max=45.0, .dig_min=5, .dig_max=45, .prefilter="", .samples_per_record=1 },
+        { .label="S.EPR.ClinEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.EPR.EPREnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.EPR.Level", .transducer="", .unit="cmH2O", .phys_min=1.0, .phys_max=3.0, .dig_min=50, .dig_max=150, .prefilter="", .samples_per_record=1 },
+        { .label="S.EPR.EPRType", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.SmartStart", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.PtAccess", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.ABFilter", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.Mask", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.Tube", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.ClimateControl", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.HumEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.HumLevel", .transducer="", .unit="", .phys_min=1.0, .phys_max=8.0, .dig_min=1, .dig_max=8, .prefilter="", .samples_per_record=1 },
+        { .label="S.TempEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.Temp", .transducer="", .unit="Celsius", .phys_min=15.6, .phys_max=30.0, .dig_min=156, .dig_max=300, .prefilter="", .samples_per_record=1 },
+        { .label="HeatedTube", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="Humidifier", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        /* [33-46] Environment and oximetry stats */
+        { .label="BlowPress.95", .transducer="", .unit="cmH2O", .phys_min=-10.0, .phys_max=45.0, .dig_min=-500, .dig_max=2250, .prefilter="", .samples_per_record=1 },
+        { .label="BlowPress.5", .transducer="", .unit="cmH2O", .phys_min=-10.0, .phys_max=45.0, .dig_min=-500, .dig_max=2250, .prefilter="", .samples_per_record=1 },
+        { .label="Flow.95", .transducer="", .unit="L/s", .phys_min=-2.0, .phys_max=3.0, .dig_min=-1000, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="Flow.5", .transducer="", .unit="L/s", .phys_min=-2.0, .phys_max=3.0, .dig_min=-1000, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="BlowFlow.50", .transducer="", .unit="L/s", .phys_min=-4.0, .phys_max=4.0, .dig_min=-2000, .dig_max=2000, .prefilter="", .samples_per_record=1 },
+        { .label="AmbHumidity.50", .transducer="", .unit="mg/L", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="HumTemp.50", .transducer="", .unit="Celsius", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="HTubeTemp.50", .transducer="", .unit="Celsius", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=400, .prefilter="", .samples_per_record=1 },
+        { .label="HTubePow.50", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="HumPow.50", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="SpO2.50", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="SpO2.95", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="SpO2.Max", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="SpO2Thresh", .transducer="", .unit="min.", .phys_min=0.0, .phys_max=1440.0, .dig_min=0, .dig_max=1440, .prefilter="", .samples_per_record=1 },
+        /* [47-68] Bilevel/ventilation summary stats */
+        { .label="MaskPress.50", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
+        { .label="MaskPress.95", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
+        { .label="MaskPress.Max", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
+        { .label="TgtIPAP.50", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=50.0, .dig_min=0, .dig_max=2500, .prefilter="", .samples_per_record=1 },
+        { .label="TgtIPAP.95", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=50.0, .dig_min=0, .dig_max=2500, .prefilter="", .samples_per_record=1 },
+        { .label="TgtIPAP.Max", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=50.0, .dig_min=0, .dig_max=2500, .prefilter="", .samples_per_record=1 },
+        { .label="TgtEPAP.50", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="TgtEPAP.95", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="TgtEPAP.Max", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="Leak.50", .transducer="", .unit="L/s", .phys_min=0.0, .phys_max=2.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="Leak.95", .transducer="", .unit="L/s", .phys_min=0.0, .phys_max=2.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="Leak.70", .transducer="", .unit="L/s", .phys_min=0.0, .phys_max=2.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="Leak.Max", .transducer="", .unit="L/s", .phys_min=0.0, .phys_max=2.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="MinVent.50", .transducer="", .unit="L/min", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=240, .prefilter="", .samples_per_record=1 },
+        { .label="MinVent.95", .transducer="", .unit="L/min", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=240, .prefilter="", .samples_per_record=1 },
+        { .label="MinVent.Max", .transducer="", .unit="L/min", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=240, .prefilter="", .samples_per_record=1 },
+        { .label="RespRate.50", .transducer="", .unit="bpm", .phys_min=0.0, .phys_max=90.0, .dig_min=0, .dig_max=450, .prefilter="", .samples_per_record=1 },
+        { .label="RespRate.95", .transducer="", .unit="bpm", .phys_min=0.0, .phys_max=90.0, .dig_min=0, .dig_max=450, .prefilter="", .samples_per_record=1 },
+        { .label="RespRate.Max", .transducer="", .unit="bpm", .phys_min=0.0, .phys_max=90.0, .dig_min=0, .dig_max=450, .prefilter="", .samples_per_record=1 },
+        { .label="TidVol.50", .transducer="", .unit="L", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="TidVol.95", .transducer="", .unit="L", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="TidVol.Max", .transducer="", .unit="L", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        /* [69-76] Indices and CSR */
+        { .label="AHI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
+        { .label="HI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
+        { .label="AI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
+        { .label="OAI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
+        { .label="CAI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
+        { .label="UAI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
+        { .label="RIN", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
+        { .label="CSR", .transducer="", .unit="", .phys_min=0.0, .phys_max=1440.0, .dig_min=0, .dig_max=1440, .prefilter="", .samples_per_record=1 },
     };
-
-    for (int i = 0; i < STR_SIGNAL_COUNT && i < (int)(sizeof(str_labels) / sizeof(str_labels[0])); i++) {
-        str_sigs[i].label = str_labels[i];
-    }
 
     /* Create STR.edf */
     char path[300];
@@ -1044,26 +1091,48 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         return ESP_FAIL;
     }
 
+    /* Copy static signal defs into the heap-allocated str_sigs array */
+    memcpy(str_sigs, str_signal_defs, STR_DATA_COUNT * sizeof(edf_signal_def_t));
+
+    /* STR.edf uses 12.00.00 noon as start time, with the noon-based day date. */
+    const char *str_start_time = "12.00.00";
+
     int header_bytes = edf_write_header(edf, patient_id, recording_id,
-                                        start_date, start_time,
+                                        start_date, str_start_time,
                                         1,  /* 1 data record */
                                         "86400.00",
-                                        "EDF", str_sigs, STR_SIGNAL_COUNT);
+                                        "EDF", str_sigs, STR_DATA_COUNT);
     if (header_bytes < 0) {
         ESP_LOGE(TAG, "STR.edf: edf_write_header failed");
         fclose(edf);
         return ESP_FAIL;
     }
 
-    /* Write the single data record: 134 int16 values + Crc16 */
-    /* Compute CRC16 over the 134 signal values */
-    uint16_t crc = crc16_ccitt((uint8_t *)str_values, STR_SIGNAL_COUNT * sizeof(int16_t));
-    str_values[133] = 0;  /* Crc16 field is NOT included in the CRC computation */
+    /* Write the single data record.
+     * Most signals have spr=1, but MaskOn and MaskOff have spr=20.
+     * Total data samples = 1 + 20 + 20 + 1 + 73 = 115 int16.
+     * Plus Crc16 (spr=1) = 116 int16 total = 232 bytes. */
+    int16_t rec_buf[115];
+    int rec_pos = 0;
+    for (int i = 0; i < STR_DATA_COUNT; i++) {
+        int spr = str_signal_defs[i].samples_per_record;
+        rec_buf[rec_pos++] = str_values[i];
+        for (int s = 1; s < spr; s++) {
+            rec_buf[rec_pos++] = -1;  /* pad unused slots with sentinel */
+        }
+    }
+    /* rec_pos must be 115 (1+20+20+1+73) */
+    if (rec_pos != 115) {
+        ESP_LOGE(TAG, "STR.edf: internal error: record buffer rec_pos=%d != 115", rec_pos);
+        fclose(edf);
+        return ESP_FAIL;
+    }
 
-    /* Write signal data */
-    fwrite(str_values, sizeof(int16_t), STR_SIGNAL_COUNT, edf);
+    /* Compute CRC16 over the 115 data signal values (230 bytes) */
+    uint16_t crc = crc16_ccitt((uint8_t *)rec_buf, 115 * sizeof(int16_t));
 
-    /* Write Crc16 signal (little-endian) */
+    /* Write data record (115 data values + Crc16) */
+    fwrite(rec_buf, sizeof(int16_t), 115, edf);
     int16_t crc_val = (int16_t)crc;
     fwrite(&crc_val, sizeof(int16_t), 1, edf);
 
@@ -1073,12 +1142,8 @@ static esp_err_t generate_str_edf(const char *edf_dir,
 
     ESP_LOGI(TAG, "STR.edf generated: %s", path);
 
-    /* Generate CSL.edf (empty — CSR annotations would require additional
-     * spool data not available in the Summary spool.  Most sessions have
-     * no CSR events, so an empty file is correct for the common case.) */
-    snprintf(path, sizeof(path), "%s/CSL.edf", edf_dir);
-    /* TODO: generate CSL.edf from CSR interval data if available */
-    ESP_LOGI(TAG, "CSL.edf: not generated (CSR annotations not yet implemented)");
+    /* CSL.edf is generated by the caller (edf_gen_generate) from the
+     * same events spool data, alongside EVE.edf. */
 
     free(ctx);
     free(str_values);
@@ -1676,6 +1741,21 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     format_edf_datetime(start_epoch_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
 
+    /* STR.edf uses the noon-based day date (sessions before noon belong
+     * to the previous day's STR.edf). */
+    char str_start_date[32];
+    {
+        time_t t = (time_t)(start_epoch_ms / 1000);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        if (tm.tm_hour < 12) {
+            t -= 86400;
+            localtime_r(&t, &tm);
+        }
+        snprintf(str_start_date, sizeof(str_start_date), "%02d.%02d.%02d",
+                 tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
+    }
+
     char recording_id[128];
     format_recording_id(recording_id, sizeof(recording_id),
                         start_epoch_ms, ident);
@@ -1792,7 +1872,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     if (summary_data && summary_len > 0) {
         if (generate_str_edf(edf_dir, summary_data, summary_len,
                              patient_id, recording_id,
-                             start_date, start_time, settings) != ESP_OK) {
+                             str_start_date, start_time,
+                             start_epoch_ms, end_epoch_ms,
+                             settings) != ESP_OK) {
             errors++;
         }
     } else {
