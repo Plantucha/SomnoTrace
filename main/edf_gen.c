@@ -821,6 +821,16 @@ static int16_t get_scalar(const summary_ctx_t *ctx, int field, int16_t default_v
     return (int16_t)ctx->scalars[field];
 }
 
+/* Map On/Off string from settings.json to AS11 EDF enum value.
+ * AS11 EDF uses: Off=1, On=2 for boolean-like settings. */
+static int on_off_to_edf(const char *s)
+{
+    if (!s) return -1;
+    if (strcmp(s, "On") == 0) return 2;
+    if (strcmp(s, "Off") == 0) return 1;
+    return -1;
+}
+
 /* Generate STR.edf from Summary spool protobuf data.
  * Also generates CSL.edf (empty or from CSR field). */
 static esp_err_t generate_str_edf(const char *edf_dir,
@@ -1002,9 +1012,155 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         str_values[5] = mode_raw;
     }
 
-    /* CPAP/AutoSet/HerAuto settings [6-13]: from settings.json (future) */
+    /* CPAP/AutoSet settings [6-13] and common comfort/settings [14-30]:
+     * from settings.json (Get RPC response captured during post-therapy).
+     * Pressures are stored in cmH2O × 50, temperatures in °C × 10.
+     * Enum fields use AS11 EDF enum values (Off=1, On=2, etc.). */
+    if (settings_json) {
+        cJSON *sp = cJSON_GetObjectItem(settings_json, "SettingProfiles");
+        cJSON *tp = sp ? cJSON_GetObjectItem(sp, "TherapyProfiles") : NULL;
+        cJSON *fp = sp ? cJSON_GetObjectItem(sp, "FeatureProfiles") : NULL;
 
-    /* Common comfort/settings [14-33]: from settings.json (future) */
+        /* Pressure fields [6-13]: cmH2O × 50 */
+        if (tp) {
+            cJSON *cpap = cJSON_GetObjectItem(tp, "CpapProfile");
+            cJSON *autoset = cJSON_GetObjectItem(tp, "AutoSetProfile");
+            cJSON *her = cJSON_GetObjectItem(tp, "AutoSetForHerProfile");
+            cJSON *v;
+            if (cpap) {
+                if ((v = cJSON_GetObjectItem(cpap, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[6] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(cpap, "SetPressure")) && cJSON_IsNumber(v))
+                    str_values[7] = (int16_t)(v->valuedouble * 50);
+            }
+            if (autoset) {
+                if ((v = cJSON_GetObjectItem(autoset, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[8] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(autoset, "MaxPressure")) && cJSON_IsNumber(v))
+                    str_values[9] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(autoset, "MinPressure")) && cJSON_IsNumber(v))
+                    str_values[10] = (int16_t)(v->valuedouble * 50);
+            }
+            if (her) {
+                if ((v = cJSON_GetObjectItem(her, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[11] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(her, "MaxPressure")) && cJSON_IsNumber(v))
+                    str_values[12] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(her, "MinPressure")) && cJSON_IsNumber(v))
+                    str_values[13] = (int16_t)(v->valuedouble * 50);
+            }
+        }
+
+        /* Comfort/settings [14-30] */
+        if (fp) {
+            cJSON *comfort = cJSON_GetObjectItem(fp, "ComfortFeature");
+            cJSON *epr = cJSON_GetObjectItem(fp, "EprFeature");
+            cJSON *ramp = cJSON_GetObjectItem(fp, "AutoRampFeature");
+            cJSON *smart = cJSON_GetObjectItem(fp, "SmartStartStopFeature");
+            cJSON *circuit = cJSON_GetObjectItem(fp, "CircuitFeature");
+            cJSON *climate = cJSON_GetObjectItem(fp, "ClimateFeature");
+            cJSON *patview = cJSON_GetObjectItem(fp, "PatientViewFeature");
+            cJSON *v;
+
+            /* [14] S.AS.Comfort: "Plus"→1, "On"→2 */
+            if (comfort) {
+                v = cJSON_GetObjectItem(comfort, "AutoSetComfort");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "On") == 0) str_values[14] = 2;
+                    else if (strcmp(v->valuestring, "Plus") == 0) str_values[14] = 1;
+                }
+            }
+
+            /* [15] S.RampEnable: "Off"→1, "On"→2, "Auto"→3 */
+            /* [16] S.RampTime: direct minutes */
+            if (ramp) {
+                v = cJSON_GetObjectItem(ramp, "RampEnable");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "Off") == 0) str_values[15] = 1;
+                    else if (strcmp(v->valuestring, "On") == 0) str_values[15] = 2;
+                    else if (strcmp(v->valuestring, "Auto") == 0) str_values[15] = 3;
+                }
+                v = cJSON_GetObjectItem(ramp, "RampTime");
+                if (v && cJSON_IsNumber(v)) str_values[16] = (int16_t)v->valuedouble;
+            }
+
+            /* [17-20] EPR settings */
+            if (epr) {
+                v = cJSON_GetObjectItem(epr, "EprEnablePatientAccess");
+                if (v && cJSON_IsString(v)) str_values[17] = (int16_t)on_off_to_edf(v->valuestring);
+                v = cJSON_GetObjectItem(epr, "EprEnable");
+                if (v && cJSON_IsString(v)) str_values[18] = (int16_t)on_off_to_edf(v->valuestring);
+                v = cJSON_GetObjectItem(epr, "EprPressure");
+                if (v && cJSON_IsNumber(v)) str_values[19] = (int16_t)(v->valuedouble * 50);
+                v = cJSON_GetObjectItem(epr, "EprType");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "RampOnly") == 0) str_values[20] = 1;
+                    else if (strcmp(v->valuestring, "FullTime") == 0) str_values[20] = 2;
+                }
+            }
+
+            /* [21] S.SmartStart */
+            if (smart) {
+                v = cJSON_GetObjectItem(smart, "SmartStart");
+                if (v && cJSON_IsString(v)) str_values[21] = (int16_t)on_off_to_edf(v->valuestring);
+            }
+
+            /* [22] S.PtAccess (PatientView) */
+            if (patview) {
+                v = cJSON_GetObjectItem(patview, "PatientView");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "Advanced") == 0) str_values[22] = 1;
+                    else if (strcmp(v->valuestring, "Basic") == 0) str_values[22] = 2;
+                }
+            }
+
+            /* [23] S.ABFilter, [24] S.Mask, [25] S.Tube */
+            if (circuit) {
+                v = cJSON_GetObjectItem(circuit, "AntiBacterialFilter");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "No") == 0) str_values[23] = 1;
+                    else if (strcmp(v->valuestring, "Yes") == 0) str_values[23] = 2;
+                }
+                v = cJSON_GetObjectItem(circuit, "MaskType");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "Nasal") == 0) str_values[24] = 1;
+                    else if (strcmp(v->valuestring, "Pillows") == 0) str_values[24] = 2;
+                    else if (strcmp(v->valuestring, "FullFace") == 0 ||
+                             strcmp(v->valuestring, "Full Face") == 0) str_values[24] = 3;
+                    else if (strcmp(v->valuestring, "Pediatric") == 0) str_values[24] = 4;
+                }
+                v = cJSON_GetObjectItem(circuit, "TubeType");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "SlimLine") == 0) str_values[25] = 1;
+                    else if (strcmp(v->valuestring, "Standard") == 0) str_values[25] = 2;
+                    else if (strcmp(v->valuestring, "3m") == 0) str_values[25] = 3;
+                    else if (strcmp(v->valuestring, "19mmNonHeated") == 0) str_values[25] = 4;
+                }
+            }
+
+            /* [26-30] Climate settings */
+            if (climate) {
+                v = cJSON_GetObjectItem(climate, "ClimateControl");
+                if (v && cJSON_IsString(v)) {
+                    if (strcmp(v->valuestring, "Auto") == 0) str_values[26] = 1;
+                    else if (strcmp(v->valuestring, "Manual") == 0) str_values[26] = 2;
+                }
+                v = cJSON_GetObjectItem(climate, "HumidifierSettingEnable");
+                if (v && cJSON_IsString(v)) str_values[27] = (int16_t)on_off_to_edf(v->valuestring);
+                v = cJSON_GetObjectItem(climate, "HumidifierLevel");
+                if (v && cJSON_IsNumber(v)) str_values[28] = (int16_t)v->valuedouble;
+                v = cJSON_GetObjectItem(climate, "HeatedTubeSettingEnable");
+                if (v && cJSON_IsString(v)) str_values[29] = (int16_t)on_off_to_edf(v->valuestring);
+                v = cJSON_GetObjectItem(climate, "HeatedTubeTemperature");
+                if (v && cJSON_IsNumber(v)) str_values[30] = (int16_t)(v->valuedouble * 10);
+            }
+        }
+    }
+
+    /* [31] HeatedTube and [32] Humidifier: from Summary spool fields.
+     * These are hardware connection status, not user settings. */
+    str_values[31] = get_scalar(ctx, SUM_F_TUBE_CONNECTED, -1);   /* HeatedTube */
+    str_values[32] = get_scalar(ctx, SUM_F_HUM_CONNECTED, -1);    /* Humidifier */
 
     /* Environment and oximetry stats [33-46] */
     str_values[33] = get_metric(ctx, SUM_F_BLOWER_PRESS, 3, 0);   /* BlowPress.95 */
