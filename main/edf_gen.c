@@ -318,11 +318,18 @@ static int edf_write_header(FILE *f, const char *patient_id,
         edf_write_field(sigblock + offset + i * 8, 8, signals[i].unit);
     edf_write_field(sigblock + offset + n_signals * 8, 8, "");
 
-    /* Field 4: physical minimum (8 chars each) */
+    /* Field 4: physical minimum (8 chars each).
+     * AS11 formats enum signals (phys==dig, small range) as integers,
+     * all others with %.2f. */
     offset = total * (16 + 80 + 8);
     for (int i = 0; i < n_signals; i++) {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.2f", signals[i].phys_min);
+        if (signals[i].phys_min == (double)signals[i].dig_min &&
+            signals[i].phys_max == (double)signals[i].dig_max &&
+            signals[i].dig_max <= 16)
+            snprintf(buf, sizeof(buf), "%d", signals[i].dig_min);
+        else
+            snprintf(buf, sizeof(buf), "%.2f", signals[i].phys_min);
         edf_write_field(sigblock + offset + i * 8, 8, buf);
     }
     edf_write_field(sigblock + offset + n_signals * 8, 8, "-32768.0");
@@ -331,7 +338,12 @@ static int edf_write_header(FILE *f, const char *patient_id,
     offset = total * (16 + 80 + 8 + 8);
     for (int i = 0; i < n_signals; i++) {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.2f", signals[i].phys_max);
+        if (signals[i].phys_min == (double)signals[i].dig_min &&
+            signals[i].phys_max == (double)signals[i].dig_max &&
+            signals[i].dig_max <= 16)
+            snprintf(buf, sizeof(buf), "%d", signals[i].dig_max);
+        else
+            snprintf(buf, sizeof(buf), "%.2f", signals[i].phys_max);
         edf_write_field(sigblock + offset + i * 8, 8, buf);
     }
     edf_write_field(sigblock + offset + n_signals * 8, 8, "32767.00");
@@ -1816,6 +1828,18 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     format_recording_id(recording_id, sizeof(recording_id),
                         start_epoch_ms, ident);
 
+    /* STR.edf recording_id uses the noon-based day date, not session start. */
+    char str_recording_id[128];
+    {
+        time_t t = (time_t)(start_epoch_ms / 1000);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        if (tm.tm_hour < 12) t -= 86400;
+        int64_t noon_ms = (int64_t)t * 1000;
+        format_recording_id(str_recording_id, sizeof(str_recording_id),
+                           noon_ms, ident);
+    }
+
     /* Patient ID will have CRC filled in by edf_finalise_crc.
      * Initial value is the "X X X X" prefix with placeholder zeros. */
     char patient_id[81] = "X X X X 0000 0000";
@@ -1927,7 +1951,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * cumulative file, not per-session. */
     if (summary_data && summary_len > 0) {
         if (generate_str_edf(edf_dir, summary_data, summary_len,
-                             patient_id, recording_id,
+                             patient_id, str_recording_id,
                              str_start_date, start_time,
                              start_epoch_ms, end_epoch_ms,
                              settings, session_dir) != ESP_OK) {
