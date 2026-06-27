@@ -324,9 +324,7 @@ static int edf_write_header(FILE *f, const char *patient_id,
     offset = total * (16 + 80 + 8);
     for (int i = 0; i < n_signals; i++) {
         char buf[16];
-        if (signals[i].phys_min == (double)signals[i].dig_min &&
-            signals[i].phys_max == (double)signals[i].dig_max &&
-            signals[i].dig_max <= 16)
+        if (signals[i].dig_min == 0 && signals[i].dig_max == 16)
             snprintf(buf, sizeof(buf), "%d", signals[i].dig_min);
         else
             snprintf(buf, sizeof(buf), "%.2f", signals[i].phys_min);
@@ -338,9 +336,7 @@ static int edf_write_header(FILE *f, const char *patient_id,
     offset = total * (16 + 80 + 8 + 8);
     for (int i = 0; i < n_signals; i++) {
         char buf[16];
-        if (signals[i].phys_min == (double)signals[i].dig_min &&
-            signals[i].phys_max == (double)signals[i].dig_max &&
-            signals[i].dig_max <= 16)
+        if (signals[i].dig_min == 0 && signals[i].dig_max == 16)
             snprintf(buf, sizeof(buf), "%d", signals[i].dig_max);
         else
             snprintf(buf, sizeof(buf), "%.2f", signals[i].phys_max);
