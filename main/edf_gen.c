@@ -820,7 +820,8 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                                   const char *patient_id, const char *recording_id,
                                   const char *start_date, const char *start_time,
                                   int64_t start_epoch_ms, int64_t end_epoch_ms,
-                                  const cJSON *settings_json)
+                                  const cJSON *settings_json,
+                                  const char *session_dir)
 {
     /* Parse the Summary protobuf to extract session statistics.
      * The top-level message has repeated field-2 wrappers, each containing
@@ -892,8 +893,12 @@ static esp_err_t generate_str_edf(const char *edf_dir,
 
     /* Session header [0-3]: Date, MaskOn, MaskOff, MaskEvents
      * Date = days from Unix epoch (Jan 1, 1970) in local time (noon-based day)
-     * MaskOn/MaskOff = minutes from noon (noon-based day), up to 20 entries each
-     * MaskEvents = count of mask on/off events */
+     * MaskOn/MaskOff = minutes from noon, up to 20 entries each
+     * MaskEvents = count of mask on/off events
+     *
+     * MaskOn/MaskOff events are read from events.snt (live EventNotification
+     * JSON lines captured by session_writer).  Each line is a JSON object with
+     * params.events[] containing {event/label, timestamp} fields. */
     {
         time_t start_t = (time_t)(start_epoch_ms / 1000);
         time_t end_t = (time_t)(end_epoch_ms / 1000);
@@ -912,20 +917,71 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         time_t epoch_t = mktime(&epoch_tm);
         str_values[0] = (int16_t)((noon_t - epoch_t) / 86400);
 
-        /* Minutes from midnight, then subtract 720 (12*60) to get minutes from noon */
-        int start_min_from_noon = tm_start.tm_hour * 60 + tm_start.tm_min - 720;
-        int end_min_from_noon = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
+        /* Compute noon-based epoch for minute-from-noon calculations */
+        int64_t noon_epoch_ms = (int64_t)noon_t * 1000;
 
-        /* If session spans midnight (before noon), add 1440 to make it positive */
-        if (start_min_from_noon < 0) start_min_from_noon += 1440;
-        if (end_min_from_noon < 0) end_min_from_noon += 1440;
+        /* Parse events.snt for MaskOn/MaskOff events */
+        int mask_on_count = 0;
+        int mask_off_count = 0;
+        char events_path[350];
+        snprintf(events_path, sizeof(events_path), "%s/events.snt", session_dir);
+        FILE *ef = fopen(events_path, "r");
+        if (ef) {
+            char line[512];
+            while (fgets(line, sizeof(line), ef) && mask_on_count < 20 && mask_off_count < 20) {
+                cJSON *msg = cJSON_Parse(line);
+                if (!msg) continue;
+                cJSON *params = cJSON_GetObjectItem(msg, "params");
+                if (params) {
+                    cJSON *events = cJSON_GetObjectItem(params, "events");
+                    if (events && cJSON_IsArray(events)) {
+                        int n = cJSON_GetArraySize(events);
+                        for (int i = 0; i < n; i++) {
+                            cJSON *ev = cJSON_GetArrayItem(events, i);
+                            if (!ev) continue;
+                            cJSON *label = cJSON_GetObjectItem(ev, "event");
+                            if (!label || !cJSON_IsString(label))
+                                label = cJSON_GetObjectItem(ev, "label");
+                            if (!label || !cJSON_IsString(label)) continue;
+                            cJSON *ts = cJSON_GetObjectItem(ev, "timestamp");
+                            if (!ts || !cJSON_IsNumber(ts)) continue;
+                            int64_t ev_ms = (int64_t)ts->valuedouble;
+                            int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
+                            if (strcmp(label->valuestring, "MaskOn") == 0 && mask_on_count < 20) {
+                                str_values[1 + mask_on_count] = (int16_t)min_from_noon;
+                                mask_on_count++;
+                            } else if (strcmp(label->valuestring, "MaskOff") == 0 && mask_off_count < 20) {
+                                str_values[21 + mask_off_count] = (int16_t)min_from_noon;
+                                mask_off_count++;
+                            }
+                        }
+                    }
+                }
+                cJSON_Delete(msg);
+            }
+            fclose(ef);
+        }
 
-        /* MaskOn[0] = session start, rest = -1 (no additional mask-on events) */
-        str_values[1] = (int16_t)start_min_from_noon;
-        /* MaskOff[0] = session end, rest = -1 */
-        str_values[2] = (int16_t)end_min_from_noon;
-        /* MaskEvents: we track one mask-on/mask-off pair per session */
-        str_values[3] = 1;
+        /* If no MaskOn events found, use session start as fallback */
+        if (mask_on_count == 0) {
+            int start_min = tm_start.tm_hour * 60 + tm_start.tm_min - 720;
+            if (start_min < 0) start_min += 1440;
+            str_values[1] = (int16_t)start_min;
+            mask_on_count = 1;
+        }
+        /* If no MaskOff events found, use session end as fallback */
+        if (mask_off_count == 0) {
+            int end_min = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
+            if (end_min < 0) end_min += 1440;
+            str_values[21] = (int16_t)end_min;
+            mask_off_count = 1;
+        }
+
+        /* MaskEvents = max(mask_on_count, mask_off_count) */
+        str_values[3] = (int16_t)(mask_on_count > mask_off_count ? mask_on_count : mask_off_count);
+
+        ESP_LOGI(TAG, "STR.edf: MaskOn=%d MaskOff=%d MaskEvents=%d",
+                 mask_on_count, mask_off_count, str_values[3]);
     }
 
     /* Session core [4-5] */
@@ -1874,7 +1930,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                              patient_id, recording_id,
                              str_start_date, start_time,
                              start_epoch_ms, end_epoch_ms,
-                             settings) != ESP_OK) {
+                             settings, session_dir) != ESP_OK) {
             errors++;
         }
     } else {
