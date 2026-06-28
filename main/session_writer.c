@@ -797,8 +797,16 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         if (abs(flow_vals[j]) > 50) has_active_flow = true;
     }
 
-    /* Edge case: auto-start session if flow is non-trivial and no session active */
-    if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped && has_active_flow) {
+    /* Mask pressure: during therapy, pressure is always >= 4 cmH2O (400).
+     * At idle, the AS11 sends a baseline flow (~0.5 L/s) and low pressure
+     * (~0.4 cmH2O). Require both flow AND pressure to avoid false triggers. */
+    bool has_therapy_pressure = false;
+    for (int j = 0; j < press_n; j++) {
+        if (press_vals[j] > 200) has_therapy_pressure = true;
+    }
+
+    /* Edge case: auto-start session if flow and pressure indicate active therapy */
+    if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped && has_active_flow && has_therapy_pressure) {
         ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
         bsp_display_set_therapy_active(true);
         s = session_writer_start();
