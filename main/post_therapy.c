@@ -114,7 +114,8 @@ static esp_err_t write_bin_file(const char *path, const uint8_t *data, size_t le
     return ESP_OK;
 }
 
-/* Atomic write: write to temp file, then rename. */
+/* Atomic-ish write: write to temp file, then rename over target.
+ * FAT32 rename() fails with EEXIST, so remove the target first. */
 static esp_err_t write_bin_atomic(const char *path, const uint8_t *data, size_t len)
 {
     char tmp_path[330];
@@ -122,6 +123,7 @@ static esp_err_t write_bin_atomic(const char *path, const uint8_t *data, size_t 
 
     if (write_bin_file(tmp_path, data, len) != ESP_OK) return ESP_FAIL;
 
+    remove(path);
     if (rename(tmp_path, path) != 0) {
         ESP_LOGE(TAG, "rename %s → %s failed: %s", tmp_path, path, strerror(errno));
         remove(tmp_path);
