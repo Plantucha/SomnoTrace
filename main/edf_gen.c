@@ -860,6 +860,15 @@ static esp_err_t generate_str_edf(const char *edf_dir,
     /* Initialise all STR values to -1 (sentinel for "no data") */
     memset(str_values, 0xFF, STR_DATA_COUNT * sizeof(int16_t));
 
+    /* Side arrays for additional MaskOn/MaskOff events (beyond the first).
+     * str_values is signal-indexed, so only the first event goes in
+     * str_values[1]/[2]; additional events are merged into the record
+     * buffer later. */
+    int16_t mask_on_extra[20];
+    int16_t mask_off_extra[20];
+    memset(mask_on_extra, 0xFF, sizeof(mask_on_extra));
+    memset(mask_off_extra, 0xFF, sizeof(mask_off_extra));
+
     /* Find field-2 wrapper records */
     bool found_record = false;
     size_t pos = 0;
@@ -938,9 +947,14 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         /* Compute noon-based epoch for minute-from-noon calculations */
         int64_t noon_epoch_ms = (int64_t)noon_t * 1000;
 
-        /* Parse events.snt for MaskOn/MaskOff events */
+        /* Parse events.snt for MaskOn/MaskOff events.
+         * MaskOn/MaskOff signals have spr=20, but str_values is signal-indexed
+         * (one entry per signal, not per sample).  Additional events beyond
+         * the first are stored in side arrays and merged into the record
+         * buffer later. */
         int mask_on_count = 0;
         int mask_off_count = 0;
+
         char events_path[350];
         snprintf(events_path, sizeof(events_path), "%s/events.snt", session_dir);
         FILE *ef = fopen(events_path, "r");
@@ -966,10 +980,16 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                             int64_t ev_ms = (int64_t)ts->valuedouble;
                             int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
                             if (strcmp(label->valuestring, "MaskOn") == 0 && mask_on_count < 20) {
-                                str_values[1 + mask_on_count] = (int16_t)min_from_noon;
+                                if (mask_on_count == 0)
+                                    str_values[1] = (int16_t)min_from_noon;
+                                else
+                                    mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
                                 mask_on_count++;
                             } else if (strcmp(label->valuestring, "MaskOff") == 0 && mask_off_count < 20) {
-                                str_values[21 + mask_off_count] = (int16_t)min_from_noon;
+                                if (mask_off_count == 0)
+                                    str_values[2] = (int16_t)min_from_noon;
+                                else
+                                    mask_off_extra[mask_off_count - 1] = (int16_t)min_from_noon;
                                 mask_off_count++;
                             }
                         }
@@ -991,7 +1011,7 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         if (mask_off_count == 0) {
             int end_min = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
             if (end_min < 0) end_min += 1440;
-            str_values[21] = (int16_t)end_min;
+            str_values[2] = (int16_t)end_min;
             mask_off_count = 1;
         }
 
@@ -1020,6 +1040,10 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         cJSON *sp = cJSON_GetObjectItem(settings_json, "SettingProfiles");
         cJSON *tp = sp ? cJSON_GetObjectItem(sp, "TherapyProfiles") : NULL;
         cJSON *fp = sp ? cJSON_GetObjectItem(sp, "FeatureProfiles") : NULL;
+        ESP_LOGI(TAG, "STR settings: sp=%s tp=%s fp=%s",
+                 sp ? "OK" : "MISSING",
+                 tp ? "OK" : "MISSING",
+                 fp ? "OK" : "MISSING");
 
         /* Pressure fields [6-13]: cmH2O × 50 */
         if (tp) {
@@ -1156,6 +1180,12 @@ static esp_err_t generate_str_edf(const char *edf_dir,
             }
         }
     }
+
+    ESP_LOGI(TAG, "STR settings values: [6]=%d [7]=%d [8]=%d [9]=%d [10]=%d [11]=%d [12]=%d [21]=%d [22]=%d [23]=%d [24]=%d [25]=%d [26]=%d [27]=%d [28]=%d [29]=%d [30]=%d",
+             str_values[6], str_values[7], str_values[8], str_values[9], str_values[10],
+             str_values[11], str_values[12], str_values[21], str_values[22], str_values[23],
+             str_values[24], str_values[25], str_values[26], str_values[27], str_values[28],
+             str_values[29], str_values[30]);
 
     /* [31] HeatedTube and [32] Humidifier: from Summary spool fields.
      * These are hardware connection status, not user settings. */
@@ -1338,7 +1368,12 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         int spr = str_signal_defs[i].samples_per_record;
         rec_buf[rec_pos++] = str_values[i];
         for (int s = 1; s < spr; s++) {
-            rec_buf[rec_pos++] = -1;  /* pad unused slots with sentinel */
+            if (i == 1 && s - 1 < 20)
+                rec_buf[rec_pos++] = mask_on_extra[s - 1];
+            else if (i == 2 && s - 1 < 20)
+                rec_buf[rec_pos++] = mask_off_extra[s - 1];
+            else
+                rec_buf[rec_pos++] = -1;  /* pad unused slots with sentinel */
         }
     }
     /* rec_pos must be 115 (1+20+20+1+73) */
@@ -1943,6 +1978,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     char settings_path[330];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", pt_dir);
     cJSON *settings = read_json_file(settings_path);
+    ESP_LOGI(TAG, "settings.json: path=%s %s", settings_path,
+             settings ? "loaded OK" : "FAILED to load");
 
     /* Read Summary spool data for STR.edf */
     char summary_path[330];
