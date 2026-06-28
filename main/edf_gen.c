@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <time.h>
 #include <errno.h>
 
@@ -673,6 +674,10 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     return ESP_OK;
 }
 
+/* Forward declarations — defined in Section 9. */
+static cJSON *read_json_file(const char *path);
+static uint8_t *read_bin_file(const char *path, size_t *out_len);
+
 /* ════════════════════════════════════════════════════════════════════
  *  Section 6: STR.edf generation from Summary spool protobuf
  * ════════════════════════════════════════════════════════════════════
@@ -756,6 +761,12 @@ typedef struct {
         int n;
     } metrics[64];
     bool has_metric[64];
+    /* Session entries from field 1 (MaskOn/MaskOff events) */
+    struct {
+        int64_t ts;    /* sub-field 1: timestamp (epoch ms) */
+        int64_t mode;  /* sub-field 2: session mode */
+    } session_entries[20];
+    int n_session_entries;
 } summary_ctx_t;
 
 /* Callback for pb_iter on a Summary record. */
@@ -768,6 +779,36 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
         /* Varint field — decode the value */
         ctx->scalars[f->field] = pb_varint_val(f);
         ctx->has_scalar[f->field] = true;
+    } else if (f->field == 1 && f->wire == 2 && f->data && f->len > 0) {
+        /* Session entry submessage: sub-field 1 = timestamp, sub-field 2 = mode */
+        if (ctx->n_session_entries < 20) {
+            int64_t ts = 0, mode = 0;
+            size_t pos = 0;
+            while (pos < f->len) {
+                uint64_t tag = pb_decode_varint(f->data, f->len, &pos);
+                int sf = (int)(tag >> 3);
+                int sw = (int)(tag & 0x07);
+                if (sf == 0) break;
+                if (sw == 0) {
+                    int64_t val = (int64_t)pb_decode_varint(f->data, f->len, &pos);
+                    if (sf == 1) ts = val;
+                    else if (sf == 2) mode = val;
+                } else if (sw == 2) {
+                    size_t lpos = pos;
+                    uint64_t flen = pb_decode_varint(f->data, f->len, &lpos);
+                    pos = lpos + flen;
+                } else if (sw == 1) {
+                    pos += 8;
+                } else if (sw == 5) {
+                    pos += 4;
+                } else {
+                    break;
+                }
+            }
+            ctx->session_entries[ctx->n_session_entries].ts = ts;
+            ctx->session_entries[ctx->n_session_entries].mode = mode;
+            ctx->n_session_entries++;
+        }
     } else if (f->wire == 2 && f->data && f->len > 0) {
         /* Length-delimited — could be a metric submessage or raw bytes.
          * Try to decode as a protobuf submessage with varint sub-fields. */
@@ -831,203 +872,16 @@ static int on_off_to_edf(const char *s)
     return -1;
 }
 
-/* Generate STR.edf from Summary spool protobuf data.
- * Also generates CSL.edf (empty or from CSR field). */
-static esp_err_t generate_str_edf(const char *edf_dir,
-                                  const uint8_t *summary_data, size_t summary_len,
-                                  const char *patient_id, const char *recording_id,
-                                  const char *start_date, const char *start_time,
-                                  int64_t start_epoch_ms, int64_t end_epoch_ms,
-                                  const cJSON *settings_json,
-                                  const char *session_dir)
+/* Build STR data values [4-76] from a summary context and settings JSON.
+ * str_values must be pre-filled with 0xFF (sentinel for "no data"). */
+static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
+                                  const cJSON *settings_json)
 {
-    /* Parse the Summary protobuf to extract session statistics.
-     * The top-level message has repeated field-2 wrappers, each containing
-     * a session summary record.  We take the first (or most recent) record.
-     *
-     * Large structs are heap-allocated to keep the task stack small
-     * (summary_ctx_t is ~5KB, str_sigs is ~6KB, str_values is 268B).
-     * These will be placed in PSRAM by the heap allocator since they
-     * exceed CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL (16KB total). */
-    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
-    int16_t *str_values = malloc(STR_DATA_COUNT * sizeof(int16_t));
-    edf_signal_def_t *str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
-    if (!ctx || !str_values || !str_sigs) {
-        ESP_LOGE(TAG, "STR.edf: malloc failed for ctx/values/sigs");
-        free(ctx); free(str_values); free(str_sigs);
-        return ESP_ERR_NO_MEM;
-    }
-    /* Initialise all STR values to -1 (sentinel for "no data") */
-    memset(str_values, 0xFF, STR_DATA_COUNT * sizeof(int16_t));
-
-    /* Side arrays for additional MaskOn/MaskOff events (beyond the first).
-     * str_values is signal-indexed, so only the first event goes in
-     * str_values[1]/[2]; additional events are merged into the record
-     * buffer later. */
-    int16_t mask_on_extra[20];
-    int16_t mask_off_extra[20];
-    memset(mask_on_extra, 0xFF, sizeof(mask_on_extra));
-    memset(mask_off_extra, 0xFF, sizeof(mask_off_extra));
-
-    /* Find field-2 wrapper records */
-    bool found_record = false;
-    size_t pos = 0;
-    while (pos < summary_len) {
-        uint64_t tag = pb_decode_varint(summary_data, summary_len, &pos);
-        int field = (int)(tag >> 3);
-        int wire = (int)(tag & 0x07);
-        if (field == 0) break;
-
-        if (field == 2 && wire == 2) {
-            /* Field-2 wrapper: contains a Summary record */
-            size_t lpos = pos;
-            uint64_t flen = pb_decode_varint(summary_data, summary_len, &lpos);
-            pos = lpos;
-            if (pos + flen > summary_len) break;
-
-            /* Parse this record */
-            pb_iter(summary_data + pos, (size_t)flen, summary_field_cb, ctx);
-            found_record = true;
-            pos += flen;
-            /* Use the first record for now */
-            break;
-        } else if (wire == 2) {
-            size_t lpos = pos;
-            uint64_t flen = pb_decode_varint(summary_data, summary_len, &lpos);
-            pos = lpos + flen;
-        } else if (wire == 0) {
-            pb_decode_varint(summary_data, summary_len, &pos);
-        } else if (wire == 1) {
-            pos += 8;
-        } else if (wire == 5) {
-            pos += 4;
-        } else {
-            break;
-        }
-    }
-
-    if (!found_record) {
-        ESP_LOGW(TAG, "STR.edf: no Summary record found in spool data");
-        /* Still write a minimal STR.edf with default values */
-    }
-
-    /* Build the 77-field STR record for VID=3 (AutoSet).
-     * Many fields come from the Summary spool; settings fields come from
-     * settings.json (obtained via Get RPC).  We use settings_json as the
-     * primary source for settings, falling back to Summary spool if needed.
-     *
-     * str_values is already heap-allocated and zeroed above. */
-
-    /* Session header [0-3]: Date, MaskOn, MaskOff, MaskEvents
-     * Date = days from Unix epoch (Jan 1, 1970) in local time (noon-based day)
-     * MaskOn/MaskOff = minutes from noon, up to 20 entries each
-     * MaskEvents = count of mask on/off events
-     *
-     * MaskOn/MaskOff events are read from events.snt (live EventNotification
-     * JSON lines captured by session_writer).  Each line is a JSON object with
-     * params.events[] containing {event/label, timestamp} fields. */
-    {
-        time_t start_t = (time_t)(start_epoch_ms / 1000);
-        time_t end_t = (time_t)(end_epoch_ms / 1000);
-        struct tm tm_start, tm_end;
-        localtime_r(&start_t, &tm_start);
-        localtime_r(&end_t, &tm_end);
-
-        /* Date: days from Unix epoch, using noon-based day.
-         * If session starts before noon, it belongs to the previous day. */
-        time_t noon_t = start_t;
-        if (tm_start.tm_hour < 12) {
-            noon_t -= 86400;
-        }
-        struct tm epoch_tm = { .tm_year=70, .tm_mon=0, .tm_mday=1,
-                               .tm_hour=0, .tm_min=0, .tm_sec=0 };
-        time_t epoch_t = mktime(&epoch_tm);
-        str_values[0] = (int16_t)((noon_t - epoch_t) / 86400);
-
-        /* Compute noon-based epoch for minute-from-noon calculations */
-        int64_t noon_epoch_ms = (int64_t)noon_t * 1000;
-
-        /* Parse events.snt for MaskOn/MaskOff events.
-         * MaskOn/MaskOff signals have spr=20, but str_values is signal-indexed
-         * (one entry per signal, not per sample).  Additional events beyond
-         * the first are stored in side arrays and merged into the record
-         * buffer later. */
-        int mask_on_count = 0;
-        int mask_off_count = 0;
-
-        char events_path[350];
-        snprintf(events_path, sizeof(events_path), "%s/events.snt", session_dir);
-        FILE *ef = fopen(events_path, "r");
-        if (ef) {
-            char line[512];
-            while (fgets(line, sizeof(line), ef) && mask_on_count < 20 && mask_off_count < 20) {
-                cJSON *msg = cJSON_Parse(line);
-                if (!msg) continue;
-                cJSON *params = cJSON_GetObjectItem(msg, "params");
-                if (params) {
-                    cJSON *events = cJSON_GetObjectItem(params, "events");
-                    if (events && cJSON_IsArray(events)) {
-                        int n = cJSON_GetArraySize(events);
-                        for (int i = 0; i < n; i++) {
-                            cJSON *ev = cJSON_GetArrayItem(events, i);
-                            if (!ev) continue;
-                            cJSON *label = cJSON_GetObjectItem(ev, "event");
-                            if (!label || !cJSON_IsString(label))
-                                label = cJSON_GetObjectItem(ev, "label");
-                            if (!label || !cJSON_IsString(label)) continue;
-                            cJSON *ts = cJSON_GetObjectItem(ev, "timestamp");
-                            if (!ts || !cJSON_IsNumber(ts)) continue;
-                            int64_t ev_ms = (int64_t)ts->valuedouble;
-                            int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
-                            if (strcmp(label->valuestring, "MaskOn") == 0 && mask_on_count < 20) {
-                                if (mask_on_count == 0)
-                                    str_values[1] = (int16_t)min_from_noon;
-                                else
-                                    mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
-                                mask_on_count++;
-                            } else if (strcmp(label->valuestring, "MaskOff") == 0 && mask_off_count < 20) {
-                                if (mask_off_count == 0)
-                                    str_values[2] = (int16_t)min_from_noon;
-                                else
-                                    mask_off_extra[mask_off_count - 1] = (int16_t)min_from_noon;
-                                mask_off_count++;
-                            }
-                        }
-                    }
-                }
-                cJSON_Delete(msg);
-            }
-            fclose(ef);
-        }
-
-        /* If no MaskOn events found, use session start as fallback */
-        if (mask_on_count == 0) {
-            int start_min = tm_start.tm_hour * 60 + tm_start.tm_min - 720;
-            if (start_min < 0) start_min += 1440;
-            str_values[1] = (int16_t)start_min;
-            mask_on_count = 1;
-        }
-        /* If no MaskOff events found, use session end as fallback */
-        if (mask_off_count == 0) {
-            int end_min = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
-            if (end_min < 0) end_min += 1440;
-            str_values[2] = (int16_t)end_min;
-            mask_off_count = 1;
-        }
-
-        /* MaskEvents = max(mask_on_count, mask_off_count) */
-        str_values[3] = (int16_t)(mask_on_count > mask_off_count ? mask_on_count : mask_off_count);
-
-        ESP_LOGI(TAG, "STR.edf: MaskOn=%d MaskOff=%d MaskEvents=%d",
-                 mask_on_count, mask_off_count, str_values[3]);
-    }
-
     /* Session core [4-5] */
     str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);  /* Duration */
     int mode_raw = get_scalar(ctx, SUM_F_SESSION_MODE, 0);
-    /* Apply enum export map for Mode */
     if (mode_raw >= 0 && mode_raw < (int)(sizeof(MODE_MAP) / sizeof(MODE_MAP[0]))) {
-        str_values[5] = MODE_MAP[mode_raw];  /* Mode */
+        str_values[5] = MODE_MAP[mode_raw];
     } else {
         str_values[5] = mode_raw;
     }
@@ -1040,10 +894,6 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         cJSON *sp = cJSON_GetObjectItem(settings_json, "SettingProfiles");
         cJSON *tp = sp ? cJSON_GetObjectItem(sp, "TherapyProfiles") : NULL;
         cJSON *fp = sp ? cJSON_GetObjectItem(sp, "FeatureProfiles") : NULL;
-        ESP_LOGI(TAG, "STR settings: sp=%s tp=%s fp=%s",
-                 sp ? "OK" : "MISSING",
-                 tp ? "OK" : "MISSING",
-                 fp ? "OK" : "MISSING");
 
         /* Pressure fields [6-13]: cmH2O × 50 */
         if (tp) {
@@ -1086,7 +936,6 @@ static esp_err_t generate_str_edf(const char *edf_dir,
             cJSON *patview = cJSON_GetObjectItem(fp, "PatientViewFeature");
             cJSON *v;
 
-            /* [14] S.AS.Comfort: "Plus"→1, "On"→2 */
             if (comfort) {
                 v = cJSON_GetObjectItem(comfort, "AutoSetComfort");
                 if (v && cJSON_IsString(v)) {
@@ -1095,8 +944,6 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                 }
             }
 
-            /* [15] S.RampEnable: "Off"→1, "On"→2, "Auto"→3 */
-            /* [16] S.RampTime: direct minutes */
             if (ramp) {
                 v = cJSON_GetObjectItem(ramp, "RampEnable");
                 if (v && cJSON_IsString(v)) {
@@ -1108,7 +955,6 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                 if (v && cJSON_IsNumber(v)) str_values[16] = (int16_t)v->valuedouble;
             }
 
-            /* [17-20] EPR settings */
             if (epr) {
                 v = cJSON_GetObjectItem(epr, "EprEnablePatientAccess");
                 if (v && cJSON_IsString(v)) str_values[17] = (int16_t)on_off_to_edf(v->valuestring);
@@ -1123,13 +969,11 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                 }
             }
 
-            /* [21] S.SmartStart */
             if (smart) {
                 v = cJSON_GetObjectItem(smart, "SmartStart");
                 if (v && cJSON_IsString(v)) str_values[21] = (int16_t)on_off_to_edf(v->valuestring);
             }
 
-            /* [22] S.PtAccess (PatientView) */
             if (patview) {
                 v = cJSON_GetObjectItem(patview, "PatientView");
                 if (v && cJSON_IsString(v)) {
@@ -1138,7 +982,6 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                 }
             }
 
-            /* [23] S.ABFilter, [24] S.Mask, [25] S.Tube */
             if (circuit) {
                 v = cJSON_GetObjectItem(circuit, "AntiBacterialFilter");
                 if (v && cJSON_IsString(v)) {
@@ -1162,7 +1005,6 @@ static esp_err_t generate_str_edf(const char *edf_dir,
                 }
             }
 
-            /* [26-30] Climate settings */
             if (climate) {
                 v = cJSON_GetObjectItem(climate, "ClimateControl");
                 if (v && cJSON_IsString(v)) {
@@ -1181,69 +1023,236 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         }
     }
 
-    ESP_LOGI(TAG, "STR settings values: [6]=%d [7]=%d [8]=%d [9]=%d [10]=%d [11]=%d [12]=%d [21]=%d [22]=%d [23]=%d [24]=%d [25]=%d [26]=%d [27]=%d [28]=%d [29]=%d [30]=%d",
-             str_values[6], str_values[7], str_values[8], str_values[9], str_values[10],
-             str_values[11], str_values[12], str_values[21], str_values[22], str_values[23],
-             str_values[24], str_values[25], str_values[26], str_values[27], str_values[28],
-             str_values[29], str_values[30]);
-
-    /* [31] HeatedTube and [32] Humidifier: from Summary spool fields.
-     * These are hardware connection status, not user settings. */
-    str_values[31] = get_scalar(ctx, SUM_F_TUBE_CONNECTED, -1);   /* HeatedTube */
-    str_values[32] = get_scalar(ctx, SUM_F_HUM_CONNECTED, -1);    /* Humidifier */
+    /* [31] HeatedTube and [32] Humidifier: from Summary spool fields. */
+    str_values[31] = get_scalar(ctx, SUM_F_TUBE_CONNECTED, -1);
+    str_values[32] = get_scalar(ctx, SUM_F_HUM_CONNECTED, -1);
 
     /* Environment and oximetry stats [33-46] */
-    str_values[33] = get_metric(ctx, SUM_F_BLOWER_PRESS, 3, 0);   /* BlowPress.95 */
-    str_values[34] = get_metric(ctx, SUM_F_BLOWER_PRESS, 1, 0);   /* BlowPress.5 */
-    str_values[35] = get_metric(ctx, SUM_F_RESP_FLOW, 3, 0);      /* Flow.95 */
-    str_values[36] = get_metric(ctx, SUM_F_RESP_FLOW, 1, 0);      /* Flow.5 */
-    str_values[37] = get_metric(ctx, SUM_F_BLOWER_FLOW, 2, 0);    /* BlowFlow.50 */
-    str_values[38] = get_metric(ctx, SUM_F_AMB_HUMID, 2, 0);      /* AmbHumidity.50 */
-    str_values[39] = get_metric(ctx, SUM_F_HUM_TEMP, 2, 0);       /* HumTemp.50 */
-    str_values[40] = get_metric(ctx, SUM_F_HTUBE_TEMP, 2, 0);     /* HTubeTemp.50 */
-    str_values[41] = get_metric(ctx, SUM_F_HTUBE_POWER, 2, 0);    /* HTubePow.50 */
-    str_values[42] = get_metric(ctx, SUM_F_HUM_POWER, 2, 0);      /* HumPow.50 */
-    str_values[43] = get_metric(ctx, SUM_F_SPO2, 2, 0);           /* SpO2.50 */
-    str_values[44] = get_metric(ctx, SUM_F_SPO2, 3, 0);           /* SpO2.95 */
-    str_values[45] = get_metric(ctx, SUM_F_SPO2, 4, 0);           /* SpO2.Max */
-    str_values[46] = get_scalar(ctx, SUM_F_SAU, 0);               /* SpO2Thresh */
+    str_values[33] = get_metric(ctx, SUM_F_BLOWER_PRESS, 3, 0);
+    str_values[34] = get_metric(ctx, SUM_F_BLOWER_PRESS, 1, 0);
+    str_values[35] = get_metric(ctx, SUM_F_RESP_FLOW, 3, 0);
+    str_values[36] = get_metric(ctx, SUM_F_RESP_FLOW, 1, 0);
+    str_values[37] = get_metric(ctx, SUM_F_BLOWER_FLOW, 2, 0);
+    str_values[38] = get_metric(ctx, SUM_F_AMB_HUMID, 2, 0);
+    str_values[39] = get_metric(ctx, SUM_F_HUM_TEMP, 2, 0);
+    str_values[40] = get_metric(ctx, SUM_F_HTUBE_TEMP, 2, 0);
+    str_values[41] = get_metric(ctx, SUM_F_HTUBE_POWER, 2, 0);
+    str_values[42] = get_metric(ctx, SUM_F_HUM_POWER, 2, 0);
+    str_values[43] = get_metric(ctx, SUM_F_SPO2, 2, 0);
+    str_values[44] = get_metric(ctx, SUM_F_SPO2, 3, 0);
+    str_values[45] = get_metric(ctx, SUM_F_SPO2, 4, 0);
+    str_values[46] = get_scalar(ctx, SUM_F_SAU, 0);
 
     /* Bilevel/ventilation summary stats [47-68] */
-    str_values[47] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 2, 0);  /* MaskPress.50 */
-    str_values[48] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 3, 0);  /* MaskPress.95 */
-    str_values[49] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 4, 0);  /* MaskPress.Max */
-    str_values[50] = get_metric(ctx, SUM_F_INSP_PRESS, 2, 0);       /* TgtIPAP.50 */
-    str_values[51] = get_metric(ctx, SUM_F_INSP_PRESS, 3, 0);       /* TgtIPAP.95 */
-    str_values[52] = get_metric(ctx, SUM_F_INSP_PRESS, 4, 0);       /* TgtIPAP.Max */
-    str_values[53] = get_metric(ctx, SUM_F_EXP_PRESS, 2, 0);        /* TgtEPAP.50 */
-    str_values[54] = get_metric(ctx, SUM_F_EXP_PRESS, 3, 0);        /* TgtEPAP.95 */
-    str_values[55] = get_metric(ctx, SUM_F_EXP_PRESS, 4, 0);        /* TgtEPAP.Max */
-    str_values[56] = get_metric(ctx, SUM_F_LEAK, 2, 0);             /* Leak.50 */
-    str_values[57] = get_metric(ctx, SUM_F_LEAK, 3, 0);             /* Leak.95 */
-    str_values[58] = get_metric(ctx, SUM_F_LEAK, 4, 0);             /* Leak.70 */
-    str_values[59] = get_metric(ctx, SUM_F_LEAK, 5, 0);             /* Leak.Max */
-    str_values[60] = get_metric(ctx, SUM_F_MIN_VENT, 2, 0);         /* MinVent.50 */
-    str_values[61] = get_metric(ctx, SUM_F_MIN_VENT, 3, 0);         /* MinVent.95 */
-    str_values[62] = get_metric(ctx, SUM_F_MIN_VENT, 4, 0);         /* MinVent.Max */
-    str_values[63] = get_metric(ctx, SUM_F_RESP_RATE, 2, 0);        /* RespRate.50 */
-    str_values[64] = get_metric(ctx, SUM_F_RESP_RATE, 3, 0);        /* RespRate.95 */
-    str_values[65] = get_metric(ctx, SUM_F_RESP_RATE, 4, 0);        /* RespRate.Max */
-    str_values[66] = get_metric(ctx, SUM_F_TIDAL_VOL, 2, 0);        /* TidVol.50 */
-    str_values[67] = get_metric(ctx, SUM_F_TIDAL_VOL, 3, 0);        /* TidVol.95 */
-    str_values[68] = get_metric(ctx, SUM_F_TIDAL_VOL, 4, 0);        /* TidVol.Max */
+    str_values[47] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 2, 0);
+    str_values[48] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 3, 0);
+    str_values[49] = get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 4, 0);
+    str_values[50] = get_metric(ctx, SUM_F_INSP_PRESS, 2, 0);
+    str_values[51] = get_metric(ctx, SUM_F_INSP_PRESS, 3, 0);
+    str_values[52] = get_metric(ctx, SUM_F_INSP_PRESS, 4, 0);
+    str_values[53] = get_metric(ctx, SUM_F_EXP_PRESS, 2, 0);
+    str_values[54] = get_metric(ctx, SUM_F_EXP_PRESS, 3, 0);
+    str_values[55] = get_metric(ctx, SUM_F_EXP_PRESS, 4, 0);
+    str_values[56] = get_metric(ctx, SUM_F_LEAK, 2, 0);
+    str_values[57] = get_metric(ctx, SUM_F_LEAK, 3, 0);
+    str_values[58] = get_metric(ctx, SUM_F_LEAK, 4, 0);
+    str_values[59] = get_metric(ctx, SUM_F_LEAK, 5, 0);
+    str_values[60] = get_metric(ctx, SUM_F_MIN_VENT, 2, 0);
+    str_values[61] = get_metric(ctx, SUM_F_MIN_VENT, 3, 0);
+    str_values[62] = get_metric(ctx, SUM_F_MIN_VENT, 4, 0);
+    str_values[63] = get_metric(ctx, SUM_F_RESP_RATE, 2, 0);
+    str_values[64] = get_metric(ctx, SUM_F_RESP_RATE, 3, 0);
+    str_values[65] = get_metric(ctx, SUM_F_RESP_RATE, 4, 0);
+    str_values[66] = get_metric(ctx, SUM_F_TIDAL_VOL, 2, 0);
+    str_values[67] = get_metric(ctx, SUM_F_TIDAL_VOL, 3, 0);
+    str_values[68] = get_metric(ctx, SUM_F_TIDAL_VOL, 4, 0);
 
     /* Indices and CSR [69-76] */
-    str_values[69] = get_scalar(ctx, SUM_F_AHI, 0);    /* AHI */
-    str_values[70] = get_scalar(ctx, SUM_F_HI, 0);     /* HI */
-    str_values[71] = get_scalar(ctx, SUM_F_AI, 0);     /* AI */
-    str_values[72] = get_scalar(ctx, SUM_F_OAI, 0);    /* OAI */
-    str_values[73] = get_scalar(ctx, SUM_F_CAI, 0);    /* CAI */
-    str_values[74] = get_scalar(ctx, SUM_F_UAI, 0);    /* UAI */
-    str_values[75] = get_scalar(ctx, SUM_F_RIN, 0);    /* RIN */
-    str_values[76] = get_scalar(ctx, SUM_F_CSR, 0);    /* CSR */
+    str_values[69] = get_scalar(ctx, SUM_F_AHI, 0);
+    str_values[70] = get_scalar(ctx, SUM_F_HI, 0);
+    str_values[71] = get_scalar(ctx, SUM_F_AI, 0);
+    str_values[72] = get_scalar(ctx, SUM_F_OAI, 0);
+    str_values[73] = get_scalar(ctx, SUM_F_CAI, 0);
+    str_values[74] = get_scalar(ctx, SUM_F_UAI, 0);
+    str_values[75] = get_scalar(ctx, SUM_F_RIN, 0);
+    str_values[76] = get_scalar(ctx, SUM_F_CSR, 0);
+}
 
-    /* Build STR.edf signal definitions with per-signal metadata matching
-     * AS11 native VID=3 STR.edf (units, phys/dig ranges, samples_per_record). */
+/* Build STR header values [0-3] from summary spool session entries.
+ * Fills str_values[0-3] and mask_on_extra/mask_off_extra arrays.
+ * period_start_ms is the PeriodStart from the summary spool (epoch ms).
+ * Returns the MaskEvents count. */
+static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
+                                 int16_t *mask_on_extra, int16_t *mask_off_extra,
+                                 int64_t period_start_ms)
+{
+    /* [0] Date: days from Unix epoch (noon-based day of period_start) */
+    time_t t = (time_t)(period_start_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    if (tm.tm_hour < 12) t -= 86400;
+    struct tm epoch_tm = { .tm_year = 70, .tm_mon = 0, .tm_mday = 1,
+                           .tm_hour = 0, .tm_min = 0, .tm_sec = 0 };
+    time_t epoch_t = mktime(&epoch_tm);
+    str_values[0] = (int16_t)((t - epoch_t) / 86400);
+
+    int64_t noon_epoch_ms = (int64_t)t * 1000;
+
+    /* [1-3] MaskOn/MaskOff/MaskEvents from session entries.
+     * Session entries alternate: even index = MaskOn, odd = MaskOff. */
+    int mask_on_count = 0;
+    int mask_off_count = 0;
+
+    for (int i = 0; i < ctx->n_session_entries && mask_on_count < 20 && mask_off_count < 20; i++) {
+        int64_t ev_ms = ctx->session_entries[i].ts;
+        int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
+
+        if (i % 2 == 0) {
+            if (mask_on_count == 0)
+                str_values[1] = (int16_t)min_from_noon;
+            else
+                mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
+            mask_on_count++;
+        } else {
+            if (mask_off_count == 0)
+                str_values[2] = (int16_t)min_from_noon;
+            else
+                mask_off_extra[mask_off_count - 1] = (int16_t)min_from_noon;
+            mask_off_count++;
+        }
+    }
+
+    /* Fallback: use PeriodStart/PeriodEnd if no session entries */
+    if (mask_on_count == 0 && ctx->has_scalar[SUM_F_PERIOD_START]) {
+        int64_t ps = ctx->scalars[SUM_F_PERIOD_START];
+        int min_from_noon = (int)((ps - noon_epoch_ms) / 60000);
+        str_values[1] = (int16_t)min_from_noon;
+        mask_on_count = 1;
+    }
+    if (mask_off_count == 0 && ctx->has_scalar[SUM_F_PERIOD_END]) {
+        int64_t pe = ctx->scalars[SUM_F_PERIOD_END];
+        int min_from_noon = (int)((pe - noon_epoch_ms) / 60000);
+        str_values[2] = (int16_t)min_from_noon;
+        mask_off_count = 1;
+    }
+
+    str_values[3] = (int16_t)(mask_on_count > mask_off_count ? mask_on_count : mask_off_count);
+    return str_values[3];
+}
+
+/* Per-day STR record for multi-record STR.edf generation. */
+typedef struct {
+    int16_t values[STR_DATA_COUNT];
+    int16_t mask_on_extra[20];
+    int16_t mask_off_extra[20];
+    int64_t period_start;  /* for chronological sorting */
+} str_day_record_t;
+
+/* Generate multi-record STR.edf from per-day summary spool files.
+ * Scans .sessions/summaries/ for *.spool files, parses each into a
+ * daily STR record, and writes them all into a single STR.edf at
+ * <sdcard_dir>/STR.edf with one EDF data record per day. */
+static esp_err_t generate_str_edf(const char *sdcard_dir,
+                                  const char *patient_id, const char *recording_id,
+                                  const char *start_date,
+                                  const cJSON *settings_json)
+{
+    /* ── Scan .sessions/summaries/ for per-day .spool files ── */
+    DIR *dir = opendir(SD_SUMMARIES_DIR);
+    if (!dir) {
+        ESP_LOGE(TAG, "STR.edf: cannot open %s: %s", SD_SUMMARIES_DIR, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    /* Collect up to 30 day records (30-day lookback window). */
+    str_day_record_t *records = calloc(30, sizeof(str_day_record_t));
+    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
+    edf_signal_def_t *str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
+    if (!records || !ctx || !str_sigs) {
+        ESP_LOGE(TAG, "STR.edf: malloc failed");
+        free(records); free(ctx); free(str_sigs);
+        closedir(dir);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int n_records = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && n_records < 30) {
+        /* Match YYYYMMDD.spool (8 digits + ".spool") */
+        const char *nm = ent->d_name;
+        size_t nlen = strlen(nm);
+        if (nlen != 14 || strcmp(nm + 8, ".spool") != 0) continue;
+        bool digits_ok = true;
+        for (int i = 0; i < 8; i++) {
+            if (nm[i] < '0' || nm[i] > '9') { digits_ok = false; break; }
+        }
+        if (!digits_ok) continue;
+
+        /* Read the spool file */
+        char spool_path[300];
+        snprintf(spool_path, sizeof(spool_path), "%s/%s", SD_SUMMARIES_DIR, nm);
+        size_t spool_len = 0;
+        uint8_t *spool_data = read_bin_file(spool_path, &spool_len);
+        if (!spool_data || spool_len == 0) {
+            ESP_LOGW(TAG, "STR.edf: skipping %s (empty or unreadable)", nm);
+            free(spool_data);
+            continue;
+        }
+
+        /* Parse the spool file directly as a Summary record.
+         * collect_summary_spool writes the inner record content (not
+         * wrapped in a field-2 tag), so we iterate it directly. */
+        memset(ctx, 0, sizeof(*ctx));
+        pb_iter(spool_data, spool_len, summary_field_cb, ctx);
+
+        int64_t period_start = 0;
+        bool found_ps = false;
+        if (ctx->has_scalar[SUM_F_PERIOD_START]) {
+            period_start = ctx->scalars[SUM_F_PERIOD_START];
+            found_ps = true;
+        }
+        free(spool_data);
+
+        if (!found_ps) {
+            ESP_LOGW(TAG, "STR.edf: skipping %s (no PeriodStart)", nm);
+            continue;
+        }
+
+        /* Build the record */
+        str_day_record_t *rec = &records[n_records];
+        memset(rec->values, 0xFF, STR_DATA_COUNT * sizeof(int16_t));
+        memset(rec->mask_on_extra, 0xFF, sizeof(rec->mask_on_extra));
+        memset(rec->mask_off_extra, 0xFF, sizeof(rec->mask_off_extra));
+
+        build_str_mask_events(ctx, rec->values, rec->mask_on_extra,
+                              rec->mask_off_extra, period_start);
+        build_str_data_values(ctx, rec->values, settings_json);
+        rec->period_start = period_start;
+        n_records++;
+
+        ESP_LOGI(TAG, "STR.edf: parsed %s (PeriodStart=%lld, Duration=%d)",
+                 nm, (long long)period_start, rec->values[4]);
+    }
+    closedir(dir);
+
+    if (n_records == 0) {
+        ESP_LOGW(TAG, "STR.edf: no valid summary spool files found in %s", SD_SUMMARIES_DIR);
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
+    }
+
+    /* Sort records by period_start (chronological) */
+    for (int i = 0; i < n_records - 1; i++) {
+        for (int j = i + 1; j < n_records; j++) {
+            if (records[j].period_start < records[i].period_start) {
+                str_day_record_t tmp = records[i];
+                records[i] = records[j];
+                records[j] = tmp;
+            }
+        }
+    }
+
+    /* STR.edf signal definitions */
     static const edf_signal_def_t str_signal_defs[STR_DATA_COUNT] = {
         /* [0-3] Session header */
         { .label="Date", .transducer="", .unit="", .phys_min=0.0, .phys_max=24836.0, .dig_min=0, .dig_max=24836, .prefilter="", .samples_per_record=1 },
@@ -1331,77 +1340,71 @@ static esp_err_t generate_str_edf(const char *edf_dir,
         { .label="CSR", .transducer="", .unit="", .phys_min=0.0, .phys_max=1440.0, .dig_min=0, .dig_max=1440, .prefilter="", .samples_per_record=1 },
     };
 
-    /* Create STR.edf */
+    memcpy(str_sigs, str_signal_defs, STR_DATA_COUNT * sizeof(edf_signal_def_t));
+
+    /* Create STR.edf at SDCARD root */
     char path[300];
-    snprintf(path, sizeof(path), "%s/STR.edf", edf_dir);
+    snprintf(path, sizeof(path), "%s/STR.edf", sdcard_dir);
 
     FILE *edf = fopen(path, "w+b");
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
+        free(records); free(ctx); free(str_sigs);
         return ESP_FAIL;
     }
 
-    /* Copy static signal defs into the heap-allocated str_sigs array */
-    memcpy(str_sigs, str_signal_defs, STR_DATA_COUNT * sizeof(edf_signal_def_t));
-
-    /* STR.edf uses 12.00.00 noon as start time, with the noon-based day date. */
+    /* STR.edf uses 12.00.00 noon as start time. */
     const char *str_start_time = "12.00.00";
 
     int header_bytes = edf_write_header(edf, patient_id, recording_id,
                                         start_date, str_start_time,
-                                        1,  /* 1 data record */
+                                        n_records,
                                         "86400.00",
                                         "EDF", str_sigs, STR_DATA_COUNT);
     if (header_bytes < 0) {
         ESP_LOGE(TAG, "STR.edf: edf_write_header failed");
         fclose(edf);
+        free(records); free(ctx); free(str_sigs);
         return ESP_FAIL;
     }
 
-    /* Write the single data record.
-     * Most signals have spr=1, but MaskOn and MaskOff have spr=20.
-     * Total data samples = 1 + 20 + 20 + 1 + 73 = 115 int16.
-     * Plus Crc16 (spr=1) = 116 int16 total = 232 bytes. */
-    int16_t rec_buf[115];
-    int rec_pos = 0;
-    for (int i = 0; i < STR_DATA_COUNT; i++) {
-        int spr = str_signal_defs[i].samples_per_record;
-        rec_buf[rec_pos++] = str_values[i];
-        for (int s = 1; s < spr; s++) {
-            if (i == 1 && s - 1 < 20)
-                rec_buf[rec_pos++] = mask_on_extra[s - 1];
-            else if (i == 2 && s - 1 < 20)
-                rec_buf[rec_pos++] = mask_off_extra[s - 1];
-            else
-                rec_buf[rec_pos++] = -1;  /* pad unused slots with sentinel */
+    /* Write one data record per day.
+     * Each record: 115 data int16 + 1 CRC int16 = 232 bytes. */
+    for (int r = 0; r < n_records; r++) {
+        int16_t rec_buf[115];
+        int rec_pos = 0;
+        for (int i = 0; i < STR_DATA_COUNT; i++) {
+            int spr = str_signal_defs[i].samples_per_record;
+            rec_buf[rec_pos++] = records[r].values[i];
+            for (int s = 1; s < spr; s++) {
+                if (i == 1 && s - 1 < 20)
+                    rec_buf[rec_pos++] = records[r].mask_on_extra[s - 1];
+                else if (i == 2 && s - 1 < 20)
+                    rec_buf[rec_pos++] = records[r].mask_off_extra[s - 1];
+                else
+                    rec_buf[rec_pos++] = -1;
+            }
         }
+        if (rec_pos != 115) {
+            ESP_LOGE(TAG, "STR.edf: internal error: rec_pos=%d != 115", rec_pos);
+            fclose(edf);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
+
+        uint16_t crc = crc16_ccitt((uint8_t *)rec_buf, 115 * sizeof(int16_t));
+        fwrite(rec_buf, sizeof(int16_t), 115, edf);
+        int16_t crc_val = (int16_t)crc;
+        fwrite(&crc_val, sizeof(int16_t), 1, edf);
     }
-    /* rec_pos must be 115 (1+20+20+1+73) */
-    if (rec_pos != 115) {
-        ESP_LOGE(TAG, "STR.edf: internal error: record buffer rec_pos=%d != 115", rec_pos);
-        fclose(edf);
-        return ESP_FAIL;
-    }
 
-    /* Compute CRC16 over the 115 data signal values (230 bytes) */
-    uint16_t crc = crc16_ccitt((uint8_t *)rec_buf, 115 * sizeof(int16_t));
-
-    /* Write data record (115 data values + Crc16) */
-    fwrite(rec_buf, sizeof(int16_t), 115, edf);
-    int16_t crc_val = (int16_t)crc;
-    fwrite(&crc_val, sizeof(int16_t), 1, edf);
-
-    /* Finalise CRC in patient ID */
     edf_finalise_crc(edf, header_bytes);
     fclose(edf);
 
-    ESP_LOGI(TAG, "STR.edf generated: %s", path);
+    ESP_LOGI(TAG, "STR.edf generated: %s (%d records)", path, n_records);
 
-    /* CSL.edf is generated by the caller (edf_gen_generate) from the
-     * same events spool data, alongside EVE.edf. */
-
+    free(records);
     free(ctx);
-    free(str_values);
     free(str_sigs);
     return ESP_OK;
 }
@@ -1663,9 +1666,6 @@ static esp_err_t generate_eve_edf(const char *edf_path,
 /* ════════════════════════════════════════════════════════════════════
  *  Section 8: Identification.json + .crc generation
  * ════════════════════════════════════════════════════════════════════ */
-
-/* Forward declaration — read_json_file is defined in Section 9. */
-static cJSON *read_json_file(const char *path);
 
 static esp_err_t generate_identification(const char *edf_dir,
                                          const char *ident_json_path)
@@ -1937,20 +1937,14 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     ESP_LOGI(TAG, "session=%s id=%s drift=%lldms",
              session_dir, session_id, (long long)clock_drift_ms);
 
-    /* ── Create EDF output directory ──
-     * EDF files go to /somnotrace/EDF/<session_id>/DATALOG/
-     * This is completely outside the sessions/ directory. */
-    char edf_root[128];
-    snprintf(edf_root, sizeof(edf_root), "%s/EDF", SD_MOUNT_POINT);
-    mkdir(edf_root, 0775);
-
-    char edf_dir[160];
-    snprintf(edf_dir, sizeof(edf_dir), "%s/%s", edf_root, session_id);
-    mkdir(edf_dir, 0775);
-
-    char datalog_dir[200];
-    snprintf(datalog_dir, sizeof(datalog_dir), "%s/DATALOG", edf_dir);
-    mkdir(datalog_dir, 0775);
+    /* ── Create SDCARD export directory structure ──
+     * EDF files go to /somnotrace/SDCARD/DATALOG/YYYYMMDD/
+     * STR.edf goes to /somnotrace/SDCARD/STR.edf (root level)
+     * Identification.json goes to /somnotrace/SDCARD/
+     * This is the ResMed-compatible SD card image, fully derived from .sessions/ */
+    mkdir(SD_SDCARD_DIR, 0775);
+    mkdir(SD_SDCARD_DATALOG, 0775);
+    mkdir(SD_SDCARD_SETTINGS, 0775);
 
     /* Create date subdirectory inside DATALOG (noon-based day folder).
      * AS11 native layout: DATALOG/YYYYMMDD/YYYYMMDD_HHMMSS_TYPE.edf */
@@ -1958,38 +1952,31 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     noon_day_folder(start_epoch_ms, day_folder, sizeof(day_folder));
 
     char day_dir[220];
-    snprintf(day_dir, sizeof(day_dir), "%s/%s", datalog_dir, day_folder);
+    snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_SDCARD_DATALOG, day_folder);
     mkdir(day_dir, 0775);
 
-    /* Session timestamp prefix for EDF filenames */
+    /* Session timestamp prefix for EDF filenames (same as session_id) */
     char ts_prefix[32];
     session_timestamp(start_epoch_ms, ts_prefix, sizeof(ts_prefix));
 
-    /* ── Load post-therapy data ── */
-    char pt_dir[300];
-    snprintf(pt_dir, sizeof(pt_dir), "%s/post-therapy", session_dir);
+    /* ── Load post-therapy data from .sessions/streams/YYYYMMDD/ ──
+     * Files use prefix-based naming: <session_id>_ident.json, etc. */
 
     /* Read identification.json for EDF header fields */
     char ident_path[330];
-    snprintf(ident_path, sizeof(ident_path), "%s/identification.json", pt_dir);
+    snprintf(ident_path, sizeof(ident_path), "%s/%s_ident.json", session_dir, session_id);
     cJSON *ident = read_json_file(ident_path);
 
     /* Read settings.json for STR.edf settings fields */
     char settings_path[330];
-    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", pt_dir);
+    snprintf(settings_path, sizeof(settings_path), "%s/%s_settings.json", session_dir, session_id);
     cJSON *settings = read_json_file(settings_path);
     ESP_LOGI(TAG, "settings.json: path=%s %s", settings_path,
              settings ? "loaded OK" : "FAILED to load");
 
-    /* Read Summary spool data for STR.edf */
-    char summary_path[330];
-    snprintf(summary_path, sizeof(summary_path), "%s/summary.bin", pt_dir);
-    size_t summary_len = 0;
-    uint8_t *summary_data = read_bin_file(summary_path, &summary_len);
-
     /* Read respiratory events spool data for EVE.edf */
     char events_path[330];
-    snprintf(events_path, sizeof(events_path), "%s/respiratory_events.bin", pt_dir);
+    snprintf(events_path, sizeof(events_path), "%s/%s_resp_events.bin", session_dir, session_id);
     size_t events_len = 0;
     uint8_t *events_data = read_bin_file(events_path, &events_len);
 
@@ -2038,7 +2025,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* ── Generate BRP.edf (25 Hz breath waveform) ── */
     {
         char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/brp.snt", session_dir);
+        snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, ts_prefix);
 
         edf_signal_def_t brp_sigs[] = {
@@ -2060,7 +2047,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
     {
         char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/sa2.snt", session_dir);
+        snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, ts_prefix);
 
         edf_signal_def_t sa2_sigs[] = {
@@ -2082,7 +2069,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* ── Generate PLD.edf (0.5 Hz per-breath stats) ── */
     {
         char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/pld.snt", session_dir);
+        snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, ts_prefix);
 
         edf_signal_def_t pld_sigs[] = {
@@ -2135,19 +2122,11 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         }
     }
 
-    /* ── Generate STR.edf from Summary spool ──
-     * STR.edf goes in the EDF root (not inside DATALOG/) — it is a daily
-     * cumulative file, not per-session. */
-    if (summary_data && summary_len > 0) {
-        if (generate_str_edf(edf_dir, summary_data, summary_len,
-                             patient_id, str_recording_id,
-                             str_start_date, start_time,
-                             start_epoch_ms, end_epoch_ms,
-                             settings, session_dir) != ESP_OK) {
-            errors++;
-        }
-    } else {
-        ESP_LOGW(TAG, "STR.edf: no Summary spool data, skipping");
+    /* ── Generate STR.edf from per-day summary spool files ──
+     * STR.edf goes in the SDCARD root (not inside DATALOG/) — it is a
+     * multi-day cumulative file with one record per day. */
+    if (generate_str_edf(SD_SDCARD_DIR, patient_id, str_recording_id,
+                         str_start_date, settings) != ESP_OK) {
         errors++;
     }
 
@@ -2176,14 +2155,29 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     }
 
     /* ── Generate Identification.json + .crc ── */
-    if (generate_identification(edf_dir, ident_path) != ESP_OK) {
+    if (generate_identification(SD_SDCARD_DIR, ident_path) != ESP_OK) {
         errors++;
+    }
+
+    /* ── Copy settings to SDCARD/SETTINGS/CurrentSettings.json ── */
+    if (settings) {
+        char *settings_str = cJSON_PrintUnformatted(settings);
+        if (settings_str) {
+            char cs_path[300];
+            snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", SD_SDCARD_SETTINGS);
+            FILE *csf = fopen(cs_path, "w");
+            if (csf) {
+                fputs(settings_str, csf);
+                fclose(csf);
+                ESP_LOGI(TAG, "wrote %s", cs_path);
+            }
+            free(settings_str);
+        }
     }
 
     /* ── Cleanup ── */
     if (ident) cJSON_Delete(ident);
     if (settings) cJSON_Delete(settings);
-    free(summary_data);
     free(events_data);
 
     ESP_LOGI(TAG, "=== EDF GENERATION DONE (%d errors) ===", errors);

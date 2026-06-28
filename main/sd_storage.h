@@ -27,10 +27,19 @@
 #include "esp_err.h"
 
 #define SD_MOUNT_POINT   "/somnotrace"
-#define SD_SESSIONS_DIR  SD_MOUNT_POINT "/sessions"
+
+/* ESP-native session data (raw streams, spool files, internal state) */
+#define SD_SESSIONS_DIR      SD_MOUNT_POINT "/.sessions"
+#define SD_STREAMS_DIR       SD_SESSIONS_DIR "/streams"
+#define SD_SUMMARIES_DIR     SD_SESSIONS_DIR "/summaries"
+
+/* ResMed-compatible export folder (self-contained, OSCAR-ready) */
+#define SD_SDCARD_DIR        SD_MOUNT_POINT "/SDCARD"
+#define SD_SDCARD_DATALOG    SD_SDCARD_DIR "/DATALOG"
+#define SD_SDCARD_SETTINGS   SD_SDCARD_DIR "/SETTINGS"
 
 /* Initialise SDMMC 4-bit mode and mount FATFS at /somnotrace.
- * Creates /somnotrace/sessions/ if it doesn't exist.
+ * Creates the .sessions/ and SDCARD/ directory trees if they don't exist.
  * Returns ESP_OK on success. Non-fatal — caller may continue without SD. */
 esp_err_t sd_storage_init(void);
 

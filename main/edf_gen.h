@@ -27,39 +27,46 @@
 
 /* ── EDF file generation ──────────────────────────────────────────────
  *
- * This module generates EDF (European Data Format) files from the session
- * data warehouse, producing output compatible with OSCAR and SleepHQ.
+ * This module generates EDF (European Data Format) files from session
+ * data, producing output compatible with OSCAR and SleepHQ.
  *
- * The data warehouse consists of:
- *   /somnotrace/sessions/<session_id>/
- *     brp.snt, sa2.snt, pld.snt, brp_mm.snt   ← stream data (live, .snt format)
- *     events.jsonl                             ← live events
- *     session.json                             ← session metadata
- *     post-therapy/
- *       summary.bin                            ← raw Summary spool protobuf
- *       respiratory_events.bin                 ← raw TherapyEvents spool protobuf
- *       identification.json                    ← device identity (from Get RPC)
- *       settings.json                          ← current settings (from Get RPC)
+ * Input data lives in .sessions/ (ESP-native):
+ *   /somnotrace/.sessions/streams/YYYYMMDD/
+ *     <prefix>_brp.snt, _sa2.snt, _pld.snt, _brp_mm.snt  ← stream data
+ *     <prefix>_events.snt                                 ← live events
+ *     <prefix>_resp_events.bin                             ← TherapyEvents spool
+ *     <prefix>_ident.json                                  ← device identity
+ *     <prefix>_settings.json                               ← current settings
+ *     <prefix>_session.json                                ← session metadata
+ *   /somnotrace/.sessions/summaries/
+ *     YYYYMMDD.spool                                       ← per-day Summary spool
  *
- * EDF output goes to a COMPLETELY SEPARATE directory:
- *   /somnotrace/EDF/<session_id>/
+ * Output goes to SDCARD/ (ResMed-compatible SD card image, OSCAR-ready):
+ *   /somnotrace/SDCARD/
+ *     STR.edf                ← Multi-record daily summary (one record per day
+ *                              from .sessions/summaries/ spool files, sorted chronologically)
+ *     Identification.json    ← Device identity (nested AS11 format)
+ *     Identification.crc     ← CRC-32 of Identification.json
+ *     SETTINGS/
+ *       CurrentSettings.json ← Latest settings snapshot
  *     DATALOG/
- *       STR.edf    ← Session summary + settings (from Summary spool)
- *       BRP.edf    ← Breath waveform 25 Hz (from brp.snt)
- *       PLD.edf    ← Per-breath stats 0.5 Hz (from pld.snt)
- *       SA2.edf    ← SpO2/pulse 1 Hz (from sa2.snt)
- *       EVE.edf    ← Respiratory event annotations (from respiratory_events.bin)
- *       CSL.edf    ← Cheyne-Stokes annotations (from Summary spool CSR field)
- *     Identification.json
- *     Identification.crc
+ *       YYYYMMDD/            ← Noon-based day folder
+ *         <prefix>_BRP.edf   ← Breath waveform 25 Hz (from brp.snt)
+ *         <prefix>_PLD.edf   ← Per-breath stats 0.5 Hz (from pld.snt)
+ *         <prefix>_SA2.edf   ← SpO2/pulse 1 Hz (from sa2.snt)
+ *         <prefix>_EVE.edf   ← Respiratory event annotations
+ *         <prefix>_CSL.edf   ← CSR event annotations
+ *
+ * SDCARD/ is fully derived from .sessions/ and can be deleted and regenerated
+ * at any time without BLE access.
  *
  * This function is blocking and should be called from a task with adequate
  * stack (8KB+).  It must be called AFTER post_therapy_collect() has completed,
  * so that all spool and RPC data is available.
  *
  * Parameters:
- *   session_dir    - path to the session directory
- *   session_id     - session identifier (e.g. "20260627_0230")
+ *   session_dir    - path to the noon-day stream folder (.sessions/streams/YYYYMMDD/)
+ *   session_id     - session prefix (e.g. "20260627_224219" or "20260627_224219_2")
  *   start_epoch_ms - session start time in epoch ms (NTP-corrected)
  *   end_epoch_ms   - session end time in epoch ms (0 if unknown)
  *   clock_drift_ms - NTP time - AS11 device time (positive = AS11 is behind).

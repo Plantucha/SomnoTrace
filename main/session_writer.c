@@ -82,8 +82,8 @@ typedef struct {
 } stream_files_t;
 
 struct session_writer {
-    char     dir[MAX_SESSION_DIR_LEN];
-    char     session_id[16];      /* YYYYMMDD_HHMM */
+    char     dir[MAX_SESSION_DIR_LEN];   /* noon-day folder path */
+    char     session_id[32];      /* YYYYMMDD_HHMMSS[_n] — file prefix */
     int64_t  start_time_us;       /* boot-relative us (for duration) */
     int64_t  start_epoch_ms;      /* NTP epoch ms at session start */
     int64_t  end_time_us;         /* boot-relative us (for duration) */
@@ -130,14 +130,29 @@ static char s_client_id[64] = {0};
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
+/* Compute the noon-based day folder (YYYYMMDD) from local time.
+ * Sessions before noon belong to the previous day's folder. */
+static void noon_day_folder_local(time_t t, char *out, size_t out_len)
+{
+    struct tm tm;
+    localtime_r(&t, &tm);
+    if (tm.tm_hour < 12) {
+        t -= 86400;
+        localtime_r(&t, &tm);
+    }
+    snprintf(out, out_len, "%04d%02d%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+}
+
+/* Generate session timestamp prefix: YYYYMMDD_HHMMSS */
 static void make_session_id(char *out, size_t out_len)
 {
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
-    snprintf(out, out_len, "%04d%02d%02d_%02d%02d",
+    snprintf(out, out_len, "%04d%02d%02d_%02d%02d%02d",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min);
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
 static void write_snt_header(FILE *f, uint8_t tier, uint16_t hz_x10,
@@ -279,8 +294,8 @@ static void flush_task(void *arg)
 
 static void write_session_json(session_writer_t *s, const char *state)
 {
-    char path[MAX_SESSION_DIR_LEN + 32];
-    snprintf(path, sizeof(path), "%s/session.json", s->dir);
+    char path[MAX_SESSION_DIR_LEN + 48];
+    snprintf(path, sizeof(path), "%s/%s_session.json", s->dir, s->session_id);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "id", s->session_id);
@@ -374,39 +389,44 @@ session_writer_t *session_writer_start(void)
 
     make_session_id(s->session_id, sizeof(s->session_id));
 
-    /* Try to create the session directory. If it already exists (same-minute
-     * restart), append a suffix to keep session data separate. */
-    snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_SESSIONS_DIR, s->session_id);
-    if (mkdir(s->dir, 0775) != 0) {
-        if (errno == EEXIST) {
-            /* Directory exists — try with _2, _3, etc. */
+    /* Compute noon-day folder (YYYYMMDD) from local time.
+     * Sessions before noon belong to the previous day's folder. */
+    char noon_day[16];
+    noon_day_folder_local(time(NULL), noon_day, sizeof(noon_day));
+
+    /* Create the noon-day folder under .sessions/streams/ */
+    snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_STREAMS_DIR, noon_day);
+    if (mkdir(s->dir, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "failed to create noon-day dir %s: %s", s->dir, strerror(errno));
+        free(s);
+        xSemaphoreGive(s_active_mutex);
+        return NULL;
+    }
+
+    /* Check for filename collision (DST fallback — same local timestamp
+     * occurs twice). If any file with this prefix exists, append _2, _3, etc. */
+    {
+        char check_path[MAX_SESSION_DIR_LEN + 48];
+        snprintf(check_path, sizeof(check_path), "%s/%s_brp.snt", s->dir, s->session_id);
+        struct stat st;
+        if (stat(check_path, &st) == 0) {
             for (int suffix = 2; suffix < 100; suffix++) {
-                snprintf(s->dir, sizeof(s->dir), "%s/%s_%d",
-                         SD_SESSIONS_DIR, s->session_id, suffix);
-                if (mkdir(s->dir, 0775) == 0) break;
+                snprintf(check_path, sizeof(check_path), "%s/%s_%d_brp.snt",
+                         s->dir, s->session_id, suffix);
+                if (stat(check_path, &st) != 0) {
+                    char sid_with_suffix[40];
+                    snprintf(sid_with_suffix, sizeof(sid_with_suffix),
+                             "%s_%d", s->session_id, suffix);
+                    strlcpy(s->session_id, sid_with_suffix, sizeof(s->session_id));
+                    break;
+                }
             }
-            /* Update session_id to include the suffix for session.json */
-            char sid_with_suffix[64];
-            snprintf(sid_with_suffix, sizeof(sid_with_suffix),
-                     "%s_%d", s->session_id, 2);
-            /* Check if we found a valid dir */
-            struct stat st;
-            if (stat(s->dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-                ESP_LOGE(TAG, "failed to create session dir for %s", s->session_id);
+            if (stat(check_path, &st) == 0) {
+                ESP_LOGE(TAG, "cannot find unique session prefix for %s", s->session_id);
                 free(s);
                 xSemaphoreGive(s_active_mutex);
                 return NULL;
             }
-            /* Update session_id to match the directory name */
-            char *last_slash = strrchr(s->dir, '/');
-            if (last_slash) {
-                strncpy(s->session_id, last_slash + 1, sizeof(s->session_id) - 1);
-            }
-        } else {
-            ESP_LOGE(TAG, "failed to create session dir %s", s->dir);
-            free(s);
-            xSemaphoreGive(s_active_mutex);
-            return NULL;
         }
     }
 
@@ -414,30 +434,31 @@ session_writer_t *session_writer_start(void)
     s->start_epoch_ms = (int64_t)time(NULL) * 1000;
     s->active = true;
 
-    /* Open files and write headers */
-    char path[MAX_SESSION_DIR_LEN + 32];
+    /* Open files and write headers.
+     * Files are flat in the noon-day folder, prefixed with the session timestamp. */
+    char path[MAX_SESSION_DIR_LEN + 48];
     int64_t start_epoch_ms = s->start_epoch_ms;
 
-    snprintf(path, sizeof(path), "%s/brp.snt", s->dir);
+    snprintf(path, sizeof(path), "%s/%s_brp.snt", s->dir, s->session_id);
     s->brp.f_l0 = fopen(path, "wb");
     if (s->brp.f_l0) write_snt_header(s->brp.f_l0, 0, 250, 2, start_epoch_ms);  /* 25 Hz */
 
-    snprintf(path, sizeof(path), "%s/brp_mm.snt", s->dir);
+    snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", s->dir, s->session_id);
     s->brp.f_l1 = fopen(path, "wb");
     if (s->brp.f_l1) write_snt_header(s->brp.f_l1, 1, 10, 4, start_epoch_ms);  /* 1 Hz */
 
-    snprintf(path, sizeof(path), "%s/sa2.snt", s->dir);
+    snprintf(path, sizeof(path), "%s/%s_sa2.snt", s->dir, s->session_id);
     s->sa2.f_l0 = fopen(path, "wb");
     if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 0, 10, 2, start_epoch_ms);  /* 1 Hz */
 
-    snprintf(path, sizeof(path), "%s/pld.snt", s->dir);
+    snprintf(path, sizeof(path), "%s/%s_pld.snt", s->dir, s->session_id);
     s->pld.f_l0 = fopen(path, "wb");
     if (s->pld.f_l0) write_snt_header(s->pld.f_l0, 0, 5, 12, start_epoch_ms);  /* 0.5 Hz */
 
-    snprintf(path, sizeof(path), "%s/events.snt", s->dir);
+    snprintf(path, sizeof(path), "%s/%s_events.snt", s->dir, s->session_id);
     s->f_events = fopen(path, "w");
     if (!s->f_events) {
-        ESP_LOGW(TAG, "failed to open events.snt (non-fatal)");
+        ESP_LOGW(TAG, "failed to open events file (non-fatal)");
     }
 
     if (!s->brp.f_l0 || !s->sa2.f_l0 || !s->pld.f_l0) {
@@ -901,7 +922,7 @@ static void write_event(session_writer_t *s, const cJSON *msg)
  * The task allocates its own stack (16KB) and self-deletes when done. */
 typedef struct {
     char     session_dir[MAX_SESSION_DIR_LEN];
-    char     session_id[16];
+    char     session_id[32];
     int64_t  start_epoch_ms;
     int64_t  end_epoch_ms;
     int64_t  clock_drift_ms;
@@ -959,10 +980,10 @@ static void stop_task(void *arg)
      * GetDateTime RPC), so we capture it AFTER the call.  session_writer_stop()
      * does not free s — we do it here after reading the drift. */
     char session_dir[MAX_SESSION_DIR_LEN];
-    char session_id[16];
+    char session_id[32];
 
     strlcpy(session_dir, s->dir, sizeof(session_dir));
-    strlcpy(session_id, s->session_id, sizeof(session_id));
+    strlcpy(session_id, s->session_id, sizeof(session_id));  /* file prefix */
 
     /* Step 1: Finalise stream data (flush, close files, write session.json).
      * This also queries AS11 clock and sets s->clock_drift_ms. */
@@ -983,7 +1004,7 @@ static void stop_task(void *arg)
      * This step blocks on BLE RPC responses (semaphores), allowing
      * notif_proc_task to run between RPCs.  May take 10-30 seconds. */
     ESP_LOGI(TAG, "stop_task: starting post-therapy collection");
-    post_therapy_collect(session_dir, start_epoch_ms, clock_drift_ms);
+    post_therapy_collect(session_dir, session_id, start_epoch_ms, clock_drift_ms);
 
     /* Step 3: Launch EDF generation on core 1 (async, non-blocking).
      * EDF generation is CPU/SD-bound only — no BLE needed.  Running it
@@ -1120,102 +1141,118 @@ void session_writer_recover(void)
 {
     if (!sd_storage_is_ready()) return;
 
-    DIR *dir = opendir(SD_SESSIONS_DIR);
+    DIR *dir = opendir(SD_STREAMS_DIR);
     if (!dir) return;
 
     struct dirent *ent;
     int recovered = 0;
 
+    /* Scan noon-day folders under .sessions/streams/ */
     while ((ent = readdir(dir)) != NULL) {
         if (ent->d_name[0] == '.') continue;
+        if (strlen(ent->d_name) != 8) continue;  /* YYYYMMDD */
 
-        char session_path[300];
-        snprintf(session_path, sizeof(session_path), "%s/%s", SD_SESSIONS_DIR, ent->d_name);
+        char day_path[300];
+        snprintf(day_path, sizeof(day_path), "%s/%s", SD_STREAMS_DIR, ent->d_name);
 
-        char json_path[330];
-        snprintf(json_path, sizeof(json_path), "%s/session.json", session_path);
+        DIR *day_dir = opendir(day_path);
+        if (!day_dir) continue;
 
-        struct stat st;
-        if (stat(json_path, &st) == 0) {
-            /* session.json exists — already finalised */
-            continue;
-        }
+        struct dirent *day_ent;
+        while ((day_ent = readdir(day_dir)) != NULL) {
+            if (day_ent->d_name[0] == '.') continue;
 
-        ESP_LOGW(TAG, "found interrupted session: %s — writing metadata", ent->d_name);
+            /* Look for *_brp.snt files — each indicates a session */
+            const char *brp_suffix = strstr(day_ent->d_name, "_brp.snt");
+            if (!brp_suffix) continue;
 
-        /* Write session.json directly without allocating a full session_writer_t
-         * (which is ~7KB and would overflow the stack) */
-        char path[330];
+            /* Extract the session prefix (everything before _brp.snt) */
+            size_t prefix_len = brp_suffix - day_ent->d_name;
+            if (prefix_len >= 32) continue;
+            char prefix[32];
+            memcpy(prefix, day_ent->d_name, prefix_len);
+            prefix[prefix_len] = '\0';
 
-        /* Read sample counts and start_epoch_ms from .snt headers */
-        uint32_t brp_samples = 0, sa2_samples = 0, pld_samples = 0, brp_mm_samples = 0;
-        int64_t start_epoch_ms = 0;
-        snt_header_t hdr;
+            /* Check if session.json already exists (session was finalised) */
+            char json_path[400];
+            snprintf(json_path, sizeof(json_path), "%s/%s_session.json", day_path, prefix);
+            struct stat st;
+            if (stat(json_path, &st) == 0) continue;
 
-        snprintf(path, sizeof(path), "%s/brp.snt", session_path);
-        FILE *f = fopen(path, "rb");
-        if (f) {
-            if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC) {
-                brp_samples = hdr.sample_count;
-                start_epoch_ms = hdr.start_epoch_ms;
-            }
-            fclose(f);
-        }
+            ESP_LOGW(TAG, "found interrupted session: %s/%s — writing metadata",
+                     ent->d_name, prefix);
 
-        snprintf(path, sizeof(path), "%s/brp_mm.snt", session_path);
-        f = fopen(path, "rb");
-        if (f) {
-            if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
-                brp_mm_samples = hdr.sample_count;
-            fclose(f);
-        }
+            /* Read sample counts and start_epoch_ms from .snt headers */
+            char path[400];
+            uint32_t brp_samples = 0, sa2_samples = 0, pld_samples = 0, brp_mm_samples = 0;
+            int64_t start_epoch_ms = 0;
+            snt_header_t hdr;
 
-        snprintf(path, sizeof(path), "%s/sa2.snt", session_path);
-        f = fopen(path, "rb");
-        if (f) {
-            if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
-                sa2_samples = hdr.sample_count;
-            fclose(f);
-        }
-
-        snprintf(path, sizeof(path), "%s/pld.snt", session_path);
-        f = fopen(path, "rb");
-        if (f) {
-            if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
-                pld_samples = hdr.sample_count;
-            fclose(f);
-        }
-
-        /* Write JSON manually to avoid cJSON heap usage on the stack-limited task */
-        f = fopen(json_path, "w");
-        if (f) {
-            fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
-                       "\"start_epoch_ms\":%lld,"
-                       "\"brp_samples\":%u,\"brp_mm_samples\":%u,"
-                       "\"sa2_samples\":%u,\"pld_samples\":%u",
-                    ent->d_name,
-                    (long long)start_epoch_ms,
-                    (unsigned)brp_samples, (unsigned)brp_mm_samples,
-                    (unsigned)sa2_samples, (unsigned)pld_samples);
-
-            /* Add start_iso if we have a valid epoch */
-            if (start_epoch_ms > 0) {
-                time_t start = (time_t)(start_epoch_ms / 1000);
-                struct tm tm;
-                localtime_r(&start, &tm);
-                char iso_start[32];
-                strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
-                fprintf(f, ",\"start_iso\":\"%s\"", iso_start);
+            snprintf(path, sizeof(path), "%s/%s_brp.snt", day_path, prefix);
+            FILE *f = fopen(path, "rb");
+            if (f) {
+                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC) {
+                    brp_samples = hdr.sample_count;
+                    start_epoch_ms = hdr.start_epoch_ms;
+                }
+                fclose(f);
             }
 
-            if (s_device_addr[0]) fprintf(f, ",\"as11_device\":\"%s\"", s_device_addr);
-            if (s_client_id[0]) fprintf(f, ",\"as11_client_id\":\"%s\"", s_client_id);
-            fprintf(f, "}\n");
-            fclose(f);
-            ESP_LOGI(TAG, "wrote %s (state=interrupted)", json_path);
-        }
+            snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", day_path, prefix);
+            f = fopen(path, "rb");
+            if (f) {
+                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
+                    brp_mm_samples = hdr.sample_count;
+                fclose(f);
+            }
 
-        recovered++;
+            snprintf(path, sizeof(path), "%s/%s_sa2.snt", day_path, prefix);
+            f = fopen(path, "rb");
+            if (f) {
+                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
+                    sa2_samples = hdr.sample_count;
+                fclose(f);
+            }
+
+            snprintf(path, sizeof(path), "%s/%s_pld.snt", day_path, prefix);
+            f = fopen(path, "rb");
+            if (f) {
+                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
+                    pld_samples = hdr.sample_count;
+                fclose(f);
+            }
+
+            /* Write session.json manually (no cJSON — stack-limited task) */
+            f = fopen(json_path, "w");
+            if (f) {
+                fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
+                           "\"start_epoch_ms\":%lld,"
+                           "\"brp_samples\":%u,\"brp_mm_samples\":%u,"
+                           "\"sa2_samples\":%u,\"pld_samples\":%u",
+                        prefix,
+                        (long long)start_epoch_ms,
+                        (unsigned)brp_samples, (unsigned)brp_mm_samples,
+                        (unsigned)sa2_samples, (unsigned)pld_samples);
+
+                if (start_epoch_ms > 0) {
+                    time_t start = (time_t)(start_epoch_ms / 1000);
+                    struct tm tm;
+                    localtime_r(&start, &tm);
+                    char iso_start[32];
+                    strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
+                    fprintf(f, ",\"start_iso\":\"%s\"", iso_start);
+                }
+
+                if (s_device_addr[0]) fprintf(f, ",\"as11_device\":\"%s\"", s_device_addr);
+                if (s_client_id[0]) fprintf(f, ",\"as11_client_id\":\"%s\"", s_client_id);
+                fprintf(f, "}\n");
+                fclose(f);
+                ESP_LOGI(TAG, "wrote %s (state=interrupted)", json_path);
+            }
+
+            recovered++;
+        }
+        closedir(day_dir);
     }
 
     closedir(dir);

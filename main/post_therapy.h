@@ -32,33 +32,31 @@
  * EVE.edf).  Additionally, device identification fields (serial number,
  * model, variant) are needed for EDF headers and Identification.json.
  *
- * This module orchestrates the collection of all post-therapy data and
- * saves it to a "post-therapy" subfolder inside the session directory:
+ * This module orchestrates the collection of all post-therapy data:
  *
- *   /somnotrace/sessions/<session_id>/
- *     brp.snt, sa2.snt, pld.snt, brp_mm.snt   ← stream data (live)
- *     events.jsonl                             ← live events
- *     session.json                             ← session metadata
- *     post-therapy/                            ← THIS MODULE writes here
- *       summary.bin                            ← raw Summary spool protobuf
- *       respiratory_events.bin                 ← raw TherapyEvents spool protobuf
- *       identification.json                    ← device identity (from Get RPC)
- *       settings.json                          ← current settings (from Get RPC)
+ *   Summary spool (30-day lookback):
+ *     → decoded per-day → .sessions/summaries/YYYYMMDD.spool
  *
- * The combination of stream .snt files + post-therapy/ data constitutes
- * the complete "data warehouse" for the session.  EDF generation (edf_gen)
- * runs as a separate step AFTER this collection completes, writing to
- * /somnotrace/EDF/ (outside the sessions directory).
+ *   TherapyEvents-RespiratoryEvents spool:
+ *     → .sessions/streams/YYYYMMDD/<prefix>_resp_events.bin
+ *
+ *   Device identification (Get RPC):
+ *     → .sessions/streams/YYYYMMDD/<prefix>_ident.json
+ *
+ *   Current settings (Get RPC):
+ *     → .sessions/streams/YYYYMMDD/<prefix>_settings.json
  *
  * post_therapy_collect() is blocking and should be called from a task
  * with adequate stack (8KB+).  It is invoked by stop_task after
  * session_writer_stop() has finalised the stream files.
  *
  * Parameters:
- *   session_dir    - path to the session directory (e.g. "/somnotrace/sessions/20260627_0230")
- *   start_epoch_ms - session start time in epoch ms (for spool fromDateTime)
+ *   session_dir    - path to the noon-day folder (e.g. ".sessions/streams/20260627")
+ *   file_prefix    - session file prefix (e.g. "20260627_023000")
+ *   start_epoch_ms - session start time in epoch ms (unused for lookback;
+ *                    30-day fixed window is used instead)
  *   clock_drift_ms - NTP time - AS11 device time (positive = AS11 is behind).
  *                    Saved to manifest.json for use by EDF generation.
  */
-esp_err_t post_therapy_collect(const char *session_dir, int64_t start_epoch_ms,
-                               int64_t clock_drift_ms);
+esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
+                               int64_t start_epoch_ms, int64_t clock_drift_ms);

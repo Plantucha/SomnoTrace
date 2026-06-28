@@ -37,9 +37,67 @@
 
 static const char *TAG = "post_therapy";
 
-/* ── Helpers ────────────────────────────────────────────────────────── */
+/* ── Protobuf helpers (minimal, for Summary spool decoding) ─────────── */
 
-/* Write a raw binary buffer to a file. Returns ESP_OK on success. */
+static uint64_t pb_decode_varint(const uint8_t *buf, size_t buf_len, size_t *pos)
+{
+    uint64_t val = 0;
+    int shift = 0;
+    while (*pos < buf_len) {
+        uint8_t b = buf[(*pos)++];
+        val |= (uint64_t)(b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+    }
+    return val;
+}
+
+/* Extract PeriodStart (field 2, varint) from a Summary record. */
+static int64_t extract_period_start(const uint8_t *rec, size_t rec_len)
+{
+    size_t pos = 0;
+    while (pos < rec_len) {
+        uint64_t tag = pb_decode_varint(rec, rec_len, &pos);
+        int field = (int)(tag >> 3);
+        int wire = (int)(tag & 0x07);
+        if (field == 0) break;
+
+        if (field == 2 && wire == 0) {
+            return (int64_t)pb_decode_varint(rec, rec_len, &pos);
+        } else if (wire == 0) {
+            pb_decode_varint(rec, rec_len, &pos);
+        } else if (wire == 2) {
+            size_t lpos = pos;
+            uint64_t flen = pb_decode_varint(rec, rec_len, &lpos);
+            pos = lpos + flen;
+        } else if (wire == 1) {
+            pos += 8;
+        } else if (wire == 5) {
+            pos += 4;
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Compute noon-based day folder (YYYYMMDD) from epoch ms.
+ * Sessions before noon belong to the previous day's folder. */
+static void noon_day_from_epoch(int64_t epoch_ms, char *out, size_t out_len)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    if (tm.tm_hour < 12) {
+        t -= 86400;
+        localtime_r(&t, &tm);
+    }
+    snprintf(out, out_len, "%04d%02d%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+}
+
+/* ── File helpers ───────────────────────────────────────────────────── */
+
 static esp_err_t write_bin_file(const char *path, const uint8_t *data, size_t len)
 {
     FILE *f = fopen(path, "wb");
@@ -53,11 +111,26 @@ static esp_err_t write_bin_file(const char *path, const uint8_t *data, size_t le
         ESP_LOGE(TAG, "short write to %s: %u/%u", path, (unsigned)written, (unsigned)len);
         return ESP_FAIL;
     }
+    return ESP_OK;
+}
+
+/* Atomic write: write to temp file, then rename. */
+static esp_err_t write_bin_atomic(const char *path, const uint8_t *data, size_t len)
+{
+    char tmp_path[330];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    if (write_bin_file(tmp_path, data, len) != ESP_OK) return ESP_FAIL;
+
+    if (rename(tmp_path, path) != 0) {
+        ESP_LOGE(TAG, "rename %s → %s failed: %s", tmp_path, path, strerror(errno));
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
     ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)len);
     return ESP_OK;
 }
 
-/* Write a cJSON object to a file as formatted JSON. Returns ESP_OK on success. */
 static esp_err_t write_json_file(const char *path, const cJSON *json)
 {
     char *str = cJSON_Print(json);
@@ -77,8 +150,6 @@ static esp_err_t write_json_file(const char *path, const cJSON *json)
     return ESP_OK;
 }
 
-/* Convert epoch milliseconds to ISO-8601 UTC string.
- * Format: "2026-06-25T15:08:00.000Z" (AS11 spool fromDateTime format). */
 static void epoch_ms_to_iso_utc(int64_t epoch_ms, char *out, size_t out_len)
 {
     time_t t = (time_t)(epoch_ms / 1000);
@@ -90,32 +161,110 @@ static void epoch_ms_to_iso_utc(int64_t epoch_ms, char *out, size_t out_len)
              tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
 }
 
-/* ── Spool collection ───────────────────────────────────────────────── */
+/* ── Summary spool decode & per-day storage ─────────────────────────── */
 
-/* Pull a spool and save the raw protobuf to a file in the post-therapy dir.
- * Returns ESP_OK on success, non-fatal on failure (logs a warning). */
-static esp_err_t collect_spool(const char *dir, const char *spool_type,
-                               const char *filename, const char *from_dt)
+/* Pull Summary spool with 30-day lookback, decode into per-day files.
+ * Each day record is written to .sessions/summaries/YYYYMMDD.spool
+ * (atomic write — latest pull wins). */
+static esp_err_t collect_summary_spool(int64_t clock_drift_ms)
+{
+    /* Fixed 30-day lookback window — no state file needed. */
+    int64_t now_ms = (int64_t)time(NULL) * 1000;
+    int64_t from_ms = now_ms - 30LL * 86400 * 1000;
+    char from_dt[32];
+    epoch_ms_to_iso_utc(from_ms, from_dt, sizeof(from_dt));
+    ESP_LOGI(TAG, "Summary spool: fromDateTime=%s (30-day lookback)", from_dt);
+
+    uint8_t *data = NULL;
+    size_t len = 0;
+    esp_err_t ret = as11_ble_spool_pull("Summary", from_dt, &data, &len);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Summary spool pull failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    if (!data || len == 0) {
+        ESP_LOGI(TAG, "Summary spool is empty");
+        free(data);
+        return ESP_OK;
+    }
+
+    /* Iterate top-level field-2 wrappers (each contains a day record) */
+    int days_written = 0;
+    size_t pos = 0;
+    while (pos < len) {
+        uint64_t tag = pb_decode_varint(data, len, &pos);
+        int field = (int)(tag >> 3);
+        int wire = (int)(tag & 0x07);
+        if (field == 0) break;
+
+        if (field == 2 && wire == 2) {
+            size_t lpos = pos;
+            uint64_t flen = pb_decode_varint(data, len, &lpos);
+            pos = lpos;
+            if (pos + flen > len) break;
+
+            const uint8_t *rec = data + pos;
+            size_t rec_len = (size_t)flen;
+
+            /* Extract PeriodStart from this day record */
+            int64_t period_start = extract_period_start(rec, rec_len);
+            if (period_start > 0) {
+                /* Apply clock drift correction */
+                period_start += clock_drift_ms;
+
+                char day_label[16];
+                noon_day_from_epoch(period_start, day_label, sizeof(day_label));
+
+                char spool_path[300];
+                snprintf(spool_path, sizeof(spool_path), "%s/%s.spool",
+                         SD_SUMMARIES_DIR, day_label);
+                write_bin_atomic(spool_path, rec, rec_len);
+                days_written++;
+            }
+            pos += flen;
+        } else if (wire == 2) {
+            size_t lpos = pos;
+            uint64_t flen = pb_decode_varint(data, len, &lpos);
+            pos = lpos + flen;
+        } else if (wire == 0) {
+            pb_decode_varint(data, len, &pos);
+        } else if (wire == 1) {
+            pos += 8;
+        } else if (wire == 5) {
+            pos += 4;
+        } else {
+            break;
+        }
+    }
+
+    free(data);
+    ESP_LOGI(TAG, "Summary spool: wrote %d day record(s) to %s", days_written, SD_SUMMARIES_DIR);
+    return ESP_OK;
+}
+
+/* ── Spool collection (TherapyEvents) ───────────────────────────────── */
+
+static esp_err_t collect_resp_events(const char *dir, const char *prefix,
+                                     const char *from_dt)
 {
     uint8_t *data = NULL;
     size_t len = 0;
 
-    esp_err_t ret = as11_ble_spool_pull(spool_type, from_dt, &data, &len);
+    esp_err_t ret = as11_ble_spool_pull("TherapyEvents-RespiratoryEvents",
+                                        from_dt, &data, &len);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "spool pull failed for %s: %s", spool_type, esp_err_to_name(ret));
-        /* Non-fatal — EDF generation will handle missing data */
+        ESP_LOGW(TAG, "resp events spool pull failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
     if (data && len > 0) {
         char path[330];
-        snprintf(path, sizeof(path), "%s/%s", dir, filename);
+        snprintf(path, sizeof(path), "%s/%s_resp_events.bin", dir, prefix);
         write_bin_file(path, data, len);
     } else {
-        ESP_LOGI(TAG, "spool %s is empty (no data for this session)", spool_type);
-        /* Write an empty file to signal "pulled but empty" vs "not pulled" */
+        ESP_LOGI(TAG, "resp events spool is empty");
         char path[330];
-        snprintf(path, sizeof(path), "%s/%s", dir, filename);
+        snprintf(path, sizeof(path), "%s/%s_resp_events.bin", dir, prefix);
         FILE *f = fopen(path, "wb");
         if (f) fclose(f);
     }
@@ -126,9 +275,6 @@ static esp_err_t collect_spool(const char *dir, const char *spool_type,
 
 /* ── Device identification via Get RPC ──────────────────────────────── */
 
-/* Device identity fields needed for EDF headers and Identification.json.
- * This list matches the Python reference QUERY_VARS in capture_data.py.
- * The AS11 Get RPC accepts these as a single batch. */
 static const char *const IDENTITY_KEYS[] = {
     "UniversalIdentifier",
     "SerialNumber",
@@ -147,17 +293,11 @@ static const char *const IDENTITY_KEYS[] = {
     "DataModelVersionIdentifier",
 };
 
-/* Therapy settings are fetched via the "SettingProfiles" subtree target.
- * The AS11 Get RPC supports subtree targets — passing "SettingProfiles"
- * returns the entire settings tree in one call, which is far more efficient
- * and reliable than listing 60+ individual variable names (which causes
- * "Invalid Params" errors).  This matches the Python reference code in
- * capture_data.py. */
 static const char *const SETTINGS_KEYS[] = {
     "SettingProfiles",
 };
 
-static esp_err_t collect_identification(const char *dir)
+static esp_err_t collect_identification(const char *dir, const char *prefix)
 {
     cJSON *ident = as11_ble_get_values(
         IDENTITY_KEYS, sizeof(IDENTITY_KEYS) / sizeof(IDENTITY_KEYS[0]));
@@ -167,13 +307,13 @@ static esp_err_t collect_identification(const char *dir)
     }
 
     char path[330];
-    snprintf(path, sizeof(path), "%s/identification.json", dir);
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, prefix);
     write_json_file(path, ident);
     cJSON_Delete(ident);
     return ESP_OK;
 }
 
-static esp_err_t collect_settings(const char *dir)
+static esp_err_t collect_settings(const char *dir, const char *prefix)
 {
     cJSON *settings = as11_ble_get_values(
         SETTINGS_KEYS, sizeof(SETTINGS_KEYS) / sizeof(SETTINGS_KEYS[0]));
@@ -183,7 +323,7 @@ static esp_err_t collect_settings(const char *dir)
     }
 
     char path[330];
-    snprintf(path, sizeof(path), "%s/settings.json", dir);
+    snprintf(path, sizeof(path), "%s/%s_settings.json", dir, prefix);
     write_json_file(path, settings);
     cJSON_Delete(settings);
     return ESP_OK;
@@ -191,79 +331,51 @@ static esp_err_t collect_settings(const char *dir)
 
 /* ── Main collection entry point ────────────────────────────────────── */
 
-esp_err_t post_therapy_collect(const char *session_dir, int64_t start_epoch_ms,
-                               int64_t clock_drift_ms)
+esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
+                               int64_t start_epoch_ms, int64_t clock_drift_ms)
 {
-    if (!session_dir) return ESP_ERR_INVALID_ARG;
+    if (!session_dir || !file_prefix) return ESP_ERR_INVALID_ARG;
     if (!sd_storage_is_ready()) {
         ESP_LOGW(TAG, "SD not ready, skipping post-therapy collection");
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG, "=== POST-THERAPY COLLECTION START ===");
-    ESP_LOGI(TAG, "session_dir=%s start_epoch_ms=%lld", session_dir, (long long)start_epoch_ms);
+    ESP_LOGI(TAG, "session_dir=%s prefix=%s", session_dir, file_prefix);
 
-    /* Create post-therapy subfolder inside the session directory.
-     * This is where all spool data and RPC-sourced data goes.
-     * The stream .snt files remain in the session root directory.
-     * Together, stream files + post-therapy/ form the complete data warehouse. */
-    char pt_dir[300];
-    snprintf(pt_dir, sizeof(pt_dir), "%s/post-therapy", session_dir);
-    if (mkdir(pt_dir, 0775) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "failed to create %s: %s", pt_dir, strerror(errno));
-        return ESP_FAIL;
-    }
-
-    /* Convert session start time to ISO-8601 UTC for spool fromDateTime.
-     * We subtract a small margin (60s) to ensure we capture the full session,
-     * in case of clock drift between NTP and AS11. */
+    /* TherapyEvents spool uses session start time (with small margin). */
     char from_dt[32];
     epoch_ms_to_iso_utc(start_epoch_ms - 60000, from_dt, sizeof(from_dt));
-    ESP_LOGI(TAG, "spool fromDateTime=%s", from_dt);
 
     int errors = 0;
 
-    /* 1. Pull Summary spool → raw protobuf → post-therapy/summary.bin
-     *    This contains session statistics and settings for STR.edf generation. */
-    if (collect_spool(pt_dir, "Summary", "summary.bin", from_dt) != ESP_OK) {
+    /* 1. Pull Summary spool with 30-day lookback → per-day .spool files */
+    if (collect_summary_spool(clock_drift_ms) != ESP_OK) {
         errors++;
     }
 
-    /* 2. Pull TherapyEvents-RespiratoryEvents spool → raw protobuf →
-     *    post-therapy/respiratory_events.bin
-     *    This contains apnea/hypopnea event timestamps for EVE.edf generation.
-     *    We also have live events in events.jsonl, but the spool is the
-     *    authoritative post-session record.  Both are stored for comparison. */
-    if (collect_spool(pt_dir, "TherapyEvents-RespiratoryEvents",
-                      "respiratory_events.bin", from_dt) != ESP_OK) {
+    /* 2. Pull TherapyEvents-RespiratoryEvents spool → <prefix>_resp_events.bin */
+    if (collect_resp_events(session_dir, file_prefix, from_dt) != ESP_OK) {
         errors++;
     }
 
-    /* 3. Get device identification via RPC → post-therapy/identification.json
-     *    Contains SerialNumber, MID, VID, ProductCode, etc. needed for
-     *    EDF recording ID field and Identification.json for SleepHQ import. */
-    if (collect_identification(pt_dir) != ESP_OK) {
+    /* 3. Get device identification → <prefix>_ident.json */
+    if (collect_identification(session_dir, file_prefix) != ESP_OK) {
         errors++;
     }
 
-    /* 4. Get current therapy settings via RPC → post-therapy/settings.json
-     *    Contains all therapy mode settings (pressures, EPR, ramp, etc.)
-     *    needed for STR.edf settings rows.  These are the current values
-     *    at the time of collection (immediately post-therapy). */
-    if (collect_settings(pt_dir) != ESP_OK) {
+    /* 4. Get current settings → <prefix>_settings.json */
+    if (collect_settings(session_dir, file_prefix) != ESP_OK) {
         errors++;
     }
 
-    /* Write a manifest file documenting what was collected.
-     * Includes clock_drift_ms so EDF generation can apply the correct
-     * time correction to spool-sourced timestamps without needing
-     * to re-read session.json. */
+    /* Write manifest with clock_drift_ms for EDF generation */
     cJSON *manifest = cJSON_CreateObject();
     cJSON_AddStringToObject(manifest, "collection_time", from_dt);
     cJSON_AddNumberToObject(manifest, "clock_drift_ms", (double)clock_drift_ms);
     cJSON_AddNumberToObject(manifest, "errors", errors);
     char mpath[330];
-    snprintf(mpath, sizeof(mpath), "%s/manifest.json", pt_dir);
+    snprintf(mpath, sizeof(mpath), "%s/%s_manifest.json", session_dir, file_prefix);
     write_json_file(mpath, manifest);
     cJSON_Delete(manifest);
 

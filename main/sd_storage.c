@@ -83,14 +83,17 @@ esp_err_t sd_storage_init(void)
 
     sdmmc_card_print_info(stdout, card);
 
+    /* Create ESP-native directory tree */
     mkdir(SD_SESSIONS_DIR, 0775);
-    DIR *d = opendir(SD_SESSIONS_DIR);
-    if (d) {
-        closedir(d);
-        ESP_LOGI(TAG, "SD mounted at %s, sessions dir ready", SD_MOUNT_POINT);
-    } else {
-        ESP_LOGW(TAG, "SD mounted but sessions dir creation failed");
-    }
+    mkdir(SD_STREAMS_DIR, 0775);
+    mkdir(SD_SUMMARIES_DIR, 0775);
+
+    /* Create ResMed-compatible export directory tree */
+    mkdir(SD_SDCARD_DIR, 0775);
+    mkdir(SD_SDCARD_DATALOG, 0775);
+    mkdir(SD_SDCARD_SETTINGS, 0775);
+
+    ESP_LOGI(TAG, "SD mounted at %s, directory tree ready", SD_MOUNT_POINT);
 
     return ESP_OK;
 }

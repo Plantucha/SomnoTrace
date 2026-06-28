@@ -36,8 +36,8 @@ typedef struct session_writer session_writer_t;
 esp_err_t session_writer_init(void);
 
 /* Start a new therapy session.
- * Creates session directory under /somnotrace/sessions/YYYYMMDD_HHMM/
- * Opens .snt files and writes headers.
+ * Creates noon-day folder under .sessions/streams/YYYYMMDD/ and opens
+ * YYYYMMDD_HHMMSS_*.snt files with prefix-based naming.
  * Returns a handle or NULL on failure. */
 session_writer_t *session_writer_start(void);
 
