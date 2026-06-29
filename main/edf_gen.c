@@ -689,11 +689,21 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     free(spr);
     free(sig);
 
-    /* Flush all data to disk before edf_finalise_crc seeks back to read the
-     * header.  Without this, the FATFS per-file cache may evict dirty data
-     * sectors (e.g. the 6000-byte BRP record) when the header sectors are
-     * read back in, silently losing the signal data. */
-    fflush(edf);
+    /* Close and reopen the file before edf_finalise_crc seeks back to read
+     * the header.  fflush() only flushes the C stdio buffer to the FATFS
+     * layer — it does NOT flush the FATFS per-file cache to disk.  When
+     * edf_finalise_crc does fseek(0)+fread(header), the FATFS cache evicts
+     * dirty data sectors (e.g. the 6000-byte BRP record) without writing
+     * them to disk, silently zeroing the signal data.  Closing the file
+     * forces a full flush of all dirty cache sectors to disk. */
+    fclose(edf);
+    edf = fopen(edf_path, "r+b");
+    if (!edf) {
+        ESP_LOGE(TAG, "cannot reopen %s for CRC finalisation: %s",
+                 edf_path, strerror(errno));
+        fclose(snt);
+        return ESP_FAIL;
+    }
 
     /* Finalise CRC in patient ID */
     edf_finalise_crc(edf, header_bytes);
@@ -1679,7 +1689,14 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         fwrite(&crc_val, sizeof(int16_t), 1, edf);
     }
 
-    fflush(edf);
+    fclose(edf);
+    edf = fopen(path, "r+b");
+    if (!edf) {
+        ESP_LOGE(TAG, "cannot reopen %s for CRC finalisation: %s",
+                 path, strerror(errno));
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
+    }
     edf_finalise_crc(edf, header_bytes);
     fclose(edf);
 
@@ -1938,7 +1955,13 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     }
 
     /* Finalise CRC in patient ID */
-    fflush(edf);
+    fclose(edf);
+    edf = fopen(path, "r+b");
+    if (!edf) {
+        ESP_LOGE(TAG, "cannot reopen %s for CRC finalisation: %s",
+                 path, strerror(errno));
+        return ESP_FAIL;
+    }
     edf_finalise_crc(edf, header_bytes);
     fclose(edf);
 
