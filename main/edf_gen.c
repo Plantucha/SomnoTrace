@@ -689,6 +689,12 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     free(spr);
     free(sig);
 
+    /* Flush all data to disk before edf_finalise_crc seeks back to read the
+     * header.  Without this, the FATFS per-file cache may evict dirty data
+     * sectors (e.g. the 6000-byte BRP record) when the header sectors are
+     * read back in, silently losing the signal data. */
+    fflush(edf);
+
     /* Finalise CRC in patient ID */
     edf_finalise_crc(edf, header_bytes);
 
@@ -1673,6 +1679,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         fwrite(&crc_val, sizeof(int16_t), 1, edf);
     }
 
+    fflush(edf);
     edf_finalise_crc(edf, header_bytes);
     fclose(edf);
 
@@ -1931,6 +1938,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     }
 
     /* Finalise CRC in patient ID */
+    fflush(edf);
     edf_finalise_crc(edf, header_bytes);
     fclose(edf);
 
