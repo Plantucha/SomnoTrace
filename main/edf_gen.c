@@ -644,13 +644,31 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
 
         /* De-interleave: [ch0_s0, ch1_s0, ...] → [ch0_all, ch1_all, ...]
          * Samples beyond available data remain zero (from memset above).
-         * If channel_map is provided, select only the mapped channels. */
+         * If channel_map is provided, select only the mapped channels.
+         *
+         * Re-scale from the capture scale (physical × 100) to each signal's
+         * EDF digital scale.  The AS11 digital scale differs per signal
+         * (dig_max/phys_max), so the raw ×100 value cannot be written as the
+         * digital value directly:
+         *   dig = dig_min + (phys - phys_min) × (dig_max-dig_min)/(phys_max-phys_min)
+         * where phys = stored / 100. */
         int avail_samples = (int)(avail / (snt_channels * sizeof(int16_t)));
         for (int ch = 0; ch < n_signals; ch++) {
             int snt_ch = channel_map ? channel_map[ch] : ch;
+            double pmin = sig[ch].phys_min;
+            double pspan = sig[ch].phys_max - sig[ch].phys_min;
+            double dmin = sig[ch].dig_min;
+            double dspan = sig[ch].dig_max - sig[ch].dig_min;
+            double k = (pspan != 0.0) ? (dspan / pspan) : 0.0;
             for (int s = 0; s < samples_per_record; s++) {
                 if (s < avail_samples) {
-                    record_buf[ch * samples_per_record + s] = raw[s * snt_channels + snt_ch];
+                    int16_t stored = raw[s * snt_channels + snt_ch];
+                    double phys = stored / 100.0;
+                    double dig = dmin + (phys - pmin) * k;
+                    int idig = (int)(dig < 0 ? dig - 0.5 : dig + 0.5);
+                    if (idig > INT16_MAX) idig = INT16_MAX;
+                    if (idig < INT16_MIN) idig = INT16_MIN;
+                    record_buf[ch * samples_per_record + s] = (int16_t)idig;
                 } else {
                     record_buf[ch * samples_per_record + s] = 0;
                 }

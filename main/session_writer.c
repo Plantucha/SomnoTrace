@@ -837,22 +837,20 @@ void session_writer_on_stream_data_raw(const char *json, int len)
 
     xSemaphoreTake(s->mutex, portMAX_DELAY);
 
-    /* BRP: PatientFlow + MaskPressure (25 Hz, 40ms natural interval) */
-    for (int j = 0; j < flow_n && s->brp_buf_count < 1500; j++) {
-        s->brp_flow[s->brp_buf_count] = flow_vals[j];
-        s->brp_buf_count++;
-    }
-
-    for (int j = 0; j < press_n; j++) {
-        if (s->brp_buf_count <= j) {
-            if (s->brp_buf_count < 1500) {
-                s->brp_flow[s->brp_buf_count] = -1;  /* missing flow → -1 sentinel */
-                s->brp_buf_count++;
-            }
+    /* BRP: PatientFlow + MaskPressure (25 Hz, 40ms natural interval).
+     * Flow and pressure arrive together (one value per 40ms tick) and must be
+     * appended in lockstep at the SAME cumulative buffer position.  Missing
+     * samples in either channel use the -1 sentinel. */
+    {
+        uint32_t base = s->brp_buf_count;
+        int n_pairs = flow_n > press_n ? flow_n : press_n;
+        for (int j = 0; j < n_pairs && base + j < 1500; j++) {
+            s->brp_flow[base + j]  = (j < flow_n)  ? flow_vals[j]  : -1;
+            s->brp_press[base + j] = (j < press_n) ? press_vals[j] : -1;
         }
-        if (j < 1500) {
-            s->brp_press[j] = press_vals[j];
-        }
+        uint32_t added = (uint32_t)n_pairs;
+        if (base + added > 1500) added = 1500 - base;
+        s->brp_buf_count = base + added;
     }
 
     /* SA2: HeartRate + SpO2 (1 Hz, decimated from 5 Hz notifications).
