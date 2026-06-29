@@ -1128,8 +1128,8 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
     str_values[54] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 3, -1), 1, 2);        /* TgtEPAP.95   /2 */
     str_values[55] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 4, -1), 1, 2);        /* TgtEPAP.Max  /2 */
     str_values[56] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 2, -1), 1, 2);             /* Leak.50      /2 */
-    str_values[57] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 3, -1), 1, 2);             /* Leak.95      /2 */
-    str_values[58] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 4, -1), 1, 2);             /* Leak.70      /2 */
+    str_values[57] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 4, -1), 1, 2);             /* Leak.95      /2 */
+    str_values[58] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 3, -1), 1, 2);             /* Leak.70      /2 */
     str_values[59] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 5, -1), 1, 2);             /* Leak.Max     /2 */
     str_values[60] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 2, -1), 2, 25);        /* MinVent.50   /12.5 */
     str_values[61] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 3, -1), 2, 25);        /* MinVent.95   /12.5 */
