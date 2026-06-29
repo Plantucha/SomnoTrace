@@ -416,58 +416,6 @@ static int edf_write_header(FILE *f, const char *patient_id,
     return header_bytes;
 }
 
-/* Compute the patient ID CRC words after the header has been written.
- * Reads back the file to compute CRC16 over the appropriate byte ranges.
- * Then rewrites the patient ID field with the CRC values filled in.
- *
- * Patient ID format: "X X X X AAAA BBBB" where:
- *   AAAA = CRC16-CCITT-FALSE of fixed header bytes 0x19..0xFF
- *   BBBB = CRC16-CCITT-FALSE of signal header bytes 0x100..header_bytes-1
- */
-static void edf_finalise_crc(FILE *f, int header_bytes)
-{
-    /* Read the entire header back into memory.
-     * The file must have been opened with "w+b" (read+write) mode. */
-    uint8_t *hdr = malloc(header_bytes);
-    if (!hdr) {
-        ESP_LOGE(TAG, "edf_finalise_crc: malloc(%d) failed", header_bytes);
-        return;
-    }
-
-    fseek(f, 0, SEEK_SET);
-    if (fread(hdr, 1, header_bytes, f) != (size_t)header_bytes) {
-        ESP_LOGE(TAG, "edf_finalise_crc: fread header failed (header_bytes=%d)",
-                 header_bytes);
-        free(hdr);
-        return;
-    }
-
-    /* First CRC: bytes 0x19..0xFF (offset 25 to 255, 231 bytes) */
-    uint16_t crc1 = crc16_ccitt(hdr + 0x19, 256 - 0x19);
-
-    /* Second CRC: bytes 0x100..header_bytes-1 (all signal header blocks) */
-    uint16_t crc2 = crc16_ccitt(hdr + 256, header_bytes - 256);
-
-    ESP_LOGI(TAG, "edf_finalise_crc: H1=%04X H2=%04X", crc1, crc2);
-
-    /* Write the CRC values into the patient ID field at offset 0x08.
-     * Format: "X X X X AAAA BBBB" (uppercase hex, left-aligned, space-padded to 80).
-     * The "X X X X " prefix is already in the header; we just need to
-     * write the two hex words at the correct offset. */
-    char pid[81];
-    snprintf(pid, sizeof(pid), "X X X X %04X %04X", crc1, crc2);
-    /* Pad to 80 chars with spaces */
-    int plen = strlen(pid);
-    while (plen < 80) pid[plen++] = ' ';
-    pid[80] = '\0';
-
-    fseek(f, 8, SEEK_SET);  /* patient ID starts at offset 0x08 */
-    fwrite(pid, 1, 80, f);
-    fflush(f);
-
-    free(hdr);
-}
-
 /* ════════════════════════════════════════════════════════════════════
  *  Section 4: .snt file format reader
  * ════════════════════════════════════════════════════════════════════ */
