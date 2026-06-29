@@ -232,6 +232,12 @@ typedef struct {
     int dig_max;            /* 8 chars */
     const char *prefilter;  /* 80 chars */
     int samples_per_record; /* 8 chars */
+    /* When true, a raw .snt sample equal to the invalid sentinel (-1) is
+     * written to the EDF as the invalid marker (-1) directly, bypassing the
+     * physical→digital scaling.  AS11 uses -1 to mark "no data" samples
+     * (e.g. SpO2/Pulse when no oximeter is connected).  Leave false for
+     * signals where -1 is a legitimate measurement (e.g. BRP Flow). */
+    bool invalid_passthrough;
 } edf_signal_def_t;
 
 /* Write the complete EDF header (fixed + per-signal) to a file.
@@ -692,9 +698,17 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
             double dmin = sig[ch].dig_min;
             double dspan = sig[ch].dig_max - sig[ch].dig_min;
             double k = (pspan != 0.0) ? (dspan / pspan) : 0.0;
+            bool passthrough = sig[ch].invalid_passthrough;
             for (int s = 0; s < samples_per_record; s++) {
                 if (s < avail_samples) {
                     int16_t stored = raw[s * snt_channels + snt_ch];
+                    /* AS11 marks "no data" samples with the invalid marker
+                     * (-1) rather than scaling them.  Pass the sentinel
+                     * through verbatim for signals that opt in. */
+                    if (passthrough && stored == -1) {
+                        record_buf[ch * samples_per_record + s] = -1;
+                        continue;
+                    }
                     double phys = stored / 100.0;
                     double dig = dmin + (phys - pmin) * k;
                     int idig = (int)(dig < 0 ? dig - 0.5 : dig + 0.5);
@@ -702,7 +716,10 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                     if (idig < INT16_MIN) idig = INT16_MIN;
                     record_buf[ch * samples_per_record + s] = (int16_t)idig;
                 } else {
-                    record_buf[ch * samples_per_record + s] = 0;
+                    /* Pad trailing samples of a partial record.  For
+                     * invalid-passthrough signals use the -1 marker to match
+                     * AS11; otherwise zero-pad. */
+                    record_buf[ch * samples_per_record + s] = passthrough ? -1 : 0;
                 }
             }
         }
@@ -2289,9 +2306,15 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     size_t events_len = 0;
     uint8_t *events_data = read_bin_file(events_path, &events_len);
 
-    /* ── Build EDF header common fields ── */
+    /* ── Build EDF header common fields ──
+     * The per-session EDF headers (BRP/SA2/PLD/EVE/CSL) carry the recording
+     * start timestamp.  AS11 stamps these in *its own* clock, which differs
+     * from our NTP clock by clock_drift_ms (NTP = AS11 + drift ⇒ AS11 = NTP −
+     * drift).  Apply the correction so our header datetime matches the value
+     * AS11 would have written for the same physical instant. */
+    int64_t edf_start_ms = start_epoch_ms - clock_drift_ms;
     char start_date[16], start_time[16];
-    format_edf_datetime(start_epoch_ms, start_date, sizeof(start_date),
+    format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
 
     /* STR.edf uses the noon-based day date (sessions before noon belong
@@ -2311,7 +2334,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
 
     char recording_id[128];
     format_recording_id(recording_id, sizeof(recording_id),
-                        start_epoch_ms, ident);
+                        edf_start_ms, ident);
 
     /* STR.edf recording_id uses the noon-based day date, not session start. */
     char str_recording_id[128];
@@ -2363,11 +2386,13 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
             { .label = "Pulse.1s", .transducer = "",
               .unit = "bpm", .phys_min = 0.0, .phys_max = 300.0,
               .dig_min = 0, .dig_max = 300,
-              .prefilter = "", .samples_per_record = 60 },
+              .prefilter = "", .samples_per_record = 60,
+              .invalid_passthrough = true },
             { .label = "SpO2.1s", .transducer = "",
               .unit = "%", .phys_min = 0.0, .phys_max = 100.0,
               .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 60 },
+              .prefilter = "", .samples_per_record = 60,
+              .invalid_passthrough = true },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
                                start_date, start_time, sa2_sigs, 2, "60.00", NULL) != ESP_OK) {
