@@ -926,6 +926,7 @@ typedef struct {
     int64_t  start_epoch_ms;
     int64_t  end_epoch_ms;
     int64_t  clock_drift_ms;
+    int64_t  stop_boot_us;  /* esp_timer_get_time() at session stop */
 } edf_task_args_t;
 
 /* Cleanup pointers for the previous edf_task's PSRAM stack and TCB.
@@ -968,7 +969,10 @@ static void spool_refresh_task(void *arg)
     }
 
     ESP_LOGI(TAG, "spool_refresh_task: waiting for spool to become current");
-    post_therapy_wait_spool_current(a->end_epoch_ms, a->clock_drift_ms);
+    bool fresh = post_therapy_wait_spool_current(a->end_epoch_ms, a->clock_drift_ms);
+    int64_t elapsed_ms = (esp_timer_get_time() - a->stop_boot_us) / 1000;
+    ESP_LOGI(TAG, "spool_refresh_task: spool %s after %lld ms from session stop",
+             fresh ? "CURRENT" : "STALE (timeout)", (long long)elapsed_ms);
 
     /* Launch EDF generation on core 1. */
     ESP_LOGI(TAG, "spool_refresh_task: launching EDF generation");
@@ -1026,6 +1030,7 @@ static void stop_task(void *arg)
     int64_t start_epoch_ms = s->start_epoch_ms;
     int64_t end_epoch_ms = s->end_epoch_ms;
     int64_t clock_drift_ms = s->clock_drift_ms;
+    int64_t stop_boot_us = s->end_time_us;
 
     /* Free the session writer struct — we have everything we need */
     free(s);
@@ -1059,6 +1064,7 @@ static void stop_task(void *arg)
         edf_args->start_epoch_ms = start_epoch_ms;
         edf_args->end_epoch_ms = end_epoch_ms;
         edf_args->clock_drift_ms = clock_drift_ms;
+        edf_args->stop_boot_us = stop_boot_us;
 
         /* Free the previous edf_task's PSRAM stack and TCB.
          * The previous task has completed and self-deleted by now

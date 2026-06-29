@@ -41,6 +41,7 @@
 #include "as11_ble.h"
 #include "session_writer.h"
 #include "bsp_display.h"
+#include "time_sync.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1921,6 +1922,21 @@ static void reconnect_task(void *arg)
         }
     }
     free(rpc);
+
+    /* ---- Wait for NTP time sync before subscribing to events or
+     * starting the data stream.  Therapy recording depends on accurate
+     * NTP time for session timestamps, clock drift calculation, and
+     * spool staleness detection.  If we start streaming before NTP sync,
+     * a TherapyStart notification could trigger session recording with
+     * wrong timestamps.
+     *
+     * NTP sync is a hard dependency — without it, no stream subscriptions
+     * are created and therapy recording cannot start.  This blocks
+     * indefinitely until NTP syncs. */
+    while (!time_sync_is_synced()) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    ESP_LOGI(TAG, "reconnect: NTP synced, proceeding with stream setup");
 
     /* ---- Subscribe to therapy events (encrypted) ---- */
     rpc = malloc(512);
