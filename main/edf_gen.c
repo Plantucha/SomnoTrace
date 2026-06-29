@@ -1184,7 +1184,8 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
     int session_count = (int)get_scalar(ctx, SUM_F_SESSION_COUNT, 0);
     if (session_count <= 0)
         session_count = ctx->n_session_entries;
-    int per_session_min = (session_count > 0) ? (duration_min / session_count) : 0;
+    int per_session_min = (session_count > 0)
+        ? ((duration_min + session_count - 1) / session_count) : 0;
 
     for (int i = 0; i < ctx->n_session_entries && mask_on_count < 20; i++) {
         int64_t ev_ms = ctx->session_entries[i].ts;
