@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -708,6 +709,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     free(spr);
     free(sig);
 
+    fsync(fileno(edf));
     fclose(edf);
     fclose(snt);
     ESP_LOGI(TAG, "EDF conversion complete: %s", edf_path);
@@ -1689,6 +1691,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         fwrite(&crc_val, sizeof(int16_t), 1, edf);
     }
 
+    fsync(fileno(edf));
     fclose(edf);
 
     ESP_LOGI(TAG, "STR.edf generated: %s (%d records)", path, n_records);
@@ -1945,6 +1948,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
         }
     }
 
+    fsync(fileno(edf));
     fclose(edf);
 
     ESP_LOGI(TAG, "EVE.edf generated: %s (%d events)", path, event_count);
