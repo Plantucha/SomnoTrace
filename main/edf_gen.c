@@ -281,9 +281,6 @@ static int edf_write_header(FILE *f, const char *patient_id,
     snprintf(ns, sizeof(ns), "%d", total_signals);
     edf_write_field(hdr + 252, 4, ns);                   /* signal count */
 
-    /* Write fixed header */
-    fwrite(hdr, 1, 256, f);
-
     /* ── Per-signal header blocks (256 bytes per signal) ──
      * EDF stores all signal metadata fields in interleaved order:
      * first all labels, then all transducer types, etc. */
@@ -381,6 +378,28 @@ static int edf_write_header(FILE *f, const char *patient_id,
     /* Field 10: reserved (32 chars each) */
     offset = total * (16 + 80 + 8 + 8 + 8 + 8 + 8 + 80 + 8);
     /* Already zeroed (space-padded) */
+
+    /* Compute header CRCs from in-memory buffers BEFORE writing to disk.
+     * This avoids seeking back to read the header after data has been
+     * written, which causes FATFS per-file cache eviction and data loss.
+     * CRC1 = crc16(hdr[0x19..0xFF]), CRC2 = crc16(sigblock[0..end]).
+     * The patient ID placeholder ("X X X X 0000 0000") is used for the
+     * CRC computation, then replaced with the actual CRC values. */
+    uint16_t crc1 = crc16_ccitt((uint8_t *)hdr + 0x19, 256 - 0x19);
+    uint16_t crc2 = crc16_ccitt((uint8_t *)sigblock, 256 * total);
+
+    ESP_LOGI(TAG, "edf_write_header: H1=%04X H2=%04X", crc1, crc2);
+
+    /* Write CRC values into the patient ID field */
+    char pid[81];
+    snprintf(pid, sizeof(pid), "X X X X %04X %04X", crc1, crc2);
+    int plen = strlen(pid);
+    while (plen < 80) pid[plen++] = ' ';
+    pid[80] = '\0';
+    memcpy(hdr + 8, pid, 80);
+
+    /* Write fixed header */
+    fwrite(hdr, 1, 256, f);
 
     /* Write signal header blocks */
     fwrite(sigblock, 1, 256 * total, f);
@@ -688,25 +707,6 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     free(record_buf);
     free(spr);
     free(sig);
-
-    /* Close and reopen the file before edf_finalise_crc seeks back to read
-     * the header.  fflush() only flushes the C stdio buffer to the FATFS
-     * layer — it does NOT flush the FATFS per-file cache to disk.  When
-     * edf_finalise_crc does fseek(0)+fread(header), the FATFS cache evicts
-     * dirty data sectors (e.g. the 6000-byte BRP record) without writing
-     * them to disk, silently zeroing the signal data.  Closing the file
-     * forces a full flush of all dirty cache sectors to disk. */
-    fclose(edf);
-    edf = fopen(edf_path, "r+b");
-    if (!edf) {
-        ESP_LOGE(TAG, "cannot reopen %s for CRC finalisation: %s",
-                 edf_path, strerror(errno));
-        fclose(snt);
-        return ESP_FAIL;
-    }
-
-    /* Finalise CRC in patient ID */
-    edf_finalise_crc(edf, header_bytes);
 
     fclose(edf);
     fclose(snt);
@@ -1690,15 +1690,6 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     }
 
     fclose(edf);
-    edf = fopen(path, "r+b");
-    if (!edf) {
-        ESP_LOGE(TAG, "cannot reopen %s for CRC finalisation: %s",
-                 path, strerror(errno));
-        free(records); free(ctx); free(str_sigs);
-        return ESP_FAIL;
-    }
-    edf_finalise_crc(edf, header_bytes);
-    fclose(edf);
 
     ESP_LOGI(TAG, "STR.edf generated: %s (%d records)", path, n_records);
 
@@ -1954,15 +1945,6 @@ static esp_err_t generate_eve_edf(const char *edf_path,
         }
     }
 
-    /* Finalise CRC in patient ID */
-    fclose(edf);
-    edf = fopen(path, "r+b");
-    if (!edf) {
-        ESP_LOGE(TAG, "cannot reopen %s for CRC finalisation: %s",
-                 path, strerror(errno));
-        return ESP_FAIL;
-    }
-    edf_finalise_crc(edf, header_bytes);
     fclose(edf);
 
     ESP_LOGI(TAG, "EVE.edf generated: %s (%d events)", path, event_count);
@@ -2327,7 +2309,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                            noon_ms, ident);
     }
 
-    /* Patient ID will have CRC filled in by edf_finalise_crc.
+    /* Patient ID has CRC filled in by edf_write_header.
      * Initial value is the "X X X X" prefix with placeholder zeros. */
     char patient_id[81] = "X X X X 0000 0000";
 
