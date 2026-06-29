@@ -24,6 +24,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 
 /* ── Post-therapy data collection ─────────────────────────────────────
  *
@@ -50,6 +51,11 @@
  * with adequate stack (8KB+).  It is invoked by stop_task after
  * session_writer_stop() has finalised the stream files.
  *
+ * After collection, *spool_current indicates whether the current day's
+ * Summary spool record is fresh (ClockB >= session end - 5s tolerance).
+ * If stale, the caller should call post_therapy_wait_spool_current()
+ * from a separate low-priority task before generating STR.edf.
+ *
  * Parameters:
  *   session_dir    - path to the noon-day folder (e.g. ".sessions/streams/20260627")
  *   file_prefix    - session file prefix (e.g. "20260627_023000")
@@ -57,6 +63,28 @@
  *                    30-day fixed window is used instead)
  *   clock_drift_ms - NTP time - AS11 device time (positive = AS11 is behind).
  *                    Saved to manifest.json for use by EDF generation.
+ *   end_epoch_ms   - session end time in epoch ms (NTP clock).  Used for
+ *                    spool staleness detection (ClockB comparison).
+ *   spool_current  - output: true if the current day's spool is fresh.
  */
 esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
-                               int64_t start_epoch_ms, int64_t clock_drift_ms);
+                               int64_t start_epoch_ms, int64_t clock_drift_ms,
+                               int64_t end_epoch_ms, bool *spool_current);
+
+/* Retry pulling the current day's Summary spool until fresh or timeout.
+ *
+ * Retries every 3 seconds for up to 2 minutes (40 attempts).  Each retry
+ * pulls only the current noon-day's record (fromDateTime = noon today)
+ * for speed.  Uses ClockB (field 40) with 5-second tolerance against
+ * the AS11-equivalent session end time for staleness detection.
+ *
+ * Should be called from a low-priority task on core 0 so it doesn't
+ * block EDF generation of other files or new therapy notifications.
+ *
+ * Parameters:
+ *   end_epoch_ms   - session end time in epoch ms (NTP clock)
+ *   clock_drift_ms - NTP time - AS11 device time
+ *
+ * Returns true if the spool became fresh, false if still stale after
+ * timeout (caller should proceed with available data). */
+bool post_therapy_wait_spool_current(int64_t end_epoch_ms, int64_t clock_drift_ms);

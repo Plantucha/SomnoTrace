@@ -950,6 +950,37 @@ static void edf_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* spool_refresh_task: retries pulling the Summary spool until fresh, then
+ * runs EDF generation.  Runs on core 0 at priority 5 (below notif_proc_task
+ * at priority 10) so BLE notifications always preempt it.
+ *
+ * The retry loop (post_therapy_wait_spool_current) yields via vTaskDelay
+ * and semaphore waits, allowing notif_proc_task to process BLE responses
+ * for each spool pull.  EDF generation is mostly SD I/O which also yields.
+ *
+ * Uses the PSRAM stack allocated by stop_task. */
+static void spool_refresh_task(void *arg)
+{
+    edf_task_args_t *a = (edf_task_args_t *)arg;
+    if (!a) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "spool_refresh_task: waiting for spool to become current");
+    post_therapy_wait_spool_current(a->end_epoch_ms, a->clock_drift_ms);
+
+    /* Launch EDF generation on core 1. */
+    ESP_LOGI(TAG, "spool_refresh_task: launching EDF generation");
+    edf_gen_generate(a->session_dir, a->session_id,
+                     a->start_epoch_ms, a->end_epoch_ms,
+                     a->clock_drift_ms);
+    free(a);
+
+    ESP_LOGI(TAG, "spool_refresh_task: done");
+    vTaskDelete(NULL);
+}
+
 /* Session stop runs in a dedicated task so that notif_proc_task is free to
  * process the GetDateTime RPC response while session_writer_stop blocks.
  *
@@ -959,14 +990,16 @@ static void edf_task(void *arg)
  *   1. session_writer_stop()  — final flush, close .snt files, write session.json
  *   2. post_therapy_collect() — pull Summary + TherapyEvents spools + Get RPC
  *                               → save to post-therapy/ subfolder
- *   3. edf_gen_generate()     — launched as a SEPARATE task on core 1
- *                               (see edf_task above) so it does NOT block
- *                               notif_proc_task from processing stream
- *                               notifications if a new therapy starts.
+ *                               → checks if Summary spool is current for today
+ *   3a. If spool is current: edf_gen_generate() launched as a SEPARATE task
+ *       on core 1 (see edf_task above).
+ *   3b. If spool is stale: spool_refresh_task launched on core 0 retries
+ *       the pull every 3s for up to 2 min. When fresh (or timeout), it
+ *       launches edf_gen_generate() on core 1.
  *
  * Steps 1 and 2 run in stop_task (needs BLE for spool pulls).
- * Step 3 is dispatched to edf_task and stop_task exits immediately,
- * freeing the high-priority slot for notif_proc_task. */
+ * Step 3 is dispatched and stop_task exits immediately, freeing the
+ * high-priority slot for notif_proc_task. */
 static void stop_task(void *arg)
 {
     session_writer_t *s = (session_writer_t *)arg;
@@ -1002,14 +1035,23 @@ static void stop_task(void *arg)
      * queries device identification/settings via Get RPC.  All data
      * is saved to the post-therapy/ subfolder inside the session directory.
      * This step blocks on BLE RPC responses (semaphores), allowing
-     * notif_proc_task to run between RPCs.  May take 10-30 seconds. */
+     * notif_proc_task to run between RPCs.  May take 10-30 seconds.
+     * Also checks whether the current day's Summary spool is fresh. */
+    bool spool_current = false;
     ESP_LOGI(TAG, "stop_task: starting post-therapy collection");
-    post_therapy_collect(session_dir, session_id, start_epoch_ms, clock_drift_ms);
+    post_therapy_collect(session_dir, session_id, start_epoch_ms, clock_drift_ms,
+                         end_epoch_ms, &spool_current);
 
-    /* Step 3: Launch EDF generation on core 1 (async, non-blocking).
-     * EDF generation is CPU/SD-bound only — no BLE needed.  Running it
-     * on core 1 at low priority ensures notif_proc_task on core 0 can
-     * continue processing stream notifications without any interference. */
+    /* Step 3: Launch EDF generation.
+     *
+     * If the spool is current, launch edf_gen_generate() immediately on
+     * core 1 (async, non-blocking).
+     *
+     * If the spool is stale, launch spool_refresh_task on core 0 which
+     * retries the pull every 3s for up to 2 min. When the spool becomes
+     * current (or timeout), it launches edf_gen_generate() on core 1.
+     * This keeps stop_task non-blocking — notif_proc_task is free to
+     * process new therapy notifications. */
     edf_task_args_t *edf_args = malloc(sizeof(edf_task_args_t));
     if (edf_args) {
         strlcpy(edf_args->session_dir, session_dir, sizeof(edf_args->session_dir));
@@ -1047,19 +1089,39 @@ static void stop_task(void *arg)
         if (edf_stack && edf_tcb) {
             s_prev_edf_stack = edf_stack;
             s_prev_edf_tcb = edf_tcb;
-            TaskHandle_t edf_handle = xTaskCreateStaticPinnedToCore(
-                edf_task, "edf_gen", edf_stack_size, edf_args, 5,
-                edf_stack, edf_tcb, 1);
-            if (edf_handle) {
-                ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1 "
-                         "(stack=%u PSRAM, internal_free=%u)",
-                         (unsigned)edf_stack_size,
-                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+            if (spool_current) {
+                /* Spool is fresh — launch EDF generation immediately. */
+                TaskHandle_t edf_handle = xTaskCreateStaticPinnedToCore(
+                    edf_task, "edf_gen", edf_stack_size, edf_args, 5,
+                    edf_stack, edf_tcb, 1);
+                if (edf_handle) {
+                    ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1 "
+                             "(spool current, stack=%u PSRAM)",
+                             (unsigned)edf_stack_size);
+                } else {
+                    ESP_LOGE(TAG, "stop_task: xTaskCreateStaticPinnedToCore failed");
+                    free(edf_stack); free(edf_tcb);
+                    s_prev_edf_stack = NULL; s_prev_edf_tcb = NULL;
+                    free(edf_args);
+                }
             } else {
-                ESP_LOGE(TAG, "stop_task: xTaskCreateStaticPinnedToCore failed");
-                free(edf_stack); free(edf_tcb);
-                s_prev_edf_stack = NULL; s_prev_edf_tcb = NULL;
-                free(edf_args);
+                /* Spool is stale — launch refresh task on core 0 that
+                 * retries the pull every 3s for up to 2 min, then
+                 * generates EDF when ready (or timeout). */
+                TaskHandle_t refresh_handle = xTaskCreateStaticPinnedToCore(
+                    spool_refresh_task, "spool_refresh", edf_stack_size, edf_args, 5,
+                    edf_stack, edf_tcb, 0);
+                if (refresh_handle) {
+                    ESP_LOGI(TAG, "stop_task: spool refresh task launched on core 0 "
+                             "(spool stale, stack=%u PSRAM)",
+                             (unsigned)edf_stack_size);
+                } else {
+                    ESP_LOGE(TAG, "stop_task: xTaskCreateStaticPinnedToCore failed");
+                    free(edf_stack); free(edf_tcb);
+                    s_prev_edf_stack = NULL; s_prev_edf_tcb = NULL;
+                    free(edf_args);
+                }
             }
         } else {
             ESP_LOGE(TAG, "stop_task: malloc failed for edf stack/tcb "

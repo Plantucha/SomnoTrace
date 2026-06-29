@@ -560,14 +560,20 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
 
     /* Total samples (per channel) and record count.
      * EDF records are 60 seconds each.  Sessions shorter than 60 seconds
-     * produce 0 data records (header-only file), matching AS11 behaviour. */
+     * produce 0 data records — the AS11 does not write a file at all. */
     uint32_t total_samples = hdr.sample_count;
     int total_records = total_samples / spr[0];
-    if (total_samples > 0 && total_records == 0) {
-        ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), writing 0 records",
-                 snt_path, total_samples, spr[0]);
-    }
     if (total_records < 0) total_records = 0;
+
+    /* AS11 does not write BRP/PLD/SA2 EDF files for sessions shorter than
+     * one data record (60 seconds).  Skip file creation to match. */
+    if (total_records == 0) {
+        ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), skipping EDF",
+                 snt_path, total_samples, spr[0]);
+        free(spr); free(sig);
+        fclose(snt);
+        return ESP_OK;
+    }
 
     ESP_LOGI(TAG, "converting %s → %s: %u samples, %d records, %d ch",
              snt_path, edf_path, total_samples, total_records, n_signals);
@@ -781,35 +787,63 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
         /* Varint field — decode the value */
         ctx->scalars[f->field] = pb_varint_val(f);
         ctx->has_scalar[f->field] = true;
-    } else if (f->field == 1 && f->wire == 2 && f->data && f->len > 0) {
-        /* Session entry submessage: sub-field 1 = timestamp, sub-field 2 = mode */
-        if (ctx->n_session_entries < 20) {
-            int64_t ts = 0, mode = 0;
-            size_t pos = 0;
-            while (pos < f->len) {
-                uint64_t tag = pb_decode_varint(f->data, f->len, &pos);
-                int sf = (int)(tag >> 3);
-                int sw = (int)(tag & 0x07);
-                if (sf == 0) break;
-                if (sw == 0) {
-                    int64_t val = (int64_t)pb_decode_varint(f->data, f->len, &pos);
-                    if (sf == 1) ts = val;
-                    else if (sf == 2) mode = val;
-                } else if (sw == 2) {
-                    size_t lpos = pos;
-                    uint64_t flen = pb_decode_varint(f->data, f->len, &lpos);
-                    pos = lpos + flen;
-                } else if (sw == 1) {
-                    pos += 8;
-                } else if (sw == 5) {
-                    pos += 4;
-                } else {
-                    break;
+    } else if (f->field == SUM_F_SESSION_MODE && f->wire == 2 && f->data && f->len > 0) {
+        /* SessionModeEntries (field 6): repeated wrapper submessages.
+         * Each wrapper (sub-field 1, wire 2) contains:
+         *   sub-sub-field 1 (varint) = timestamp (epoch ms)
+         *   sub-sub-field 2 (varint) = session mode */
+        size_t pos = 0;
+        while (pos < f->len && ctx->n_session_entries < 20) {
+            uint64_t tag = pb_decode_varint(f->data, f->len, &pos);
+            int sf = (int)(tag >> 3);
+            int sw = (int)(tag & 0x07);
+            if (sf == 0) break;
+            if (sw == 2 && sf == 1) {
+                /* Wrapper submessage for one session entry */
+                size_t lpos = pos;
+                uint64_t flen = pb_decode_varint(f->data, f->len, &lpos);
+                const uint8_t *inner = f->data + lpos;
+                size_t inner_len = (size_t)flen;
+                pos = lpos + flen;
+                int64_t ts = 0, mode = 0;
+                size_t ip = 0;
+                while (ip < inner_len) {
+                    uint64_t itag = pb_decode_varint(inner, inner_len, &ip);
+                    int isf = (int)(itag >> 3);
+                    int isw = (int)(itag & 0x07);
+                    if (isf == 0) break;
+                    if (isw == 0) {
+                        int64_t val = (int64_t)pb_decode_varint(inner, inner_len, &ip);
+                        if (isf == 1) ts = val;
+                        else if (isf == 2) mode = val;
+                    } else if (isw == 2) {
+                        size_t ilpos = ip;
+                        uint64_t ilen = pb_decode_varint(inner, inner_len, &ilpos);
+                        ip = ilpos + ilen;
+                    } else if (isw == 1) {
+                        ip += 8;
+                    } else if (isw == 5) {
+                        ip += 4;
+                    } else {
+                        break;
+                    }
                 }
+                ctx->session_entries[ctx->n_session_entries].ts = ts;
+                ctx->session_entries[ctx->n_session_entries].mode = mode;
+                ctx->n_session_entries++;
+            } else if (sw == 2) {
+                size_t lpos = pos;
+                uint64_t flen = pb_decode_varint(f->data, f->len, &lpos);
+                pos = lpos + flen;
+            } else if (sw == 0) {
+                (void)pb_decode_varint(f->data, f->len, &pos);
+            } else if (sw == 1) {
+                pos += 8;
+            } else if (sw == 5) {
+                pos += 4;
+            } else {
+                break;
             }
-            ctx->session_entries[ctx->n_session_entries].ts = ts;
-            ctx->session_entries[ctx->n_session_entries].mode = mode;
-            ctx->n_session_entries++;
         }
     } else if (f->wire == 2 && f->data && f->len > 0) {
         /* Length-delimited — could be a metric submessage or raw bytes.
@@ -914,7 +948,9 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
 {
     /* Session core [4-5] — logical_scale = 1, no conversion needed */
     str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);  /* Duration */
-    int mode_raw = get_scalar(ctx, SUM_F_SESSION_MODE, 0);
+    int mode_raw = 0;
+    if (ctx->n_session_entries > 0)
+        mode_raw = (int)ctx->session_entries[0].mode - 1;  /* 1-indexed → 0-indexed */
     if (mode_raw >= 0 && mode_raw < (int)(sizeof(MODE_MAP) / sizeof(MODE_MAP[0]))) {
         str_values[5] = MODE_MAP[mode_raw];
     } else {
@@ -1138,27 +1174,34 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
     int64_t noon_epoch_ms = (int64_t)t * 1000;
 
     /* [1-3] MaskOn/MaskOff/MaskEvents from session entries.
-     * Session entries alternate: even index = MaskOn, odd = MaskOff. */
+     * Session entries are all MaskOn (session start) timestamps.
+     * MaskOff is computed as MaskOn + per_session_duration, where
+     * per_session_duration = DurationMin / SessionCount. */
     int mask_on_count = 0;
     int mask_off_count = 0;
 
-    for (int i = 0; i < ctx->n_session_entries && mask_on_count < 20 && mask_off_count < 20; i++) {
+    int duration_min = (int)get_scalar(ctx, SUM_F_DURATION_MIN, 0);
+    int session_count = (int)get_scalar(ctx, SUM_F_SESSION_COUNT, 0);
+    if (session_count <= 0)
+        session_count = ctx->n_session_entries;
+    int per_session_min = (session_count > 0) ? (duration_min / session_count) : 0;
+
+    for (int i = 0; i < ctx->n_session_entries && mask_on_count < 20; i++) {
         int64_t ev_ms = ctx->session_entries[i].ts;
         int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
 
-        if (i % 2 == 0) {
-            if (mask_on_count == 0)
-                str_values[1] = (int16_t)min_from_noon;
-            else
-                mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
-            mask_on_count++;
-        } else {
-            if (mask_off_count == 0)
-                str_values[2] = (int16_t)min_from_noon;
-            else
-                mask_off_extra[mask_off_count - 1] = (int16_t)min_from_noon;
-            mask_off_count++;
-        }
+        if (mask_on_count == 0)
+            str_values[1] = (int16_t)min_from_noon;
+        else
+            mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
+        mask_on_count++;
+
+        int off_min = min_from_noon + per_session_min;
+        if (mask_off_count == 0)
+            str_values[2] = (int16_t)off_min;
+        else
+            mask_off_extra[mask_off_count - 1] = (int16_t)off_min;
+        mask_off_count++;
     }
 
     /* Fallback: use PeriodStart/PeriodEnd if no session entries */
