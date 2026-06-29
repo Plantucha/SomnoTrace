@@ -35,6 +35,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "edf_gen";
@@ -633,7 +634,18 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     /* Raw buffer must hold snt_channels per sample (interleaved) */
     size_t raw_record_bytes = samples_per_record * snt_channels * sizeof(int16_t);
     int16_t *raw = malloc(raw_record_bytes);          /* interleaved input */
-    int16_t *record_buf = malloc(record_bytes);       /* de-interleaved output */
+    /* record_buf is written to the SD card via fwrite.  It MUST live in
+     * PSRAM: the ESP32-S3 SDMMC driver mishandles direct multi-sector DMA
+     * writes from internal RAM (the full-sector chunk is silently written
+     * as zeros), whereas PSRAM source buffers are bounced through an aligned
+     * internal buffer and write correctly.  Without this, any EDF data
+     * region larger than one sector (e.g. the 6000-byte BRP record) is
+     * zeroed on disk except for the trailing partial sector.  Fall back to
+     * internal RAM if PSRAM is unavailable. */
+    int16_t *record_buf = heap_caps_malloc(record_bytes, MALLOC_CAP_SPIRAM);
+    if (!record_buf) {
+        record_buf = malloc(record_bytes);
+    }
     if (!raw || !record_buf) {
         ESP_LOGE(TAG, "malloc record buffers failed");
         free(raw); free(record_buf); free(spr); free(sig);
