@@ -99,15 +99,18 @@ and are already in EDF digital units (e.g. pressures × 50, temperatures
 
 #### 4.3.3 Current day in STR.edf
 
-The AS11 includes the **current (in-progress) noon-day** in the Summary
-spool with all accumulated stats.  Therefore `collect_summary_spool()`
-already captures and stores it as `YYYYMMDD.spool`.  No separate live
-`Get` RPC query is needed for current-day stats.
+The AS11 only includes **completed noon-days** in the Summary spool.  The
+current in-progress noon-day (which ends at noon on the next calendar day)
+is NOT included until it is complete.  Therefore `collect_summary_spool()`
+typically captures the previous day's record but not the current one.
 
-`build_current_day_record()` remains as a fallback for when the spool
-pull fails entirely — it synthesizes Date, MaskOn/MaskOff, MaskEvents,
-and Duration from `events.snt` and session timing, with -1 sentinels for
-all other fields.
+`build_current_day_record()` synthesizes a minimal STR record for the
+current session's noon-day when no matching spool record exists.  It
+populates Date, MaskOn/MaskOff, MaskEvents, and Duration from
+`events.snt` and session timing, with -1 sentinels for all other fields.
+The full stats for the current day will appear in the next session's
+STR.edf (after the noon-day completes and the AS11 includes it in the
+Summary spool).
 
 ### 4.4 Error handling & edge cases
 
@@ -122,7 +125,8 @@ all other fields.
 
 - [x] STR.edf stats fields match AS11 firmware output (verified via
       live BLE spool vs Get RPC comparison, 2026-06-29).
-- [x] Current noon-day included in STR.edf via Summary spool.
+- [ ] Current noon-day synthesized via `build_current_day_record()` when
+      spool doesn't include it (debug logging added, needs verification).
 - [ ] Multi-day STR.edf opens correctly in OSCAR.
 - [ ] BRP/PLD/SA2/EVE EDF files match AS11 SD card output.
 

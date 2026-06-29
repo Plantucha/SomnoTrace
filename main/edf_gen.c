@@ -1424,16 +1424,24 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
      * If not, synthesize a record from the current session's data. */
     char current_day_label[16];
     noon_day_folder(start_epoch_ms, current_day_label, sizeof(current_day_label));
+    ESP_LOGI(TAG, "STR.edf: current day label=%s (start_epoch_ms=%lld)",
+             current_day_label, (long long)start_epoch_ms);
     bool current_day_found = false;
     for (int i = 0; i < n_records; i++) {
         char rec_day[16];
         noon_day_folder(records[i].period_start, rec_day, sizeof(rec_day));
+        ESP_LOGI(TAG, "STR.edf: record[%d] day=%s (period_start=%lld)",
+                 i, rec_day, (long long)records[i].period_start);
         if (strcmp(rec_day, current_day_label) == 0) {
             current_day_found = true;
             break;
         }
     }
+    ESP_LOGI(TAG, "STR.edf: current_day_found=%d n_records=%d",
+             current_day_found, n_records);
     if (!current_day_found && n_records < 30) {
+        ESP_LOGI(TAG, "STR.edf: synthesizing current day record (day=%s)",
+                 current_day_label);
         build_current_day_record(&records[n_records], session_dir,
                                  session_id,
                                  start_epoch_ms, end_epoch_ms, settings_json);
@@ -2144,6 +2152,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     ESP_LOGI(TAG, "=== EDF GENERATION START ===");
     ESP_LOGI(TAG, "session=%s id=%s drift=%lldms",
              session_dir, session_id, (long long)clock_drift_ms);
+    ESP_LOGI(TAG, "start_epoch_ms=%lld end_epoch_ms=%lld",
+             (long long)start_epoch_ms, (long long)end_epoch_ms);
 
     /* ── Create SDCARD export directory structure ──
      * EDF files go to /somnotrace/SDCARD/DATALOG/YYYYMMDD/
