@@ -2495,9 +2495,16 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         errors++;
     }
 
-    /* ── Copy settings to SDCARD/SETTINGS/CurrentSettings.json ── */
+    /* ── Copy settings to SDCARD/SETTINGS/CurrentSettings.json ──
+     * The device returns {"SettingProfiles":{...}} but AS11 nests this under
+     * a "FlowGenerator" wrapper: {"FlowGenerator":{"SettingProfiles":{...}}}.
+     * Use a reference wrapper so the original `settings` tree is freed once
+     * below (cJSON_AddItemReferenceToObject does not transfer ownership). */
     if (settings) {
-        char *settings_str = cJSON_PrintUnformatted(settings);
+        cJSON *cs_root = cJSON_CreateObject();
+        cJSON_AddItemReferenceToObject(cs_root, "FlowGenerator", settings);
+        char *settings_str = cJSON_PrintUnformatted(cs_root);
+        cJSON_Delete(cs_root);
         if (settings_str) {
             char cs_path[300];
             snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", SD_SDCARD_SETTINGS);
