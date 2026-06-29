@@ -1197,7 +1197,7 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
             mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
         mask_on_count++;
 
-        int off_min = min_from_noon + per_session_min;
+        int off_min = min_from_noon + (ctx->session_entries[i].mode != 0 ? per_session_min : 0);
         if (mask_off_count == 0)
             str_values[2] = (int16_t)off_min;
         else
