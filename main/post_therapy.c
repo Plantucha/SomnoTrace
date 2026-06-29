@@ -208,12 +208,15 @@ static esp_err_t collect_summary_spool(int64_t clock_drift_ms)
             const uint8_t *rec = data + pos;
             size_t rec_len = (size_t)flen;
 
-            /* Extract PeriodStart from this day record */
+            /* Extract PeriodStart from this day record.
+             * Use the raw AS11 timestamp (no drift correction) for the
+             * noon-day label — the AS11 defines its noon-day boundaries
+             * by its own clock, and edf_gen.c also uses raw PeriodStart
+             * for day classification.  Applying drift here would shift
+             * the label by one day when the corrected time falls before
+             * noon (e.g. 12:00 AS11 → 11:52 NTP → wrong day). */
             int64_t period_start = extract_period_start(rec, rec_len);
             if (period_start > 0) {
-                /* Apply clock drift correction */
-                period_start += clock_drift_ms;
-
                 char day_label[16];
                 noon_day_from_epoch(period_start, day_label, sizeof(day_label));
 

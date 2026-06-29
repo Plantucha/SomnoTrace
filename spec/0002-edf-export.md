@@ -99,18 +99,21 @@ and are already in EDF digital units (e.g. pressures × 50, temperatures
 
 #### 4.3.3 Current day in STR.edf
 
-The AS11 only includes **completed noon-days** in the Summary spool.  The
-current in-progress noon-day (which ends at noon on the next calendar day)
-is NOT included until it is complete.  Therefore `collect_summary_spool()`
-typically captures the previous day's record but not the current one.
+The AS11 **does include the current in-progress noon-day** in the Summary
+spool.  The PeriodStart/PeriodEnd span the full noon-to-noon window even
+while the day is still in progress, and DurationMin accumulates as
+sessions are added.
 
-`build_current_day_record()` synthesizes a minimal STR record for the
-current session's noon-day when no matching spool record exists.  It
-populates Date, MaskOn/MaskOff, MaskEvents, and Duration from
-`events.snt` and session timing, with -1 sentinels for all other fields.
-The full stats for the current day will appear in the next session's
-STR.edf (after the noon-day completes and the AS11 includes it in the
-Summary spool).
+`collect_summary_spool()` captures and stores it as `YYYYMMDD.spool`,
+where the filename is derived from the raw AS11 PeriodStart (no clock
+drift correction).  This is critical: applying drift correction before
+computing the noon-day label can shift the day by one when the corrected
+time falls before noon (e.g. 12:00 AS11 → 11:52 NTP → previous day).
+
+`build_current_day_record()` remains as a fallback for when the spool
+pull fails entirely — it synthesizes Date, MaskOn/MaskOff, MaskEvents,
+and Duration from `events.snt` and session timing, with -1 sentinels for
+all other fields.
 
 ### 4.4 Error handling & edge cases
 
@@ -118,15 +121,17 @@ Summary spool).
 - Spool pull failure → `build_current_day_record()` synthesizes a
   minimal record from session events.
 - Missing settings JSON → settings fields [6-30] remain -1 sentinel.
-- Clock drift correction applied to `PeriodStart` before noon-day
-  classification.
+- Spool filenames use raw AS11 PeriodStart for noon-day classification
+  (no drift correction) — consistent with `edf_gen.c`'s day matching.
 
 ## 5. Acceptance criteria
 
 - [x] STR.edf stats fields match AS11 firmware output (verified via
       live BLE spool vs Get RPC comparison, 2026-06-29).
-- [ ] Current noon-day synthesized via `build_current_day_record()` when
-      spool doesn't include it (debug logging added, needs verification).
+- [x] Current in-progress noon-day included in Summary spool (verified
+      via FTP fetch + Python protobuf parse, 2026-06-29).
+- [x] Spool filename uses raw AS11 PeriodStart (no drift correction)
+      — fixed in `post_therapy.c`.
 - [ ] Multi-day STR.edf opens correctly in OSCAR.
 - [ ] BRP/PLD/SA2/EVE EDF files match AS11 SD card output.
 
