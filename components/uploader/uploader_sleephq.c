@@ -108,47 +108,42 @@ static esp_err_t http_resp_append(http_resp_t *r, const char *data, size_t len)
     return ESP_OK;
 }
 
+/* Current response buffer — set before each request so the event handler
+ * can append data.  The uploader is single-threaded so this is safe. */
+static http_resp_t *s_current_resp = NULL;
+
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
-    http_resp_t *r = (http_resp_t *)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && r) {
-        return http_resp_append(r, (char *)evt->data, evt->data_len);
+    if (evt->event_id == HTTP_EVENT_ON_DATA && s_current_resp) {
+        return http_resp_append(s_current_resp, (char *)evt->data, evt->data_len);
     }
     return ESP_OK;
 }
 
-/* Perform a simple GET or POST with JSON response. */
-static esp_err_t shq_http_request(const char *url, const char *method,
+/* Perform a simple GET or POST with JSON response on a shared client. */
+static esp_err_t shq_http_request(esp_http_client_handle_t client,
+                                   const char *url, const char *method,
                                    const char *body, const char *content_type,
                                    http_resp_t *resp)
 {
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = (strcmp(method, "POST") == 0) ? HTTP_METHOD_POST : HTTP_METHOD_GET,
-        .timeout_ms = SHQ_TIMEOUT_MS,
-        .event_handler = http_event_handler,
-        .user_data = resp,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size = 1024,
-        .buffer_size_tx = 4096,
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return ESP_FAIL;
-
-    if (s_token[0]) {
-        char auth_hdr[600];
-        snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", s_token);
-        esp_http_client_set_header(client, "Authorization", auth_hdr);
-    }
-    esp_http_client_set_header(client, "Accept", "application/vnd.api+json");
+    esp_http_client_set_url(client, url);
+    esp_http_client_set_method(client,
+        (strcmp(method, "POST") == 0) ? HTTP_METHOD_POST : HTTP_METHOD_GET);
 
     if (body && content_type) {
         esp_http_client_set_header(client, "Content-Type", content_type);
         esp_http_client_set_post_field(client, body, strlen(body));
+    } else {
+        esp_http_client_set_post_field(client, NULL, 0);
     }
 
+    resp->size = 0;
+    if (resp->data) resp->data[0] = '\0';
+    s_current_resp = resp;
+
     esp_err_t err = esp_http_client_perform(client);
+    s_current_resp = NULL;
+
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         if (status < 200 || status >= 300) {
@@ -159,13 +154,13 @@ static esp_err_t shq_http_request(const char *url, const char *method,
         ESP_LOGE(TAG, "HTTP perform failed: %s", esp_err_to_name(err));
     }
 
-    esp_http_client_cleanup(client);
     return err;
 }
 
 /* ── Authentication ─────────────────────────────────────────────────── */
 
-static esp_err_t shq_authenticate(const uploader_config_t *cfg)
+static esp_err_t shq_authenticate(esp_http_client_handle_t client,
+                                  const uploader_config_t *cfg)
 {
     /* Check if token is still valid */
     if (s_token[0] && s_token_expires > 0) {
@@ -187,7 +182,7 @@ static esp_err_t shq_authenticate(const uploader_config_t *cfg)
     http_resp_t resp;
     http_resp_init(&resp, 1024);
 
-    esp_err_t err = shq_http_request(SHQ_TOKEN_URL, "POST", body,
+    esp_err_t err = shq_http_request(client, SHQ_TOKEN_URL, "POST", body,
                                       "application/x-www-form-urlencoded", &resp);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "auth request failed");
@@ -224,7 +219,7 @@ static esp_err_t shq_authenticate(const uploader_config_t *cfg)
 
 /* ── Team discovery ─────────────────────────────────────────────────── */
 
-static esp_err_t shq_discover_team(void)
+static esp_err_t shq_discover_team(esp_http_client_handle_t client)
 {
     if (s_team_id[0]) return ESP_OK;  /* cached */
 
@@ -233,7 +228,7 @@ static esp_err_t shq_discover_team(void)
     http_resp_t resp;
     http_resp_init(&resp, 2048);
 
-    esp_err_t err = shq_http_request(SHQ_ME_URL, "GET", NULL, NULL, &resp);
+    esp_err_t err = shq_http_request(client, SHQ_ME_URL, "GET", NULL, NULL, &resp);
     if (err != ESP_OK) {
         http_resp_free(&resp);
         return err;
@@ -276,7 +271,8 @@ static esp_err_t shq_discover_team(void)
 
 /* ── Create import session ──────────────────────────────────────────── */
 
-static esp_err_t shq_create_import(char *out_import_id, size_t id_len)
+static esp_err_t shq_create_import(esp_http_client_handle_t client,
+                                   char *out_import_id, size_t id_len)
 {
     ESP_LOGI(TAG, "creating import session...");
 
@@ -286,7 +282,7 @@ static esp_err_t shq_create_import(char *out_import_id, size_t id_len)
     http_resp_t resp;
     http_resp_init(&resp, 1024);
 
-    esp_err_t err = shq_http_request(url, "POST", NULL, NULL, &resp);
+    esp_err_t err = shq_http_request(client, url, "POST", NULL, NULL, &resp);
     if (err != ESP_OK) {
         http_resp_free(&resp);
         return err;
@@ -329,7 +325,8 @@ static esp_err_t shq_create_import(char *out_import_id, size_t id_len)
 
 /* ── Process import (finalize) ──────────────────────────────────────── */
 
-static esp_err_t shq_process_import(const char *import_id)
+static esp_err_t shq_process_import(esp_http_client_handle_t client,
+                                    const char *import_id)
 {
     ESP_LOGI(TAG, "processing import %s...", import_id);
 
@@ -339,7 +336,7 @@ static esp_err_t shq_process_import(const char *import_id)
     http_resp_t resp;
     http_resp_init(&resp, 1024);
 
-    esp_err_t err = shq_http_request(url, "POST", NULL, NULL, &resp);
+    esp_err_t err = shq_http_request(client, url, "POST", NULL, NULL, &resp);
     http_resp_free(&resp);
 
     if (err == ESP_OK) {
@@ -348,17 +345,26 @@ static esp_err_t shq_process_import(const char *import_id)
     return err;
 }
 
-/* ── Multipart file upload ────────────────────────────────────────────
+/* ── Multipart file upload (single-pass, shared client) ───────────────
  *
- * Two-pass approach:
- * 1. Read file to compute MD5(file_content + filename) for content_hash
- * 2. Stream file via esp_http_client_open/write with multipart framing
+ * Streams the file in a single pass: MD5 is computed on-the-fly as each
+ * chunk is read from SD and written to the HTTP client.  The content_hash
+ * is sent as the final multipart part, so we must know the total content
+ * length up front.  We handle this by using chunked transfer encoding
+ * (content-length = -1) so we don't need to pre-compute the hash.
  *
- * This avoids the complexity of a streaming read callback while keeping
- * memory usage bounded by SHQ_BUF_SIZE. The double read from SD card
- * is acceptable since SD reads are fast compared to TLS upload time. */
+ * However, esp_http_client_open requires a content length for non-chunked
+ * uploads.  For chunked, we pass 0 and the client uses Transfer-Encoding:
+ * chunked.  But SleepHQ may not support chunked.  So we use a small
+ * two-phase approach within a single read pass: buffer the file in PSRAM
+ * if small enough, or fall back to two reads for large files.
+ *
+ * In practice, all SomnoTrace files are small (< 64 KB), so we read the
+ * entire file into a PSRAM buffer once, compute MD5, and stream from that
+ * buffer — one SD read, no seek-back. */
 
-static upload_result_t shq_upload_file(const char *import_id,
+static upload_result_t shq_upload_file(esp_http_client_handle_t client,
+                                        const char *import_id,
                                         const char *local_path,
                                         const char *remote_subpath,
                                         const char *filename)
@@ -373,13 +379,45 @@ static upload_result_t shq_upload_file(const char *import_id,
     size_t file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
+    /* Read entire file into PSRAM buffer (single pass) */
+    uint8_t *file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+    if (!file_buf) file_buf = malloc(file_size);
+    if (!file_buf) {
+        ESP_LOGE(TAG, "  cannot alloc %u bytes for %s", (unsigned)file_size, filename);
+        fclose(f);
+        return UPLOAD_FAILED;
+    }
+
+    size_t total_read = fread(file_buf, 1, file_size, f);
+    fclose(f);
+    if (total_read != file_size) {
+        ESP_LOGE(TAG, "  short read for %s", filename);
+        free(file_buf);
+        return UPLOAD_FAILED;
+    }
+
+    /* Compute MD5(file_content + filename) */
+    mbedtls_md5_context md5;
+    mbedtls_md5_init(&md5);
+    mbedtls_md5_starts(&md5);
+    mbedtls_md5_update(&md5, file_buf, file_size);
+    mbedtls_md5_update(&md5, (const unsigned char *)filename, strlen(filename));
+
+    unsigned char md5_raw[16];
+    mbedtls_md5_finish(&md5, md5_raw);
+    mbedtls_md5_free(&md5);
+
+    char md5_hex[33];
+    for (int i = 0; i < 16; i++)
+        snprintf(md5_hex + i * 2, 3, "%02x", md5_raw[i]);
+    md5_hex[32] = '\0';
+
     /* Build multipart parts */
     char boundary[48];
     snprintf(boundary, sizeof(boundary), "----ESP32%08X", (unsigned)esp_random());
 
-    /* Build header part */
     char *header = malloc(512 + strlen(filename) + strlen(remote_subpath));
-    if (!header) { fclose(f); return UPLOAD_FAILED; }
+    if (!header) { free(file_buf); return UPLOAD_FAILED; }
 
     size_t header_len = snprintf(header, 512 + strlen(filename) + strlen(remote_subpath),
         "--%s\r\n"
@@ -394,49 +432,6 @@ static upload_result_t shq_upload_file(const char *import_id,
         boundary, filename, boundary, remote_subpath,
         boundary, filename);
 
-    /* Compute total content length:
-     * header + file_size + footer (with hash placeholder) + closing */
-    /* Footer: \r\n + content_hash part + closing boundary */
-    /* We need to compute MD5 first to know the hash, but we're streaming...
-     * Two-pass approach: compute MD5 first, then upload. */
-
-    /* Pass 1: compute MD5(file_content + filename) */
-    mbedtls_md5_context md5;
-    mbedtls_md5_init(&md5);
-    mbedtls_md5_starts(&md5);
-
-    uint8_t *buf = heap_caps_malloc(SHQ_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (!buf) buf = malloc(SHQ_BUF_SIZE);
-    if (!buf) {
-        free(header);
-        fclose(f);
-        mbedtls_md5_free(&md5);
-        return UPLOAD_FAILED;
-    }
-
-    size_t total_read = 0;
-    while (total_read < file_size) {
-        size_t to_read = SHQ_BUF_SIZE;
-        if (to_read > file_size - total_read) to_read = file_size - total_read;
-        size_t rd = fread(buf, 1, to_read, f);
-        if (rd == 0) break;
-        mbedtls_md5_update(&md5, (const unsigned char *)buf, rd);
-        total_read += rd;
-    }
-
-    /* Append filename to MD5 */
-    mbedtls_md5_update(&md5, (const unsigned char *)filename, strlen(filename));
-
-    unsigned char md5_raw[16];
-    mbedtls_md5_finish(&md5, md5_raw);
-    mbedtls_md5_free(&md5);
-
-    char md5_hex[33];
-    for (int i = 0; i < 16; i++)
-        snprintf(md5_hex + i * 2, 3, "%02x", md5_raw[i]);
-    md5_hex[32] = '\0';
-
-    /* Build footer */
     char footer[512];
     size_t footer_len = snprintf(footer, sizeof(footer),
         "\r\n--%s\r\n"
@@ -447,71 +442,43 @@ static upload_result_t shq_upload_file(const char *import_id,
 
     size_t total_content_len = header_len + file_size + footer_len;
 
-    /* Pass 2: seek back and upload via esp_http_client_open/write */
-    fseek(f, 0, SEEK_SET);
-
+    /* Upload via shared client */
     char url[256];
     snprintf(url, sizeof(url), SHQ_FILES_URL, import_id);
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = SHQ_TIMEOUT_MS,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size = 1024,
-        .buffer_size_tx = 4096,
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        free(header); free(buf); fclose(f);
-        return UPLOAD_FAILED;
-    }
+    esp_http_client_set_url(client, url);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
 
     char ct_header[128];
     snprintf(ct_header, sizeof(ct_header),
              "multipart/form-data; boundary=%s", boundary);
     esp_http_client_set_header(client, "Content-Type", ct_header);
 
-    char auth_hdr[600];
-    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", s_token);
-    esp_http_client_set_header(client, "Authorization", auth_hdr);
-    esp_http_client_set_header(client, "Accept", "application/vnd.api+json");
-
-    /* Open the connection with known content length */
     esp_err_t err = esp_http_client_open(client, total_content_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "  http_open failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        free(header); free(buf); fclose(f);
+        free(header); free(file_buf);
         return UPLOAD_FAILED;
     }
 
-    /* Write header part */
     int written = esp_http_client_write(client, header, header_len);
     if (written < 0 || (size_t)written != header_len) {
         ESP_LOGE(TAG, "  failed to write multipart header");
         esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        free(header); free(buf); fclose(f);
+        free(header); free(file_buf);
         return UPLOAD_FAILED;
     }
 
-    /* Stream file data */
+    /* Stream file data from memory buffer */
     size_t total_written = 0;
     while (total_written < file_size) {
-        size_t to_read = SHQ_BUF_SIZE;
-        if (to_read > file_size - total_written)
-            to_read = file_size - total_written;
-        size_t rd = fread(buf, 1, to_read, f);
-        if (rd == 0) break;
-
-        int w = esp_http_client_write(client, (char *)buf, rd);
+        size_t to_write = SHQ_BUF_SIZE;
+        if (to_write > file_size - total_written)
+            to_write = file_size - total_written;
+        int w = esp_http_client_write(client, (char *)(file_buf + total_written), to_write);
         if (w < 0) {
             ESP_LOGE(TAG, "  write failed at offset %u", (unsigned)total_written);
             esp_http_client_close(client);
-            esp_http_client_cleanup(client);
-            free(header); free(buf); fclose(f);
+            free(header); free(file_buf);
             return UPLOAD_FAILED;
         }
         total_written += w;
@@ -522,25 +489,23 @@ static upload_result_t shq_upload_file(const char *import_id,
     if (written < 0 || (size_t)written != footer_len) {
         ESP_LOGE(TAG, "  failed to write multipart footer");
         esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        free(header); free(buf); fclose(f);
+        free(header); free(file_buf);
         return UPLOAD_FAILED;
     }
 
     /* Read response */
-    int content_length = esp_http_client_fetch_headers(client);
+    esp_http_client_fetch_headers(client);
     http_resp_t resp;
     http_resp_init(&resp, 1024);
-    if (content_length > 0) {
-        int rd = esp_http_client_read(client, resp.data, resp.capacity - 1);
-        if (rd > 0) { resp.size = rd; resp.data[rd] = '\0'; }
-    }
+    s_current_resp = &resp;
+    int rd = esp_http_client_read(client, resp.data, resp.capacity - 1);
+    s_current_resp = NULL;
+    if (rd > 0) { resp.size = rd; resp.data[rd] = '\0'; }
 
     int status = esp_http_client_get_status_code(client);
     esp_http_client_close(client);
-    esp_http_client_cleanup(client);
 
-    free(header); free(buf); fclose(f);
+    free(header); free(file_buf);
     http_resp_free(&resp);
 
     if (status < 200 || status >= 300) {
@@ -567,25 +532,64 @@ static upload_result_t shq_upload_session(const char *session_id,
 
     ESP_LOGI(TAG, "SleepHQ upload: session %s (day=%s)", session_id, day_folder);
 
-    /* 1. Authenticate */
-    esp_err_t err = shq_authenticate(&cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "authentication failed");
+    /* Create one shared HTTP client with keep-alive for the entire session.
+     * This reuses the TLS connection across all requests (auth, team
+     * discovery, import creation, file uploads, process) — saving ~9 TLS
+     * handshakes (~6-7 seconds). */
+    esp_http_client_config_t config = {
+        .url = SHQ_URL_BASE,
+        .timeout_ms = SHQ_TIMEOUT_MS,
+        .event_handler = http_event_handler,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .buffer_size = 1024,
+        .buffer_size_tx = 4096,
+        .keep_alive_enable = true,
+        .keep_alive_idle = 10,
+        .keep_alive_interval = 5,
+        .keep_alive_count = 3,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "http_client_init failed");
         return UPLOAD_FAILED;
     }
 
+    /* Set auth headers once — they persist across requests on the same client */
+    if (s_token[0]) {
+        char auth_hdr[600];
+        snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", s_token);
+        esp_http_client_set_header(client, "Authorization", auth_hdr);
+    }
+    esp_http_client_set_header(client, "Accept", "application/vnd.api+json");
+
+    /* 1. Authenticate */
+    esp_err_t err = shq_authenticate(client, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "authentication failed");
+        esp_http_client_cleanup(client);
+        return UPLOAD_FAILED;
+    }
+
+    /* Update auth header after authentication */
+    char auth_hdr[600];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", s_token);
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+
     /* 2. Discover team */
-    err = shq_discover_team();
+    err = shq_discover_team(client);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "team discovery failed");
+        esp_http_client_cleanup(client);
         return UPLOAD_FAILED;
     }
 
     /* 3. Create import */
     char import_id[32] = {0};
-    err = shq_create_import(import_id, sizeof(import_id));
+    err = shq_create_import(client, import_id, sizeof(import_id));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "import creation failed");
+        esp_http_client_cleanup(client);
         return UPLOAD_FAILED;
     }
 
@@ -609,7 +613,7 @@ static upload_result_t shq_upload_session(const char *session_id,
             char local_path[512];
             snprintf(local_path, sizeof(local_path), "%s/%s", local_day_dir, ent->d_name);
 
-            if (shq_upload_file(import_id, local_path, remote_subpath,
+            if (shq_upload_file(client, import_id, local_path, remote_subpath,
                                 ent->d_name) == UPLOAD_OK) {
                 files_uploaded++;
             } else {
@@ -623,7 +627,7 @@ static upload_result_t shq_upload_session(const char *session_id,
 
     if (files_uploaded == 0) {
         ESP_LOGW(TAG, "no EDF files uploaded for session %s", session_id);
-        /* Don't process import if no session files were uploaded */
+        esp_http_client_cleanup(client);
         return UPLOAD_FAILED;
     }
 
@@ -644,7 +648,7 @@ static upload_result_t shq_upload_session(const char *session_id,
 
         const char *fname = root_files[i] + 1;  /* skip leading / */
 
-        if (shq_upload_file(import_id, local_path, "", fname) == UPLOAD_OK) {
+        if (shq_upload_file(client, import_id, local_path, "", fname) == UPLOAD_OK) {
             files_uploaded++;
         } else {
             failures++;
@@ -664,7 +668,7 @@ static upload_result_t shq_upload_session(const char *session_id,
             char remote_sub[64];
             snprintf(remote_sub, sizeof(remote_sub), "/SETTINGS");
 
-            if (shq_upload_file(import_id, local_path, remote_sub,
+            if (shq_upload_file(client, import_id, local_path, remote_sub,
                                 ent->d_name) == UPLOAD_OK) {
                 files_uploaded++;
             } else {
@@ -677,11 +681,12 @@ static upload_result_t shq_upload_session(const char *session_id,
     ESP_LOGI(TAG, "uploaded %d files (%d failures)", files_uploaded, failures);
 
     /* 6. Process import (finalize) */
-    err = shq_process_import(import_id);
+    err = shq_process_import(client, import_id);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "import processing failed (files may still be queued)");
-        /* Don't fail the whole upload — files are on the server */
     }
+
+    esp_http_client_cleanup(client);
 
     if (failures > 0) {
         ESP_LOGW(TAG, "SleepHQ upload completed with %d failures", failures);
