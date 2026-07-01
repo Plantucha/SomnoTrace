@@ -36,9 +36,11 @@
 #include "sd_storage.h"
 #include "session_writer.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "ftp.h"
 #include "time_sync.h"
+#include "uploader.h"
 
 
 static const char *TAG = "somnotrace";
@@ -100,6 +102,9 @@ void app_main(void)
     if (as11_ble_init() != ESP_OK) {
         ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
     }
+    ESP_LOGI(TAG, "[heap] after BLE init: internal free=%u min=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 
     /* 4c. Initialise SD card storage and session writer. Non-fatal. */
     if (sd_storage_init() != ESP_OK) {
@@ -136,6 +141,9 @@ void app_main(void)
 
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Wi-Fi connected, IP=%s", ip);
+        ESP_LOGI(TAG, "[heap] after WiFi: internal free=%u min=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         bsp_display_set_wifi_connected(true);
         netprov_start_connected_server(ip);
         time_sync_init();
@@ -143,6 +151,9 @@ void app_main(void)
         if (sd_storage_is_ready()) {
             ftp_server_start();
         }
+
+        /* Initialise upload system (needs Wi-Fi + NVS + SD card). */
+        uploader_init();
 
         char ip_line[32];
         snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);

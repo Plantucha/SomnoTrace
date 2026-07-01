@@ -6,6 +6,7 @@
 #include "net_provision.h"
 #include "as11_ble.h"
 #include "time_sync.h"
+#include "uploader.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_http_server.h"
@@ -444,6 +446,24 @@ static const char PORTAL_HTML[] =
 "</div>"
 "<div id=\"ble-status\" class=\"status-msg\"></div>"
 "</div>"
+"<div class=\"wifi-block\" style=\"margin-top:20px;text-align:left\">"
+"<div class=\"block-header\"><span class=\"block-title\">Upload Settings</span></div>"
+"<div class=\"form-group\"><label>SMB Server</label><input id=\"smb-host\" type=\"text\" placeholder=\"e.g. 192.168.1.100\"></div>"
+"<div class=\"form-group\"><label>SMB Share</label><input id=\"smb-share\" type=\"text\" placeholder=\"e.g. sleep\"></div>"
+"<div class=\"form-group\" style=\"display:flex;gap:8px\">"
+"<div style=\"flex:1\"><label>User</label><input id=\"smb-user\" type=\"text\" placeholder=\"guest\"></div>"
+"<div style=\"flex:1\"><label>Password</label><input id=\"smb-pass\" type=\"password\" placeholder=\"(blank for guest)\"></div></div>"
+"<div class=\"form-group\"><label>SMB Path</label><input id=\"smb-path\" type=\"text\" placeholder=\"/SomnoTrace\"></div>"
+"<div style=\"border-top:1px solid var(--border-color);margin:16px 0;padding-top:16px\"></div>"
+"<div class=\"form-group\"><label>SleepHQ API Key (Client ID)</label><input id=\"shq-cid\" type=\"text\" placeholder=\"API key\"></div>"
+"<div class=\"form-group\"><label>SleepHQ Client Secret</label><input id=\"shq-secret\" type=\"password\" placeholder=\"Client secret\"></div>"
+"<button type=\"button\" class=\"primary\" onclick=\"saveUpload()\">Save Upload Settings</button>"
+"<div id=\"upload-save-status\" class=\"status-msg\"></div>"
+"<div style=\"border-top:1px solid var(--border-color);margin:16px 0;padding-top:16px\"></div>"
+"<div class=\"block-header\"><span class=\"block-title\">Upload Status</span></div>"
+"<div id=\"upload-status\" style=\"font-size:0.8rem;color:var(--text-muted);max-height:200px;overflow-y:auto\"></div>"
+"<button type=\"button\" class=\"secondary\" style=\"margin-top:8px\" onclick=\"loadUploadStatus()\">Refresh Status</button>"
+"</div>"
 "</div>"
 "</div>"
 "<script>"
@@ -620,7 +640,34 @@ static const char PORTAL_HTML[] =
 "bleStatusMsg(d.state==='paired'?'Paired successfully':'')}"
 "else{paired.style.display='none';unp.style.display='block';fgt.style.display='none'}"
 "}).catch(()=>{})}"
-"window.onload=()=>{initTheme();loadStatus();bleRefresh();if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')};"
+"function loadUploadConfig(){fetch('/api/uploads/config').then(r=>r.json()).then(d=>{"
+"function setVal(id,v){var el=document.getElementById(id);if(el)el.value=v||''}"
+"if(d.smb){setVal('smb-host',d.smb.host);setVal('smb-share',d.smb.share);"
+"setVal('smb-user',d.smb.user);setVal('smb-pass',d.smb.pass);"
+"setVal('smb-path',d.smb.path)}"
+"if(d.sleephq){setVal('shq-cid',d.sleephq.client_id);"
+"setVal('shq-secret',d.sleephq.client_secret)}}).catch(()=>{})}"
+"function saveUpload(){var s=document.getElementById('upload-save-status');s.textContent='Saving...';"
+"var body={smb:{host:val('smb-host'),share:val('smb-share'),user:val('smb-user'),"
+"pass:val('smb-pass'),path:val('smb-path')},"
+"sleephq:{client_id:val('shq-cid'),client_secret:val('shq-secret')}};"
+"fetch('/api/uploads/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})"
+".then(r=>r.json()).then(()=>{s.textContent='Saved!';loadUploadStatus()})"
+".catch(()=>{s.textContent='Save failed'})}"
+"function val(id){var el=document.getElementById(id);return el?el.value:''}"
+"function loadUploadStatus(){fetch('/api/uploads/status').then(r=>r.json()).then(d=>{"
+"var el=document.getElementById('upload-status');if(!el)return;"
+"if(!d.sessions||!d.sessions.length){el.innerHTML='<i>No upload sessions yet.</i>';return}"
+"var h='';d.sessions.forEach(s=>{"
+"h+='<div style=\"margin-bottom:8px;padding:8px;border:1px solid var(--border-color);border-radius:6px\">';"
+"h+='<strong>'+s.session_id+'</strong> ('+s.day_folder+')<br>';"
+"if(s.backends){s.backends.forEach(b=>{"
+"var c=b.status==='done'?'#10b981':b.status==='failed'?'#ef4444':'#fbbf24';"
+"h+='<span style=\"color:'+c+'\">'+b.backend+': '+b.status+'</span>';"
+"if(b.attempts>0)h+=' ('+b.attempts+' attempts)';"
+"h+='<br>'})}"
+"h+='</div>'});el.innerHTML=h}).catch(()=>{})}"
+"window.onload=()=>{initTheme();loadStatus();bleRefresh();loadUploadConfig();loadUploadStatus();if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')};"
 "</script></body></html>";
 
 static esp_err_t redirect_to_portal(httpd_req_t *req)
@@ -1124,6 +1171,66 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── Upload config and status endpoints ────────────────────────────── */
+
+static esp_err_t upload_config_get_handler(httpd_req_t *req)
+{
+    char *json = NULL;
+    if (uploader_get_config_json(&json) != ESP_OK || !json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t upload_config_post_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 2048) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_FAIL;
+    }
+    char *body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    if (uploader_save_config_json(body) != ESP_OK) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid config");
+        return ESP_FAIL;
+    }
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t upload_status_get_handler(httpd_req_t *req)
+{
+    char *json = NULL;
+    if (uploader_get_status_json(&json) != ESP_OK || !json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
 static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
@@ -1134,10 +1241,19 @@ static esp_err_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 26;
+    config.max_uri_handlers = 30;
+    config.stack_size = 8192;
+    config.max_open_sockets = 5;
 
-    if (httpd_start(&s_httpd, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "failed to start httpd");
+    ESP_LOGI(TAG, "starting httpd: stack=%d, handlers=%d, internal free=%u",
+             config.stack_size, config.max_uri_handlers,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    esp_err_t herr = httpd_start(&s_httpd, &config);
+    if (herr != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start httpd: %s (internal free=%u)",
+                 esp_err_to_name(herr),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return ESP_FAIL;
     }
 
@@ -1178,6 +1294,14 @@ static esp_err_t start_webserver(void)
     httpd_uri_t dl_hdl = { .uri = "/download", .method = HTTP_GET, .handler = download_get_handler };
     httpd_register_uri_handler(s_httpd, &dir_hdl);
     httpd_register_uri_handler(s_httpd, &dl_hdl);
+
+    /* Upload configuration and status endpoints */
+    httpd_uri_t up_cfg_get = { .uri = "/api/uploads/config", .method = HTTP_GET, .handler = upload_config_get_handler };
+    httpd_uri_t up_cfg_post = { .uri = "/api/uploads/config", .method = HTTP_POST, .handler = upload_config_post_handler };
+    httpd_uri_t up_status = { .uri = "/api/uploads/status", .method = HTTP_GET, .handler = upload_status_get_handler };
+    httpd_register_uri_handler(s_httpd, &up_cfg_get);
+    httpd_register_uri_handler(s_httpd, &up_cfg_post);
+    httpd_register_uri_handler(s_httpd, &up_status);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */

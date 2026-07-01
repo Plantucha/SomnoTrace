@@ -27,6 +27,7 @@
 #include "as11_ble.h"
 #include "post_therapy.h"
 #include "edf_gen.h"
+#include "uploader.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -938,9 +939,26 @@ static void edf_task(void *arg)
     ESP_LOGI(TAG, "edf_task: started on core %d", xPortGetCoreID());
     edf_task_args_t *a = (edf_task_args_t *)arg;
     if (a) {
-        edf_gen_generate(a->session_dir, a->session_id,
+        esp_err_t ret = edf_gen_generate(a->session_dir, a->session_id,
                          a->start_epoch_ms, a->end_epoch_ms,
                          a->clock_drift_ms);
+        if (ret == ESP_OK) {
+            /* EDF generation complete — trigger upload.
+             * Compute the noon-based day folder from session start time. */
+            char day_folder[32];
+            time_t t = (time_t)(a->start_epoch_ms / 1000);
+            struct tm tm;
+            localtime_r(&t, &tm);
+            if (tm.tm_hour < 12) {
+                t -= 86400;
+                localtime_r(&t, &tm);
+            }
+            snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+            uploader_on_session_ready(a->session_id, day_folder);
+        } else {
+            ESP_LOGW(TAG, "edf_task: generation failed, not triggering upload");
+        }
         free(a);
     } else {
         ESP_LOGE(TAG, "edf_task: NULL args");
@@ -974,9 +992,24 @@ static void spool_refresh_task(void *arg)
 
     /* Launch EDF generation on core 1. */
     ESP_LOGI(TAG, "spool_refresh_task: launching EDF generation");
-    edf_gen_generate(a->session_dir, a->session_id,
+    esp_err_t ret = edf_gen_generate(a->session_dir, a->session_id,
                      a->start_epoch_ms, a->end_epoch_ms,
                      a->clock_drift_ms);
+    if (ret == ESP_OK) {
+        char day_folder[32];
+        time_t t = (time_t)(a->start_epoch_ms / 1000);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        if (tm.tm_hour < 12) {
+            t -= 86400;
+            localtime_r(&t, &tm);
+        }
+        snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        uploader_on_session_ready(a->session_id, day_folder);
+    } else {
+        ESP_LOGW(TAG, "spool_refresh_task: EDF generation failed, not triggering upload");
+    }
     free(a);
 
     ESP_LOGI(TAG, "spool_refresh_task: done");
