@@ -46,6 +46,16 @@ determined to have been incorporated.
   `/somnotrace` as mount point, default to anonymous credentials, and remove
   external event-group dependency.
 
+## libsmb2
+
+- **Project:** libsmb2
+- **Source:** https://github.com/sahlberg/libsmb2 (tag `libsmb2-6.2`)
+- **Used for:** SMB2/SMB3 client library for uploading EDF files to SMB shares
+- **License:** LGPL-2.1 (library) / BSD-2-Clause (examples)
+- **Notes:** Vendored in `third_party/libsmb2/`. ESP-IDF CMakeLists.txt
+  adapted from upstream to work with IDF v5.5 build system. `include/esp/config.h`
+  updated with `_U_` and `SOL_TCP` macros and `HAVE_SYS_TIME_H`.
+
 ---
 
 ## MIT License (reference text)

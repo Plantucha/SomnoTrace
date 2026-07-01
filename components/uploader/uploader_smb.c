@@ -284,13 +284,13 @@ static upload_result_t smb_upload_session(const char *session_id,
     }
     ESP_LOGI(TAG, "SMB connected");
 
-    /* Build remote base path */
+    /* Build remote base path — SMB paths are relative to the share root,
+     * so must NOT start with '/' or '\'.  Windows returns
+     * STATUS_INVALID_PARAMETER for absolute paths. */
     char remote_base[256];
-    if (cfg.smb_path[0] == '/') {
-        snprintf(remote_base, sizeof(remote_base), "%s", cfg.smb_path);
-    } else {
-        snprintf(remote_base, sizeof(remote_base), "/%s", cfg.smb_path);
-    }
+    const char *p = cfg.smb_path;
+    while (*p == '/' || *p == '\\') p++;
+    snprintf(remote_base, sizeof(remote_base), "%s", p);
 
     /* Create remote directories */
     char remote_datalog[400];
@@ -324,8 +324,9 @@ static upload_result_t smb_upload_session(const char *session_id,
     smb2_disconnect_share(smb2);
     smb2_destroy_context(smb2);
 
-    ESP_LOGI(TAG, "SMB upload complete for session %s", session_id);
-    return UPLOAD_OK;
+    int total = edf_count + mand_count;
+    ESP_LOGI(TAG, "SMB upload complete for session %s (%d files)", session_id, total);
+    return total > 0 ? UPLOAD_OK : UPLOAD_FAILED;
 }
 
 const upload_backend_t smb_backend = {
