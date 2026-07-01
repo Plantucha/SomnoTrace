@@ -502,13 +502,10 @@ void uploader_on_session_ready(const char *session_id, const char *day_folder)
 
     ESP_LOGI(TAG, "session ready for upload: %s (day=%s)", session_id, day_folder);
 
-    /* Add to state immediately so it's tracked even if upload fails */
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    uploader_state_find_or_create(s_state, session_id, day_folder);
-    uploader_state_save(s_state);
-    xSemaphoreGive(s_state_mutex);
-
-    /* Queue the upload event */
+    /* Queue the upload event — state find_or_create + save happens in
+     * process_session() on the uploader task (internal stack).  Do NOT
+     * do flash I/O here: callers may run on a PSRAM stack, and flash
+     * operations disable the cache, making PSRAM inaccessible. */
     upload_event_t ev = {0};
     strlcpy(ev.session_id, session_id, sizeof(ev.session_id));
     strlcpy(ev.day_folder, day_folder, sizeof(ev.day_folder));
