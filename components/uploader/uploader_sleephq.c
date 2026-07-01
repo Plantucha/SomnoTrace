@@ -135,6 +135,7 @@ static esp_err_t shq_http_request(esp_http_client_handle_t client,
         esp_http_client_set_post_field(client, body, strlen(body));
     } else {
         esp_http_client_set_post_field(client, NULL, 0);
+        esp_http_client_delete_header(client, "Content-Type");
     }
 
     resp->size = 0;
@@ -503,16 +504,20 @@ static upload_result_t shq_upload_file(esp_http_client_handle_t client,
     if (rd > 0) { resp.size = rd; resp.data[rd] = '\0'; }
 
     int status = esp_http_client_get_status_code(client);
-    /* Don't close the client — let the keep-alive connection persist
-     * for the next file upload.  esp_http_client_cleanup() at the end
-     * of the session will tear everything down. */
+
+    /* Close the HTTP request to reset the client's internal state machine.
+     * With keep_alive_enable=true, the underlying TLS connection stays
+     * alive — only the HTTP request/response state is reset.  Without
+     * this, esp_http_client_perform() in subsequent calls (e.g.
+     * process_import) will see the client as still "open" and skip
+     * sending the request entirely. */
+    esp_http_client_close(client);
 
     free(header); free(file_buf);
     http_resp_free(&resp);
 
     if (status < 200 || status >= 300) {
         ESP_LOGW(TAG, "  file upload HTTP %d for %s", status, filename);
-        esp_http_client_close(client);
         return UPLOAD_FAILED;
     }
 
