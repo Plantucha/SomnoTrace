@@ -503,13 +503,16 @@ static upload_result_t shq_upload_file(esp_http_client_handle_t client,
     if (rd > 0) { resp.size = rd; resp.data[rd] = '\0'; }
 
     int status = esp_http_client_get_status_code(client);
-    esp_http_client_close(client);
+    /* Don't close the client — let the keep-alive connection persist
+     * for the next file upload.  esp_http_client_cleanup() at the end
+     * of the session will tear everything down. */
 
     free(header); free(file_buf);
     http_resp_free(&resp);
 
     if (status < 200 || status >= 300) {
         ESP_LOGW(TAG, "  file upload HTTP %d for %s", status, filename);
+        esp_http_client_close(client);
         return UPLOAD_FAILED;
     }
 
