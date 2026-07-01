@@ -2256,11 +2256,15 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
 
     /* ── Build EDF header common fields ──
      * The per-session EDF headers (BRP/SA2/PLD/EVE/CSL) carry the recording
-     * start timestamp.  AS11 stamps these in *its own* clock, which differs
-     * from our NTP clock by clock_drift_ms (NTP = AS11 + drift ⇒ AS11 = NTP −
-     * drift).  Apply the correction so our header datetime matches the value
-     * AS11 would have written for the same physical instant. */
-    int64_t edf_start_ms = start_epoch_ms - clock_drift_ms;
+     * start timestamp.  We use NTP-corrected time directly so that the
+     * timestamps reflect the real wall-clock time and align with data
+     * from separate devices (e.g. oximeters).
+     *
+     * To produce byte-identical files mimicking a real AS11 SD card (which
+     * stamps EDF headers in the machine's own drifting clock), use:
+     *   int64_t edf_start_ms = start_epoch_ms - clock_drift_ms;
+     * We intentionally correct to NTP instead. */
+    int64_t edf_start_ms = start_epoch_ms;
     char start_date[16], start_time[16];
     format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
