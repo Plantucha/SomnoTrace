@@ -683,7 +683,7 @@ function scanWifi() {
   function pollScan() {
     fetch('/scan').then(function(r){ return r.json(); }).then(function(d) {
       if (d.scanning) {
-        setTimeout(pollScan, 800);
+        setTimeout(pollScan, 200);
       } else {
         processResults(d);
       }

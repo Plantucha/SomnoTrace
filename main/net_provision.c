@@ -510,7 +510,21 @@ static SemaphoreHandle_t s_scan_mutex = NULL;
 static void wifi_scan_task(void *arg)
 {
     ESP_LOGI(TAG, "wifi scan starting");
-    esp_wifi_scan_start(NULL, true);
+    if (s_portal_mode) {
+        /* SoftAP: BLE is disconnected, so custom active scan params are safe.
+         * ~20ms per channel × 13 channels ≈ 300ms total. */
+        wifi_scan_config_t fast_cfg = {
+            .show_hidden = false,
+            .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+            .scan_time.active.min = 0,
+            .scan_time.active.max = 20,
+        };
+        esp_wifi_scan_start(&fast_cfg, true);
+    } else {
+        /* STA: BLE may be active — pass NULL to let the driver use
+         * BT-coexistence-safe defaults. */
+        esp_wifi_scan_start(NULL, true);
+    }
     ESP_LOGI(TAG, "wifi scan complete");
 
     uint16_t ap_count = 0;
