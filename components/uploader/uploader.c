@@ -268,6 +268,11 @@ esp_err_t uploader_get_status_json(char **out_json)
 {
     if (!out_json) return ESP_ERR_INVALID_ARG;
 
+    if (!s_state_mutex || !s_state) {
+        *out_json = strdup("{\"sessions\":[]}");
+        return *out_json ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     esp_err_t ret = uploader_state_to_json(s_state, out_json);
     xSemaphoreGive(s_state_mutex);

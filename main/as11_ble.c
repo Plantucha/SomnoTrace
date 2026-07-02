@@ -2231,6 +2231,17 @@ esp_err_t as11_ble_forget(void)
     return e;
 }
 
+esp_err_t as11_ble_disconnect(void)
+{
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGI(TAG, "disconnecting BLE (conn_handle=%d)", s_conn_handle);
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    set_state(AS11_STATUS_IDLE);
+    return ESP_OK;
+}
+
 /* Stop the AS11 data stream.
  * With 64 ACL buffers + offloaded notification processing, outgoing RPCs
  * can be sent while stream notifications are active. */

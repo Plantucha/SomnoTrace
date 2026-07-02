@@ -79,6 +79,10 @@ cJSON *as11_ble_get_paired_info(void);
 /* Erase stored pairing credentials from NVS. */
 esp_err_t as11_ble_forget(void);
 
+/* Disconnect the active BLE connection if any.
+ * Frees the radio for WiFi-only operations (e.g. SoftAP scanning). */
+esp_err_t as11_ble_disconnect(void);
+
 /* Stop the AS11 data stream. Currently a no-op — the stream continues
  * between sessions and is restarted on next reconnect. Stopping via
  * StartStream with empty dataIds or CCCD write would block RPC responses

@@ -1,0 +1,1050 @@
+<!--
+SomnoTrace - Web UI portal page (SoftAP provisioning + STA dashboard)
+Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
+
+This file is part of SomnoTrace.
+
+SomnoTrace is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+SomnoTrace is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
+
+ADDITIONAL TERM (GPLv3 Section 7(b)): Redistributions must preserve the
+attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
+(https://github.com/ilyakruchinin)." See the NOTICE file for details.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<link rel="manifest" href="/manifest.json">
+<title>SomnoTrace</title>
+<style>
+/* ── Design Tokens ─────────────────────────────────────────────── */
+:root{
+--bg:#0b0f19;--card-bg:#111827;--card-border:#1e293b;--text:#f3f4f6;--text-muted:#94a3b8;
+--primary:#0d9488;--primary-hover:#0f766e;--primary-glow:rgba(13,148,136,0.15);
+--border-color:#334155;--input-bg:#1e293b;--input-focus:#0d9488;
+--danger:#f87171;--danger-hover:#ef4444;--success:#34d399;--warning:#fbbf24;
+--color-airflow:#22d3ee;--color-pressure:#fb923c;--color-leak:#c084fc;
+--color-spo2:#60a5fa;--color-pulse:#f87171;
+--accent-wifi:#0d9488;--accent-smb:#fb923c;--accent-shq:#60a5fa;--accent-ble:#34d399;
+}
+[data-theme="day"]{
+--bg:#f1f5f9;--card-bg:#ffffff;--card-border:#e2e8f0;--text:#0f172a;--text-muted:#64748b;
+--primary:#0f766e;--primary-hover:#115e59;--primary-glow:rgba(15,118,110,0.12);
+--border-color:#cbd5e1;--input-bg:#f8fafc;--input-focus:#0f766e;
+--danger:#dc2626;--danger-hover:#b91c1c;--success:#10b981;--warning:#f59e0b;
+--color-airflow:#0891b2;--color-pressure:#ea580c;--color-leak:#7c3aed;
+--color-spo2:#2563eb;--color-pulse:#dc2626;
+--accent-wifi:#0f766e;--accent-smb:#ea580c;--accent-shq:#2563eb;--accent-ble:#10b981;
+}
+
+/* ── Reset & Base ──────────────────────────────────────────────── */
+*{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+body{background:var(--bg);color:var(--text);transition:background .2s,color .2s;min-height:100vh;display:flex;flex-direction:column}
+
+/* ── Header ────────────────────────────────────────────────────── */
+header{background:var(--card-bg);border-bottom:1px solid var(--card-border);padding:0 16px;height:56px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.brand{display:flex;align-items:center;gap:8px;font-size:1.2rem;font-weight:700;color:var(--text);text-decoration:none}
+.brand svg{width:22px;height:22px;fill:var(--primary)}
+.setup-badge{display:none;font-size:.7rem;font-weight:600;color:var(--warning);background:rgba(251,191,36,.12);padding:2px 8px;border-radius:10px;margin-left:8px}
+.nav-tabs{display:flex;gap:4px;height:100%;align-items:center}
+.tab-btn{background:none;border:none;color:var(--text-muted);padding:8px 14px;font-size:.9rem;font-weight:500;cursor:pointer;border-radius:6px;transition:all .2s;height:38px;display:flex;align-items:center}
+.tab-btn:hover{color:var(--text);background:var(--input-bg)}
+.tab-btn.active{color:var(--primary);background:var(--input-bg);font-weight:600}
+.theme-selector{display:flex;background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:2px;gap:2px}
+.theme-btn{background:none;border:none;color:var(--text-muted);padding:5px 10px;height:30px;border-radius:6px;cursor:pointer;display:flex;align-items:center;gap:5px;font-size:.8rem;font-weight:500;transition:all .2s}
+.theme-btn svg{width:14px;height:14px;fill:currentColor}
+.theme-btn.active{background:var(--primary);color:#fff}
+
+/* ── Main Layout ───────────────────────────────────────────────── */
+main{flex:1;padding:16px;max-width:960px;width:100%;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.tab-content{display:none;flex-direction:column;gap:16px;animation:fadeIn .15s ease-out}
+.tab-content.active{display:flex}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── Cards ─────────────────────────────────────────────────────── */
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:20px;border-left:3px solid transparent}
+.card-wifi{border-left-color:var(--accent-wifi)}
+.card-smb{border-left-color:var(--accent-smb)}
+.card-shq{border-left-color:var(--accent-shq)}
+.card-ble{border-left-color:var(--accent-ble)}
+.card-title{font-size:1rem;font-weight:600;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}
+.card-title svg{width:18px;height:18px;fill:var(--primary)}
+
+/* ── Form Elements ─────────────────────────────────────────────── */
+.form-group{margin-bottom:14px;display:flex;flex-direction:column;gap:5px}
+.form-group:last-child{margin-bottom:0}
+.form-group label{font-size:.85rem;font-weight:600;color:var(--text)}
+.form-control{width:100%;background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:10px 12px;color:var(--text);font-size:.9rem;outline:none;transition:border-color .2s,box-shadow .2s}
+.form-control:focus{border-color:var(--input-focus);box-shadow:0 0 0 3px var(--primary-glow)}
+select.form-control{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='%2394a3b8'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
+
+/* ── Unified Button System ─────────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;width:auto;padding:11px 20px;font-size:.9rem;font-weight:600;border-radius:8px;border:none;cursor:pointer;transition:all .2s ease;text-decoration:none;line-height:1.2}
+.btn:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
+.btn svg{width:16px;height:16px;fill:currentColor;flex-shrink:0}
+.btn-block{width:100%}
+
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover:not(:disabled){background:var(--primary-hover);box-shadow:0 2px 8px var(--primary-glow)}
+
+.btn-outline{background:transparent;border:1px solid var(--border-color);color:var(--text)}
+.btn-outline:hover:not(:disabled){background:var(--input-bg);border-color:var(--primary)}
+
+.btn-ghost{background:transparent;border:1px dashed var(--border-color);color:var(--text-muted)}
+.btn-ghost:hover:not(:disabled){border-color:var(--primary);color:var(--primary);background:var(--primary-glow)}
+
+.btn-danger{background:transparent;border:1px solid var(--danger);color:var(--danger)}
+.btn-danger:hover:not(:disabled){background:rgba(248,113,113,.1)}
+
+.btn-sm{padding:7px 12px;font-size:.8rem;border-radius:6px}
+
+/* ── Password Wrapper ──────────────────────────────────────────── */
+.pw-wrap{position:relative;display:flex;align-items:center}
+.pw-wrap .form-control{padding-right:44px}
+.pw-toggle{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:var(--text-muted);padding:4px;display:flex;align-items:center;justify-content:center;border-radius:4px;transition:color .2s}
+.pw-toggle:hover{color:var(--text)}
+.pw-toggle svg{width:18px;height:18px;fill:currentColor}
+
+/* ── WiFi Block ────────────────────────────────────────────────── */
+.wifi-block{border:1px solid var(--card-border);background:var(--input-bg);padding:14px;border-radius:10px;margin-bottom:12px;transition:border-color .2s}
+.wifi-block:focus-within{border-color:var(--primary)}
+.block-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.block-title{font-size:.75rem;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em}
+.ssid-row{display:flex;align-items:center;gap:6px}
+.ssid-row .form-control{flex:1}
+.btn-input-toggle{background:none;border:none;color:var(--primary);font-size:.75rem;font-weight:600;cursor:pointer;padding:2px 0;white-space:nowrap}
+.btn-input-toggle:hover{text-decoration:underline}
+.btn-remove-net{background:none;border:none;color:var(--danger);font-size:.78rem;font-weight:600;cursor:pointer;padding:0}
+.btn-remove-net:hover{text-decoration:underline}
+
+/* ── Status Message ────────────────────────────────────────────── */
+.status-msg{text-align:center;font-weight:500;font-size:.85rem;min-height:1.2em;color:var(--warning);padding:8px 0;transition:opacity .2s}
+.status-msg.success{color:var(--success)}
+.status-msg.error{color:var(--danger)}
+
+/* ── Save Footer ───────────────────────────────────────────────── */
+.save-footer{padding:4px 0 16px;display:flex;flex-direction:column;gap:8px}
+
+/* ── SMB Preview ───────────────────────────────────────────────── */
+.smb-preview{background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.82rem;color:var(--color-airflow);word-break:break-all;margin-top:2px}
+
+/* ── Dashboard ─────────────────────────────────────────────────── */
+.dashboard-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
+.date-navigator{display:flex;align-items:center;background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;overflow:hidden}
+.date-btn{background:none;border:none;color:var(--text);width:40px;height:40px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .2s}
+.date-btn:hover{background:var(--input-bg)}
+.date-display{font-size:.95rem;font-weight:600;padding:0 14px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);user-select:none;border-left:1px solid var(--card-border);border-right:1px solid var(--card-border)}
+.date-picker-hidden{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.stat-card{display:flex;flex-direction:column;gap:4px}
+.stat-val{font-size:1.8rem;font-weight:700}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600;text-transform:uppercase;margin-top:4px;width:fit-content}
+.badge-green{background:rgba(16,185,129,.15);color:var(--success)}
+.badge-orange{background:rgba(245,158,11,.15);color:var(--warning)}
+.badge-red{background:rgba(239,68,68,.15);color:var(--danger)}
+.chart-placeholder{min-height:300px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.9rem;text-align:center;padding:40px}
+
+/* ── Status Tab ────────────────────────────────────────────────── */
+.status-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.info-list{display:flex;flex-direction:column;gap:10px}
+.info-row{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--card-border);padding-bottom:8px}
+.info-label{color:var(--text-muted);font-size:.85rem}
+.info-value{font-weight:600;font-size:.85rem}
+
+/* ── Logs Tab ──────────────────────────────────────────────────── */
+.logs-container{display:flex;flex-direction:column;height:500px}
+.logs-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap}
+.logs-search{background:var(--input-bg);border:1px solid var(--border-color);color:var(--text);padding:8px 12px;border-radius:6px;outline:none;font-size:.85rem;width:220px}
+.logs-search:focus{border-color:var(--input-focus)}
+.terminal{flex:1;background:#030712;border:1px solid #1e293b;border-radius:8px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.82rem;overflow-y:auto;color:#34d399;white-space:pre-wrap;line-height:1.4}
+
+/* ── BLE Section ───────────────────────────────────────────────── */
+.ble-status-paired{font-size:.9rem;margin-bottom:8px;padding:10px 12px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.2);border-radius:8px}
+.ble-status-paired .paired-badge{color:var(--success);font-weight:600}
+
+/* ── Settings Grid ─────────────────────────────────────────────── */
+.settings-grid{display:flex;flex-direction:column;gap:16px}
+
+/* ── Responsive ────────────────────────────────────────────────── */
+@media(max-width:768px){.status-grid{grid-template-columns:1fr}}
+@media(max-width:600px){
+header{flex-direction:column;height:auto;padding:10px 12px;gap:6px}
+.nav-tabs{width:100%;justify-content:space-around}
+.theme-selector{align-self:flex-end}
+main{padding:10px}
+.card{padding:14px}
+.save-footer{padding-bottom:28px}
+}
+</style>
+</head>
+<body>
+
+<header>
+<a href="#" class="brand">
+<svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 9.9 9.9 0 0 0-.2-2 7 7 0 1 1-8.3-8.3A10.1 10.1 0 0 0 12 3z"/></svg>
+SomnoTrace
+<span class="setup-badge" id="setup-badge">Setup Mode</span>
+</a>
+<div class="nav-tabs" id="nav-tabs">
+<button class="tab-btn" onclick="switchTab('dashboard')">Dashboard</button>
+<button class="tab-btn" onclick="switchTab('tab-status')">Status</button>
+<button class="tab-btn" onclick="switchTab('logs')">Logs</button>
+<button class="tab-btn active" onclick="switchTab('settings')">Settings</button>
+</div>
+<div class="theme-selector">
+<button class="theme-btn" id="theme-day-btn" onclick="setTheme('day')" title="Day Mode">
+<svg viewBox="0 0 24 24"><path d="M12 7a5 5 0 1 0 5 5 5 5 0 0 0-5-5zm0 2a3 3 0 1 1-3 3 3 3 0 0 1 3-3zm0-7a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0V3a1 1 0 0 0-1-1zm0 17a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1zm10-9h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2zM4 11H3a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2zm14.8-6.4a1 1 0 0 0-1.4 0l-.7.7a1 1 0 0 0 1.4 1.4l.7-.7a1 1 0 0 0 0-1.4zm-11.4 12-.7.7a1 1 0 0 0 1.4 1.4l.7-.7a1 1 0 0 0-1.4-1.4zm12.1.7a1 1 0 0 0 0-1.4l-.7-.7a1 1 0 0 0-1.4 1.4l.7.7a1 1 0 0 0 1.4 0zM6.6 5.2a1 1 0 0 0-1.4 1.4l.7.7a1 1 0 0 0 1.4-1.4z"/></svg>
+<span>Day</span>
+</button>
+<button class="theme-btn active" id="theme-night-btn" onclick="setTheme('night')" title="Night Mode">
+<svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 9.9 9.9 0 0 0-.2-2 7 7 0 1 1-8.3-8.3A10.1 10.1 0 0 0 12 3z"/></svg>
+<span>Night</span>
+</button>
+<button class="theme-btn" id="theme-auto-btn" onclick="setTheme('auto')" title="Auto Mode">
+<svg viewBox="0 0 24 24"><path d="M12 2A10 10 0 1 0 22 12 10 10 0 0 0 12 2zm1 17.93V19a1 1 0 0 1-2 0v-.07A8 8 0 0 1 4.07 13H5a1 1 0 0 1 0-2h-.93A8 8 0 0 1 11 4.07V5a1 1 0 0 1 2 0v-.07A8 8 0 0 1 19.93 11H19a1 1 0 0 1 0 2h.93A8 8 0 0 1 13 18.93z"/></svg>
+<span>Auto</span>
+</button>
+</div>
+</header>
+
+<main>
+
+<!-- ═══════════════ SETTINGS TAB ═══════════════ -->
+<section id="settings" class="tab-content active">
+<div class="settings-grid">
+
+<!-- WiFi & Timezone (always visible) -->
+<div class="card card-wifi">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M1 9l2 2a12.73 12.73 0 0 1 18 0l2-2A15.57 15.57 0 0 0 1 9zm4 4l2 2a8.5 8.5 0 0 1 10 0l2-2A11.36 11.36 0 0 0 5 13zm4 4l3 3 3-3a4.24 4.24 0 0 0-6 0z"/></svg>
+Wi-Fi &amp; Timezone
+</div>
+<button class="btn btn-outline btn-sm" style="margin-bottom:14px" onclick="scanWifi()" id="btn-scan">
+<svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+<span id="scan-label">Scan for networks</span>
+</button>
+<div id="wifi-blocks"></div>
+<div id="add-wifi-container">
+<button id="btn-add-wifi" type="button" class="btn btn-ghost btn-block" onclick="addWifiBlock()">+ Add another Wi-Fi network</button>
+</div>
+<div class="form-group" style="margin-top:14px">
+<label>Timezone (GMT offset)</label>
+<select id="gmt-off" class="form-control" data-dirty="false" onchange="markDirty(this)"></select>
+</div>
+</div>
+
+<!-- SMB Upload (STA only) -->
+<div class="card card-smb sta-only">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
+SMB Server
+</div>
+<div class="form-group">
+<label>Host / IP Address</label>
+<input type="text" class="form-control" id="smb-host" placeholder="192.168.1.100" data-dirty="false" oninput="markDirty(this);updateSmbPreview()">
+</div>
+<div class="form-group">
+<label>Share Name</label>
+<input type="text" class="form-control" id="smb-share" placeholder="sleep" data-dirty="false" oninput="markDirty(this);updateSmbPreview()">
+</div>
+<div class="form-group">
+<label>Username</label>
+<input type="text" class="form-control" id="smb-user" placeholder="guest" data-dirty="false" oninput="markDirty(this);updateSmbPreview()">
+</div>
+<div class="form-group">
+<label>Password</label>
+<div class="pw-wrap">
+<input type="password" class="form-control" id="smb-pass" placeholder="(blank for guest)" data-dirty="false" data-has-stored="false" oninput="markDirty(this);updateSmbPreview()">
+<button type="button" class="pw-toggle" onclick="togglePw('smb-pass')" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+<svg viewBox="0 0 24 24" class="eye-closed" style="display:none"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46A11.8 11.8 0 0 0 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>
+</button>
+</div>
+</div>
+<div class="form-group">
+<label>Remote Path</label>
+<input type="text" class="form-control" id="smb-path" placeholder="/SomnoTrace" data-dirty="false" oninput="markDirty(this);updateSmbPreview()">
+</div>
+<div class="form-group">
+<label style="font-size:.8rem;color:var(--text-muted)">Connection Preview</label>
+<div class="smb-preview" id="smb-uri-preview">smb://guest:@192.168.1.100/sleep/SomnoTrace</div>
+</div>
+</div>
+
+<!-- SleepHQ (STA only) -->
+<div class="card card-shq sta-only">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h.71A5.5 5.5 0 0 1 12 6c2.76 0 5 2.24 5 5v1h2c1.65 0 3 1.35 3 3s-1.35 3-3 3z"/></svg>
+SleepHQ Integration
+</div>
+<div class="form-group">
+<label>API Key (Client ID)</label>
+<input type="text" class="form-control" id="shq-cid" placeholder="Client ID" data-dirty="false" oninput="markDirty(this)">
+</div>
+<div class="form-group">
+<label>Client Secret</label>
+<div class="pw-wrap">
+<input type="password" class="form-control" id="shq-secret" placeholder="Client Secret" data-dirty="false" data-has-stored="false" oninput="markDirty(this)">
+<button type="button" class="pw-toggle" onclick="togglePw('shq-secret')" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+<svg viewBox="0 0 24 24" class="eye-closed" style="display:none"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46A11.8 11.8 0 0 0 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>
+</button>
+</div>
+</div>
+</div>
+
+<!-- BLE Pairing (STA only) -->
+<div class="card card-ble sta-only">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/></svg>
+Bluetooth Pairing
+</div>
+<div class="form-group">
+<label>ResMed AirSense 11</label>
+<div id="ble-paired" class="ble-status-paired" style="display:none">
+<span class="paired-badge">● Paired</span> with <strong id="ble-dev-name">AirSense 11</strong>
+</div>
+<div id="ble-unpaired">
+<button class="btn btn-outline" type="button" onclick="bleScan()">
+<svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+Scan for AirSense 11
+</button>
+<div class="form-group" id="ble-select-group" style="display:none;margin-top:10px">
+<label>Select Device</label>
+<select id="ble-dev" class="form-control"></select>
+</div>
+<button class="btn btn-primary" type="button" id="btn-ble-pair" style="display:none;margin-top:8px" onclick="blePair()">Pair Device</button>
+<div class="form-group" id="ble-passkey-group" style="display:none;margin-top:12px">
+<label>Enter the 4-digit code shown on your CPAP screen</label>
+<input id="ble-passkey" type="text" inputmode="numeric" maxlength="4" placeholder="1234" class="form-control" style="max-width:140px;text-align:center;font-size:1.2rem;letter-spacing:.3em">
+<button class="btn btn-primary" type="button" style="margin-top:8px" onclick="bleConfirm()">Confirm Code</button>
+</div>
+</div>
+<button class="btn btn-danger btn-sm" type="button" id="btn-ble-forget" style="display:none;margin-top:10px" onclick="bleForget()">Unpair Device</button>
+<div id="ble-status" class="status-msg"></div>
+</div>
+<div class="form-group" style="opacity:.4;margin-top:14px">
+<label>Wellue O2 Ring <span style="font-size:.78rem;font-weight:normal;color:var(--text-muted)">(Coming Soon)</span></label>
+<button class="btn btn-outline" disabled>Pair O2 Ring</button>
+</div>
+</div>
+
+<!-- Upload Status (STA only) -->
+<div class="card sta-only">
+<div class="card-title">Upload Status</div>
+<div id="upload-status" style="font-size:.8rem;color:var(--text-muted);max-height:200px;overflow-y:auto"></div>
+<button class="btn btn-outline btn-sm" type="button" style="margin-top:8px" onclick="loadUploadStatus()">Refresh Status</button>
+</div>
+
+<!-- Future Placeholder (STA only) -->
+<div class="card sta-only" style="opacity:.4">
+<div class="card-title">Extra Settings <span style="font-size:.78rem;font-weight:normal;color:var(--text-muted)">(Coming Soon)</span></div>
+<div class="form-group">
+<label>Bedside Smart Alarm</label>
+<input type="time" class="form-control" value="07:00" disabled>
+</div>
+<div class="form-group">
+<label>LCD Brightness</label>
+<input type="range" class="form-control" min="10" max="100" value="50" disabled style="padding:0">
+</div>
+</div>
+
+</div>
+
+<!-- Single Save & Reboot Button -->
+<div class="save-footer">
+<button id="btn-save" class="btn btn-primary btn-block" onclick="saveAll()" disabled>
+<svg viewBox="0 0 24 24"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z"/></svg>
+Save &amp; Reboot
+</button>
+<div id="save-status" class="status-msg"></div>
+</div>
+
+</section>
+
+<!-- ═══════════════ DASHBOARD TAB ═══════════════ -->
+<section id="dashboard" class="tab-content sta-only">
+<div class="dashboard-header">
+<div class="date-navigator">
+<button class="date-btn" onclick="stepDate(-1)">&larr;</button>
+<div class="date-display" id="date-display-label" onclick="triggerDatePicker()">Select date</div>
+<button class="date-btn" onclick="triggerDatePicker()" style="border-right:1px solid var(--card-border)">
+<svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor"><path d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V9h14v11zM5 7V6h14v1zm7 5h5v5h-5z"/></svg>
+</button>
+<input type="date" class="date-picker-hidden" id="session-date" onchange="handleDateChange(this.value)">
+<button class="date-btn" onclick="stepDate(1)">&rarr;</button>
+</div>
+<div style="font-size:.85rem;color:var(--text-muted)">Noon-to-Noon window</div>
+</div>
+<div class="stats-grid">
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">AHI</div><div class="stat-val" id="stat-ahi">--</div><span class="badge badge-green" id="stat-ahi-badge">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Usage Time</div><div class="stat-val" id="stat-usage">--</div><span class="badge badge-green">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">95th% Leak</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange">--</span></div>
+</div>
+<div class="card" style="flex:1;min-height:400px;display:flex;flex-direction:column">
+<div class="card-title">Therapy Channels</div>
+<div class="chart-placeholder" id="chart-placeholder">
+Therapy charts will appear here when session data endpoints are implemented.<br>
+uPlot library and /api/session/data endpoint required.
+</div>
+</div>
+</section>
+
+<!-- ═══════════════ STATUS TAB ═══════════════ -->
+<section id="tab-status" class="tab-content sta-only">
+<div class="status-grid">
+<div class="card info-list">
+<div class="card-title">System Status</div>
+<div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="status-uptime">--</span></div>
+<div class="info-row"><span class="info-label">Local IP</span><span class="info-value" id="status-ip">--</span></div>
+<div class="info-row"><span class="info-label">Timezone</span><span class="info-value" id="status-tz">--</span></div>
+<div class="info-row"><span class="info-label">NTP Sync</span><span class="info-value" id="status-ntp">--</span></div>
+<div class="info-row"><span class="info-label">SD Card</span><span class="info-value" id="status-sd">--</span></div>
+<div class="info-row"><span class="info-label">AirSense 11</span><span class="info-value" id="status-ble">--</span></div>
+<div class="info-row"><span class="info-label">WiFi RSSI</span><span class="info-value" id="status-rssi">--</span></div>
+</div>
+<div class="card" style="display:flex;flex-direction:column">
+<div class="card-title">Device Telemetry</div>
+<div class="chart-placeholder" style="min-height:200px">CPU and RAM telemetry graphs will appear here.<br>Requires /api/status polling and uPlot library.</div>
+</div>
+</div>
+</section>
+
+<!-- ═══════════════ LOGS TAB ═══════════════ -->
+<section id="logs" class="tab-content sta-only">
+<div class="card logs-container">
+<div class="logs-header">
+<input type="text" class="logs-search" placeholder="Filter logs..." oninput="filterLogs(this.value)">
+<div style="display:flex;gap:6px">
+<button class="btn btn-outline btn-sm" onclick="clearLogs()">Clear</button>
+<button class="btn btn-primary btn-sm" onclick="downloadLogs()">Download</button>
+</div>
+</div>
+<div class="terminal" id="log-terminal">Log streaming requires /api/logs/stream SSE endpoint.
+Connect to view real-time device logs.</div>
+</div>
+</section>
+
+</main>
+
+<script>
+/* ── Constants ─────────────────────────────────────────────────── */
+var PORTAL_MODE = (location.hostname === '192.168.4.1' ||
+                   location.hostname.indexOf('gstatic.com') !== -1 ||
+                   location.hostname.indexOf('apple.com') !== -1 ||
+                   location.hostname.indexOf('msftconnecttest') !== -1 ||
+                   location.hostname.indexOf('google') !== -1 ||
+                   location.hostname.indexOf('ubuntu') !== -1);
+var PW_SENTINEL_WIFI = '\u2588UNCHANGED\u2588';
+var PW_SENTINEL_UPLOAD = '***';
+
+/* ── Theme ─────────────────────────────────────────────────────── */
+function switchTab(tabId) {
+  document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
+  document.querySelectorAll('.tab-content').forEach(function(c){ c.classList.remove('active'); });
+  var labels = {dashboard:'Dashboard','tab-status':'Status',logs:'Logs',settings:'Settings'};
+  var lbl = labels[tabId] || tabId;
+  var btn = Array.from(document.querySelectorAll('.tab-btn')).find(function(b){ return b.textContent.trim() === lbl; });
+  if (btn) btn.classList.add('active');
+  var sec = document.getElementById(tabId);
+  if (sec) sec.classList.add('active');
+}
+
+function setTheme(theme) {
+  document.querySelectorAll('.theme-btn').forEach(function(b){ b.classList.remove('active'); });
+  var attr = (theme === 'auto') ? getSystemTheme() : theme;
+  document.documentElement.setAttribute('data-theme', attr);
+  var btn = document.getElementById('theme-' + theme + '-btn');
+  if (btn) btn.classList.add('active');
+  localStorage.setItem('somnotrace_theme', theme);
+}
+function getSystemTheme() { var h = new Date().getHours(); return (h >= 8 && h < 20) ? 'day' : 'night'; }
+
+/* ── Password Toggle ───────────────────────────────────────────── */
+function togglePw(id) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  var wrap = el.closest('.pw-wrap');
+  var isHidden = (el.type === 'password');
+  el.type = isHidden ? 'text' : 'password';
+  if (wrap) {
+    var open = wrap.querySelector('.eye-open');
+    var closed = wrap.querySelector('.eye-closed');
+    if (open) open.style.display = isHidden ? 'none' : 'block';
+    if (closed) closed.style.display = isHidden ? 'block' : 'none';
+  }
+}
+
+/* ── Dirty State Tracking ──────────────────────────────────────── */
+var isDirty = { wifi: false, upload: false };
+
+function markDirty(el) {
+  if (el) el.setAttribute('data-dirty', 'true');
+  // Determine which section
+  var card = el ? el.closest('.card') : null;
+  if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq'))) {
+    isDirty.upload = true;
+  } else {
+    isDirty.wifi = true;
+  }
+  updateSaveButton();
+}
+
+function markWifiDirty() {
+  isDirty.wifi = true;
+  updateSaveButton();
+}
+
+function updateSaveButton() {
+  var btn = document.getElementById('btn-save');
+  if (btn) btn.disabled = !(isDirty.wifi || isDirty.upload);
+}
+
+/* ── WiFi State ────────────────────────────────────────────────── */
+var activeBlocks = 1;
+var manualSSID = {};
+var scannedNetworks = [];
+var savedPasswords = {};
+
+function populateGmtOff(saved) {
+  var sel = document.getElementById('gmt-off');
+  if (!sel) return;
+  sel.innerHTML = '';
+  for (var i = -12; i <= 14; i++) {
+    var o = document.createElement('option');
+    o.value = i;
+    o.textContent = 'GMT' + (i >= 0 ? '+' : '') + i + ':00';
+    if (i === saved) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+/* ── Signal Strength Helper ────────────────────────────────────── */
+function rssiIcon(rssi) {
+  var bars = rssi > -50 ? 4 : rssi > -60 ? 3 : rssi > -70 ? 2 : 1;
+  var svg = '<svg viewBox="0 0 24 24" width="16" height="16" style="vertical-align:middle;margin-right:4px;fill:currentColor;opacity:.7">';
+  // 4 bars of increasing height
+  var heights = [4,8,12,16];
+  var x = 3;
+  for (var b = 0; b < 4; b++) {
+    var col = b < bars ? 'currentColor' : 'var(--border-color)';
+    svg += '<rect x="' + x + '" y="' + (18 - heights[b]) + '" width="3" height="' + heights[b] + '" rx="1" fill="' + col + '"/>';
+    x += 5;
+  }
+  svg += '</svg>';
+  return svg;
+}
+
+/* ── WiFi Rendering ────────────────────────────────────────────── */
+function renderWifiBlocks() {
+  var container = document.getElementById('wifi-blocks');
+  // Save current values
+  var savedVals = [];
+  for (var i = 1; i <= 4; i++) {
+    var sEl = document.getElementById('ssid-' + i);
+    var pEl = document.getElementById('pass-' + i);
+    savedVals.push({ ssid: sEl ? sEl.value : '', pass: pEl ? pEl.value : '' });
+  }
+  container.innerHTML = '';
+  for (var i = 1; i <= activeBlocks; i++) {
+    var block = document.createElement('div');
+    block.className = 'wifi-block';
+
+    var headerHtml = '<div class="block-header"><span class="block-title">Network #' + i + '</span>';
+    if (i > 1) headerHtml += '<button type="button" class="btn-remove-net" onclick="removeWifiBlock(' + i + ')">Remove</button>';
+    headerHtml += '</div>';
+
+    var ssidHtml = '<div class="form-group"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">';
+    ssidHtml += '<label>SSID</label>';
+    ssidHtml += '<button type="button" class="btn-input-toggle" id="btn-manual-' + i + '" onclick="toggleManualSSID(' + i + ')">';
+    ssidHtml += manualSSID[i] ? 'Choose from list ▾' : 'Type manually ✏️';
+    ssidHtml += '</button></div>';
+    ssidHtml += '<div id="ssid-container-' + i + '"></div></div>';
+
+    var passHtml = '<div class="form-group"><label>Password</label>';
+    passHtml += '<div class="pw-wrap">';
+    passHtml += '<input id="pass-' + i + '" type="password" placeholder="' + (savedPasswords[i] ? '••••••••' : 'Password') + '" class="form-control" data-has-stored="' + (savedPasswords[i] ? 'true' : 'false') + '" data-dirty="false" oninput="markWifiDirty()">';
+    passHtml += '<button type="button" class="pw-toggle" onclick="togglePw(\'pass-' + i + '\')" aria-label="Toggle password">';
+    passHtml += '<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>';
+    passHtml += '<svg viewBox="0 0 24 24" class="eye-closed" style="display:none"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46A11.8 11.8 0 0 0 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>';
+    passHtml += '</button></div></div>';
+
+    block.innerHTML = headerHtml + ssidHtml + passHtml;
+    container.appendChild(block);
+
+    // Populate SSID field
+    var sCont = document.getElementById('ssid-container-' + i);
+    if (manualSSID[i]) {
+      sCont.innerHTML = '<input id="ssid-' + i + '" type="text" placeholder="Enter network name" class="form-control" data-dirty="false" oninput="markWifiDirty()">';
+    } else {
+      sCont.innerHTML = '<select id="ssid-' + i + '" class="form-control" data-dirty="false" onchange="markWifiDirty()"><option value="">— Select a network —</option></select>';
+      populateWifiSelect(i);
+    }
+
+    // Restore values
+    var sEl2 = document.getElementById('ssid-' + i);
+    var pEl2 = document.getElementById('pass-' + i);
+    if (sEl2 && savedVals[i - 1] && savedVals[i - 1].ssid) sEl2.value = savedVals[i - 1].ssid;
+    if (pEl2 && savedVals[i - 1] && savedVals[i - 1].pass) pEl2.value = savedVals[i - 1].pass;
+  }
+
+  var addBtn = document.getElementById('btn-add-wifi');
+  if (addBtn) addBtn.style.display = (activeBlocks < 4) ? '' : 'none';
+}
+
+function populateWifiSelect(id) {
+  var sel = document.getElementById('ssid-' + id);
+  if (!sel || sel.tagName !== 'SELECT') return;
+  var currentVal = sel.value;
+  sel.innerHTML = '<option value="">— Select a network —</option>';
+  scannedNetworks.forEach(function(n) {
+    var o = document.createElement('option');
+    o.value = n.ssid;
+    o.innerHTML = n.ssid + '  ' + rssiIcon(n.rssi) + (n.lock ? ' 🔒' : '');
+    // For option text (no HTML in options), use plain text fallback
+    o.textContent = n.ssid + ' (' + n.rssi + ' dBm)' + (n.lock ? ' 🔒' : '');
+    if (n.ssid === currentVal) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+function addWifiBlock() {
+  if (activeBlocks < 4) { activeBlocks++; markWifiDirty(); renderWifiBlocks(); }
+}
+function removeWifiBlock(idx) {
+  // Shift values down
+  for (var i = idx; i < activeBlocks; i++) {
+    var nextSSID = document.getElementById('ssid-' + (i + 1));
+    var nextPass = document.getElementById('pass-' + (i + 1));
+    var currSSID = document.getElementById('ssid-' + i);
+    var currPass = document.getElementById('pass-' + i);
+    if (currSSID && nextSSID) currSSID.value = nextSSID.value;
+    if (currPass && nextPass) currPass.value = nextPass.value;
+    manualSSID[i] = manualSSID[i + 1];
+    savedPasswords[i] = savedPasswords[i + 1];
+  }
+  delete manualSSID[activeBlocks];
+  delete savedPasswords[activeBlocks];
+  activeBlocks--;
+  markWifiDirty();
+  renderWifiBlocks();
+}
+function toggleManualSSID(id) {
+  manualSSID[id] = !manualSSID[id];
+  renderWifiBlocks();
+}
+
+/* ── WiFi Scan ─────────────────────────────────────────────────── */
+function scanWifi() {
+  var label = document.getElementById('scan-label');
+  if (label) label.textContent = 'Scanning…';
+  var btn = document.getElementById('btn-scan');
+  if (btn) btn.disabled = true;
+
+  function processResults(d) {
+    var unique = {};
+    d.forEach(function(n) {
+      if (!unique[n.ssid] || unique[n.ssid].rssi < n.rssi) unique[n.ssid] = n;
+    });
+    scannedNetworks = Object.values(unique).sort(function(a, b) { return b.rssi - a.rssi; });
+    if (label) label.textContent = scannedNetworks.length + ' networks found';
+    if (btn) btn.disabled = false;
+
+    for (var i = 1; i <= activeBlocks; i++) {
+      if (!manualSSID[i]) populateWifiSelect(i);
+    }
+
+    for (var i = 1; i <= activeBlocks; i++) {
+      var el = document.getElementById('ssid-' + i);
+      if (el && el.value && !manualSSID[i]) {
+        var found = scannedNetworks.some(function(n) { return n.ssid === el.value; });
+        if (!found) {
+          manualSSID[i] = true;
+          renderWifiBlocks();
+          var el2 = document.getElementById('ssid-' + i);
+          if (el2) el2.value = el.value;
+        }
+      }
+    }
+  }
+
+  function pollScan() {
+    fetch('/scan').then(function(r){ return r.json(); }).then(function(d) {
+      if (d.scanning) {
+        setTimeout(pollScan, 800);
+      } else {
+        processResults(d);
+      }
+    }).catch(function() {
+      if (label) label.textContent = 'Scan failed';
+      if (btn) btn.disabled = false;
+    });
+  }
+
+  pollScan();
+}
+
+/* ── Load Status (boot) ────────────────────────────────────────── */
+function loadStatus() {
+  fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
+    if (d.mode === 'setup') {
+      PORTAL_MODE = true;
+      applyPortalMode();
+    } else if (d.mode === 'connected') {
+      if (PORTAL_MODE) {
+        PORTAL_MODE = false;
+        var nav = document.getElementById('nav-tabs'); if (nav) nav.style.display = '';
+        var badge = document.getElementById('setup-badge'); if (badge) badge.style.display = 'none';
+        document.querySelectorAll('.sta-only').forEach(function(el) { el.style.display = ''; });
+        bleRefresh();
+        loadUploadConfig();
+        loadUploadStatus();
+      }
+      loadStatusTab(d);
+    }
+
+    populateGmtOff(d.gmt_off || 0);
+
+    // WiFi profiles: default to dropdown mode
+    if (d.ssids && d.ssids.length > 0) {
+      activeBlocks = d.ssids.length;
+      // Don't set manualSSID — leave as dropdown by default
+    }
+    renderWifiBlocks();
+
+    // Populate saved SSIDs and password states
+    if (d.ssids && d.ssids.length > 0) {
+      for (var i = 1; i <= d.ssids.length; i++) {
+        var el = document.getElementById('ssid-' + i);
+        if (el) el.value = d.ssids[i - 1];
+        if (d.has_pass && d.has_pass[i - 1]) {
+          savedPasswords[i] = true;
+          var passEl = document.getElementById('pass-' + i);
+          if (passEl) {
+            passEl.placeholder = '••••••••';
+            passEl.setAttribute('data-has-stored', 'true');
+          }
+        }
+      }
+    }
+
+    // Trigger scan after loading
+    scanWifi();
+  }).catch(function() {
+    renderWifiBlocks();
+    scanWifi();
+  });
+}
+
+function loadStatusTab(d) {
+  function setEl(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
+  setEl('status-ip', d.ip || '--');
+  setEl('status-tz', 'GMT' + (d.gmt_off >= 0 ? '+' : '') + (d.gmt_off || 0));
+  var ntpEl = document.getElementById('status-ntp');
+  if (ntpEl) {
+    ntpEl.textContent = d.ntp_synced ? 'Synchronized' : 'Not synced';
+    ntpEl.style.color = d.ntp_synced ? 'var(--success)' : 'var(--warning)';
+  }
+  setEl('status-rssi', (d.rssi && d.rssi > -128) ? (d.rssi + ' dBm') : '--');
+  var bleEl = document.getElementById('status-ble');
+  if (bleEl) { bleEl.textContent = 'Not paired'; bleEl.style.color = 'var(--text-muted)'; }
+  setEl('status-sd', '--');
+  setEl('status-uptime', '--');
+}
+
+/* ── Save All ──────────────────────────────────────────────────── */
+function saveAll() {
+  var statusEl = document.getElementById('save-status');
+  if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.className = 'status-msg'; }
+
+  var promises = [];
+
+  // WiFi + Timezone
+  if (isDirty.wifi) {
+    var body = '';
+    var validCount = 0;
+    for (var i = 1; i <= activeBlocks; i++) {
+      var ssidEl = document.getElementById('ssid-' + i);
+      var passEl = document.getElementById('pass-' + i);
+      var ssid = ssidEl ? ssidEl.value.trim() : '';
+      var pass = passEl ? passEl.value : '';
+      if (ssid) {
+        if (body) body += '&';
+        // If password wasn't touched and there's a stored one, send sentinel
+        if (!pass && savedPasswords[i]) pass = PW_SENTINEL_WIFI;
+        body += 'ssid' + (validCount + 1) + '=' + encodeURIComponent(ssid) + '&pass' + (validCount + 1) + '=' + encodeURIComponent(pass);
+        validCount++;
+      }
+    }
+    if (validCount === 0) {
+      if (statusEl) { statusEl.textContent = 'Please configure at least one Wi-Fi network'; statusEl.className = 'status-msg error'; }
+      return;
+    }
+    var gmtEl = document.getElementById('gmt-off');
+    if (gmtEl) body += '&gmt_off=' + gmtEl.value;
+
+    promises.push(
+      fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+    );
+  }
+
+  // Upload config (SMB + SleepHQ)
+  if (isDirty.upload) {
+    var smbPass = valOf('smb-pass');
+    var shqSecret = valOf('shq-secret');
+    var uploadBody = {
+      smb: {
+        host: valOf('smb-host'), share: valOf('smb-share'), user: valOf('smb-user'),
+        pass: smbPass || PW_SENTINEL_UPLOAD, path: valOf('smb-path')
+      },
+      sleephq: {
+        client_id: valOf('shq-cid'),
+        client_secret: shqSecret || PW_SENTINEL_UPLOAD
+      }
+    };
+    promises.push(
+      fetch('/api/uploads/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(uploadBody) })
+    );
+  }
+
+  if (promises.length === 0) {
+    if (statusEl) { statusEl.textContent = 'No changes to save'; statusEl.className = 'status-msg'; }
+    return;
+  }
+
+  Promise.all(promises).then(function() {
+    if (statusEl) { statusEl.textContent = 'Saved! Rebooting…'; statusEl.className = 'status-msg success'; }
+    isDirty = { wifi: false, upload: false };
+    updateSaveButton();
+  }).catch(function() {
+    if (statusEl) { statusEl.textContent = 'Save failed — please try again'; statusEl.className = 'status-msg error'; }
+  });
+}
+
+function valOf(id) { var el = document.getElementById(id); return el ? el.value : ''; }
+
+/* ── BLE Pairing ───────────────────────────────────────────────── */
+var blePollTimer = null;
+function bleStatusMsg(t) { var el = document.getElementById('ble-status'); if (el) el.textContent = t; }
+
+function bleScan() {
+  bleStatusMsg('Scanning for AirSense 11…');
+  fetch('/api/ble/scan').then(function(r){ return r.json(); }).then(function(d) {
+    var sel = document.getElementById('ble-dev');
+    if (!sel) return;
+    sel.innerHTML = '';
+    if (!d.length) { bleStatusMsg('No AirSense 11 devices found'); return; }
+    d.sort(function(a, b) { return b.rssi - a.rssi; });
+    d.forEach(function(n) {
+      var o = document.createElement('option');
+      o.value = n.addr;
+      o.textContent = n.name + ' (' + n.rssi + ' dBm)';
+      sel.appendChild(o);
+    });
+    document.getElementById('ble-select-group').style.display = 'block';
+    document.getElementById('btn-ble-pair').style.display = '';
+    bleStatusMsg(d.length + ' device(s) found');
+  }).catch(function() { bleStatusMsg('Scan failed'); });
+}
+
+function blePair() {
+  var addr = document.getElementById('ble-dev').value;
+  if (!addr) { bleStatusMsg('Select a device first'); return; }
+  bleStatusMsg('Connecting…');
+  fetch('/api/ble/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: addr }) })
+    .then(function(r){ return r.json(); }).then(function() { blePoll(); }).catch(function() { bleStatusMsg('Pair failed'); });
+}
+function bleConfirm() {
+  var pk = document.getElementById('ble-passkey').value.trim();
+  if (pk.length !== 4) { bleStatusMsg('Enter the 4-digit code from your CPAP'); return; }
+  bleStatusMsg('Verifying…');
+  fetch('/api/ble/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passkey: pk }) })
+    .then(function(r){ return r.json(); }).then(function() { blePoll(); }).catch(function() { bleStatusMsg('Confirm failed'); });
+}
+function bleForget() {
+  if (!confirm('Unpair the CPAP device?')) return;
+  fetch('/api/ble/forget', { method: 'POST' }).then(function() { bleRefresh(); });
+}
+function blePoll() {
+  if (blePollTimer) clearInterval(blePollTimer);
+  blePollTimer = setInterval(bleRefresh, 500);
+  bleRefresh();
+}
+function bleRefresh() {
+  fetch('/api/ble/status').then(function(r){ return r.json(); }).then(function(d) {
+    var paired = document.getElementById('ble-paired');
+    var unp = document.getElementById('ble-unpaired');
+    var fgt = document.getElementById('btn-ble-forget');
+    var pg = document.getElementById('ble-passkey-group');
+
+    if (d.state === 'waiting_passkey') { pg.style.display = 'block'; bleStatusMsg('Enter the code shown on your CPAP screen'); return; }
+    if (d.state === 'connecting') { bleStatusMsg('Connecting to device…'); return; }
+    if (d.state === 'confirming') { bleStatusMsg('Verifying code…'); return; }
+    if (d.state === 'error') { if (blePollTimer) clearInterval(blePollTimer); if (pg) pg.style.display = 'none'; bleStatusMsg('Error: ' + (d.error || 'pairing failed')); return; }
+
+    if (d.paired) {
+      if (blePollTimer) clearInterval(blePollTimer);
+      if (paired) paired.style.display = 'block';
+      if (unp) unp.style.display = 'none';
+      if (fgt) fgt.style.display = '';
+      if (pg) pg.style.display = 'none';
+      var dn = document.getElementById('ble-dev-name');
+      if (dn) dn.textContent = (d.device && d.device.name) || 'AirSense 11';
+      bleStatusMsg(d.state === 'paired' ? 'Paired successfully' : '');
+    } else {
+      if (paired) paired.style.display = 'none';
+      if (unp) unp.style.display = 'block';
+      if (fgt) fgt.style.display = 'none';
+    }
+  }).catch(function() {});
+}
+
+/* ── Upload Config ─────────────────────────────────────────────── */
+function loadUploadConfig() {
+  fetch('/api/uploads/config').then(function(r){ return r.json(); }).then(function(d) {
+    function setVal(id, v) { var el = document.getElementById(id); if (el) el.value = v || ''; }
+    function setStoredPw(id) {
+      var el = document.getElementById(id);
+      if (el) { el.value = ''; el.placeholder = '••••••••'; el.setAttribute('data-has-stored', 'true'); }
+    }
+    if (d.smb) {
+      setVal('smb-host', d.smb.host);
+      setVal('smb-share', d.smb.share);
+      setVal('smb-user', d.smb.user);
+      setVal('smb-path', d.smb.path);
+      if (d.smb.pass === PW_SENTINEL_UPLOAD) setStoredPw('smb-pass');
+      else setVal('smb-pass', d.smb.pass);
+    }
+    if (d.sleephq) {
+      setVal('shq-cid', d.sleephq.client_id);
+      if (d.sleephq.client_secret === PW_SENTINEL_UPLOAD) setStoredPw('shq-secret');
+      else setVal('shq-secret', d.sleephq.client_secret);
+    }
+    updateSmbPreview();
+  }).catch(function() {});
+}
+
+function loadUploadStatus() {
+  fetch('/api/uploads/status').then(function(r){ return r.json(); }).then(function(d) {
+    var el = document.getElementById('upload-status');
+    if (!el) return;
+    if (!d.sessions || !d.sessions.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload sessions yet.</div>'; return; }
+    var h = '';
+    d.sessions.forEach(function(s) {
+      h += '<div style="margin-bottom:8px;padding:8px;border:1px solid var(--card-border);border-radius:8px">';
+      h += '<strong>' + s.session_id + '</strong> <span style="color:var(--text-muted)">(' + s.day_folder + ')</span><br>';
+      if (s.backends) { s.backends.forEach(function(b) {
+        var c = b.status === 'done' ? 'var(--success)' : b.status === 'failed' ? 'var(--danger)' : 'var(--warning)';
+        h += '<span style="color:' + c + '">' + b.backend + ': ' + b.status + '</span>';
+        if (b.attempts > 0) h += ' <span style="color:var(--text-muted)">(' + b.attempts + ' attempts)</span>';
+        h += '<br>';
+      }); }
+      h += '</div>';
+    });
+    el.innerHTML = h;
+  }).catch(function() {});
+}
+
+function updateSmbPreview() {
+  var host = valOf('smb-host') || 'host';
+  var share = valOf('smb-share') || 'share';
+  var user = valOf('smb-user');
+  var pass = valOf('smb-pass');
+  var path = valOf('smb-path');
+  var displayPass = pass ? '***' : '';
+  var cred = user ? user + ':' + displayPass + '@' : '';
+  var pathClean = path ? (path.startsWith('/') ? path : '/' + path) : '';
+  var el = document.getElementById('smb-uri-preview');
+  if (el) el.textContent = 'smb://' + cred + host + '/' + share + pathClean;
+}
+
+/* ── Logs ──────────────────────────────────────────────────────── */
+function filterLogs(q) {
+  var term = document.getElementById('log-terminal');
+  var lines = term.dataset.original ? term.dataset.original.split('\n') : term.textContent.split('\n');
+  if (!term.dataset.original) term.dataset.original = lines.join('\n');
+  var filtered = q ? lines.filter(function(l) { return l.toLowerCase().indexOf(q.toLowerCase()) >= 0; }) : lines;
+  term.textContent = filtered.join('\n');
+}
+function clearLogs() { var term = document.getElementById('log-terminal'); if (term) { term.textContent = ''; term.dataset.original = ''; } }
+function downloadLogs() { alert('Log download requires /api/logs/download endpoint.'); }
+
+/* ── Dashboard Date ────────────────────────────────────────────── */
+function updateDateDisplayLabel(dateIsoStr) {
+  var parts = dateIsoStr.split('-');
+  var d = new Date(parts[0], parts[1] - 1, parts[2]);
+  var formatted;
+  try {
+    formatted = new Intl.DateTimeFormat(navigator.language, { weekday: 'long', year: 'numeric', month: 'short', day: 'numeric' }).format(d);
+  } catch (e) {
+    var mm = String(d.getMonth() + 1).padStart(2, '0');
+    var dd = String(d.getDate()).padStart(2, '0');
+    formatted = d.getFullYear() + '/' + mm + '/' + dd;
+  }
+  var el = document.getElementById('date-display-label');
+  if (el) el.textContent = formatted;
+}
+function triggerDatePicker() {
+  var picker = document.getElementById('session-date');
+  if (picker && typeof picker.showPicker === 'function') picker.showPicker();
+}
+function handleDateChange(val) { updateDateDisplayLabel(val); loadSessionData(); }
+function stepDate(days) {
+  var picker = document.getElementById('session-date');
+  var parts = picker.value.split('-');
+  var date = new Date(parts[0], parts[1] - 1, parts[2]);
+  date.setDate(date.getDate() + days);
+  var newval = date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+  picker.value = newval;
+  handleDateChange(newval);
+}
+function loadSessionData() { console.log('Loading session data for:', document.getElementById('session-date').value); }
+
+/* ── SoftAP Mode ───────────────────────────────────────────────── */
+function applyPortalMode() {
+  if (!PORTAL_MODE) return;
+  // Hide nav tabs
+  var nav = document.getElementById('nav-tabs');
+  if (nav) nav.style.display = 'none';
+  // Show setup badge
+  var badge = document.getElementById('setup-badge');
+  if (badge) badge.style.display = 'inline-block';
+  // Hide all STA-only elements
+  document.querySelectorAll('.sta-only').forEach(function(el) { el.style.display = 'none'; });
+  // Theme selector stays visible (per spec)
+}
+
+/* ── Boot ──────────────────────────────────────────────────────── */
+window.onload = function() {
+  setTheme(localStorage.getItem('somnotrace_theme') || 'night');
+  applyPortalMode();
+  loadStatus();
+  if (!PORTAL_MODE) {
+    bleRefresh();
+    loadUploadConfig();
+    loadUploadStatus();
+  }
+  // Set today's date for dashboard
+  var today = new Date();
+  var picker = document.getElementById('session-date');
+  if (picker) {
+    picker.value = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
+    updateDateDisplayLabel(picker.value);
+  }
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+};
+</script>
+</body>
+</html>

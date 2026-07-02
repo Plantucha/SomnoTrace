@@ -56,6 +56,7 @@ static void show_status(const char *title, const char *lines[], int n)
 
 static void enter_softap(const struct netprov_config *cfg)
 {
+    as11_ble_disconnect();
     bsp_display_set_wifi_connected(false);
     char ap_ip[16] = "0.0.0.0";
     esp_err_t err = netprov_start_portal(cfg, ap_ip);
