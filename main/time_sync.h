@@ -28,14 +28,17 @@
 #include "esp_err.h"
 
 /* Initialise SNTP after Wi-Fi STA connects.
- * Reads GMT offset from NVS, configures timezone, starts SNTP in poll mode
- * (1-hour re-sync interval). Tries DHCP option 42 servers first, falls back
- * to public NTP pools. */
+ * Reads timezone from NVS (POSIX TZ string), configures timezone, starts SNTP
+ * in poll mode (1-hour re-sync interval). Tries DHCP option 42 servers first,
+ * falls back to public NTP pools. Defaults to UTC if no timezone is set. */
 esp_err_t time_sync_init(void);
 
-/* Get/set GMT offset (hours, -12..+14) stored in NVS. */
-int time_sync_get_gmt_offset(void);
-esp_err_t time_sync_set_gmt_offset(int gmt_off);
+/* Get/set timezone as POSIX TZ string and IANA name, stored in NVS.
+ * tz_str: e.g. "AEST-10AEDT,M10.1.0,M4.1.0/3"
+ * tz_name: e.g. "Australia/Melbourne" (for UI re-selection only) */
+esp_err_t time_sync_set_timezone(const char *tz_str, const char *tz_name);
+void time_sync_get_timezone(char *tz_str, size_t tz_str_len);
+void time_sync_get_tz_name(char *tz_name, size_t tz_name_len);
 
 /* Returns true if system time has been synchronised via NTP. */
 bool time_sync_is_synced(void);

@@ -5,4 +5,17 @@ idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provisio
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json
                                 bt mbedtls esp_rom fatfs sdmmc esp-idf-ftpServer uploader)
 
+# Download zones.json (IANA-to-POSIX timezone database) if not present.
+# Source: https://github.com/nayarsystems/posix_tz_db (MIT License)
+find_package(Python3 REQUIRED)
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_LIST_DIR}/zones.json"
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../scripts/gen_tz_db.py
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/../scripts/gen_tz_db.py
+    COMMENT "Fetching timezone database (zones.json)"
+    VERBATIM)
+add_custom_target(tz_db DEPENDS "${CMAKE_CURRENT_LIST_DIR}/zones.json")
+add_dependencies(${COMPONENT_LIB} tz_db)
+
 target_add_binary_data(${COMPONENT_LIB} "portal.html" TEXT)
+target_add_binary_data(${COMPONENT_LIB} "zones.json" TEXT)

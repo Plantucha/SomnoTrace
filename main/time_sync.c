@@ -37,7 +37,10 @@
 static const char *TAG = "time_sync";
 
 #define NVS_NAMESPACE    "cfg"
-#define NVS_KEY_GMT_OFF  "gmt_off"
+#define NVS_KEY_TZ_STR   "tz_str"
+#define NVS_KEY_TZ_NAME  "tz_name"
+#define TZ_STR_MAX       64
+#define TZ_NAME_MAX      40
 #define SNTP_SYNC_MS    (3600 * 1000)   /* 1 hour */
 
 static bool s_synced = false;
@@ -53,43 +56,56 @@ static void sntp_sync_cb(struct timeval *tv)
              tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
 }
 
-static void apply_timezone(int gmt_off)
+static void apply_timezone(const char *tz_str)
 {
-    char tz[16];
-    if (gmt_off >= 0) {
-        snprintf(tz, sizeof(tz), "GMT-%d", gmt_off);
-    } else {
-        snprintf(tz, sizeof(tz), "GMT+%d", -gmt_off);
+    if (!tz_str || tz_str[0] == '\0') {
+        tz_str = "UTC0";
     }
-    /* POSIX TZ: GMT-N means N hours *ahead* of UTC (counter-intuitive sign) */
-    setenv("TZ", tz, 1);
+    setenv("TZ", tz_str, 1);
     tzset();
-    ESP_LOGI(TAG, "timezone set to %s (GMT%+d)", tz, gmt_off);
+    ESP_LOGI(TAG, "timezone set to %s", tz_str);
 }
 
-int time_sync_get_gmt_offset(void)
+esp_err_t time_sync_set_timezone(const char *tz_str, const char *tz_name)
 {
-    nvs_handle_t h;
-    int8_t val = 0;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_i8(h, NVS_KEY_GMT_OFF, &val);
-        nvs_close(h);
-    }
-    return (int)val;
-}
-
-esp_err_t time_sync_set_gmt_offset(int gmt_off)
-{
-    if (gmt_off < -12 || gmt_off > 14) {
+    if (!tz_str || tz_str[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
-    err = nvs_set_i8(h, NVS_KEY_GMT_OFF, (int8_t)gmt_off);
+    err = nvs_set_str(h, NVS_KEY_TZ_STR, tz_str);
+    if (err == ESP_OK && tz_name && tz_name[0]) {
+        nvs_set_str(h, NVS_KEY_TZ_NAME, tz_name);
+    }
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
+    if (err == ESP_OK) {
+        apply_timezone(tz_str);
+    }
     return err;
+}
+
+void time_sync_get_timezone(char *tz_str, size_t tz_str_len)
+{
+    if (!tz_str || tz_str_len == 0) return;
+    tz_str[0] = '\0';
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_str(h, NVS_KEY_TZ_STR, tz_str, &tz_str_len);
+        nvs_close(h);
+    }
+}
+
+void time_sync_get_tz_name(char *tz_name, size_t tz_name_len)
+{
+    if (!tz_name || tz_name_len == 0) return;
+    tz_name[0] = '\0';
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_str(h, NVS_KEY_TZ_NAME, tz_name, &tz_name_len);
+        nvs_close(h);
+    }
 }
 
 bool time_sync_is_synced(void)
@@ -99,8 +115,9 @@ bool time_sync_is_synced(void)
 
 esp_err_t time_sync_init(void)
 {
-    int gmt_off = time_sync_get_gmt_offset();
-    apply_timezone(gmt_off);
+    char tz_str[TZ_STR_MAX];
+    time_sync_get_timezone(tz_str, sizeof(tz_str));
+    apply_timezone(tz_str);
 
     /* Configure SNTP using esp_netif_sntp — this API handles DHCP option 42
      * servers automatically when CONFIG_LWIP_DHCP_GET_NTP_SRV is enabled. */

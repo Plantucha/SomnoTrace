@@ -56,6 +56,20 @@ determined to have been incorporated.
   adapted from upstream to work with IDF v5.5 build system. `include/esp/config.h`
   updated with `_U_` and `SOL_TCP` macros and `HAVE_SYS_TIME_H`.
 
+## posix_tz_db
+
+- **Project:** POSIX Timezone Database
+- **Source:** https://github.com/nayarsystems/posix_tz_db
+- **Used for:** IANA-to-POSIX TZ string mapping (e.g. `Australia/Melbourne` →
+  `AEST-10AEDT,M10.1.0,M4.1.0/3`) for timezone selection in the web UI.
+  The `zones.json` file is downloaded at build time and embedded into firmware
+  via `target_add_binary_data`, then served to the web UI via the `/api/tz`
+  endpoint. This allows timezone selection without internet connectivity
+  (e.g. in SoftAP setup mode).
+- **License:** MIT
+- **Notes:** `zones.json` is fetched by `scripts/gen_tz_db.py` at build time
+  and is git-ignored (generated artifact). The data is not modified.
+
 ---
 
 ## MIT License (reference text)

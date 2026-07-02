@@ -365,6 +365,11 @@ extern const char _binary_portal_html_end[];
 #define PORTAL_HTML_START _binary_portal_html_start
 #define PORTAL_HTML_LEN   ((size_t)(_binary_portal_html_end - _binary_portal_html_start))
 
+extern const char _binary_zones_json_start[];
+extern const char _binary_zones_json_end[];
+#define ZONES_JSON_START _binary_zones_json_start
+#define ZONES_JSON_LEN   ((size_t)(_binary_zones_json_end - _binary_zones_json_start))
+
 /* portal.html is embedded via CMakeLists.txt target_add_binary_data */
 
 
@@ -394,6 +399,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, PORTAL_HTML_START, PORTAL_HTML_LEN);
+    return ESP_OK;
+}
+
+static esp_err_t tz_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, ZONES_JSON_START, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -463,7 +475,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
-    int gmt = time_sync_get_gmt_offset();
+    char tz_str[64];
+    char tz_name[40];
+    time_sync_get_timezone(tz_str, sizeof(tz_str));
+    time_sync_get_tz_name(tz_name, sizeof(tz_name));
     bool synced = time_sync_is_synced();
     char time_str[32] = "";
     time_t now = time(NULL);
@@ -481,18 +496,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     esp_wifi_sta_get_rssi(&rssi);
     esp_wifi_get_channel(&primary_chan, &second_chan);
 
-    char resp[600];
+    char resp[700];
     if (s_portal_mode) {
         snprintf(resp, sizeof(resp),
-                 "{\"mode\":\"setup\",\"ssids\":[%s],\"has_pass\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s,"
+                 "{\"mode\":\"setup\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
                  "\"rssi\":%d,\"channel\":%d}",
-                 ssids_json, has_pass_json, gmt, time_str, synced ? "true" : "false",
+                 ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
                  rssi, primary_chan);
     } else {
         snprintf(resp, sizeof(resp),
-                 "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"gmt_off\":%d,\"time\":%s,\"ntp_synced\":%s,"
+                 "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
                  "\"rssi\":%d,\"channel\":%d}",
-                 s_connected_ip, ssids_json, has_pass_json, gmt, time_str, synced ? "true" : "false",
+                 s_connected_ip, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
                  rssi, primary_chan);
     }
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -725,59 +740,67 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     }
     body[received] = '\0';
 
+    /* Check if this is a timezone-only update */
+    char tz_only[4] = { 0 };
+    form_get(body, "tz_only", tz_only, sizeof(tz_only));
+    bool is_tz_only = (tz_only[0] == '1');
+
     struct netprov_config old_cfg;
     netprov_load_config(&old_cfg);
 
     struct netprov_config cfg;
     memcpy(&cfg, &old_cfg, sizeof(cfg));
-    memset(cfg.wifi, 0, sizeof(cfg.wifi));
 
     int saved_count = 0;
-    for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
-        char ssid_key[16];
-        char pass_key[16];
-        snprintf(ssid_key, sizeof(ssid_key), "ssid%d", i + 1);
-        snprintf(pass_key, sizeof(pass_key), "pass%d", i + 1);
 
-        char ssid[NETPROV_SSID_MAXLEN + 1] = { 0 };
-        char pass[NETPROV_PASS_MAXLEN + 1] = { 0 };
+    if (!is_tz_only) {
+        memset(cfg.wifi, 0, sizeof(cfg.wifi));
 
-        if (form_get(body, ssid_key, ssid, sizeof(ssid)) && ssid[0] != '\0') {
-            form_get(body, pass_key, pass, sizeof(pass));
-            strlcpy(cfg.wifi[saved_count].ssid, ssid, sizeof(cfg.wifi[saved_count].ssid));
-            if (strcmp(pass, "\xe2\x96\x88UNCHANGED\xe2\x96\x88") == 0) {
-                for (int j = 0; j < NETPROV_MAX_SSID_SLOTS; j++) {
-                    if (strcmp(old_cfg.wifi[j].ssid, ssid) == 0) {
-                        strlcpy(cfg.wifi[saved_count].pass, old_cfg.wifi[j].pass, sizeof(cfg.wifi[saved_count].pass));
-                        break;
+        for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
+            char ssid_key[16];
+            char pass_key[16];
+            snprintf(ssid_key, sizeof(ssid_key), "ssid%d", i + 1);
+            snprintf(pass_key, sizeof(pass_key), "pass%d", i + 1);
+
+            char ssid[NETPROV_SSID_MAXLEN + 1] = { 0 };
+            char pass[NETPROV_PASS_MAXLEN + 1] = { 0 };
+
+            if (form_get(body, ssid_key, ssid, sizeof(ssid)) && ssid[0] != '\0') {
+                form_get(body, pass_key, pass, sizeof(pass));
+                strlcpy(cfg.wifi[saved_count].ssid, ssid, sizeof(cfg.wifi[saved_count].ssid));
+                if (strcmp(pass, "\xe2\x96\x88UNCHANGED\xe2\x96\x88") == 0) {
+                    for (int j = 0; j < NETPROV_MAX_SSID_SLOTS; j++) {
+                        if (strcmp(old_cfg.wifi[j].ssid, ssid) == 0) {
+                            strlcpy(cfg.wifi[saved_count].pass, old_cfg.wifi[j].pass, sizeof(cfg.wifi[saved_count].pass));
+                            break;
+                        }
                     }
+                } else {
+                    strlcpy(cfg.wifi[saved_count].pass, pass, sizeof(cfg.wifi[saved_count].pass));
                 }
-            } else {
-                strlcpy(cfg.wifi[saved_count].pass, pass, sizeof(cfg.wifi[saved_count].pass));
+                saved_count++;
             }
-            saved_count++;
         }
-    }
 
-    if (saved_count == 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ssid");
-        return ESP_FAIL;
-    }
-
-    if (netprov_save_config(&cfg) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs save failed");
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "saved %d credentials", saved_count);
-
-    /* Save GMT offset if present */
-    char gmt_str[8] = { 0 };
-    if (form_get(body, "gmt_off", gmt_str, sizeof(gmt_str)) && gmt_str[0] != '\0') {
-        int gmt = atoi(gmt_str);
-        if (gmt >= -12 && gmt <= 14) {
-            time_sync_set_gmt_offset(gmt);
-            ESP_LOGI(TAG, "saved GMT offset %d", gmt);
+        if (saved_count == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ssid");
+            return ESP_FAIL;
         }
+
+        if (netprov_save_config(&cfg) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs save failed");
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "saved %d credentials", saved_count);
+    }
+
+    /* Save timezone if present */
+    char tz_str_val[64] = { 0 };
+    char tz_name_val[40] = { 0 };
+    if (form_get(body, "tz_str", tz_str_val, sizeof(tz_str_val)) && tz_str_val[0] != '\0') {
+        form_get(body, "tz_name", tz_name_val, sizeof(tz_name_val));
+        time_sync_set_timezone(tz_str_val, tz_name_val);
+        ESP_LOGI(TAG, "saved timezone %s (%s)", tz_name_val, tz_str_val);
     }
 
     httpd_resp_set_type(req, "text/html");
@@ -1065,6 +1088,9 @@ static esp_err_t start_webserver(void)
 
     httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
     httpd_register_uri_handler(s_httpd, &status);
+
+    httpd_uri_t tz_db = { .uri = "/api/tz", .method = HTTP_GET, .handler = tz_get_handler };
+    httpd_register_uri_handler(s_httpd, &tz_db);
 
     httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler };
     httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };

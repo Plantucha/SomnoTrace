@@ -239,8 +239,9 @@ Wi-Fi &amp; Timezone
 <button id="btn-add-wifi" type="button" class="btn btn-ghost btn-block" onclick="addWifiBlock()">+ Add another Wi-Fi network</button>
 </div>
 <div class="form-group" style="margin-top:14px">
-<label>Timezone (GMT offset)</label>
-<select id="gmt-off" class="form-control" data-dirty="false" onchange="markDirty(this)"></select>
+<label>Timezone</label>
+<select id="tz-select" class="form-control" data-dirty="false" onchange="markDirty(this)"></select>
+<input type="hidden" id="tz-str">
 </div>
 </div>
 
@@ -488,16 +489,20 @@ function togglePw(id) {
 }
 
 /* ── Dirty State Tracking ──────────────────────────────────────── */
-var isDirty = { wifi: false, upload: false };
+var isDirty = { wifi: false, upload: false, tz: false };
 
 function markDirty(el) {
   if (el) el.setAttribute('data-dirty', 'true');
   // Determine which section
-  var card = el ? el.closest('.card') : null;
-  if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq'))) {
-    isDirty.upload = true;
+  if (el && el.id === 'tz-select') {
+    isDirty.tz = true;
   } else {
-    isDirty.wifi = true;
+    var card = el ? el.closest('.card') : null;
+    if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq'))) {
+      isDirty.upload = true;
+    } else {
+      isDirty.wifi = true;
+    }
   }
   updateSaveButton();
 }
@@ -509,7 +514,7 @@ function markWifiDirty() {
 
 function updateSaveButton() {
   var btn = document.getElementById('btn-save');
-  if (btn) btn.disabled = !(isDirty.wifi || isDirty.upload);
+  if (btn) btn.disabled = !(isDirty.wifi || isDirty.upload || isDirty.tz);
 }
 
 /* ── WiFi State ────────────────────────────────────────────────── */
@@ -518,16 +523,46 @@ var manualSSID = {};
 var scannedNetworks = [];
 var savedPasswords = {};
 
-function populateGmtOff(saved) {
-  var sel = document.getElementById('gmt-off');
+var tzData = null;
+
+function loadTimezones(savedTzName) {
+  var sel = document.getElementById('tz-select');
   if (!sel) return;
-  sel.innerHTML = '';
-  for (var i = -12; i <= 14; i++) {
-    var o = document.createElement('option');
-    o.value = i;
-    o.textContent = 'GMT' + (i >= 0 ? '+' : '') + i + ':00';
-    if (i === saved) o.selected = true;
-    sel.appendChild(o);
+  sel.innerHTML = '<option value="">Loading...</option>';
+
+  fetch('/api/tz').then(function(r) { return r.json(); }).then(function(data) {
+    tzData = data;
+    var keys = Object.keys(data).sort();
+    sel.innerHTML = '';
+    for (var i = 0; i < keys.length; i++) {
+      var o = document.createElement('option');
+      o.value = keys[i];
+      o.textContent = keys[i];
+      sel.appendChild(o);
+    }
+
+    var target = savedTzName && savedTzName.length > 0 ? savedTzName : '';
+    if (!target) {
+      try { target = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e) {}
+    }
+    if (target && data[target]) {
+      sel.value = target;
+    }
+    updateTzStr();
+  }).catch(function() {
+    sel.innerHTML = '<option value="">Timezone data unavailable</option>';
+  });
+
+  sel.onchange = function() { markDirty(this); updateTzStr(); };
+}
+
+function updateTzStr() {
+  var sel = document.getElementById('tz-select');
+  var hidden = document.getElementById('tz-str');
+  if (sel && hidden && tzData && tzData[sel.value]) {
+    hidden.value = tzData[sel.value];
+  } else if (hidden) {
+    hidden.value = '';
   }
 }
 
@@ -715,7 +750,7 @@ function loadStatus() {
       loadStatusTab(d);
     }
 
-    populateGmtOff(d.gmt_off || 0);
+    loadTimezones(d.tz_name || '');
 
     // WiFi profiles: default to dropdown mode
     if (d.ssids && d.ssids.length > 0) {
@@ -751,7 +786,7 @@ function loadStatus() {
 function loadStatusTab(d) {
   function setEl(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
   setEl('status-ip', d.ip || '--');
-  setEl('status-tz', 'GMT' + (d.gmt_off >= 0 ? '+' : '') + (d.gmt_off || 0));
+  setEl('status-tz', d.tz_name || 'UTC');
   var ntpEl = document.getElementById('status-ntp');
   if (ntpEl) {
     ntpEl.textContent = d.ntp_synced ? 'Synchronized' : 'Not synced';
@@ -792,12 +827,27 @@ function saveAll() {
       if (statusEl) { statusEl.textContent = 'Please configure at least one Wi-Fi network'; statusEl.className = 'status-msg error'; }
       return;
     }
-    var gmtEl = document.getElementById('gmt-off');
-    if (gmtEl) body += '&gmt_off=' + gmtEl.value;
+    var tzSel = document.getElementById('tz-select');
+    var tzHidden = document.getElementById('tz-str');
+    if (tzSel && tzSel.value) body += '&tz_name=' + encodeURIComponent(tzSel.value);
+    if (tzHidden && tzHidden.value) body += '&tz_str=' + encodeURIComponent(tzHidden.value);
 
     promises.push(
       fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
     );
+  } else if (isDirty.tz) {
+    // Timezone-only change — don't touch WiFi config
+    var tzSel = document.getElementById('tz-select');
+    var tzHidden = document.getElementById('tz-str');
+    var tzBody = '';
+    if (tzSel && tzSel.value) tzBody += '&tz_name=' + encodeURIComponent(tzSel.value);
+    if (tzHidden && tzHidden.value) tzBody += '&tz_str=' + encodeURIComponent(tzHidden.value);
+    if (tzBody) {
+      tzBody = 'tz_only=1' + tzBody;
+      promises.push(
+        fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: tzBody })
+      );
+    }
   }
 
   // Upload config (SMB + SleepHQ)
@@ -826,7 +876,7 @@ function saveAll() {
 
   Promise.all(promises).then(function() {
     if (statusEl) { statusEl.textContent = 'Saved! Rebooting…'; statusEl.className = 'status-msg success'; }
-    isDirty = { wifi: false, upload: false };
+    isDirty = { wifi: false, upload: false, tz: false };
     updateSaveButton();
   }).catch(function() {
     if (statusEl) { statusEl.textContent = 'Save failed — please try again'; statusEl.className = 'status-msg error'; }
@@ -961,9 +1011,8 @@ function updateSmbPreview() {
   var host = valOf('smb-host') || 'host';
   var share = valOf('smb-share') || 'share';
   var user = valOf('smb-user');
-  var pass = valOf('smb-pass');
   var path = valOf('smb-path');
-  var displayPass = pass ? '***' : '';
+  var displayPass = user ? '********' : '';
   var cred = user ? user + ':' + displayPass + '@' : '';
   var pathClean = path ? (path.startsWith('/') ? path : '/' + path) : '';
   var el = document.getElementById('smb-uri-preview');
