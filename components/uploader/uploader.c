@@ -63,7 +63,6 @@ static const int retry_delays_ms[] = {30000, 60000, 120000, 300000, 600000};
 /* ── Internal state ─────────────────────────────────────────────────── */
 
 typedef struct {
-    char session_id[32];
     char day_folder[16];
 } upload_event_t;
 
@@ -280,18 +279,49 @@ esp_err_t uploader_get_status_json(char **out_json)
     return ret;
 }
 
+/* ── Reset state ─────────────────────────────────────────────────────── */
+
+esp_err_t uploader_reset_state(void)
+{
+    if (!s_state_mutex || !s_state) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    memset(s_state, 0, sizeof(*s_state));
+    uploader_state_save(s_state);
+    xSemaphoreGive(s_state_mutex);
+
+    ESP_LOGI(TAG, "upload state cleared");
+    return ESP_OK;
+}
+
 /* ── Upload task ────────────────────────────────────────────────────── */
 
-static void process_session(const char *session_id, const char *day_folder)
+static void process_day(const char *day_folder)
 {
-    ESP_LOGI(TAG, "processing session %s (day=%s)", session_id, day_folder);
+    ESP_LOGI(TAG, "processing day %s", day_folder);
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
 
-    /* Ensure session exists in state */
-    uploader_state_find_or_create(s_state, session_id, day_folder);
+    /* Ensure day exists in state */
+    day_state_t *day = uploader_state_find_or_create(s_state, day_folder);
 
-    /* Run each configured backend sequentially */
+    /* Dirty: if any backend was ST_OK, reset to ST_PENDING so the whole
+     * day is re-uploaded with the new session data.  This happens here
+     * (on the uploader task's internal stack) rather than in
+     * uploader_on_day_ready() because callers may run on a PSRAM stack
+     * and flash I/O would crash (cache disabled → PSRAM inaccessible). */
+    if (day) {
+        for (int i = 0; i < day->n_backends; i++) {
+            if (day->backends[i].status == ST_OK) {
+                ESP_LOGI(TAG, "  backend %s: dirtying (was OK) for re-upload", day->backends[i].name);
+                day->backends[i].status = ST_PENDING;
+            }
+        }
+    }
+
+    /* Run each configured backend sequentially, skipping those already done */
     for (int i = 0; i < s_n_backends; i++) {
         const upload_backend_t *be = s_backends[i];
         if (!be || !be->is_configured || !be->is_configured()) {
@@ -299,8 +329,21 @@ static void process_session(const char *session_id, const char *day_folder)
             continue;
         }
 
+        /* Skip backends that are still pending from a previous failed run
+         * only if they were NOT dirtied above — but since dirtying resets
+         * ST_OK → ST_PENDING, we only skip ST_OK (which shouldn't exist
+         * after dirtying).  In practice, after dirtying all backends are
+         * either ST_PENDING or ST_FAILED, so we process them all. */
+        if (day) {
+            backend_state_t *bs = uploader_state_backend_find_or_create(day, be->name);
+            if (bs && bs->status == ST_OK) {
+                ESP_LOGI(TAG, "  backend %s: already OK, skipping", be->name);
+                continue;
+            }
+        }
+
         ESP_LOGI(TAG, "  backend %s: uploading...", be->name);
-        upload_result_t result = be->upload_session(session_id, day_folder);
+        upload_result_t result = be->upload_day(day_folder);
 
         upload_status_t st;
         switch (result) {
@@ -319,9 +362,8 @@ static void process_session(const char *session_id, const char *day_folder)
         }
 
         /* Update state */
-        session_state_t *sess = uploader_state_find(s_state, session_id);
-        if (sess) {
-            backend_state_t *bs = uploader_state_backend_find_or_create(sess, be->name);
+        if (day) {
+            backend_state_t *bs = uploader_state_backend_find_or_create(day, be->name);
             if (bs) {
                 bs->status = st;
                 if (st == ST_OK || st == ST_FAILED) {
@@ -342,15 +384,22 @@ static void check_retries(void)
 
     int64_t now_ms = (int64_t)time(NULL) * 1000;
 
-    for (int i = 0; i < s_state->n_sessions; i++) {
-        session_state_t *s = &s_state->sessions[i];
+    for (int i = 0; i < s_state->n_days; i++) {
+        day_state_t *s = &s_state->days[i];
         bool needs_retry = false;
 
         for (int j = 0; j < s->n_backends; j++) {
             backend_state_t *b = &s->backends[j];
             if (b->status == ST_FAILED && b->attempts < MAX_RETRY_ATTEMPTS) {
-                int delay_idx = b->attempts < N_RETRY_DELAYS ? b->attempts : N_RETRY_DELAYS - 1;
-                if (now_ms - b->last_try_ms >= retry_delays_ms[delay_idx]) {
+                int delay_idx = b->attempts - 1;
+                if (delay_idx < 0) delay_idx = 0;
+                if (delay_idx >= N_RETRY_DELAYS) delay_idx = N_RETRY_DELAYS - 1;
+                int delay = retry_delays_ms[delay_idx];
+                int64_t elapsed = now_ms - b->last_try_ms;
+                if (elapsed >= delay) {
+                    ESP_LOGI(TAG, "retry: day %s backend %s: attempt %d, elapsed %lldms (delay was %dms)",
+                             s->day_folder, b->name, b->attempts + 1,
+                             (long long)elapsed, delay);
                     needs_retry = true;
                     break;
                 }
@@ -358,9 +407,8 @@ static void check_retries(void)
         }
 
         if (needs_retry) {
-            ESP_LOGI(TAG, "retry: session %s needs retry", s->session_id);
+            ESP_LOGI(TAG, "retry: day %s needs retry", s->day_folder);
             upload_event_t ev = {0};
-            strlcpy(ev.session_id, s->session_id, sizeof(ev.session_id));
             strlcpy(ev.day_folder, s->day_folder, sizeof(ev.day_folder));
             xQueueSend(s_queue, &ev, 0);
         }
@@ -373,10 +421,9 @@ static void upload_task(void *arg)
 {
     ESP_LOGI(TAG, "upload task started on core %d", xPortGetCoreID());
 
-    /* On boot, re-queue any pending/failed sessions */
+    /* On boot, re-queue any pending/failed days */
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    const char *ids[UPLOAD_MAX_SESSIONS];
-    const char *days[UPLOAD_MAX_SESSIONS];
+    const char *days[UPLOAD_MAX_DAYS];
 
     const char *be_names[MAX_BACKENDS];
     int n_be = 0;
@@ -387,18 +434,17 @@ static void upload_task(void *arg)
     }
 
     int n_pending = uploader_state_get_pending(s_state, be_names, n_be,
-                                                ids, days, UPLOAD_MAX_SESSIONS);
+                                                days, UPLOAD_MAX_DAYS);
     xSemaphoreGive(s_state_mutex);
 
     for (int i = 0; i < n_pending; i++) {
         upload_event_t ev = {0};
-        strlcpy(ev.session_id, ids[i], sizeof(ev.session_id));
         strlcpy(ev.day_folder, days[i], sizeof(ev.day_folder));
         xQueueSend(s_queue, &ev, 0);
     }
 
     if (n_pending > 0) {
-        ESP_LOGI(TAG, "queued %d pending sessions from state", n_pending);
+        ESP_LOGI(TAG, "queued %d pending days from state", n_pending);
     }
 
     /* Main loop: wait for events, process, then periodic retry check */
@@ -416,7 +462,7 @@ static void upload_task(void *arg)
         }
 
         if (xQueueReceive(s_queue, &ev, wait_ticks) == pdTRUE) {
-            process_session(ev.session_id, ev.day_folder);
+            process_day(ev.day_folder);
         }
 
         /* Periodic retry check */
@@ -488,8 +534,8 @@ esp_err_t uploader_init(void)
     }
 
     s_initialised = true;
-    ESP_LOGI(TAG, "uploader initialised (%d backends, %d sessions in state)",
-             s_n_backends, s_state->n_sessions);
+    ESP_LOGI(TAG, "uploader initialised (%d backends, %d days in state)",
+             s_n_backends, s_state->n_days);
 
     /* Log heap diagnostics for debugging memory issues */
     ESP_LOGI(TAG, "heap: internal free=%u min=%u | PSRAM free=%u min=%u",
@@ -501,18 +547,17 @@ esp_err_t uploader_init(void)
     return ESP_OK;
 }
 
-void uploader_on_session_ready(const char *session_id, const char *day_folder)
+void uploader_on_day_ready(const char *day_folder)
 {
-    if (!s_initialised || !session_id || !day_folder) return;
+    if (!s_initialised || !day_folder) return;
 
-    ESP_LOGI(TAG, "session ready for upload: %s (day=%s)", session_id, day_folder);
+    ESP_LOGI(TAG, "day ready for upload: %s", day_folder);
 
-    /* Queue the upload event — state find_or_create + save happens in
-     * process_session() on the uploader task (internal stack).  Do NOT
+    /* Queue the upload event — dirtying and state save happen in
+     * process_day() on the uploader task (internal stack).  Do NOT
      * do flash I/O here: callers may run on a PSRAM stack, and flash
      * operations disable the cache, making PSRAM inaccessible. */
     upload_event_t ev = {0};
-    strlcpy(ev.session_id, session_id, sizeof(ev.session_id));
     strlcpy(ev.day_folder, day_folder, sizeof(ev.day_folder));
     xQueueSend(s_queue, &ev, portMAX_DELAY);
 }

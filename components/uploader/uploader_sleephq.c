@@ -663,8 +663,7 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
 
 /* ── Upload all files for a session ─────────────────────────────────── */
 
-static upload_result_t shq_upload_session(const char *session_id,
-                                           const char *day_folder)
+static upload_result_t shq_upload_day(const char *day_folder)
 {
     uploader_config_t cfg;
     uploader_load_config(&cfg);
@@ -673,7 +672,7 @@ static upload_result_t shq_upload_session(const char *session_id,
         return UPLOAD_NOT_CONFIGURED;
     }
 
-    ESP_LOGI(TAG, "SleepHQ upload: session %s (day=%s)", session_id, day_folder);
+    ESP_LOGI(TAG, "SleepHQ upload: day %s", day_folder);
 
     /* Open a single TLS connection for the entire session.
      * All API calls and file uploads reuse this one connection —
@@ -729,7 +728,7 @@ static upload_result_t shq_upload_session(const char *session_id,
     int files_uploaded = 0;
     int failures = 0;
 
-    /* 4. Upload session EDF files from DATALOG/day_folder/ */
+    /* 4. Upload all EDF files from DATALOG/day_folder/ */
     char local_day_dir[256];
     snprintf(local_day_dir, sizeof(local_day_dir), "%s/%s", SD_SDCARD_DATALOG, day_folder);
 
@@ -741,7 +740,6 @@ static upload_result_t shq_upload_session(const char *session_id,
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
             if (strstr(ent->d_name, ".edf") == NULL) continue;
-            if (strstr(ent->d_name, session_id) == NULL) continue;
 
             char local_path[512];
             snprintf(local_path, sizeof(local_path), "%s/%s", local_day_dir, ent->d_name);
@@ -759,7 +757,7 @@ static upload_result_t shq_upload_session(const char *session_id,
     }
 
     if (files_uploaded == 0) {
-        ESP_LOGW(TAG, "no EDF files uploaded for session %s", session_id);
+        ESP_LOGW(TAG, "no EDF files uploaded for day %s", day_folder);
         esp_tls_conn_destroy(tls);
         return UPLOAD_FAILED;
     }
@@ -823,7 +821,7 @@ static upload_result_t shq_upload_session(const char *session_id,
         return UPLOAD_FAILED;
     }
 
-    ESP_LOGI(TAG, "SleepHQ upload complete for session %s", session_id);
+    ESP_LOGI(TAG, "SleepHQ upload complete for day %s", day_folder);
     return UPLOAD_OK;
 }
 
@@ -837,5 +835,5 @@ static bool shq_is_configured(void)
 const upload_backend_t sleephq_backend = {
     .name = "sleephq",
     .is_configured = shq_is_configured,
-    .upload_session = shq_upload_session,
+    .upload_day = shq_upload_day,
 };

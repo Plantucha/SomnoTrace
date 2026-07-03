@@ -7,6 +7,8 @@
 #include "as11_ble.h"
 #include "time_sync.h"
 #include "uploader.h"
+#include "edf_gen.h"
+#include "sd_storage.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -1048,6 +1050,248 @@ static esp_err_t upload_status_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── Actions: Reset State, Delete EDFs, Reset All, Recreate EDFs ───── */
+
+/* Recursively delete a directory and all its contents. */
+static void recursive_delete(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) {
+        remove(path);
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        char child[512];
+        snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+        if (ent->d_type == DT_DIR) {
+            recursive_delete(child);
+        } else {
+            remove(child);
+        }
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+/* Scan SDCARD/DATALOG for day folders and queue each for upload. */
+static void scan_and_queue_uploads(void)
+{
+    DIR *d = opendir(SD_SDCARD_DATALOG);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_type != DT_DIR) continue;
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        /* Each subdirectory is a noon-day folder — queue it. */
+        uploader_on_day_ready(ent->d_name);
+    }
+    closedir(d);
+}
+
+/* Background task for recreate EDFs (long-running, needs large stack). */
+typedef struct {
+    char session_dir[256];
+    char session_id[32];
+    int64_t start_epoch_ms;
+    int64_t end_epoch_ms;
+    int64_t clock_drift_ms;
+} recreate_session_t;
+
+static void recreate_edfs_task(void *arg)
+{
+    ESP_LOGI(TAG, "recreate_edfs_task: starting");
+
+    /* 1. Delete everything in SDCARD/ recursively. */
+    recursive_delete(SD_SDCARD_DIR);
+    ESP_LOGI(TAG, "recreate_edfs_task: SDCARD/ deleted");
+
+    /* 2. Scan .sessions/streams/ for day folders, collect sessions.
+     * Allocate the sessions array on the heap (PSRAM) — 64 * ~312 bytes
+     * = ~20KB, which would overflow the 10KB task stack. */
+    recreate_session_t *sessions = calloc(64, sizeof(recreate_session_t));
+    if (!sessions) {
+        ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate sessions array");
+        vTaskDelete(NULL);
+        return;
+    }
+    int n_sessions = 0;
+
+    DIR *d = opendir(SD_STREAMS_DIR);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && n_sessions < 64) {
+            if (ent->d_type != DT_DIR) continue;
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            char day_dir[300];
+            snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_STREAMS_DIR, ent->d_name);
+            DIR *dd = opendir(day_dir);
+            if (!dd) continue;
+            struct dirent *fent;
+            while ((fent = readdir(dd)) != NULL && n_sessions < 64) {
+                if (fent->d_type != DT_REG) continue;
+                const char *suffix = "_session.json";
+                int slen = strlen(suffix);
+                int flen = strlen(fent->d_name);
+                if (flen <= slen || strcmp(fent->d_name + flen - slen, suffix) != 0)
+                    continue;
+                /* Extract session prefix */
+                char session_id[32];
+                int prefix_len = flen - slen;
+                if (prefix_len <= 0 || prefix_len >= (int)sizeof(session_id)) continue;
+                memcpy(session_id, fent->d_name, prefix_len);
+                session_id[prefix_len] = '\0';
+                /* Read session.json */
+                char json_path[600];
+                snprintf(json_path, sizeof(json_path), "%s/%s", day_dir, fent->d_name);
+                FILE *f = fopen(json_path, "r");
+                if (!f) continue;
+                fseek(f, 0, SEEK_END);
+                long fsize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (fsize <= 0 || fsize > 4096) { fclose(f); continue; }
+                char *buf = malloc(fsize + 1);
+                if (!buf) { fclose(f); continue; }
+                fread(buf, 1, fsize, f);
+                buf[fsize] = '\0';
+                fclose(f);
+                cJSON *j = cJSON_Parse(buf);
+                free(buf);
+                if (!j) continue;
+                cJSON *j_start = cJSON_GetObjectItem(j, "start_epoch_ms");
+                cJSON *j_end = cJSON_GetObjectItem(j, "end_epoch_ms");
+                cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
+                if (j_start && cJSON_IsNumber(j_start)) {
+                    recreate_session_t *s = &sessions[n_sessions++];
+                    strlcpy(s->session_dir, day_dir, sizeof(s->session_dir));
+                    strlcpy(s->session_id, session_id, sizeof(s->session_id));
+                    s->start_epoch_ms = (int64_t)j_start->valuedouble;
+                    s->end_epoch_ms = (j_end && cJSON_IsNumber(j_end)) ? (int64_t)j_end->valuedouble : 0;
+                    s->clock_drift_ms = (j_drift && cJSON_IsNumber(j_drift)) ? (int64_t)j_drift->valuedouble : 0;
+                }
+                cJSON_Delete(j);
+            }
+            closedir(dd);
+        }
+        closedir(d);
+    }
+
+    ESP_LOGI(TAG, "recreate_edfs_task: found %d sessions", n_sessions);
+
+    /* 3. Sort sessions by start_epoch_ms (simple insertion sort). */
+    for (int i = 1; i < n_sessions; i++) {
+        recreate_session_t tmp = sessions[i];
+        int j = i - 1;
+        while (j >= 0 && sessions[j].start_epoch_ms > tmp.start_epoch_ms) {
+            sessions[j + 1] = sessions[j];
+            j--;
+        }
+        sessions[j + 1] = tmp;
+    }
+
+    /* 4. Generate EDFs for each session in chronological order. */
+    for (int i = 0; i < n_sessions; i++) {
+        ESP_LOGI(TAG, "recreate_edfs_task: generating EDFs for session %d/%d: %s",
+                 i + 1, n_sessions, sessions[i].session_id);
+        edf_gen_generate(sessions[i].session_dir, sessions[i].session_id,
+                         sessions[i].start_epoch_ms, sessions[i].end_epoch_ms,
+                         sessions[i].clock_drift_ms);
+    }
+
+    /* 5. Queue unique day folders for upload (not per-session). */
+    char queued_days[64][16];
+    int n_queued_days = 0;
+    for (int i = 0; i < n_sessions; i++) {
+        char day_folder[32];
+        time_t t = (time_t)(sessions[i].start_epoch_ms / 1000);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        if (tm.tm_hour < 12) {
+            t -= 86400;
+            localtime_r(&t, &tm);
+        }
+        snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        /* Skip if already queued */
+        bool dup = false;
+        for (int j = 0; j < n_queued_days; j++) {
+            if (strcmp(queued_days[j], day_folder) == 0) { dup = true; break; }
+        }
+        if (!dup && n_queued_days < 64) {
+            strlcpy(queued_days[n_queued_days++], day_folder, sizeof(queued_days[0]));
+            uploader_on_day_ready(day_folder);
+        }
+    }
+
+    ESP_LOGI(TAG, "recreate_edfs_task: done (%d sessions, %d unique days queued)",
+             n_sessions, n_queued_days);
+    free(sessions);
+    vTaskDelete(NULL);
+}
+
+/* HTTP handlers for actions. Each responds immediately and runs work in a task. */
+
+static esp_err_t action_reset_state_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "action: reset upload state");
+    uploader_reset_state();
+    scan_and_queue_uploads();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t action_delete_edfs_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "action: delete all EDF files");
+    recursive_delete(SD_SDCARD_DIR);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t action_reset_all_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "action: reset all (state + SDCARD + .sessions)");
+    uploader_reset_state();
+    recursive_delete(SD_SDCARD_DIR);
+    recursive_delete(SD_SESSIONS_DIR);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t action_recreate_edfs_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "action: recreate EDFs");
+    /* Run in a background task with PSRAM stack (EDF gen needs 10KB+).
+     * Internal-RAM stacks fragment the heap and cause SDMMC DMA allocation
+     * failures — see the same pattern in session_writer.c stop_task. */
+    const uint32_t stack_size = 16384;
+    StackType_t *stack = heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM);
+    StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (!stack || !tcb) {
+        free(stack); free(tcb);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    TaskHandle_t h = xTaskCreateStaticPinnedToCore(
+        recreate_edfs_task, "recreate_edfs", stack_size, NULL, 5,
+        stack, tcb, 1);
+    if (!h) {
+        free(stack); free(tcb);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "task create failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
@@ -1122,6 +1366,16 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &up_cfg_get);
     httpd_register_uri_handler(s_httpd, &up_cfg_post);
     httpd_register_uri_handler(s_httpd, &up_status);
+
+    /* Actions endpoints (Reset State, Delete EDFs, Reset All, Recreate EDFs) */
+    httpd_uri_t act_reset_state = { .uri = "/api/actions/reset-state", .method = HTTP_POST, .handler = action_reset_state_handler };
+    httpd_uri_t act_delete_edfs = { .uri = "/api/actions/delete-edfs", .method = HTTP_POST, .handler = action_delete_edfs_handler };
+    httpd_uri_t act_reset_all = { .uri = "/api/actions/reset-all", .method = HTTP_POST, .handler = action_reset_all_handler };
+    httpd_uri_t act_recreate = { .uri = "/api/actions/recreate-edfs", .method = HTTP_POST, .handler = action_recreate_edfs_handler };
+    httpd_register_uri_handler(s_httpd, &act_reset_state);
+    httpd_register_uri_handler(s_httpd, &act_delete_edfs);
+    httpd_register_uri_handler(s_httpd, &act_reset_all);
+    httpd_register_uri_handler(s_httpd, &act_recreate);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */

@@ -45,15 +45,17 @@ typedef struct {
     /* Check if this backend has valid configuration (config keys in NVS). */
     bool (*is_configured)(void);
 
-    /* Upload all EDF files for one session + mandatory root files.
+    /* Upload all EDF files for one noon-day + mandatory root files.
      *
-     * Parameters:
-     *   session_id  - file prefix, e.g. "20260629_232738"
+     * Parameter:
      *   day_folder  - noon-based DATALOG subfolder, e.g. "20260629"
      *
+     * The backend opens one connection, uploads ALL .edf files in
+     * DATALOG/{day_folder}/, then uploads root files (STR.edf,
+     * Identification.json, SETTINGS/) once.
+     *
      * Returns UPLOAD_OK on success, UPLOAD_FAILED on error. */
-    upload_result_t (*upload_session)(const char *session_id,
-                                       const char *day_folder);
+    upload_result_t (*upload_day)(const char *day_folder);
 } upload_backend_t;
 
 /* ── Configuration ──────────────────────────────────────────────────── */
@@ -82,9 +84,11 @@ esp_err_t uploader_init(void);
 
 /* Notify the uploader that EDF generation for a session is complete.
  * This is the primary event trigger — called after edf_gen_generate()
- * finishes successfully. Adds the session to the upload queue and wakes
- * the upload task. Safe to call from any task. */
-void uploader_on_session_ready(const char *session_id, const char *day_folder);
+ * finishes successfully. Adds the noon-day to the upload queue and wakes
+ * the upload task. If the day was already uploaded, it is "dirtied"
+ * (reset to pending) so the whole day is re-uploaded with the new data.
+ * Safe to call from any task. */
+void uploader_on_day_ready(const char *day_folder);
 
 /* Register a backend. Called during uploader_init() for built-in backends. */
 void uploader_register_backend(const upload_backend_t *backend);
@@ -108,3 +112,8 @@ esp_err_t uploader_get_config_json(char **out_json);
 /* Save upload config from a JSON string (from web UI POST body).
  * Parses the JSON and stores values in NVS. */
 esp_err_t uploader_save_config_json(const char *json_str);
+
+/* Clear all upload state (session tracking, per-backend status).
+ * Resets in-memory state and writes empty state file to LittleFS.
+ * After calling this, all sessions will be re-queued for upload. */
+esp_err_t uploader_reset_state(void);

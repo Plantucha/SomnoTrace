@@ -76,24 +76,21 @@ esp_err_t uploader_state_load(upload_state_t *state)
         return ESP_ERR_INVALID_STATE;
     }
 
-    cJSON *sessions = cJSON_GetObjectItem(root, "sessions");
-    if (sessions && cJSON_IsArray(sessions)) {
-        int n = cJSON_GetArraySize(sessions);
-        if (n > UPLOAD_MAX_SESSIONS) n = UPLOAD_MAX_SESSIONS;
+    cJSON *days = cJSON_GetObjectItem(root, "days");
+    if (days && cJSON_IsArray(days)) {
+        int n = cJSON_GetArraySize(days);
+        if (n > UPLOAD_MAX_DAYS) n = UPLOAD_MAX_DAYS;
 
         for (int i = 0; i < n; i++) {
-            cJSON *sess = cJSON_GetArrayItem(sessions, i);
-            if (!sess) continue;
+            cJSON *dy = cJSON_GetArrayItem(days, i);
+            if (!dy) continue;
 
-            session_state_t *s = &state->sessions[i];
-            cJSON *id = cJSON_GetObjectItem(sess, "id");
-            cJSON *day = cJSON_GetObjectItem(sess, "day");
-            if (id && cJSON_IsString(id))
-                strlcpy(s->session_id, id->valuestring, sizeof(s->session_id));
-            if (day && cJSON_IsString(day))
-                strlcpy(s->day_folder, day->valuestring, sizeof(s->day_folder));
+            day_state_t *s = &state->days[i];
+            cJSON *day_fld = cJSON_GetObjectItem(dy, "day");
+            if (day_fld && cJSON_IsString(day_fld))
+                strlcpy(s->day_folder, day_fld->valuestring, sizeof(s->day_folder));
 
-            cJSON *backends = cJSON_GetObjectItem(sess, "backends");
+            cJSON *backends = cJSON_GetObjectItem(dy, "backends");
             if (backends && cJSON_IsArray(backends)) {
                 int nb = cJSON_GetArraySize(backends);
                 if (nb > UPLOAD_MAX_BACKENDS) nb = UPLOAD_MAX_BACKENDS;
@@ -123,11 +120,11 @@ esp_err_t uploader_state_load(upload_state_t *state)
                 s->n_backends = nb;
             }
         }
-        state->n_sessions = n;
+        state->n_days = n;
     }
 
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "loaded %d sessions from state", state->n_sessions);
+    ESP_LOGI(TAG, "loaded %d days from state", state->n_days);
     return ESP_OK;
 }
 
@@ -138,13 +135,12 @@ esp_err_t uploader_state_save(const upload_state_t *state)
     if (!state) return ESP_ERR_INVALID_ARG;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *sessions_arr = cJSON_CreateArray();
+    cJSON *days_arr = cJSON_CreateArray();
 
-    for (int i = 0; i < state->n_sessions; i++) {
-        const session_state_t *s = &state->sessions[i];
-        cJSON *sess = cJSON_CreateObject();
-        cJSON_AddStringToObject(sess, "id", s->session_id);
-        cJSON_AddStringToObject(sess, "day", s->day_folder);
+    for (int i = 0; i < state->n_days; i++) {
+        const day_state_t *s = &state->days[i];
+        cJSON *dy = cJSON_CreateObject();
+        cJSON_AddStringToObject(dy, "day", s->day_folder);
 
         cJSON *bes = cJSON_CreateArray();
         for (int j = 0; j < s->n_backends; j++) {
@@ -158,11 +154,11 @@ esp_err_t uploader_state_save(const upload_state_t *state)
             cJSON_AddNumberToObject(be, "last_try", (double)b->last_try_ms);
             cJSON_AddItemToArray(bes, be);
         }
-        cJSON_AddItemToObject(sess, "backends", bes);
-        cJSON_AddItemToArray(sessions_arr, sess);
+        cJSON_AddItemToObject(dy, "backends", bes);
+        cJSON_AddItemToArray(days_arr, dy);
     }
 
-    cJSON_AddItemToObject(root, "sessions", sessions_arr);
+    cJSON_AddItemToObject(root, "days", days_arr);
 
     char *json_str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -188,51 +184,49 @@ esp_err_t uploader_state_save(const upload_state_t *state)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "saved %d sessions", state->n_sessions);
+    ESP_LOGI(TAG, "saved %d days", state->n_days);
     return ESP_OK;
 }
 
 /* ── Find / create ──────────────────────────────────────────────────── */
 
-session_state_t *uploader_state_find(upload_state_t *state, const char *session_id)
+day_state_t *uploader_state_find(upload_state_t *state, const char *day_folder)
 {
-    if (!state || !session_id) return NULL;
-    for (int i = 0; i < state->n_sessions; i++) {
-        if (strcmp(state->sessions[i].session_id, session_id) == 0)
-            return &state->sessions[i];
+    if (!state || !day_folder) return NULL;
+    for (int i = 0; i < state->n_days; i++) {
+        if (strcmp(state->days[i].day_folder, day_folder) == 0)
+            return &state->days[i];
     }
     return NULL;
 }
 
-session_state_t *uploader_state_find_or_create(upload_state_t *state,
-                                                const char *session_id,
-                                                const char *day_folder)
+day_state_t *uploader_state_find_or_create(upload_state_t *state,
+                                            const char *day_folder)
 {
-    session_state_t *s = uploader_state_find(state, session_id);
+    day_state_t *s = uploader_state_find(state, day_folder);
     if (s) return s;
 
-    if (state->n_sessions >= UPLOAD_MAX_SESSIONS) {
-        ESP_LOGE(TAG, "session table full (%d)", UPLOAD_MAX_SESSIONS);
+    if (state->n_days >= UPLOAD_MAX_DAYS) {
+        ESP_LOGE(TAG, "day table full (%d)", UPLOAD_MAX_DAYS);
         return NULL;
     }
 
-    s = &state->sessions[state->n_sessions++];
+    s = &state->days[state->n_days++];
     memset(s, 0, sizeof(*s));
-    strlcpy(s->session_id, session_id, sizeof(s->session_id));
     strlcpy(s->day_folder, day_folder, sizeof(s->day_folder));
     return s;
 }
 
-backend_state_t *uploader_state_backend_find_or_create(session_state_t *sess,
+backend_state_t *uploader_state_backend_find_or_create(day_state_t *day,
                                                         const char *backend_name)
 {
-    if (!sess || !backend_name) return NULL;
-    for (int i = 0; i < sess->n_backends; i++) {
-        if (strcmp(sess->backends[i].name, backend_name) == 0)
-            return &sess->backends[i];
+    if (!day || !backend_name) return NULL;
+    for (int i = 0; i < day->n_backends; i++) {
+        if (strcmp(day->backends[i].name, backend_name) == 0)
+            return &day->backends[i];
     }
-    if (sess->n_backends >= UPLOAD_MAX_BACKENDS) return NULL;
-    backend_state_t *b = &sess->backends[sess->n_backends++];
+    if (day->n_backends >= UPLOAD_MAX_BACKENDS) return NULL;
+    backend_state_t *b = &day->backends[day->n_backends++];
     memset(b, 0, sizeof(*b));
     strlcpy(b->name, backend_name, sizeof(b->name));
     b->status = ST_PENDING;
@@ -240,11 +234,11 @@ backend_state_t *uploader_state_backend_find_or_create(session_state_t *sess,
 }
 
 void uploader_state_set_backend_status(upload_state_t *state,
-                                        const char *session_id,
+                                        const char *day_folder,
                                         const char *backend_name,
                                         upload_status_t status)
 {
-    session_state_t *s = uploader_state_find(state, session_id);
+    day_state_t *s = uploader_state_find(state, day_folder);
     if (!s) return;
     backend_state_t *b = uploader_state_backend_find_or_create(s, backend_name);
     if (!b) return;
@@ -255,18 +249,17 @@ void uploader_state_set_backend_status(upload_state_t *state,
     }
 }
 
-/* ── Get pending sessions ───────────────────────────────────────────── */
+/* ── Get pending days ─────────────────────────────────────────────── */
 
 int uploader_state_get_pending(const upload_state_t *state,
                                 const char *backend_names[], int n_backends,
-                                const char *out_ids[], const char *out_days[],
-                                int max_out)
+                                const char *out_days[], int max_out)
 {
-    if (!state || !out_ids || !out_days) return 0;
+    if (!state || !out_days) return 0;
     int count = 0;
 
-    for (int i = 0; i < state->n_sessions && count < max_out; i++) {
-        const session_state_t *s = &state->sessions[i];
+    for (int i = 0; i < state->n_days && count < max_out; i++) {
+        const day_state_t *s = &state->days[i];
         bool needs_work = false;
 
         for (int j = 0; j < s->n_backends; j++) {
@@ -291,7 +284,6 @@ int uploader_state_get_pending(const upload_state_t *state,
         }
 
         if (needs_work) {
-            out_ids[count] = s->session_id;
             out_days[count] = s->day_folder;
             count++;
         }
@@ -299,7 +291,7 @@ int uploader_state_get_pending(const upload_state_t *state,
     return count;
 }
 
-/* ── Prune old completed sessions ───────────────────────────────────── */
+/* ── Prune old completed days ─────────────────────────────────────── */
 
 int uploader_state_prune(upload_state_t *state, int max_age_days)
 {
@@ -309,8 +301,8 @@ int uploader_state_prune(upload_state_t *state, int max_age_days)
     int64_t cutoff_s = now_s - (int64_t)max_age_days * 86400;
 
     int write_idx = 0;
-    for (int read_idx = 0; read_idx < state->n_sessions; read_idx++) {
-        session_state_t *s = &state->sessions[read_idx];
+    for (int read_idx = 0; read_idx < state->n_days; read_idx++) {
+        day_state_t *s = &state->days[read_idx];
         bool all_ok = true;
 
         for (int j = 0; j < s->n_backends; j++) {
@@ -337,14 +329,14 @@ int uploader_state_prune(upload_state_t *state, int max_age_days)
         }
 
         if (write_idx != read_idx) {
-            state->sessions[write_idx] = state->sessions[read_idx];
+            state->days[write_idx] = state->days[read_idx];
         }
         write_idx++;
     }
 
-    state->n_sessions = write_idx;
+    state->n_days = write_idx;
     if (pruned > 0) {
-        ESP_LOGI(TAG, "pruned %d old completed sessions", pruned);
+        ESP_LOGI(TAG, "pruned %d old completed days", pruned);
     }
     return pruned;
 }
@@ -356,15 +348,14 @@ esp_err_t uploader_state_to_json(const upload_state_t *state, char **out_json)
     if (!state || !out_json) return ESP_ERR_INVALID_ARG;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *sessions_arr = cJSON_CreateArray();
+    cJSON *days_arr = cJSON_CreateArray();
 
     int pending = 0, failed = 0;
 
-    for (int i = 0; i < state->n_sessions; i++) {
-        const session_state_t *s = &state->sessions[i];
-        cJSON *sess = cJSON_CreateObject();
-        cJSON_AddStringToObject(sess, "id", s->session_id);
-        cJSON_AddStringToObject(sess, "day", s->day_folder);
+    for (int i = 0; i < state->n_days; i++) {
+        const day_state_t *s = &state->days[i];
+        cJSON *dy = cJSON_CreateObject();
+        cJSON_AddStringToObject(dy, "day", s->day_folder);
 
         cJSON *bes = cJSON_CreateObject();
         bool has_failed = false;
@@ -377,15 +368,15 @@ esp_err_t uploader_state_to_json(const upload_state_t *state, char **out_json)
             if (b->status == ST_FAILED) has_failed = true;
             if (b->status == ST_PENDING) pending++;
         }
-        cJSON_AddItemToObject(sess, "backends", bes);
+        cJSON_AddItemToObject(dy, "backends", bes);
         if (has_failed) failed++;
-        cJSON_AddItemToArray(sessions_arr, sess);
+        cJSON_AddItemToArray(days_arr, dy);
     }
 
-    cJSON_AddItemToObject(root, "sessions", sessions_arr);
+    cJSON_AddItemToObject(root, "days", days_arr);
     cJSON_AddNumberToObject(root, "pending", pending);
     cJSON_AddNumberToObject(root, "failed", failed);
-    cJSON_AddNumberToObject(root, "total", state->n_sessions);
+    cJSON_AddNumberToObject(root, "total", state->n_days);
 
     *out_json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

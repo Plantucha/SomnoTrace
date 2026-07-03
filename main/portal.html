@@ -200,6 +200,7 @@ SomnoTrace
 <button class="tab-btn" onclick="switchTab('dashboard')">Dashboard</button>
 <button class="tab-btn" onclick="switchTab('tab-status')">Status</button>
 <button class="tab-btn" onclick="switchTab('logs')">Logs</button>
+<button class="tab-btn" onclick="switchTab('actions')">Actions</button>
 <button class="tab-btn active" onclick="switchTab('settings')">Settings</button>
 </div>
 <div class="theme-selector">
@@ -438,6 +439,54 @@ Connect to view real-time device logs.</div>
 </div>
 </section>
 
+<!-- ═══════════════ ACTIONS TAB ═══════════════ -->
+<section id="actions" class="tab-content sta-only">
+<div class="card" style="border-left-color:var(--warning)">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.83L19.53 19H4.47L12 5.83zM11 10v6h2v-6h-2zm0 8v2h2v-2h-2z"/></svg>
+Maintenance Actions
+</div>
+<p style="color:var(--text-muted);font-size:.85rem;margin-bottom:16px">These actions modify files on the SD card and upload state. Each action requires confirmation before proceeding.</p>
+
+<div style="display:flex;flex-direction:column;gap:12px">
+
+<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px">
+<div>
+<div style="font-weight:600;font-size:.9rem">Reset Upload State</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Clears upload tracking so all days re-upload from the beginning</div>
+</div>
+<button class="btn btn-primary" onclick="execAction('reset-state','Clear upload state? This will reset the upload tracking for all sessions. All EDF files on the SD card will be re-uploaded to configured backends. Continue?')">Reset State</button>
+</div>
+
+<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px">
+<div>
+<div style="font-weight:600;font-size:.9rem">Delete All EDF Files</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Removes all EDF and related files from SDCARD/ (session data preserved)</div>
+</div>
+<button class="btn btn-primary" onclick="execAction('delete-edfs','Delete all EDF files? This will remove all EDF files and related data (SETTINGS, STR.edf, Identification.json) from the SDCARD folder. Session data in .sessions/ is preserved. Continue?')">Delete All EDFs</button>
+</div>
+
+<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px">
+<div>
+<div style="font-weight:600;font-size:.9rem">Recreate EDFs from Sessions</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes all EDFs and re-exports them from .session files in chronological order</div>
+</div>
+<button class="btn btn-primary" onclick="execAction('recreate-edfs','Recreate all EDF files? This will delete all existing EDF files and re-export them from session data. This may take several minutes. Continue?')">Recreate EDFs</button>
+</div>
+
+<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--danger);border-radius:8px;background:rgba(248,113,113,.05)">
+<div>
+<div style="font-weight:600;font-size:.9rem;color:var(--danger)">Reset ALL (Destructive)</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes everything under /somnotrace/ (SDCARD + .sessions) and clears upload state</div>
+</div>
+<button class="btn btn-danger" onclick="execAction('reset-all','RESET EVERYTHING? This will permanently delete ALL data on the SD card: EDF files, session data, upload state — everything under /somnotrace/. This cannot be undone. Continue?')">Reset ALL</button>
+</div>
+
+</div>
+<div id="action-status" class="status-msg" style="margin-top:14px"></div>
+</div>
+</section>
+
 </main>
 
 <script>
@@ -455,7 +504,7 @@ var PW_SENTINEL_UPLOAD = '***';
 function switchTab(tabId) {
   document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
   document.querySelectorAll('.tab-content').forEach(function(c){ c.classList.remove('active'); });
-  var labels = {dashboard:'Dashboard','tab-status':'Status',logs:'Logs',settings:'Settings'};
+  var labels = {dashboard:'Dashboard','tab-status':'Status',logs:'Logs',actions:'Actions',settings:'Settings'};
   var lbl = labels[tabId] || tabId;
   var btn = Array.from(document.querySelectorAll('.tab-btn')).find(function(b){ return b.textContent.trim() === lbl; });
   if (btn) btn.classList.add('active');
@@ -990,17 +1039,22 @@ function loadUploadStatus() {
   fetch('/api/uploads/status').then(function(r){ return r.json(); }).then(function(d) {
     var el = document.getElementById('upload-status');
     if (!el) return;
-    if (!d.sessions || !d.sessions.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload sessions yet.</div>'; return; }
+    if (!d.days || !d.days.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload days yet.</div>'; return; }
     var h = '';
-    d.sessions.forEach(function(s) {
+    d.days.forEach(function(dy) {
       h += '<div style="margin-bottom:8px;padding:8px;border:1px solid var(--card-border);border-radius:8px">';
-      h += '<strong>' + s.session_id + '</strong> <span style="color:var(--text-muted)">(' + s.day_folder + ')</span><br>';
-      if (s.backends) { s.backends.forEach(function(b) {
-        var c = b.status === 'done' ? 'var(--success)' : b.status === 'failed' ? 'var(--danger)' : 'var(--warning)';
-        h += '<span style="color:' + c + '">' + b.backend + ': ' + b.status + '</span>';
-        if (b.attempts > 0) h += ' <span style="color:var(--text-muted)">(' + b.attempts + ' attempts)</span>';
-        h += '<br>';
-      }); }
+      h += '<strong>' + dy.day + '</strong><br>';
+      if (dy.backends) {
+        var bes = dy.backends;
+        for (var name in bes) {
+          if (name.startsWith('_')) continue;
+          var st = bes[name];
+          var c = st === 'ok' ? 'var(--success)' : st === 'failed' ? 'var(--danger)' : 'var(--warning)';
+          h += '<span style="color:' + c + '">' + name + ': ' + st + '</span>';
+          if (bes._attempts > 0) h += ' <span style="color:var(--text-muted)">(' + bes._attempts + ' attempts)</span>';
+          h += '<br>';
+        }
+      }
       h += '</div>';
     });
     el.innerHTML = h;
@@ -1017,6 +1071,26 @@ function updateSmbPreview() {
   var pathClean = path ? (path.startsWith('/') ? path : '/' + path) : '';
   var el = document.getElementById('smb-uri-preview');
   if (el) el.textContent = 'smb://' + cred + host + '/' + share + pathClean;
+}
+
+/* ── Actions ───────────────────────────────────────────────────── */
+function execAction(action, confirmMsg) {
+  if (!confirm(confirmMsg)) return;
+  var statusEl = document.getElementById('action-status');
+  if (statusEl) { statusEl.textContent = 'Working…'; statusEl.className = 'status-msg'; }
+  fetch('/api/actions/' + action, { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) {
+        if (statusEl) { statusEl.textContent = 'Action completed successfully.'; statusEl.className = 'status-msg success'; }
+        if (action === 'reset-state' || action === 'recreate-edfs') { loadUploadStatus(); }
+      } else {
+        if (statusEl) { statusEl.textContent = 'Action failed.'; statusEl.className = 'status-msg error'; }
+      }
+    })
+    .catch(function() {
+      if (statusEl) { statusEl.textContent = 'Action failed — network error.'; statusEl.className = 'status-msg error'; }
+    });
 }
 
 /* ── Logs ──────────────────────────────────────────────────────── */

@@ -1399,6 +1399,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                                   const char *session_id,
                                   int64_t start_epoch_ms, int64_t end_epoch_ms)
 {
+    (void)start_date;  /* computed internally from oldest record */
     /* ── Scan .sessions/summaries/ for per-day .spool files ── */
     DIR *dir = opendir(SD_SUMMARIES_DIR);
     if (!dir) {
@@ -1623,11 +1624,57 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         return ESP_FAIL;
     }
 
-    /* STR.edf uses 12.00.00 noon as start time. */
+    /* STR.edf uses 12.00.00 noon as start time.
+     * The start date must correspond to the oldest record (records[0] after
+     * sorting), not the current session — otherwise SleepHQ misaligns every
+     * record by the offset between the header date and the actual first day. */
     const char *str_start_time = "12.00.00";
+    char str_date[32];
+    {
+        time_t t = (time_t)(records[0].period_start / 1000);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        if (tm.tm_hour < 12) {
+            t -= 86400;
+            localtime_r(&t, &tm);
+        }
+        snprintf(str_date, sizeof(str_date), "%02d.%02d.%02d",
+                 tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
+    }
+    ESP_LOGI(TAG, "STR.edf: header date=%s (from oldest record PeriodStart=%lld)",
+             str_date, (long long)records[0].period_start);
 
-    int header_bytes = edf_write_header(edf, patient_id, recording_id,
-                                        start_date, str_start_time,
+    /* Rewrite the recording_id Startdate to match the header start_date
+     * (oldest record), not the current session's noon day.  The recording_id
+     * format is "Startdate DD-MMM-YYYY X X X SRN=...". */
+    char fixed_recording_id[128];
+    {
+        time_t t = (time_t)(records[0].period_start / 1000);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        if (tm.tm_hour < 12) {
+            t -= 86400;
+            localtime_r(&t, &tm);
+        }
+        static const char *mon_names[] = {
+            "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+        };
+        /* Find the tail after "Startdate DD-MMM-YYYY" in the original */
+        const char *tail = recording_id;
+        if (strncmp(tail, "Startdate ", 10) == 0) {
+            /* Skip "Startdate " + date (11 chars for "DD-MMM-YYYY") */
+            tail += 10;
+            while (*tail && *tail != ' ') tail++;
+        }
+        snprintf(fixed_recording_id, sizeof(fixed_recording_id),
+                 "Startdate %02d-%s-%04d%s",
+                 tm.tm_mday, mon_names[tm.tm_mon % 12],
+                 tm.tm_year + 1900, tail);
+    }
+
+    int header_bytes = edf_write_header(edf, patient_id, fixed_recording_id,
+                                        str_date, str_start_time,
                                         n_records,
                                         "86400.00",
                                         "EDF", str_sigs, STR_DATA_COUNT);
@@ -1699,42 +1746,67 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
  *   ReraEnd         → "Arousal"
  */
 
-/* Event protobuf field numbers (from rpc_spools.md event family) */
-#define EVT_F_TIMESTAMP    1   /* event timestamp (varint, epoch ms) */
-#define EVT_F_TYPE         2   /* event type string (length-delimited) */
-#define EVT_F_DURATION     3   /* event duration in seconds (varint) */
+/* Event protobuf field numbers (from rpc_spools.md event family).
+ * The spool wire format is:
+ *   top-level field 4 (wire 2) → outer wrapper
+ *     inner field 1 (wire 2) → inner wrapper
+ *       repeated field 1 (wire 2) → individual event records
+ *         field 1 (varint) = event type code
+ *         field 2 (varint) = timestamp (may be start or reportTime)
+ *         field 3 (varint) = end timestamp / reportTime
+ *         field 4 (varint) = duration in ms (optional)
+ * Note: docs label field 2 as "start" but real AS11 EDF output places
+ * the annotation onset at the event END (reportTime).  We use field 3
+ * as the primary onset source with field 2 as fallback. */
+#define EVT_F_TYPE_CODE    1   /* event type code (varint) */
+#define EVT_F_START_TS     2   /* timestamp (varint, epoch ms) */
+#define EVT_F_END_TS       3   /* end timestamp / reportTime (varint, epoch ms) */
+#define EVT_F_DURATION_MS  4   /* duration in milliseconds (varint, optional) */
+
+/* Event type codes from TherapyEvents-RespiratoryEvents */
+enum {
+    EVT_TYPE_NONE = 0,
+    EVT_TYPE_HYPOPNEA_END = 1,
+    EVT_TYPE_CENTRAL_APNEA_END = 2,
+    EVT_TYPE_OBSTRUCTIVE_APNEA_END = 3,
+    EVT_TYPE_APNEA_END = 4,
+    EVT_TYPE_RERA_END = 5,
+    EVT_TYPE_CSR_START = 6,
+    EVT_TYPE_CSR_END = 7,
+};
 
 /* Context for event protobuf iteration */
 typedef struct {
-    int64_t timestamp_ms;
-    char type[64];
-    int64_t duration_sec;
+    int64_t start_ts_ms;
+    int64_t end_ts_ms;
+    int type_code;
+    int64_t duration_ms;
 } event_record_t;
 
 static void event_field_cb(const pb_field_t *f, void *ud)
 {
     event_record_t *evt = (event_record_t *)ud;
-    if (f->field == EVT_F_TIMESTAMP && f->wire == 0) {
-        evt->timestamp_ms = pb_varint_val(f);
-    } else if (f->field == EVT_F_TYPE && f->wire == 2 && f->data && f->len > 0) {
-        size_t len = f->len < sizeof(evt->type) - 1 ? f->len : sizeof(evt->type) - 1;
-        memcpy(evt->type, f->data, len);
-        evt->type[len] = '\0';
-    } else if (f->field == EVT_F_DURATION && f->wire == 0) {
-        evt->duration_sec = pb_varint_val(f);
+    if (f->wire != 0) return;
+    int64_t val = pb_varint_val(f);
+    switch (f->field) {
+        case EVT_F_TYPE_CODE:   evt->type_code = (int)val; break;
+        case EVT_F_START_TS:    evt->start_ts_ms = val; break;
+        case EVT_F_END_TS:      evt->end_ts_ms = val; break;
+        case EVT_F_DURATION_MS: evt->duration_ms = val; break;
     }
 }
 
-/* Map RPC event type to EDF annotation label. */
-static const char *event_label_map(const char *rpc_type)
+/* Map event type code to EDF annotation label. */
+static const char *event_label_map(int type_code)
 {
-    if (!rpc_type) return NULL;
-    if (strcmp(rpc_type, "HypopneaEnd") == 0) return "Hypopnea";
-    if (strcmp(rpc_type, "CentralApneaEnd") == 0) return "Central Apnea";
-    if (strcmp(rpc_type, "ObstructiveApneaEnd") == 0) return "Obstructive Apnea";
-    if (strcmp(rpc_type, "ApneaEnd") == 0) return "Apnea";
-    if (strcmp(rpc_type, "ReraEnd") == 0) return "Arousal";
-    return NULL;  /* unknown event type — skip */
+    switch (type_code) {
+        case EVT_TYPE_HYPOPNEA_END:         return "Hypopnea";
+        case EVT_TYPE_CENTRAL_APNEA_END:    return "Central Apnea";
+        case EVT_TYPE_OBSTRUCTIVE_APNEA_END:return "Obstructive Apnea";
+        case EVT_TYPE_APNEA_END:            return "Apnea";
+        case EVT_TYPE_RERA_END:             return "Arousal";
+        default:                            return NULL;
+    }
 }
 
 static esp_err_t generate_eve_edf(const char *edf_path,
@@ -1748,14 +1820,16 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     path[sizeof(path) - 1] = '\0';
 
     /* Parse events from the protobuf spool data.
-     * The spool contains repeated event records, each a protobuf message
-     * with timestamp, type, and duration fields. */
-    /* For now, if we have no event data, write a minimal EVE.edf with
-     * just the "Recording starts" marker. */
+     * The spool has two wrapper levels: outer field 4 → inner field 1 →
+     * repeated event records (each field 1 inside the inner wrapper). */
 
-    /* Count events we can decode */
-    int event_count = 0;
+    /* Helper: extract inner event data from the two-level wrapper.
+     * Returns pointer to the inner event-list data and its length,
+ * or NULL if the wrapper structure is not recognised. */
+    const uint8_t *event_list = NULL;
+    size_t event_list_len = 0;
     if (events_data && events_len > 0) {
+        /* Outer level: find field 4 (wire 2) */
         size_t pos = 0;
         while (pos < events_len) {
             uint64_t tag = pb_decode_varint(events_data, events_len, &pos);
@@ -1767,16 +1841,72 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                 uint64_t flen = pb_decode_varint(events_data, events_len, &lpos);
                 pos = lpos;
                 if (pos + flen > events_len) break;
-                /* Check if this is an event wrapper (field 7 per rpc_spools.md) */
-                /* Try to parse as event record */
-                event_record_t evt = {0};
-                pb_iter(events_data + pos, (size_t)flen, event_field_cb, &evt);
-                if (evt.type[0] && event_label_map(evt.type)) {
-                    event_count++;
+                if (field == 4) {
+                    /* Outer wrapper found — parse inner field 1 */
+                    const uint8_t *outer = events_data + pos;
+                    size_t outer_len = (size_t)flen;
+                    size_t opos = 0;
+                    while (opos < outer_len) {
+                        uint64_t otag = pb_decode_varint(outer, outer_len, &opos);
+                        int ofield = (int)(otag >> 3);
+                        int owire = (int)(otag & 0x07);
+                        if (ofield == 0) break;
+                        if (owire == 2) {
+                            size_t ilpos = opos;
+                            uint64_t ilen = pb_decode_varint(outer, outer_len, &ilpos);
+                            opos = ilpos;
+                            if (opos + ilen > outer_len) break;
+                            if (ofield == 1) {
+                                event_list = outer + opos;
+                                event_list_len = (size_t)ilen;
+                            }
+                            opos += ilen;
+                        } else if (owire == 0) {
+                            pb_decode_varint(outer, outer_len, &opos);
+                        } else if (owire == 1) {
+                            opos += 8;
+                        } else if (owire == 5) {
+                            opos += 4;
+                        } else {
+                            break;
+                        }
+                    }
                 }
                 pos += flen;
             } else if (wire == 0) {
                 pb_decode_varint(events_data, events_len, &pos);
+            } else if (wire == 1) {
+                pos += 8;
+            } else if (wire == 5) {
+                pos += 4;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /* Count events we can decode */
+    int event_count = 0;
+    if (event_list && event_list_len > 0) {
+        size_t pos = 0;
+        while (pos < event_list_len) {
+            uint64_t tag = pb_decode_varint(event_list, event_list_len, &pos);
+            int field = (int)(tag >> 3);
+            int wire = (int)(tag & 0x07);
+            if (field == 0) break;
+            if (wire == 2) {
+                size_t lpos = pos;
+                uint64_t flen = pb_decode_varint(event_list, event_list_len, &lpos);
+                pos = lpos;
+                if (pos + flen > event_list_len) break;
+                event_record_t evt = {0};
+                pb_iter(event_list + pos, (size_t)flen, event_field_cb, &evt);
+                if (event_label_map(evt.type_code)) {
+                    event_count++;
+                }
+                pos += flen;
+            } else if (wire == 0) {
+                pb_decode_varint(event_list, event_list_len, &pos);
             } else if (wire == 1) {
                 pos += 8;
             } else if (wire == 5) {
@@ -1792,7 +1922,9 @@ static esp_err_t generate_eve_edf(const char *edf_path,
 
     ESP_LOGI(TAG, "EVE.edf: %d events, %d total records", event_count, total_records);
 
-    /* EVE.edf signal definitions: EDF Annotations + Crc16 */
+    /* EVE.edf signal definitions: EDF Annotations only.
+     * edf_write_header auto-appends Crc16 as the last signal,
+     * giving 2 total signals (768-byte header, 64-byte records). */
     edf_signal_def_t eve_sigs[1];
     eve_sigs[0].label = "EDF Annotations";
     eve_sigs[0].transducer = "";
@@ -1851,35 +1983,43 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     }
 
     /* Subsequent records: one event per record */
-    if (events_data && events_len > 0) {
+    if (event_list && event_list_len > 0) {
         size_t pos = 0;
-        while (pos < events_len) {
-            uint64_t tag = pb_decode_varint(events_data, events_len, &pos);
+        while (pos < event_list_len) {
+            uint64_t tag = pb_decode_varint(event_list, event_list_len, &pos);
             int field = (int)(tag >> 3);
             int wire = (int)(tag & 0x07);
             if (field == 0) break;
             if (wire == 2) {
                 size_t lpos = pos;
-                uint64_t flen = pb_decode_varint(events_data, events_len, &lpos);
+                uint64_t flen = pb_decode_varint(event_list, event_list_len, &lpos);
                 pos = lpos;
-                if (pos + flen > events_len) break;
+                if (pos + flen > event_list_len) break;
 
                 event_record_t evt = {0};
-                pb_iter(events_data + pos, (size_t)flen, event_field_cb, &evt);
+                pb_iter(event_list + pos, (size_t)flen, event_field_cb, &evt);
                 pos += flen;
 
-                const char *label = event_label_map(evt.type);
+                const char *label = event_label_map(evt.type_code);
                 if (!label) continue;
 
                 /* Compute onset (seconds from session start).
-                 * Event timestamps from the spool are in AS11 internal time.
-                 * Session start is in NTP time.  Apply clock_drift_ms to
-                 * convert AS11 time to NTP time before computing the offset:
-                 *   ntp_event = as11_event + drift
-                 *   onset = ntp_event - session_start_ntp */
-                int64_t event_ntp_ms = evt.timestamp_ms + clock_drift_ms;
+                 * Real AS11 EDF files place the onset at the END of the event
+                 * (reportTime), not the start — confirmed by cross-referencing
+                 * EVE onsets with BRP flow data: flow is flat (apnea) at
+                 * onset-duration and resumes at onset.
+                 * Use end_ts_ms (protobuf field 3) as the primary source;
+                 * fall back to start_ts_ms (field 2) if end is absent, since
+                 * some spool records may only populate field 2.
+                 * Timestamps are in AS11 internal time; apply clock_drift_ms
+                 * to convert to NTP time before computing the offset. */
+                int64_t report_ts_ms = evt.end_ts_ms ? evt.end_ts_ms : evt.start_ts_ms;
+                int64_t event_ntp_ms = report_ts_ms + clock_drift_ms;
                 int64_t onset_sec = (event_ntp_ms - session_start_ms) / 1000;
                 if (onset_sec < 0) onset_sec = 0;
+
+                /* Duration: spool gives milliseconds, EDF wants seconds */
+                int64_t dur_sec = evt.duration_ms / 1000;
 
                 /* Build TAL payload */
                 uint8_t payload[62];
@@ -1899,7 +2039,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                 p += strlen(onset_str);
                 payload[p++] = 0x15;  /* duration separator */
                 char dur_str[24];
-                snprintf(dur_str, sizeof(dur_str), "%lld", (long long)evt.duration_sec);
+                snprintf(dur_str, sizeof(dur_str), "%lld", (long long)dur_sec);
                 memcpy(payload + p, dur_str, strlen(dur_str));
                 p += strlen(dur_str);
                 payload[p++] = 0x14;
@@ -1914,7 +2054,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                 uint8_t crc_bytes[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
                 fwrite(crc_bytes, 1, 2, edf);
             } else if (wire == 0) {
-                pb_decode_varint(events_data, events_len, &pos);
+                pb_decode_varint(event_list, event_list_len, &pos);
             } else if (wire == 1) {
                 pos += 8;
             } else if (wire == 5) {

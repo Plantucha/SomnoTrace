@@ -145,8 +145,7 @@ static upload_result_t smb_upload_file(struct smb2_context *smb2,
 /* Upload all .edf files from a DATALOG day folder. */
 static int upload_day_folder(struct smb2_context *smb2,
                               const char *local_day_dir,
-                              const char *remote_day_dir,
-                              const char *session_id)
+                              const char *remote_day_dir)
 {
     DIR *d = opendir(local_day_dir);
     if (!d) {
@@ -157,9 +156,8 @@ static int upload_day_folder(struct smb2_context *smb2,
     int count = 0;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        /* Only upload .edf files that match the session prefix */
+        /* Upload all .edf files in the day folder */
         if (strstr(ent->d_name, ".edf") == NULL) continue;
-        if (strstr(ent->d_name, session_id) == NULL) continue;
 
         char local_path[512];
         snprintf(local_path, sizeof(local_path), "%s/%s", local_day_dir, ent->d_name);
@@ -240,8 +238,7 @@ static bool smb_is_configured(void)
     return uploader_is_smb_configured();
 }
 
-static upload_result_t smb_upload_session(const char *session_id,
-                                           const char *day_folder)
+static upload_result_t smb_upload_day(const char *day_folder)
 {
     uploader_config_t cfg;
     uploader_load_config(&cfg);
@@ -250,7 +247,7 @@ static upload_result_t smb_upload_session(const char *session_id,
         return UPLOAD_NOT_CONFIGURED;
     }
 
-    ESP_LOGI(TAG, "SMB upload: %s -> %s/%s%s", session_id,
+    ESP_LOGI(TAG, "SMB upload: day %s -> %s/%s%s", day_folder,
              cfg.smb_host, cfg.smb_share, cfg.smb_path);
 
     /* Init SMB context */
@@ -285,7 +282,7 @@ static upload_result_t smb_upload_session(const char *session_id,
     ESP_LOGI(TAG, "SMB connected");
 
     /* Build remote base path — SMB paths are relative to the share root,
-     * so must NOT start with '/' or '\'.  Windows returns
+     * so must NOT start with '/' or '\\'.  Windows returns
      * STATUS_INVALID_PARAMETER for absolute paths. */
     char remote_base[256];
     const char *p = cfg.smb_path;
@@ -305,8 +302,8 @@ static upload_result_t smb_upload_session(const char *session_id,
     char local_day_dir[256];
     snprintf(local_day_dir, sizeof(local_day_dir), "%s/%s", SD_SDCARD_DATALOG, day_folder);
 
-    /* Upload session EDF files */
-    int edf_count = upload_day_folder(smb2, local_day_dir, remote_day_dir, session_id);
+    /* Upload all EDF files in the day folder */
+    int edf_count = upload_day_folder(smb2, local_day_dir, remote_day_dir);
     if (edf_count < 0) {
         ESP_LOGE(TAG, "failed to read day folder %s", local_day_dir);
         smb2_disconnect_share(smb2);
@@ -314,7 +311,7 @@ static upload_result_t smb_upload_session(const char *session_id,
         return UPLOAD_FAILED;
     }
 
-    ESP_LOGI(TAG, "uploaded %d EDF files for session %s", edf_count, session_id);
+    ESP_LOGI(TAG, "uploaded %d EDF files for day %s", edf_count, day_folder);
 
     /* Upload mandatory root files */
     int mand_count = upload_mandatory_files(smb2, remote_base);
@@ -325,12 +322,12 @@ static upload_result_t smb_upload_session(const char *session_id,
     smb2_destroy_context(smb2);
 
     int total = edf_count + mand_count;
-    ESP_LOGI(TAG, "SMB upload complete for session %s (%d files)", session_id, total);
+    ESP_LOGI(TAG, "SMB upload complete for day %s (%d files)", day_folder, total);
     return total > 0 ? UPLOAD_OK : UPLOAD_FAILED;
 }
 
 const upload_backend_t smb_backend = {
     .name = "smb",
     .is_configured = smb_is_configured,
-    .upload_session = smb_upload_session,
+    .upload_day = smb_upload_day,
 };

@@ -33,13 +33,14 @@
  * (/littlefs/upload_state.json). The file is rewritten atomically
  * (write to .tmp, rename) on each state change.
  *
- * Session-level tracking: each session has per-backend status.
- * No per-file fingerprinting — a session is either fully uploaded
- * to a backend or not. */
+ * Day-level tracking: each noon-day (DATALOG/YYYYMMDD) has per-backend
+ * status. When a new session is added to an already-uploaded day, the
+ * day is "dirtied" (reset to pending) so the whole day is re-uploaded.
+ * This is simpler and more correct than per-file fingerprinting. */
 
 #define UPLOAD_STATE_PATH    "/littlefs/upload_state.json"
 #define UPLOAD_STATE_TMP     "/littlefs/upload_state.json.tmp"
-#define UPLOAD_MAX_SESSIONS  16
+#define UPLOAD_MAX_DAYS      30
 #define UPLOAD_MAX_BACKENDS  4
 #define UPLOAD_BACKEND_NAME_LEN 16
 
@@ -57,15 +58,14 @@ typedef struct {
 } backend_state_t;
 
 typedef struct {
-    char session_id[32];       /* e.g. "20260629_232738" */
-    char day_folder[16];       /* e.g. "20260629" */
+    char day_folder[16];       /* e.g. "20260629" (noon-based) */
     int n_backends;
     backend_state_t backends[UPLOAD_MAX_BACKENDS];
-} session_state_t;
+} day_state_t;
 
 typedef struct {
-    int n_sessions;
-    session_state_t sessions[UPLOAD_MAX_SESSIONS];
+    int n_days;
+    day_state_t days[UPLOAD_MAX_DAYS];
 } upload_state_t;
 
 /* Load state from LittleFS. Returns ESP_OK on success.
@@ -75,37 +75,35 @@ esp_err_t uploader_state_load(upload_state_t *state);
 /* Save state to LittleFS atomically. */
 esp_err_t uploader_state_save(const upload_state_t *state);
 
-/* Find or create a session entry in the state.
- * Returns pointer to the session entry, or NULL if full. */
-session_state_t *uploader_state_find_or_create(upload_state_t *state,
-                                                const char *session_id,
-                                                const char *day_folder);
+/* Find or create a day entry in the state.
+ * Returns pointer to the day entry, or NULL if full. */
+day_state_t *uploader_state_find_or_create(upload_state_t *state,
+                                            const char *day_folder);
 
-/* Find a session entry by session_id. Returns NULL if not found. */
-session_state_t *uploader_state_find(upload_state_t *state,
-                                      const char *session_id);
+/* Find a day entry by day_folder. Returns NULL if not found. */
+day_state_t *uploader_state_find(upload_state_t *state,
+                                  const char *day_folder);
 
-/* Find or create a backend entry within a session. */
-backend_state_t *uploader_state_backend_find_or_create(session_state_t *sess,
+/* Find or create a backend entry within a day. */
+backend_state_t *uploader_state_backend_find_or_create(day_state_t *day,
                                                         const char *backend_name);
 
-/* Update a backend's status for a session. */
+/* Update a backend's status for a day. */
 void uploader_state_set_backend_status(upload_state_t *state,
-                                        const char *session_id,
+                                        const char *day_folder,
                                         const char *backend_name,
                                         upload_status_t status);
 
-/* Get a list of sessions that need retry (status != OK for any
- * configured backend, and attempts < max_attempts).
- * Fills out_ids and out_day_folders with up to max_out entries.
- * Returns the number of sessions needing retry. */
+/* Get a list of days that need upload (status != OK for any
+ * configured backend).
+ * Fills out_days with up to max_out entries.
+ * Returns the number of days needing work. */
 int uploader_state_get_pending(const upload_state_t *state,
                                 const char *backend_names[], int n_backends,
-                                const char *out_ids[], const char *out_days[],
-                                int max_out);
+                                const char *out_days[], int max_out);
 
-/* Prune sessions older than max_age_days that have all backends OK.
- * Returns number of sessions pruned. */
+/* Prune days older than max_age_days that have all backends OK.
+ * Returns number of days pruned. */
 int uploader_state_prune(upload_state_t *state, int max_age_days);
 
 /* Convert state to JSON string for web UI. Caller must free(). */

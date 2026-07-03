@@ -955,7 +955,7 @@ static void edf_task(void *arg)
             }
             snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-            uploader_on_session_ready(a->session_id, day_folder);
+            uploader_on_day_ready(day_folder);
         } else {
             ESP_LOGW(TAG, "edf_task: generation failed, not triggering upload");
         }
@@ -1006,7 +1006,7 @@ static void spool_refresh_task(void *arg)
         }
         snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-        uploader_on_session_ready(a->session_id, day_folder);
+        uploader_on_day_ready(day_folder);
     } else {
         ESP_LOGW(TAG, "spool_refresh_task: EDF generation failed, not triggering upload");
     }
