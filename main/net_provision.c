@@ -401,6 +401,7 @@ static esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, PORTAL_HTML_START, PORTAL_HTML_LEN);
     return ESP_OK;
 }
@@ -408,6 +409,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 static esp_err_t tz_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");
     httpd_resp_send(req, ZONES_JSON_START, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }

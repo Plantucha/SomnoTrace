@@ -738,11 +738,29 @@ var tzData = null;
 function loadTimezones(savedTzName) {
   var sel = document.getElementById('tz-select');
   if (!sel) return;
-  sel.innerHTML = '<option value="">Loading...</option>';
+
+  /* Show current timezone immediately from /api/status data */
+  if (savedTzName && savedTzName.length > 0) {
+    sel.innerHTML = '';
+    var o = document.createElement('option');
+    o.value = savedTzName;
+    o.textContent = savedTzName;
+    sel.appendChild(o);
+    sel.value = savedTzName;
+  } else {
+    sel.innerHTML = '<option value="">Select timezone…</option>';
+  }
+  sel.onchange = function() { markDirty(this); updateTzStr(); };
+}
+
+function loadTimezoneList(savedTzName) {
+  var sel = document.getElementById('tz-select');
+  if (!sel) return;
 
   fetch('/api/tz').then(function(r) { return r.json(); }).then(function(data) {
     tzData = data;
     var keys = Object.keys(data).sort();
+    var currentVal = sel.value;
     sel.innerHTML = '';
     for (var i = 0; i < keys.length; i++) {
       var o = document.createElement('option');
@@ -757,10 +775,12 @@ function loadTimezones(savedTzName) {
     }
     if (target && data[target]) {
       sel.value = target;
+    } else if (currentVal) {
+      sel.value = currentVal;
     }
     updateTzStr();
   }).catch(function() {
-    sel.innerHTML = '<option value="">Timezone data unavailable</option>';
+    /* Keep the single-option display if full list fails to load */
   });
 
   sel.onchange = function() { markDirty(this); updateTzStr(); };
@@ -961,6 +981,10 @@ function loadStatus() {
     }
 
     loadTimezones(d.tz_name || '');
+
+    /* Background-load full timezone list after page is interactive.
+     * The dropdown already shows the current TZ from /api/status. */
+    setTimeout(function() { loadTimezoneList(d.tz_name || ''); }, 2000);
 
     // WiFi profiles: default to dropdown mode
     if (d.ssids && d.ssids.length > 0) {
