@@ -150,7 +150,23 @@ void app_main(void)
         time_sync_init();
 
         if (sd_storage_is_ready()) {
-            ftp_server_start();
+            /* Configure FTP server from uploader config (NVS) */
+            uploader_config_t upcfg;
+            if (uploader_load_config(&upcfg) == ESP_OK && upcfg.ftp_enabled) {
+                ftp_anonymous_mode = upcfg.ftp_anonymous;
+                if (upcfg.ftp_anonymous) {
+                    strlcpy(ftp_user, "anonymous", sizeof(ftp_user));
+                    strlcpy(ftp_pass, "anonymous@", sizeof(ftp_pass));
+                } else {
+                    strlcpy(ftp_user, upcfg.ftp_user, sizeof(ftp_user));
+                    strlcpy(ftp_pass, upcfg.ftp_pass, sizeof(ftp_pass));
+                }
+                ftp_server_start();
+                ESP_LOGI(TAG, "FTP server started (%s mode)",
+                         upcfg.ftp_anonymous ? "anonymous" : "authenticated");
+            } else {
+                ESP_LOGI(TAG, "FTP server disabled in config");
+            }
         }
 
         /* Initialise upload system (needs Wi-Fi + NVS + SD card). */

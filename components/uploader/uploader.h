@@ -62,6 +62,7 @@ typedef struct {
 
 typedef struct {
     /* SMB server */
+    bool smb_enabled;        /* toggle: include SMB in upload cycle         */
     char smb_host[64];       /* server IP or hostname                      */
     char smb_share[64];      /* share name (e.g. "cpap")                   */
     char smb_user[64];       /* username (empty = guest)                   */
@@ -69,8 +70,15 @@ typedef struct {
     char smb_path[128];      /* remote path within share (e.g. "/SomnoTrace") */
 
     /* SleepHQ */
+    bool shq_enabled;        /* toggle: include SleepHQ in upload cycle     */
     char shq_client_id[128];      /* API key (Client UID)                */
     char shq_client_secret[128];  /* Client Secret                       */
+
+    /* Built-in FTP server */
+    bool ftp_enabled;        /* toggle: start FTP server at boot            */
+    bool ftp_anonymous;      /* true = anonymous, false = user/pass auth    */
+    char ftp_user[32];       /* FTP username (when not anonymous)           */
+    char ftp_pass[32];       /* FTP password (when not anonymous)           */
 } uploader_config_t;
 
 /* ── Public API ─────────────────────────────────────────────────────── */
@@ -97,9 +105,14 @@ void uploader_register_backend(const upload_backend_t *backend);
 esp_err_t uploader_load_config(uploader_config_t *cfg);
 esp_err_t uploader_save_config(const uploader_config_t *cfg);
 
-/* Check if specific backends are configured. */
+/* Check if specific backends are configured and enabled. */
 bool uploader_is_smb_configured(void);
 bool uploader_is_sleephq_configured(void);
+bool uploader_is_smb_enabled(void);
+bool uploader_is_sleephq_enabled(void);
+
+/* Check if FTP server is enabled in config. */
+bool uploader_is_ftp_enabled(void);
 
 /* Get upload status as a JSON string (for web UI).
  * Caller must free() the returned string. */

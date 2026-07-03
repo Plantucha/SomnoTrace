@@ -89,6 +89,17 @@ main{flex:1;padding:16px;max-width:960px;width:100%;margin:0 auto;display:flex;f
 .form-control:focus{border-color:var(--input-focus);box-shadow:0 0 0 3px var(--primary-glow)}
 select.form-control{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='%2394a3b8'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
 
+/* ── Toggle Switch ─────────────────────────────────────────────── */
+.toggle-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.toggle-row label{font-size:.9rem;font-weight:600;color:var(--text)}
+.toggle{position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.toggle-slider{position:absolute;cursor:pointer;inset:0;background:var(--border-color);border-radius:24px;transition:.3s}
+.toggle-slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.toggle input:checked+.toggle-slider{background:var(--primary)}
+.toggle input:checked+.toggle-slider:before{transform:translateX(20px)}
+.card-disabled .form-group{opacity:.35;pointer-events:none}
+
 /* ── Unified Button System ─────────────────────────────────────── */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;width:auto;padding:11px 20px;font-size:.9rem;font-weight:600;border-radius:8px;border:none;cursor:pointer;transition:all .2s ease;text-decoration:none;line-height:1.2}
 .btn:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
@@ -247,10 +258,14 @@ Wi-Fi &amp; Timezone
 </div>
 
 <!-- SMB Upload (STA only) -->
-<div class="card card-smb sta-only">
+<div class="card card-smb sta-only" id="smb-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
 SMB Server
+</div>
+<div class="toggle-row">
+<label>Enable SMB Upload</label>
+<label class="toggle"><input type="checkbox" id="smb-enabled" checked onchange="markDirty(this);toggleCardDisabled('smb-card','smb-enabled')"><span class="toggle-slider"></span></label>
 </div>
 <div class="form-group">
 <label>Host / IP Address</label>
@@ -285,10 +300,14 @@ SMB Server
 </div>
 
 <!-- SleepHQ (STA only) -->
-<div class="card card-shq sta-only">
+<div class="card card-shq sta-only" id="shq-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h.71A5.5 5.5 0 0 1 12 6c2.76 0 5 2.24 5 5v1h2c1.65 0 3 1.35 3 3s-1.35 3-3 3z"/></svg>
 SleepHQ Integration
+</div>
+<div class="toggle-row">
+<label>Enable SleepHQ Upload</label>
+<label class="toggle"><input type="checkbox" id="shq-enabled" checked onchange="markDirty(this);toggleCardDisabled('shq-card','shq-enabled')"><span class="toggle-slider"></span></label>
 </div>
 <div class="form-group">
 <label>API Key (Client ID)</label>
@@ -302,6 +321,41 @@ SleepHQ Integration
 <svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
 <svg viewBox="0 0 24 24" class="eye-closed" style="display:none"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46A11.8 11.8 0 0 0 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>
 </button>
+</div>
+</div>
+</div>
+
+<!-- FTP Server (STA only) -->
+<div class="card sta-only" id="ftp-card" style="border-left-color:var(--accent-ble)">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
+FTP Server
+</div>
+<div class="toggle-row">
+<label>Enable FTP Server</label>
+<label class="toggle"><input type="checkbox" id="ftp-enabled" checked onchange="markDirty(this);toggleCardDisabled('ftp-card','ftp-enabled')"><span class="toggle-slider"></span></label>
+</div>
+<div class="form-group">
+<label>Authentication Mode</label>
+<select id="ftp-auth-mode" class="form-control" data-dirty="false" onchange="markDirty(this);updateFtpAuthMode()">
+<option value="anonymous">Anonymous</option>
+<option value="credentials">Username &amp; Password</option>
+</select>
+</div>
+<div id="ftp-cred-fields">
+<div class="form-group">
+<label>FTP Username</label>
+<input type="text" class="form-control" id="ftp-user" placeholder="ftpuser" data-dirty="false" oninput="markDirty(this)">
+</div>
+<div class="form-group">
+<label>FTP Password</label>
+<div class="pw-wrap">
+<input type="password" class="form-control" id="ftp-pass" placeholder="Password" data-dirty="false" data-has-stored="false" oninput="markDirty(this)">
+<button type="button" class="pw-toggle" onclick="togglePw('ftp-pass')" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+<svg viewBox="0 0 24 24" class="eye-closed" style="display:none"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46A11.8 11.8 0 0 0 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>
+</button>
+</div>
 </div>
 </div>
 </div>
@@ -547,7 +601,7 @@ function markDirty(el) {
     isDirty.tz = true;
   } else {
     var card = el ? el.closest('.card') : null;
-    if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq'))) {
+    if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq') || card.id === 'ftp-card')) {
       isDirty.upload = true;
     } else {
       isDirty.wifi = true;
@@ -559,6 +613,21 @@ function markDirty(el) {
 function markWifiDirty() {
   isDirty.wifi = true;
   updateSaveButton();
+}
+
+function toggleCardDisabled(cardId, toggleId) {
+  var card = document.getElementById(cardId);
+  var toggle = document.getElementById(toggleId);
+  if (!card || !toggle) return;
+  if (toggle.checked) card.classList.remove('card-disabled');
+  else card.classList.add('card-disabled');
+}
+
+function updateFtpAuthMode() {
+  var sel = document.getElementById('ftp-auth-mode');
+  var credFields = document.getElementById('ftp-cred-fields');
+  if (!sel || !credFields) return;
+  credFields.style.display = (sel.value === 'credentials') ? '' : 'none';
 }
 
 function updateSaveButton() {
@@ -899,18 +968,28 @@ function saveAll() {
     }
   }
 
-  // Upload config (SMB + SleepHQ)
+  // Upload config (SMB + SleepHQ + FTP)
   if (isDirty.upload) {
     var smbPass = valOf('smb-pass');
     var shqSecret = valOf('shq-secret');
+    var ftpPass = valOf('ftp-pass');
+    var ftpAuthSel = document.getElementById('ftp-auth-mode');
     var uploadBody = {
       smb: {
+        enabled: document.getElementById('smb-enabled').checked,
         host: valOf('smb-host'), share: valOf('smb-share'), user: valOf('smb-user'),
         pass: smbPass || PW_SENTINEL_UPLOAD, path: valOf('smb-path')
       },
       sleephq: {
+        enabled: document.getElementById('shq-enabled').checked,
         client_id: valOf('shq-cid'),
         client_secret: shqSecret || PW_SENTINEL_UPLOAD
+      },
+      ftp: {
+        enabled: document.getElementById('ftp-enabled').checked,
+        anonymous: ftpAuthSel ? (ftpAuthSel.value === 'anonymous') : true,
+        user: valOf('ftp-user'),
+        pass: ftpPass || PW_SENTINEL_UPLOAD
       }
     };
     promises.push(
@@ -1014,22 +1093,36 @@ function bleRefresh() {
 function loadUploadConfig() {
   fetch('/api/uploads/config').then(function(r){ return r.json(); }).then(function(d) {
     function setVal(id, v) { var el = document.getElementById(id); if (el) el.value = v || ''; }
+    function setChecked(id, v) { var el = document.getElementById(id); if (el) el.checked = !!v; }
     function setStoredPw(id) {
       var el = document.getElementById(id);
       if (el) { el.value = ''; el.placeholder = '••••••••'; el.setAttribute('data-has-stored', 'true'); }
     }
     if (d.smb) {
+      setChecked('smb-enabled', d.smb.enabled !== false);
       setVal('smb-host', d.smb.host);
       setVal('smb-share', d.smb.share);
       setVal('smb-user', d.smb.user);
       setVal('smb-path', d.smb.path);
       if (d.smb.pass === PW_SENTINEL_UPLOAD) setStoredPw('smb-pass');
       else setVal('smb-pass', d.smb.pass);
+      toggleCardDisabled('smb-card', 'smb-enabled');
     }
     if (d.sleephq) {
+      setChecked('shq-enabled', d.sleephq.enabled !== false);
       setVal('shq-cid', d.sleephq.client_id);
       if (d.sleephq.client_secret === PW_SENTINEL_UPLOAD) setStoredPw('shq-secret');
       else setVal('shq-secret', d.sleephq.client_secret);
+      toggleCardDisabled('shq-card', 'shq-enabled');
+    }
+    if (d.ftp) {
+      setChecked('ftp-enabled', d.ftp.enabled !== false);
+      setVal('ftp-auth-mode', d.ftp.anonymous ? 'anonymous' : 'credentials');
+      setVal('ftp-user', d.ftp.user);
+      if (d.ftp.pass === PW_SENTINEL_UPLOAD) setStoredPw('ftp-pass');
+      else setVal('ftp-pass', d.ftp.pass);
+      updateFtpAuthMode();
+      toggleCardDisabled('ftp-card', 'ftp-enabled');
     }
     updateSmbPreview();
   }).catch(function() {});

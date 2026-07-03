@@ -120,11 +120,26 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
     if (!cfg) return ESP_ERR_INVALID_ARG;
     memset(cfg, 0, sizeof(*cfg));
 
+    /* Defaults: all toggles enabled for backward compatibility */
+    cfg->smb_enabled   = true;
+    cfg->shq_enabled   = true;
+    cfg->ftp_enabled   = true;
+    cfg->ftp_anonymous = true;
+
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
         ESP_LOGI(TAG, "no uploader config in NVS — using defaults");
         return ESP_ERR_NVS_NOT_FOUND;
     }
+
+    /* Boolean toggles — use u8 with backward-compatible defaults.
+     * If key is missing (first boot after upgrade), default to enabled
+     * for SMB/SHQ and FTP so existing setups keep working. */
+    uint8_t u8val;
+    cfg->smb_enabled   = (nvs_get_u8(h, "smb_en", &u8val) == ESP_OK) ? u8val : 1;
+    cfg->shq_enabled   = (nvs_get_u8(h, "shq_en", &u8val) == ESP_OK) ? u8val : 1;
+    cfg->ftp_enabled   = (nvs_get_u8(h, "ftp_en", &u8val) == ESP_OK) ? u8val : 1;
+    cfg->ftp_anonymous = (nvs_get_u8(h, "ftp_anon", &u8val) == ESP_OK) ? u8val : 1;
 
     size_t len;
     len = sizeof(cfg->smb_host);
@@ -141,6 +156,10 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
     nvs_get_str(h, "shq_cid", cfg->shq_client_id, &len);
     len = sizeof(cfg->shq_client_secret);
     nvs_get_str(h, "shq_secret", cfg->shq_client_secret, &len);
+    len = sizeof(cfg->ftp_user);
+    nvs_get_str(h, "ftp_user", cfg->ftp_user, &len);
+    len = sizeof(cfg->ftp_pass);
+    nvs_get_str(h, "ftp_pass", cfg->ftp_pass, &len);
 
     nvs_close(h);
     return ESP_OK;
@@ -154,6 +173,10 @@ esp_err_t uploader_save_config(const uploader_config_t *cfg)
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
 
+    nvs_set_u8(h, "smb_en", cfg->smb_enabled ? 1 : 0);
+    nvs_set_u8(h, "shq_en", cfg->shq_enabled ? 1 : 0);
+    nvs_set_u8(h, "ftp_en", cfg->ftp_enabled ? 1 : 0);
+    nvs_set_u8(h, "ftp_anon", cfg->ftp_anonymous ? 1 : 0);
     nvs_set_str(h, "smb_host", cfg->smb_host);
     nvs_set_str(h, "smb_share", cfg->smb_share);
     nvs_set_str(h, "smb_user", cfg->smb_user);
@@ -161,6 +184,8 @@ esp_err_t uploader_save_config(const uploader_config_t *cfg)
     nvs_set_str(h, "smb_path", cfg->smb_path);
     nvs_set_str(h, "shq_cid", cfg->shq_client_id);
     nvs_set_str(h, "shq_secret", cfg->shq_client_secret);
+    nvs_set_str(h, "ftp_user", cfg->ftp_user);
+    nvs_set_str(h, "ftp_pass", cfg->ftp_pass);
     nvs_commit(h);
     nvs_close(h);
 
@@ -172,12 +197,29 @@ esp_err_t uploader_save_config(const uploader_config_t *cfg)
 
 bool uploader_is_smb_configured(void)
 {
-    return s_config.smb_host[0] != '\0' && s_config.smb_share[0] != '\0';
+    return s_config.smb_enabled &&
+           s_config.smb_host[0] != '\0' && s_config.smb_share[0] != '\0';
 }
 
 bool uploader_is_sleephq_configured(void)
 {
-    return s_config.shq_client_id[0] != '\0' && s_config.shq_client_secret[0] != '\0';
+    return s_config.shq_enabled &&
+           s_config.shq_client_id[0] != '\0' && s_config.shq_client_secret[0] != '\0';
+}
+
+bool uploader_is_smb_enabled(void)
+{
+    return s_config.smb_enabled;
+}
+
+bool uploader_is_sleephq_enabled(void)
+{
+    return s_config.shq_enabled;
+}
+
+bool uploader_is_ftp_enabled(void)
+{
+    return s_config.ftp_enabled;
 }
 
 /* ── Config JSON for web UI ─────────────────────────────────────────── */
@@ -189,6 +231,7 @@ esp_err_t uploader_get_config_json(char **out_json)
     cJSON *root = cJSON_CreateObject();
 
     cJSON *smb = cJSON_CreateObject();
+    cJSON_AddBoolToObject(smb, "enabled", s_config.smb_enabled);
     cJSON_AddStringToObject(smb, "host", s_config.smb_host);
     cJSON_AddStringToObject(smb, "share", s_config.smb_share);
     cJSON_AddStringToObject(smb, "user", s_config.smb_user);
@@ -199,11 +242,20 @@ esp_err_t uploader_get_config_json(char **out_json)
     cJSON_AddItemToObject(root, "smb", smb);
 
     cJSON *shq = cJSON_CreateObject();
+    cJSON_AddBoolToObject(shq, "enabled", s_config.shq_enabled);
     cJSON_AddStringToObject(shq, "client_id", s_config.shq_client_id);
     /* Mask secret */
     cJSON_AddStringToObject(shq, "client_secret", s_config.shq_client_secret[0] ? "***" : "");
     cJSON_AddBoolToObject(shq, "configured", uploader_is_sleephq_configured());
     cJSON_AddItemToObject(root, "sleephq", shq);
+
+    cJSON *ftp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(ftp, "enabled", s_config.ftp_enabled);
+    cJSON_AddBoolToObject(ftp, "anonymous", s_config.ftp_anonymous);
+    cJSON_AddStringToObject(ftp, "user", s_config.ftp_user);
+    /* Mask password */
+    cJSON_AddStringToObject(ftp, "pass", s_config.ftp_pass[0] ? "***" : "");
+    cJSON_AddItemToObject(root, "ftp", ftp);
 
     *out_json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -226,6 +278,8 @@ esp_err_t uploader_save_config_json(const char *json_str)
     cJSON *smb = cJSON_GetObjectItem(root, "smb");
     if (smb) {
         cJSON *v;
+        if ((v = cJSON_GetObjectItem(smb, "enabled")) && cJSON_IsBool(v))
+            cfg.smb_enabled = cJSON_IsTrue(v);
         if ((v = cJSON_GetObjectItem(smb, "host")) && cJSON_IsString(v))
             strlcpy(cfg.smb_host, v->valuestring, sizeof(cfg.smb_host));
         if ((v = cJSON_GetObjectItem(smb, "share")) && cJSON_IsString(v))
@@ -244,11 +298,28 @@ esp_err_t uploader_save_config_json(const char *json_str)
     cJSON *shq = cJSON_GetObjectItem(root, "sleephq");
     if (shq) {
         cJSON *v;
+        if ((v = cJSON_GetObjectItem(shq, "enabled")) && cJSON_IsBool(v))
+            cfg.shq_enabled = cJSON_IsTrue(v);
         if ((v = cJSON_GetObjectItem(shq, "client_id")) && cJSON_IsString(v))
             strlcpy(cfg.shq_client_id, v->valuestring, sizeof(cfg.shq_client_id));
         if ((v = cJSON_GetObjectItem(shq, "client_secret")) && cJSON_IsString(v)) {
             if (strcmp(v->valuestring, "***") != 0)
                 strlcpy(cfg.shq_client_secret, v->valuestring, sizeof(cfg.shq_client_secret));
+        }
+    }
+
+    cJSON *ftp = cJSON_GetObjectItem(root, "ftp");
+    if (ftp) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(ftp, "enabled")) && cJSON_IsBool(v))
+            cfg.ftp_enabled = cJSON_IsTrue(v);
+        if ((v = cJSON_GetObjectItem(ftp, "anonymous")) && cJSON_IsBool(v))
+            cfg.ftp_anonymous = cJSON_IsTrue(v);
+        if ((v = cJSON_GetObjectItem(ftp, "user")) && cJSON_IsString(v))
+            strlcpy(cfg.ftp_user, v->valuestring, sizeof(cfg.ftp_user));
+        if ((v = cJSON_GetObjectItem(ftp, "pass")) && cJSON_IsString(v)) {
+            if (strcmp(v->valuestring, "***") != 0)
+                strlcpy(cfg.ftp_pass, v->valuestring, sizeof(cfg.ftp_pass));
         }
     }
 

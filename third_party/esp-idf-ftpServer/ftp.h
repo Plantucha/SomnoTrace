@@ -180,13 +180,18 @@ typedef enum {
 
 #if 0
 extern const char *FTP_TAG;
-extern char ftp_user[FTP_USER_PASS_LEN_MAX + 1];
-extern char ftp_pass[FTP_USER_PASS_LEN_MAX + 1];
 extern uint32_t ftp_stack_size;
 extern QueueHandle_t ftp_mutex;
 extern int ftp_buff_size;
 extern int ftp_timeout;
 #endif
+
+/* Credentials — set these before calling ftp_server_start() to override
+ * the default anonymous login. */
+extern char ftp_user[FTP_USER_PASS_LEN_MAX + 1];
+extern char ftp_pass[FTP_USER_PASS_LEN_MAX + 1];
+extern bool ftp_anonymous_mode;  /* true: accept anonymous/ftp + any password;
+                                  * false: require exact user/pass match */
 
 bool ftp_init (void);
 void ftp_deinit (void);

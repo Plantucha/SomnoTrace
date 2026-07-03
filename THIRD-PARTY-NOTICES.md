@@ -43,8 +43,9 @@ determined to have been incorporated.
 - **Used for:** lightweight FTP server for Wi-Fi file transfer to/from SD card
 - **License:** MIT (Copyright (c) 2021 nopnop2002, Copyright (c) 2018 LoBo)
 - **Notes:** Vendored in `third_party/esp-idf-ftpServer/`. Modified to use
-  `/somnotrace` as mount point, default to anonymous credentials, and remove
-  external event-group dependency.
+  `/somnotrace` as mount point, support selectable anonymous/authenticated
+  login modes via `ftp_anonymous_mode` flag, and remove external event-group
+  dependency.
 
 ## libsmb2
 

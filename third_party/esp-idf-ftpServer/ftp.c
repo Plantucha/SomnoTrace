@@ -70,6 +70,7 @@ const char *MOUNT_POINT = "/somnotrace";
 static uint8_t ftp_stop = 0;
 char ftp_user[FTP_USER_PASS_LEN_MAX + 1];
 char ftp_pass[FTP_USER_PASS_LEN_MAX + 1];
+bool ftp_anonymous_mode = true;  /* default: anonymous (accept any password) */
 
 /******************************************************************************
  DECLARE PRIVATE DATA
@@ -838,21 +839,41 @@ static void ftp_process_cmd (void) {
 			break;
 		case E_FTP_CMD_USER:
 			ftp_pop_param (&bufptr, ftp_scratch_buffer, FTP_MAX_PARAM_SIZE, true, true);
-			if (strcasecmp(ftp_scratch_buffer, "anonymous") == 0 ||
-				strcasecmp(ftp_scratch_buffer, "ftp") == 0) {
-				ftp_data.loggin.uservalid = true;
-			}
-			else if (!memcmp(ftp_scratch_buffer, ftp_user, MAX(strlen(ftp_scratch_buffer), strlen(ftp_user)))) {
-				ftp_data.loggin.uservalid = true && (strlen(ftp_user) == strlen(ftp_scratch_buffer));
+			if (ftp_anonymous_mode) {
+				/* Anonymous mode: accept "anonymous" or "ftp" as username */
+				if (strcasecmp(ftp_scratch_buffer, "anonymous") == 0 ||
+					strcasecmp(ftp_scratch_buffer, "ftp") == 0) {
+					ftp_data.loggin.uservalid = true;
+				}
+			} else {
+				/* Authenticated mode: only accept the configured username */
+				if (strlen(ftp_user) > 0 &&
+					strlen(ftp_scratch_buffer) == strlen(ftp_user) &&
+					memcmp(ftp_scratch_buffer, ftp_user, strlen(ftp_user)) == 0) {
+					ftp_data.loggin.uservalid = true;
+				}
 			}
 			ftp_send_reply(331, NULL);
 			break;
 		case E_FTP_CMD_PASS:
 			ftp_pop_param (&bufptr, ftp_scratch_buffer, FTP_MAX_PARAM_SIZE, true, true);
 			if (ftp_data.loggin.uservalid) {
-				ftp_data.loggin.passvalid = true;
-				ftp_send_reply(230, NULL);
-				ESP_LOGW(FTP_TAG, "Connected.");
+				if (ftp_anonymous_mode) {
+					/* Anonymous: accept any password (including blank) */
+					ftp_data.loggin.passvalid = true;
+				} else {
+					/* Authenticated: validate password against configured one */
+					if (strlen(ftp_scratch_buffer) == strlen(ftp_pass) &&
+						memcmp(ftp_scratch_buffer, ftp_pass, strlen(ftp_pass)) == 0) {
+						ftp_data.loggin.passvalid = true;
+					}
+				}
+				if (ftp_data.loggin.passvalid) {
+					ftp_send_reply(230, NULL);
+					ESP_LOGW(FTP_TAG, "Connected.");
+				} else {
+					ftp_send_reply(530, NULL);
+				}
 			} else {
 				ftp_send_reply(530, NULL);
 			}
@@ -1376,8 +1397,12 @@ void ftp_task(void *pvParameters)
 {
 	ESP_LOGI(FTP_TAG, "ftp_task start");
 	esp_log_level_set(FTP_TAG, ESP_LOG_WARN);
-	strcpy(ftp_user, "anonymous");
-	strcpy(ftp_pass, "anonymous@");
+	/* ftp_user / ftp_pass are set by the caller before ftp_server_start().
+	 * Only default to anonymous if no credentials were provided. */
+	if (ftp_user[0] == '\0') {
+		strcpy(ftp_user, "anonymous");
+		strcpy(ftp_pass, "anonymous@");
+	}
 
 	uint64_t elapsed, time_ms = mp_hal_ticks_ms();
 	if (!ftp_init()) {
