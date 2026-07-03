@@ -90,8 +90,8 @@ main{flex:1;padding:16px;max-width:960px;width:100%;margin:0 auto;display:flex;f
 select.form-control{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='%2394a3b8'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
 
 /* ── Toggle Switch ─────────────────────────────────────────────── */
-.toggle-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-.toggle-row label{font-size:.9rem;font-weight:600;color:var(--text)}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;background:var(--input-bg);border:1px solid var(--border-color);padding:10px 14px;border-radius:8px;margin-bottom:14px}
+.toggle-row label{font-size:.9rem;font-weight:600;color:var(--text);cursor:pointer}
 .toggle{position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0}
 .toggle input{opacity:0;width:0;height:0;position:absolute}
 .toggle-slider{position:absolute;cursor:pointer;inset:0;background:var(--border-color);border-radius:24px;transition:.3s}
@@ -144,8 +144,10 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .status-msg.success{color:var(--success)}
 .status-msg.error{color:var(--danger)}
 
-/* ── Save Footer ───────────────────────────────────────────────── */
-.save-footer{padding:4px 0 16px;display:flex;flex-direction:column;gap:8px}
+/* ── Save Footer (Sticky Action Bar) ───────────────────────────── */
+.save-footer{position:sticky;bottom:16px;z-index:50;padding:14px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:12px;transition:all .3s cubic-bezier(0.16,1,0.3,1)}
+.save-footer.dirty{border-color:var(--primary);box-shadow:0 8px 30px rgba(59,130,246,0.25);transform:translateY(-2px)}
+.save-info{display:flex;flex-direction:column;gap:2px}
 
 /* ── SMB Preview ───────────────────────────────────────────────── */
 .smb-preview{background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.82rem;color:var(--color-airflow);word-break:break-all;margin-top:2px}
@@ -174,28 +176,50 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .info-value{font-weight:600;font-size:.85rem}
 
 /* ── Logs Tab ──────────────────────────────────────────────────── */
-.logs-container{display:flex;flex-direction:column;height:500px}
+.logs-container{display:flex;flex-direction:column;flex:1;min-height:380px;height:calc(100vh - 120px)}
 .logs-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap}
 .logs-search{background:var(--input-bg);border:1px solid var(--border-color);color:var(--text);padding:8px 12px;border-radius:6px;outline:none;font-size:.85rem;width:220px}
 .logs-search:focus{border-color:var(--input-focus)}
-.terminal{flex:1;background:#030712;border:1px solid #1e293b;border-radius:8px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.82rem;overflow-y:auto;color:#34d399;white-space:pre-wrap;line-height:1.4}
+.terminal{flex:1;min-height:0;background:#030712;border:1px solid #1e293b;border-radius:8px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.82rem;overflow-y:auto;color:#34d399;white-space:pre-wrap;line-height:1.4}
 
 /* ── BLE Section ───────────────────────────────────────────────── */
 .ble-status-paired{font-size:.9rem;margin-bottom:8px;padding:10px 12px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.2);border-radius:8px}
 .ble-status-paired .paired-badge{color:var(--success);font-weight:600}
 
-/* ── Settings Grid ─────────────────────────────────────────────── */
+/* ── Settings Grid & Sections ──────────────────────────────────── */
 .settings-grid{display:flex;flex-direction:column;gap:16px}
+.settings-section-header{font-size:.95rem;font-weight:700;color:var(--text);margin:12px 0 2px 2px;display:flex;align-items:center;gap:10px}
+.step-num{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:var(--primary);color:#fff;font-size:.78rem;font-weight:700;flex-shrink:0}
+.settings-grid-2col{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
+.card-desc{font-size:.82rem;color:var(--text-muted);line-height:1.4;margin:-4px 0 14px 0}
 
 /* ── Responsive ────────────────────────────────────────────────── */
-@media(max-width:768px){.status-grid{grid-template-columns:1fr}}
+@media(max-width:768px){
+.status-grid,.settings-grid-2col{grid-template-columns:1fr}
+}
 @media(max-width:600px){
 header{flex-direction:column;height:auto;padding:10px 12px;gap:6px}
 .nav-tabs{width:100%;justify-content:space-around}
 .theme-selector{align-self:flex-end}
 main{padding:10px}
 .card{padding:14px}
-.save-footer{padding-bottom:28px}
+.save-footer{flex-direction:column;align-items:stretch;padding:12px;bottom:8px}
+.logs-container{height:calc(100vh - 145px);min-height:340px}
+}
+body.fixed-height {
+  height: 100vh;
+  overflow: hidden;
+}
+body.fixed-height main {
+  min-height: 0;
+}
+body.fixed-height .tab-content.active {
+  min-height: 0;
+  flex: 1;
+}
+body.fixed-height .logs-container {
+  height: auto;
+  min-height: 0;
 }
 </style>
 </head>
@@ -234,39 +258,103 @@ SomnoTrace
 
 <!-- ═══════════════ SETTINGS TAB ═══════════════ -->
 <section id="settings" class="tab-content active">
-<div class="settings-grid">
 
-<!-- WiFi & Timezone (always visible) -->
+<!-- Section 1: Connection & Time -->
+<div class="settings-section-header">
+<span class="step-num">1</span> Wi-Fi Network &amp; Timezone
+</div>
 <div class="card card-wifi">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M1 9l2 2a12.73 12.73 0 0 1 18 0l2-2A15.57 15.57 0 0 0 1 9zm4 4l2 2a8.5 8.5 0 0 1 10 0l2-2A11.36 11.36 0 0 0 5 13zm4 4l3 3 3-3a4.24 4.24 0 0 0-6 0z"/></svg>
-Wi-Fi &amp; Timezone
+Wi-Fi Configuration
 </div>
-<button class="btn btn-outline btn-sm" style="margin-bottom:14px" onclick="scanWifi()" id="btn-scan">
+<p class="card-desc">Connect the device to your local wireless network for time synchronization and automatic data uploads.</p>
+<button class="btn btn-outline btn-sm" style="margin-bottom:14px;width:fit-content" onclick="scanWifi()" id="btn-scan">
 <svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
 <span id="scan-label">Scan for networks</span>
 </button>
 <div id="wifi-blocks"></div>
-<div id="add-wifi-container">
-<button id="btn-add-wifi" type="button" class="btn btn-ghost btn-block" onclick="addWifiBlock()">+ Add another Wi-Fi network</button>
+<div id="add-wifi-container" style="display:flex;margin-top:4px">
+<button id="btn-add-wifi" type="button" class="btn btn-ghost btn-sm" onclick="addWifiBlock()">+ Add Wi-Fi network</button>
 </div>
-<div class="form-group" style="margin-top:14px">
+<div class="form-group" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--card-border)">
 <label>Timezone</label>
+<p class="card-desc" style="margin:2px 0 8px 0">Set your local timezone so timestamps on recorded sleep files are accurate.</p>
 <select id="tz-select" class="form-control" data-dirty="false" onchange="markDirty(this)"></select>
 <input type="hidden" id="tz-str">
 </div>
 </div>
 
-<!-- SMB Upload (STA only) -->
-<div class="card card-smb sta-only" id="smb-card">
+<!-- Section 2: Medical Devices (Data Sources) -->
+<div class="settings-section-header sta-only">
+<span class="step-num">2</span> Connected Medical Devices (Data Sources)
+</div>
+<div class="settings-grid-2col sta-only">
+<!-- ResMed AirSense 11 -->
+<div class="card card-ble" style="display:flex;flex-direction:column;justify-content:space-between">
+<div>
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/></svg>
+ResMed AirSense 11 CPAP
+</div>
+<p class="card-desc">Pair over Bluetooth to download therapy records after sleep.</p>
+<div class="form-group">
+<div id="ble-paired" class="ble-status-paired" style="display:none">
+<span class="paired-badge">● Paired</span> with <strong id="ble-dev-name">AirSense 11</strong>
+</div>
+<div id="ble-unpaired">
+<button class="btn btn-outline btn-sm" type="button" onclick="bleScan()">
+<svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+Scan for AirSense 11
+</button>
+<div class="form-group" id="ble-select-group" style="display:none;margin-top:10px">
+<label>Select Device</label>
+<select id="ble-dev" class="form-control"></select>
+</div>
+<button class="btn btn-primary btn-sm" type="button" id="btn-ble-pair" style="display:none;margin-top:8px" onclick="blePair()">Pair Device</button>
+<div class="form-group" id="ble-passkey-group" style="display:none;margin-top:12px">
+<label>Enter the 4-digit code shown on your CPAP screen</label>
+<input id="ble-passkey" type="text" inputmode="numeric" maxlength="4" placeholder="1234" class="form-control" style="max-width:140px;text-align:center;font-size:1.2rem;letter-spacing:.3em">
+<button class="btn btn-primary btn-sm" type="button" style="margin-top:8px" onclick="bleConfirm()">Confirm Code</button>
+</div>
+</div>
+<button class="btn btn-danger btn-sm" type="button" id="btn-ble-forget" style="display:none;margin-top:10px;width:fit-content" onclick="bleForget()">Unpair Device</button>
+<div id="ble-status" class="status-msg"></div>
+</div>
+</div>
+</div>
+
+<!-- Wellue/Viatom O2 Ring S -->
+<div class="card" style="opacity:.5;display:flex;flex-direction:column;justify-content:space-between">
+<div>
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+Wellue/Viatom O2 Ring S Pulse Oximeter
+</div>
+<p class="card-desc">Continuous pulse oximetry and heart rate recording during sleep. <span style="font-weight:600">(Coming Soon)</span></p>
+</div>
+<div style="margin-top:14px">
+<button class="btn btn-outline btn-sm" disabled>Pair O2 Ring</button>
+</div>
+</div>
+</div>
+
+<!-- Section 3: Automatic Uploads (Data Destinations) -->
+<div class="settings-section-header sta-only">
+<span class="step-num">3</span> Automatic Uploads (Data Destinations)
+</div>
+<div class="settings-grid-2col sta-only">
+<!-- Network Folder (SMB) -->
+<div class="card card-smb" id="smb-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
-SMB Server
+Network Folder (SMB Share)
 </div>
 <div class="toggle-row">
-<label>Enable SMB Upload</label>
+<label for="smb-enabled">Enable SMB Upload</label>
 <label class="toggle"><input type="checkbox" id="smb-enabled" checked onchange="markDirty(this);toggleCardDisabled('smb-card','smb-enabled')"><span class="toggle-slider"></span></label>
 </div>
+<p class="card-desc">Automatically save recorded sleep files directly to a home server, NAS, or Windows shared folder.</p>
 <div class="form-group">
 <label>Host / IP Address</label>
 <input type="text" class="form-control" id="smb-host" placeholder="192.168.1.100" data-dirty="false" oninput="markDirty(this);updateSmbPreview()">
@@ -299,16 +387,17 @@ SMB Server
 </div>
 </div>
 
-<!-- SleepHQ (STA only) -->
-<div class="card card-shq sta-only" id="shq-card">
+<!-- SleepHQ Cloud -->
+<div class="card card-shq" id="shq-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h.71A5.5 5.5 0 0 1 12 6c2.76 0 5 2.24 5 5v1h2c1.65 0 3 1.35 3 3s-1.35 3-3 3z"/></svg>
-SleepHQ Integration
+SleepHQ Cloud Upload
 </div>
 <div class="toggle-row">
-<label>Enable SleepHQ Upload</label>
+<label for="shq-enabled">Enable SleepHQ Upload</label>
 <label class="toggle"><input type="checkbox" id="shq-enabled" checked onchange="markDirty(this);toggleCardDisabled('shq-card','shq-enabled')"><span class="toggle-slider"></span></label>
 </div>
+<p class="card-desc">Automatically upload therapy records to your SleepHQ.com account for online sleep analysis and sharing.</p>
 <div class="form-group">
 <label>API Key (Client ID)</label>
 <input type="text" class="form-control" id="shq-cid" placeholder="Client ID" data-dirty="false" oninput="markDirty(this)">
@@ -324,22 +413,27 @@ SleepHQ Integration
 </div>
 </div>
 </div>
+</div>
 
-<!-- FTP Server (STA only) -->
+<!-- Section 4: Remote File Access (FTP) -->
+<div class="settings-section-header sta-only">
+<span class="step-num">4</span> Remote File Access (FTP Server)
+</div>
 <div class="card sta-only" id="ftp-card" style="border-left-color:var(--accent-ble)">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
-FTP Server
+SD Card File Access (FTP)
 </div>
 <div class="toggle-row">
-<label>Enable FTP Server</label>
+<label for="ftp-enabled">Enable FTP Server</label>
 <label class="toggle"><input type="checkbox" id="ftp-enabled" checked onchange="markDirty(this);toggleCardDisabled('ftp-card','ftp-enabled')"><span class="toggle-slider"></span></label>
 </div>
+<p class="card-desc">Allow computers or mobile devices on your Wi-Fi network to browse and download recorded sleep files directly from the SD card using an FTP client.</p>
 <div class="form-group">
 <label>Authentication Mode</label>
 <select id="ftp-auth-mode" class="form-control" data-dirty="false" onchange="markDirty(this);updateFtpAuthMode()">
-<option value="anonymous">Anonymous</option>
-<option value="credentials">Username &amp; Password</option>
+<option value="anonymous">Anonymous (No password needed)</option>
+<option value="credentials">Username &amp; Password Required</option>
 </select>
 </div>
 <div id="ftp-cred-fields">
@@ -360,52 +454,10 @@ FTP Server
 </div>
 </div>
 
-<!-- BLE Pairing (STA only) -->
-<div class="card card-ble sta-only">
-<div class="card-title">
-<svg viewBox="0 0 24 24"><path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/></svg>
-Bluetooth Pairing
-</div>
-<div class="form-group">
-<label>ResMed AirSense 11</label>
-<div id="ble-paired" class="ble-status-paired" style="display:none">
-<span class="paired-badge">● Paired</span> with <strong id="ble-dev-name">AirSense 11</strong>
-</div>
-<div id="ble-unpaired">
-<button class="btn btn-outline" type="button" onclick="bleScan()">
-<svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-Scan for AirSense 11
-</button>
-<div class="form-group" id="ble-select-group" style="display:none;margin-top:10px">
-<label>Select Device</label>
-<select id="ble-dev" class="form-control"></select>
-</div>
-<button class="btn btn-primary" type="button" id="btn-ble-pair" style="display:none;margin-top:8px" onclick="blePair()">Pair Device</button>
-<div class="form-group" id="ble-passkey-group" style="display:none;margin-top:12px">
-<label>Enter the 4-digit code shown on your CPAP screen</label>
-<input id="ble-passkey" type="text" inputmode="numeric" maxlength="4" placeholder="1234" class="form-control" style="max-width:140px;text-align:center;font-size:1.2rem;letter-spacing:.3em">
-<button class="btn btn-primary" type="button" style="margin-top:8px" onclick="bleConfirm()">Confirm Code</button>
-</div>
-</div>
-<button class="btn btn-danger btn-sm" type="button" id="btn-ble-forget" style="display:none;margin-top:10px" onclick="bleForget()">Unpair Device</button>
-<div id="ble-status" class="status-msg"></div>
-</div>
-<div class="form-group" style="opacity:.4;margin-top:14px">
-<label>Wellue O2 Ring <span style="font-size:.78rem;font-weight:normal;color:var(--text-muted)">(Coming Soon)</span></label>
-<button class="btn btn-outline" disabled>Pair O2 Ring</button>
-</div>
-</div>
-
-<!-- Upload Status (STA only) -->
-<div class="card sta-only">
-<div class="card-title">Upload Status</div>
-<div id="upload-status" style="font-size:.8rem;color:var(--text-muted);max-height:200px;overflow-y:auto"></div>
-<button class="btn btn-outline btn-sm" type="button" style="margin-top:8px" onclick="loadUploadStatus()">Refresh Status</button>
-</div>
-
-<!-- Future Placeholder (STA only) -->
-<div class="card sta-only" style="opacity:.4">
-<div class="card-title">Extra Settings <span style="font-size:.78rem;font-weight:normal;color:var(--text-muted)">(Coming Soon)</span></div>
+<!-- Extra Settings (Coming Soon) -->
+<div class="card sta-only" style="opacity:.4;margin-top:8px">
+<div class="card-title">Hardware Preferences <span style="font-size:.78rem;font-weight:normal;color:var(--text-muted)">(Coming Soon)</span></div>
+<div class="settings-grid-2col">
 <div class="form-group">
 <label>Bedside Smart Alarm</label>
 <input type="time" class="form-control" value="07:00" disabled>
@@ -415,16 +467,18 @@ Scan for AirSense 11
 <input type="range" class="form-control" min="10" max="100" value="50" disabled style="padding:0">
 </div>
 </div>
-
 </div>
 
-<!-- Single Save & Reboot Button -->
-<div class="save-footer">
-<button id="btn-save" class="btn btn-primary btn-block" onclick="saveAll()" disabled>
+<!-- Sticky Floating Save & Reboot Bar -->
+<div id="save-footer" class="save-footer">
+<div class="save-info">
+<span id="save-msg" style="font-size:0.9rem;font-weight:600;color:var(--text-muted)">No changes to save</span>
+<div id="save-status" class="status-msg" style="margin:0;padding:0;min-height:0"></div>
+</div>
+<button id="btn-save" class="btn btn-primary" onclick="saveAll()" disabled>
 <svg viewBox="0 0 24 24"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z"/></svg>
 Save &amp; Reboot
 </button>
-<div id="save-status" class="status-msg"></div>
 </div>
 
 </section>
@@ -476,6 +530,18 @@ uPlot library and /api/session/data endpoint required.
 <div class="chart-placeholder" style="min-height:200px">CPU and RAM telemetry graphs will appear here.<br>Requires /api/status polling and uPlot library.</div>
 </div>
 </div>
+<!-- Recent Upload Activity & Sync History -->
+<div class="card" style="margin-top:16px">
+<div class="card-title" style="justify-content:space-between">
+<div style="display:flex;align-items:center;gap:8px">
+<svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+Recent Upload Activity &amp; Sync History
+</div>
+<button class="btn btn-outline btn-sm" type="button" onclick="loadUploadStatus()">Refresh Status</button>
+</div>
+<p class="card-desc">History of daily sleep session files processed and uploaded to network folders or cloud storage.</p>
+<div id="upload-status" style="font-size:.82rem;color:var(--text-muted);max-height:260px;overflow-y:auto;margin-top:8px"></div>
+</div>
 </section>
 
 <!-- ═══════════════ LOGS TAB ═══════════════ -->
@@ -483,13 +549,19 @@ uPlot library and /api/session/data endpoint required.
 <div class="card logs-container">
 <div class="logs-header">
 <input type="text" class="logs-search" placeholder="Filter logs..." oninput="filterLogs(this.value)">
-<div style="display:flex;gap:6px">
+<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+<select id="log-level-select" class="form-control" style="width:auto;font-size:.82rem;padding:5px 28px 5px 8px" onchange="setLogLevel(this.value)">
+<option value="error">Error</option>
+<option value="warn">Warning</option>
+<option value="info" selected>Info</option>
+<option value="debug">Debug</option>
+</select>
+<span id="log-conn-status" style="font-size:.75rem;color:var(--text-muted)">● Disconnected</span>
 <button class="btn btn-outline btn-sm" onclick="clearLogs()">Clear</button>
 <button class="btn btn-primary btn-sm" onclick="downloadLogs()">Download</button>
 </div>
 </div>
-<div class="terminal" id="log-terminal">Log streaming requires /api/logs/stream SSE endpoint.
-Connect to view real-time device logs.</div>
+<div class="terminal" id="log-terminal"></div>
 </div>
 </section>
 
@@ -564,6 +636,15 @@ function switchTab(tabId) {
   if (btn) btn.classList.add('active');
   var sec = document.getElementById(tabId);
   if (sec) sec.classList.add('active');
+  /* Connect/disconnect log stream based on tab visibility. */
+  if (tabId === 'logs') {
+    document.body.classList.add('fixed-height');
+    connectLogStream();
+    loadLogLevel();
+  } else {
+    document.body.classList.remove('fixed-height');
+    disconnectLogStream();
+  }
 }
 
 function setTheme(theme) {
@@ -632,7 +713,18 @@ function updateFtpAuthMode() {
 
 function updateSaveButton() {
   var btn = document.getElementById('btn-save');
-  if (btn) btn.disabled = !(isDirty.wifi || isDirty.upload || isDirty.tz);
+  var footer = document.getElementById('save-footer');
+  var msg = document.getElementById('save-msg');
+  var dirty = isDirty.wifi || isDirty.upload || isDirty.tz;
+  if (btn) btn.disabled = !dirty;
+  if (footer) {
+    if (dirty) footer.classList.add('dirty');
+    else footer.classList.remove('dirty');
+  }
+  if (msg) {
+    msg.textContent = dirty ? 'You have unsaved changes' : 'No changes to save';
+    msg.style.color = dirty ? 'var(--text)' : 'var(--text-muted)';
+  }
 }
 
 /* ── WiFi State ────────────────────────────────────────────────── */
@@ -1187,15 +1279,83 @@ function execAction(action, confirmMsg) {
 }
 
 /* ── Logs ──────────────────────────────────────────────────────── */
-function filterLogs(q) {
-  var term = document.getElementById('log-terminal');
-  var lines = term.dataset.original ? term.dataset.original.split('\n') : term.textContent.split('\n');
-  if (!term.dataset.original) term.dataset.original = lines.join('\n');
-  var filtered = q ? lines.filter(function(l) { return l.toLowerCase().indexOf(q.toLowerCase()) >= 0; }) : lines;
-  term.textContent = filtered.join('\n');
+var logEvtSource = null;
+var logLines = [];                /* master list of all received lines */
+var LOG_MAX_LINES = 512;         /* cap to prevent DOM explosion */
+var logFilterQuery = '';
+
+function setLogConnStatus(state) {
+  var el = document.getElementById('log-conn-status');
+  if (!el) return;
+  if (state === 'connected')   { el.textContent = '● Connected';    el.style.color = 'var(--success)'; }
+  else if (state === 'error')  { el.textContent = '● Reconnecting…'; el.style.color = 'var(--warning)'; }
+  else                         { el.textContent = '● Disconnected';  el.style.color = 'var(--text-muted)'; }
 }
-function clearLogs() { var term = document.getElementById('log-terminal'); if (term) { term.textContent = ''; term.dataset.original = ''; } }
-function downloadLogs() { alert('Log download requires /api/logs/download endpoint.'); }
+
+function connectLogStream() {
+  if (logEvtSource) return;
+  logEvtSource = new EventSource('/api/logs/stream');
+  logEvtSource.onopen = function() { setLogConnStatus('connected'); };
+  logEvtSource.onmessage = function(e) {
+    logLines.push(e.data);
+    if (logLines.length > LOG_MAX_LINES) logLines = logLines.slice(-LOG_MAX_LINES);
+    renderLogTerminal();
+  };
+  logEvtSource.onerror = function() { setLogConnStatus('error'); };
+}
+
+function disconnectLogStream() {
+  if (logEvtSource) { logEvtSource.close(); logEvtSource = null; }
+  setLogConnStatus('disconnected');
+}
+
+function renderLogTerminal() {
+  var term = document.getElementById('log-terminal');
+  if (!term) return;
+  var lines = logFilterQuery
+    ? logLines.filter(function(l) { return l.toLowerCase().indexOf(logFilterQuery) >= 0; })
+    : logLines;
+  term.textContent = lines.join('\n');
+  /* Auto-scroll to bottom unless user has scrolled up deliberately. */
+  var atBottom = (term.scrollHeight - term.scrollTop - term.clientHeight) < 80;
+  if (atBottom) term.scrollTop = term.scrollHeight;
+}
+
+function filterLogs(q) {
+  logFilterQuery = (q || '').toLowerCase();
+  renderLogTerminal();
+}
+
+function clearLogs() {
+  logLines = [];
+  renderLogTerminal();
+}
+
+function downloadLogs() {
+  window.location.href = '/api/logs/download';
+}
+
+function setLogLevel(level) {
+  fetch('/api/logs/level', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ level: level })
+  }).then(function(r) { return r.json(); })
+    .then(function(d) {
+      var sel = document.getElementById('log-level-select');
+      if (sel && d.level) sel.value = d.level;
+    })
+    .catch(function() { /* ignore */ });
+}
+
+function loadLogLevel() {
+  fetch('/api/logs/level').then(function(r) { return r.json(); })
+    .then(function(d) {
+      var sel = document.getElementById('log-level-select');
+      if (sel && d.level) sel.value = d.level;
+    })
+    .catch(function() { /* ignore */ });
+}
 
 /* ── Dashboard Date ────────────────────────────────────────────── */
 function updateDateDisplayLabel(dateIsoStr) {

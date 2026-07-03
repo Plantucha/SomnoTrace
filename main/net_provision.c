@@ -9,6 +9,7 @@
 #include "uploader.h"
 #include "edf_gen.h"
 #include "sd_storage.h"
+#include "log_stream.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -1376,6 +1377,9 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &act_delete_edfs);
     httpd_register_uri_handler(s_httpd, &act_reset_all);
     httpd_register_uri_handler(s_httpd, &act_recreate);
+
+    /* Log stream endpoints (SSE, download, level control) */
+    log_stream_register_handlers(s_httpd);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */

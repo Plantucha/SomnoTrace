@@ -41,6 +41,7 @@
 #include "ftp.h"
 #include "time_sync.h"
 #include "uploader.h"
+#include "log_stream.h"
 
 
 static const char *TAG = "somnotrace";
@@ -83,6 +84,9 @@ void app_main(void)
 
     /* 1. Power latch — must be first or device powers off on button release. */
     bsp_power_hold();
+
+    /* 1b. Start log capture early so the ring buffer catches boot messages. */
+    log_stream_init();
 
     /* 2. Start button monitors. */
     bsp_power_start_button_monitor(5000);   /* PWR 5 s = power off */
