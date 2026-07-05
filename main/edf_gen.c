@@ -921,6 +921,26 @@ static int on_off_to_edf(const char *s)
     return -1;
 }
 
+/* Map ActiveTherapyProfile name from settings.json to the MOP enum index
+ * used by MODE_MAP.  The AS11 STR.edf Mode field is sourced from the
+ * ActiveTherapyProfile (MOP setting), not from SessionModeEntries in the
+ * Summary spool (which contain unreliable values).  See edf_signals.md
+ * "STR enum export maps" and resmed_config.py ENUM_OPTIONS['MOP']. */
+static int profile_name_to_mop(const char *name)
+{
+    if (!name) return -1;
+    if (strcmp(name, "CpapProfile") == 0)       return 0;  /* CPAP      */
+    if (strcmp(name, "AutoSetProfile") == 0)    return 1;  /* AutoSet   */
+    if (strcmp(name, "SpontProfile") == 0)      return 3;  /* S         */
+    if (strcmp(name, "STProfile") == 0)         return 4;  /* ST        */
+    if (strcmp(name, "TimedProfile") == 0)      return 5;  /* T         */
+    if (strcmp(name, "VAutoProfile") == 0)      return 6;  /* VAuto     */
+    if (strcmp(name, "ASVProfile") == 0)        return 7;  /* ASV       */
+    if (strcmp(name, "ASVAutoProfile") == 0)    return 8;  /* ASVAuto   */
+    if (strcmp(name, "AutoSetForHerProfile") == 0) return 11; /* AutoSet Her */
+    return -1;
+}
+
 /* Convert a raw spool value to the EDF digital value by dividing by the
  * field's "logical scale".  The AS11 stores summary metrics in the protobuf
  * spool as fixed-point integers; its firmware STR writer divides each by a
@@ -961,13 +981,27 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
 {
     /* Session core [4-5] — logical_scale = 1, no conversion needed */
     str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);  /* Duration */
-    int mode_raw = 0;
-    if (ctx->n_session_entries > 0)
-        mode_raw = (int)ctx->session_entries[0].mode - 1;  /* 1-indexed → 0-indexed */
+
+    /* Mode [5]: derived from ActiveTherapyProfile in settings.json.
+     * The AS11's own export uses the MOP setting (ActiveTherapyProfile),
+     * not the SessionModeEntries from the Summary spool, which contain
+     * unreliable values.  See edf_signals.md "STR enum export maps". */
+    int mode_raw = -1;
+    if (settings_json) {
+        cJSON *sp = cJSON_GetObjectItem(settings_json, "SettingProfiles");
+        cJSON *ap = sp ? cJSON_GetObjectItem(sp, "ActiveProfiles") : NULL;
+        cJSON *tp_name = ap ? cJSON_GetObjectItem(ap, "TherapyProfile") : NULL;
+        if (tp_name && cJSON_IsString(tp_name))
+            mode_raw = profile_name_to_mop(tp_name->valuestring);
+    }
     if (mode_raw >= 0 && mode_raw < (int)(sizeof(MODE_MAP) / sizeof(MODE_MAP[0]))) {
         str_values[5] = MODE_MAP[mode_raw];
+    } else if (mode_raw == 11) {
+        /* AutoSet Her: not in standard MODE_MAP (which has 11 entries for
+         * indices 0-10).  Use the MOP enum value directly as the EDF value. */
+        str_values[5] = 11;
     } else {
-        str_values[5] = mode_raw;
+        str_values[5] = -1;  /* unknown — leave sentinel */
     }
 
     /* CPAP/AutoSet settings [6-13] and common comfort/settings [14-30]:
