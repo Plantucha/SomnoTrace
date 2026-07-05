@@ -37,7 +37,7 @@ static const char *TAG = "dev_settings";
 #define NVS_KEY_LCD_THERAPY  "lcd_thr"
 
 #define DEFAULT_BRIGHTNESS       50
-#define MIN_BRIGHTNESS           10
+#define MIN_BRIGHTNESS           1
 #define MAX_BRIGHTNESS           100
 
 static device_settings_t s_settings;

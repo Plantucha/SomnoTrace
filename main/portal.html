@@ -460,7 +460,7 @@ SD Card File Access (FTP)
 <div class="settings-grid-2col">
 <div class="form-group">
 <label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">50%</span></label>
-<input type="range" id="lcd-brightness" class="form-control" min="10" max="100" value="50" style="padding:0" oninput="onBrightnessInput(this.value)">
+<input type="range" id="lcd-brightness" class="form-control" min="1" max="100" value="50" style="padding:0" oninput="onBrightnessInput(this.value)">
 </div>
 <div class="form-group">
 <label>LCD During Therapy</label>
@@ -718,7 +718,7 @@ function updateSaveButton() {
   var btn = document.getElementById('btn-save');
   var footer = document.getElementById('save-footer');
   var msg = document.getElementById('save-msg');
-  var dirty = isDirty.wifi || isDirty.upload || isDirty.tz;
+  var dirty = isDirty.wifi || isDirty.upload || isDirty.tz || isDirty.device;
   if (btn) btn.disabled = !dirty;
   if (footer) {
     if (dirty) footer.classList.add('dirty');
@@ -1233,7 +1233,17 @@ function onBrightnessInput(val) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ brightness: parseInt(val) })
-    }).catch(function() {});
+    }).then(function() {
+      if (label) label.textContent = val + '% ✓';
+      setTimeout(function() {
+        if (label) label.textContent = val + '%';
+      }, 1000);
+    }).catch(function() {
+      if (label) label.textContent = val + '% ✗';
+      setTimeout(function() {
+        if (label) label.textContent = val + '%';
+      }, 1500);
+    });
   }, 200);
 }
 

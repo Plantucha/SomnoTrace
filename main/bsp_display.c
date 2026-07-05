@@ -558,7 +558,7 @@ void bsp_display_set_as11_paired(bool paired)
 
 void bsp_display_set_brightness(uint8_t percent)
 {
-    if (percent < 10) percent = 10;
+    if (percent < 1) percent = 1;
     if (percent > 100) percent = 100;
     s_brightness = percent;
     if (s_backlight_on) {
