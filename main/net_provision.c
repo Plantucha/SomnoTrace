@@ -731,6 +731,14 @@ static void reboot_task(void *arg)
     esp_restart();
 }
 
+static esp_err_t reboot_post_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
     char body[768];
@@ -1423,6 +1431,10 @@ static esp_err_t start_webserver(void)
     httpd_uri_t dev_post = { .uri = "/api/device/settings", .method = HTTP_POST, .handler = device_settings_post_handler };
     httpd_register_uri_handler(s_httpd, &dev_get);
     httpd_register_uri_handler(s_httpd, &dev_post);
+
+    /* Reboot endpoint */
+    httpd_uri_t reboot_post = { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler };
+    httpd_register_uri_handler(s_httpd, &reboot_post);
 
     /* Actions endpoints (Reset State, Delete EDFs, Reset All, Recreate EDFs) */
     httpd_uri_t act_reset_state = { .uri = "/api/actions/reset-state", .method = HTTP_POST, .handler = action_reset_state_handler };

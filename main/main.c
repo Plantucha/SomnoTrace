@@ -99,16 +99,17 @@ void app_main(void)
         ESP_LOGE(TAG, "display init failed");
     }
 
-    /* 3b. Load device settings (brightness, LCD therapy mode) and apply. */
-    device_settings_t dev_cfg;
-    device_settings_load(&dev_cfg);
-    bsp_display_set_brightness(dev_cfg.brightness);
-
     const char *boot_lines[] = { "Booting..." };
     show_status("SomnoTrace", boot_lines, 1);
 
-    /* 4. Initialise networking stack. */
+    /* 4. Initialise networking stack (includes NVS init). */
     ESP_ERROR_CHECK(netprov_init());
+
+    /* 4a. Load device settings (brightness, LCD therapy mode) and apply.
+     * Must be after netprov_init() which calls nvs_flash_init(). */
+    device_settings_t dev_cfg;
+    device_settings_load(&dev_cfg);
+    bsp_display_set_brightness(dev_cfg.brightness);
 
     /* 4b. Initialise BLE (AirSense 11 pairing). Non-fatal on failure. */
     if (as11_ble_init() != ESP_OK) {

@@ -1137,6 +1137,10 @@ function saveAll() {
     if (statusEl) { statusEl.textContent = 'Saved! Rebooting…'; statusEl.className = 'status-msg success'; }
     isDirty = { wifi: false, upload: false, tz: false, device: false };
     updateSaveButton();
+    /* Trigger actual reboot after a short delay to let the response reach the client */
+    setTimeout(function() {
+      fetch('/api/reboot', { method: 'POST' }).catch(function() {});
+    }, 500);
   }).catch(function() {
     if (statusEl) { statusEl.textContent = 'Save failed — please try again'; statusEl.className = 'status-msg error'; }
   });
