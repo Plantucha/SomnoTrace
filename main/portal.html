@@ -454,17 +454,20 @@ SD Card File Access (FTP)
 </div>
 </div>
 
-<!-- Extra Settings (Coming Soon) -->
-<div class="card sta-only" style="opacity:.4;margin-top:8px">
-<div class="card-title">Hardware Preferences <span style="font-size:.78rem;font-weight:normal;color:var(--text-muted)">(Coming Soon)</span></div>
+<!-- Hardware Preferences -->
+<div class="card sta-only" style="margin-top:8px">
+<div class="card-title">Hardware Preferences</div>
 <div class="settings-grid-2col">
 <div class="form-group">
-<label>Bedside Smart Alarm</label>
-<input type="time" class="form-control" value="07:00" disabled>
+<label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">50%</span></label>
+<input type="range" id="lcd-brightness" class="form-control" min="10" max="100" value="50" style="padding:0" oninput="onBrightnessInput(this.value)">
 </div>
 <div class="form-group">
-<label>LCD Brightness</label>
-<input type="range" class="form-control" min="10" max="100" value="50" disabled style="padding:0">
+<label>LCD During Therapy</label>
+<select id="lcd-therapy-mode" class="form-control" onchange="onLcdTherapyModeChange()">
+<option value="0">Live Graph</option>
+<option value="1">Off (no backlight)</option>
+</select>
 </div>
 </div>
 </div>
@@ -673,7 +676,7 @@ function togglePw(id) {
 }
 
 /* ── Dirty State Tracking ──────────────────────────────────────── */
-var isDirty = { wifi: false, upload: false, tz: false };
+var isDirty = { wifi: false, upload: false, tz: false, device: false };
 
 function markDirty(el) {
   if (el) el.setAttribute('data-dirty', 'true');
@@ -976,6 +979,7 @@ function loadStatus() {
         bleRefresh();
         loadUploadConfig();
         loadUploadStatus();
+        loadDeviceSettings();
       }
       loadStatusTab(d);
     }
@@ -1113,6 +1117,17 @@ function saveAll() {
     );
   }
 
+  // Device settings (LCD therapy mode — brightness is already saved live)
+  if (isDirty.device) {
+    var devBody = {
+      brightness: parseInt(valOf('lcd-brightness')) || 50,
+      lcd_therapy_mode: parseInt(valOf('lcd-therapy-mode')) || 0
+    };
+    promises.push(
+      fetch('/api/device/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(devBody) })
+    );
+  }
+
   if (promises.length === 0) {
     if (statusEl) { statusEl.textContent = 'No changes to save'; statusEl.className = 'status-msg'; }
     return;
@@ -1120,7 +1135,7 @@ function saveAll() {
 
   Promise.all(promises).then(function() {
     if (statusEl) { statusEl.textContent = 'Saved! Rebooting…'; statusEl.className = 'status-msg success'; }
-    isDirty = { wifi: false, upload: false, tz: false };
+    isDirty = { wifi: false, upload: false, tz: false, device: false };
     updateSaveButton();
   }).catch(function() {
     if (statusEl) { statusEl.textContent = 'Save failed — please try again'; statusEl.className = 'status-msg error'; }
@@ -1201,6 +1216,43 @@ function bleRefresh() {
       if (paired) paired.style.display = 'none';
       if (unp) unp.style.display = 'block';
       if (fgt) fgt.style.display = 'none';
+    }
+  }).catch(function() {});
+}
+
+/* ── Device Settings (brightness, LCD therapy mode) ────────────── */
+var brightnessTimer = null;
+
+function onBrightnessInput(val) {
+  var label = document.getElementById('brightness-val');
+  if (label) label.textContent = val + '%';
+  /* Debounce the POST so we don't spam the device while dragging */
+  if (brightnessTimer) clearTimeout(brightnessTimer);
+  brightnessTimer = setTimeout(function() {
+    fetch('/api/device/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ brightness: parseInt(val) })
+    }).catch(function() {});
+  }, 200);
+}
+
+function onLcdTherapyModeChange() {
+  isDirty.device = true;
+  updateSaveButton();
+}
+
+function loadDeviceSettings() {
+  fetch('/api/device/settings').then(function(r){ return r.json(); }).then(function(d) {
+    var br = document.getElementById('lcd-brightness');
+    if (br && typeof d.brightness === 'number') {
+      br.value = d.brightness;
+      var label = document.getElementById('brightness-val');
+      if (label) label.textContent = d.brightness + '%';
+    }
+    var mode = document.getElementById('lcd-therapy-mode');
+    if (mode && typeof d.lcd_therapy_mode === 'number') {
+      mode.value = String(d.lcd_therapy_mode);
     }
   }).catch(function() {});
 }
@@ -1435,6 +1487,7 @@ window.onload = function() {
     bleRefresh();
     loadUploadConfig();
     loadUploadStatus();
+    loadDeviceSettings();
   }
   // Set today's date for dashboard
   var today = new Date();

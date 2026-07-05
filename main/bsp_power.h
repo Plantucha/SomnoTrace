@@ -47,3 +47,8 @@ void bsp_power_start_button_monitor(int hold_ms);
  * is held for hold_ms milliseconds. softap_flag must remain valid for the
  * lifetime of the task. */
 void bsp_power_start_boot_monitor(volatile bool *softap_flag, int hold_ms);
+
+/* Start a background task that monitors the PLUS button (IO4) for
+ * double-clicks. On a double-click, sends EnterStandby RPC to stop
+ * AS11 therapy (only if therapy is currently active). */
+void bsp_power_start_plus_monitor(void);

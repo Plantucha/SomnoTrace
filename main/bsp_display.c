@@ -20,6 +20,8 @@
 #include "esp_lcd_panel_ops.h"
 #include "font_roboto.h"
 #include "esp_wifi.h"
+#include "driver/ledc.h"
+#include "device_settings.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -38,6 +40,16 @@
 #define LCD_CMD_BITS        8
 #define LCD_PARAM_BITS      8
 #define LCD_INVERT_COLOR    true
+
+/* LEDC PWM for backlight dimming */
+#define BL_LEDC_TIMER       LEDC_TIMER_0
+#define BL_LEDC_CHANNEL     LEDC_CHANNEL_0
+#define BL_LEDC_FREQ_HZ     5000
+#define BL_LEDC_RESOLUTION  LEDC_TIMER_10_BIT  /* 0-1023 duty */
+#define BL_DUTY_MAX         ((1 << 10) - 1)    /* 1023 */
+
+static uint8_t s_brightness = 50;   /* current brightness percent */
+static bool s_backlight_on = true;  /* backlight hardware state */
 
 static const char *TAG = "bsp_display";
 
@@ -120,6 +132,11 @@ static int   s_flow_count = 0;
 void bsp_display_set_therapy_active(bool active)
 {
     if (!s_state_mutex) return;
+
+    /* Check LCD therapy mode setting */
+    const device_settings_t *dev = device_settings_get();
+    bool lcd_off_mode = (dev->lcd_therapy_mode == LCD_THERAPY_OFF);
+
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     disp_mode_t new_mode = active ? DISP_MODE_GRAPH : DISP_MODE_STATUS;
     if (s_mode != new_mode) {
@@ -134,6 +151,12 @@ void bsp_display_set_therapy_active(bool active)
         }
     }
     xSemaphoreGive(s_state_mutex);
+
+    /* In LCD-off mode, turn backlight off during therapy, restore on stop */
+    if (lcd_off_mode) {
+        bsp_display_set_backlight(!active);
+    }
+
     /* Wake the render task so the mode change is reflected immediately. */
     if (s_display_task) xTaskNotifyGive(s_display_task);
 }
@@ -406,12 +429,28 @@ esp_err_t bsp_display_init(void)
      * and I/O drain, so quiet it down to WARN regardless of the global level. */
     esp_log_level_set("spi_master", ESP_LOG_WARN);
 
-    gpio_config_t bl_cfg = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << LCD_PIN_BL,
+    /* Backlight: LEDC PWM for brightness control */
+    ledc_timer_config_t bl_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = BL_LEDC_RESOLUTION,
+        .timer_num = BL_LEDC_TIMER,
+        .freq_hz = BL_LEDC_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    ESP_ERROR_CHECK(gpio_config(&bl_cfg));
-    gpio_set_level(LCD_PIN_BL, 1);
+    ESP_ERROR_CHECK(ledc_timer_config(&bl_timer));
+
+    ledc_channel_config_t bl_ch = {
+        .gpio_num = LCD_PIN_BL,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = BL_LEDC_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = BL_LEDC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&bl_ch));
+    s_backlight_on = true;
+    s_brightness = 50;
 
     s_flush_done = xSemaphoreCreateCounting(LCD_STRIP_BUFS, 0);
 
@@ -513,6 +552,39 @@ void bsp_display_set_as11_paired(bool paired)
     s_status_dirty = true;
     xSemaphoreGive(s_state_mutex);
     if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+/* ── Backlight control ─────────────────────────────────────────────── */
+
+void bsp_display_set_brightness(uint8_t percent)
+{
+    if (percent < 10) percent = 10;
+    if (percent > 100) percent = 100;
+    s_brightness = percent;
+    if (s_backlight_on) {
+        uint32_t duty = (uint32_t)(percent) * BL_DUTY_MAX / 100;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
+    }
+}
+
+void bsp_display_set_backlight(bool on)
+{
+    if (on == s_backlight_on) return;
+    s_backlight_on = on;
+    if (on) {
+        uint32_t duty = (uint32_t)(s_brightness) * BL_DUTY_MAX / 100;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
+    } else {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
+    }
+}
+
+uint8_t bsp_display_get_brightness(void)
+{
+    return s_brightness;
 }
 
 static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)

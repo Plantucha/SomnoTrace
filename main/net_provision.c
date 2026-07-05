@@ -10,6 +10,7 @@
 #include "edf_gen.h"
 #include "sd_storage.h"
 #include "log_stream.h"
+#include "device_settings.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -1053,6 +1054,53 @@ static esp_err_t upload_status_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── Device settings endpoints ─────────────────────────────────────── */
+
+static esp_err_t device_settings_get_handler(httpd_req_t *req)
+{
+    char *json = NULL;
+    if (device_settings_get_json(&json) != ESP_OK || !json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t device_settings_post_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 512) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_FAIL;
+    }
+    char *body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    if (device_settings_save_json(body) != ESP_OK) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid settings");
+        return ESP_FAIL;
+    }
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 /* ── Actions: Reset State, Delete EDFs, Reset All, Recreate EDFs ───── */
 
 /* Recursively delete a directory and all its contents. */
@@ -1369,6 +1417,12 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &up_cfg_get);
     httpd_register_uri_handler(s_httpd, &up_cfg_post);
     httpd_register_uri_handler(s_httpd, &up_status);
+
+    /* Device settings endpoints (brightness, LCD therapy mode) */
+    httpd_uri_t dev_get = { .uri = "/api/device/settings", .method = HTTP_GET, .handler = device_settings_get_handler };
+    httpd_uri_t dev_post = { .uri = "/api/device/settings", .method = HTTP_POST, .handler = device_settings_post_handler };
+    httpd_register_uri_handler(s_httpd, &dev_get);
+    httpd_register_uri_handler(s_httpd, &dev_post);
 
     /* Actions endpoints (Reset State, Delete EDFs, Reset All, Recreate EDFs) */
     httpd_uri_t act_reset_state = { .uri = "/api/actions/reset-state", .method = HTTP_POST, .handler = action_reset_state_handler };

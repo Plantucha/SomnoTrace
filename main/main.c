@@ -42,6 +42,7 @@
 #include "time_sync.h"
 #include "uploader.h"
 #include "log_stream.h"
+#include "device_settings.h"
 
 
 static const char *TAG = "somnotrace";
@@ -91,11 +92,17 @@ void app_main(void)
     /* 2. Start button monitors. */
     bsp_power_start_button_monitor(5000);   /* PWR 5 s = power off */
     bsp_power_start_boot_monitor(&s_softap_requested, 5000);
+    bsp_power_start_plus_monitor();         /* PLUS double-click = stop therapy */
 
     /* 3. Initialise display. */
     if (bsp_display_init() != ESP_OK) {
         ESP_LOGE(TAG, "display init failed");
     }
+
+    /* 3b. Load device settings (brightness, LCD therapy mode) and apply. */
+    device_settings_t dev_cfg;
+    device_settings_load(&dev_cfg);
+    bsp_display_set_brightness(dev_cfg.brightness);
 
     const char *boot_lines[] = { "Booting..." };
     show_status("SomnoTrace", boot_lines, 1);

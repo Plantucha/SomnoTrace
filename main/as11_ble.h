@@ -128,3 +128,8 @@ esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
  * The result is the "result" object from the RPC response, mapping
  * variable names to their values. */
 cJSON *as11_ble_get_values(const char *const *keys, int n_keys);
+
+/* Send EnterStandby RPC to stop therapy on the AS11.
+ * Requires an active encrypted BLE session.
+ * Returns ESP_OK on success. */
+esp_err_t as11_ble_stop_therapy(void);

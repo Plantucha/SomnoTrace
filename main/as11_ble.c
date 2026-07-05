@@ -2650,3 +2650,37 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
     cJSON_Delete(resp);
     return result;
 }
+
+esp_err_t as11_ble_stop_therapy(void)
+{
+    if (!s_session_encrypted) {
+        ESP_LOGW(TAG, "stop_therapy: no encrypted session");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const char *rpc = "{\"id\":50,\"jsonrpc\":\"1.0\",\"method\":\"EnterStandby\"}";
+    clear_response();
+    if (send_rpc_encrypted(rpc) != ESP_OK) {
+        ESP_LOGW(TAG, "stop_therapy: send failed");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = wait_response(10000);
+    if (!resp) {
+        ESP_LOGW(TAG, "stop_therapy: timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    cJSON *err = cJSON_GetObjectItem(resp, "error");
+    if (err) {
+        char *s = cJSON_Print(err);
+        ESP_LOGW(TAG, "stop_therapy: RPC error: %s", s ? s : "?");
+        if (s) free(s);
+        cJSON_Delete(resp);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "stop_therapy: EnterStandby accepted");
+    cJSON_Delete(resp);
+    return ESP_OK;
+}
