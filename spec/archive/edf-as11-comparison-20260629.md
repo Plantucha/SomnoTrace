@@ -1,5 +1,12 @@
 # SomnoTrace — EDF vs AS11 Reference Comparison (2026-06-29)
 
+> **⚠ PARTIALLY OUTDATED** — Sections 3.1–3.3 and the recommendation
+> (Section 5) describe a ~13 s capture-start offset that has since been
+> **fixed**. Recording now starts at TherapyStart (not BLE reconnect),
+> reducing the offset to ~5–9 s (AS11's internal processing delay).
+> See `as11-summary-spool-and-mask-events.md` §4 for the fix details.
+> Sections 2, 3.4, 3.5, and 4 remain valid.
+
 Analysis of ESP-generated EDF files against AS11 reference exports for
 session `20260629_232738` (ESP) vs `20260629_233520` / `20260629_233506`
 (AS11).
@@ -51,32 +58,35 @@ prefilter/spr/reserved field.
 
 ## 3. Remaining differences
 
-### 3.1 Header start_time (13 s therapy-start detection lag)
+### 3.1 Header start_time (13 s therapy-start detection lag) — ⚠ OUTDATED
+
+> **Fixed:** Recording now starts at TherapyStart event, not BLE reconnect.
+> The ~13 s offset described below was from the old pre-TherapyStart
+> recording behavior. Current offset is ~5–9 s (AS11 internal delay
+> after TherapyStart before BRP recording begins). See
+> `as11-summary-spool-and-mask-events.md` §4.
 
 | File group | ESP header time | AS11 header time | Delta |
 |------------|----------------|-----------------|-------|
 | BRP / SA2 / PLD | 23.35.07 | 23.35.20 | -13 s |
 | EVE / CSL       | 23.35.07 | 23.35.06 | +1 s  |
 
-**Root cause:** ESP detects therapy start from the first BLE stream
-notification. AS11 starts its EDF recording ~13 s later, when it
-internally decides therapy is stable. The drift correction itself is
-correct — both timestamps are in the AS11 clock domain. The 1 s offset
-for EVE/CSL is because event annotations start at a slightly different
-point than signal recording.
+**Root cause (original):** ESP was recording from BLE reconnect time
+(~7.5 min before TherapyStart) due to stream setup overhead. The fix
+is to record from TherapyStart (session_writer_start) to TherapyStop
+(session_writer_stop), matching the AS11's session lifecycle.
 
 **CRC1 (H1) differs** as a direct consequence, since CRC1 covers header
 bytes 0x19–0xFF which include the start_time field. CRC2 (H2, signal
 header blocks) matches in all files.
 
-**Possible fixes (not implemented):**
-- Query AS11 for its session start time via BLE RPC after therapy stops.
-- Delay session start detection to match AS11's internal threshold.
-- Both add complexity for a cosmetic header difference.
+### 3.2 BRP.edf — waveform capture offset (74.5 % byte difference) — ⚠ OUTDATED
 
-### 3.2 BRP.edf — waveform capture offset (74.5 % byte difference)
+> **Fixed:** The 13.4 s offset was from pre-TherapyStart recording.
+> Current offset is ~5–9 s (AS11 internal delay). The correlation
+> results below were from the old offset and are no longer representative.
 
-The byte difference is entirely due to the 13.4 s capture-start offset
+The byte difference was entirely due to the 13.4 s capture-start offset
 (335 samples × 0.04 s). When aligned:
 
 | Signal | Correlation | Max error | Mean error | Lag |
@@ -87,10 +97,13 @@ The byte difference is entirely due to the 13.4 s capture-start offset
 The waveforms overlay almost perfectly. Max error is 2 digital units
 out of ±2500 full-scale — within rounding noise of the int16 scaling.
 
-### 3.3 PLD.edf — waveform capture offset (33.8 % byte difference)
+### 3.3 PLD.edf — waveform capture offset (33.8 % byte difference) — ⚠ OUTDATED
+
+> **Fixed:** Same root cause as 3.2 — pre-TherapyStart recording.
+> Current offset is ~5–9 s (2–4 PLD samples at 2 s interval).
 
 Same 14 s capture-start offset (7 samples × 2 s). ESP's first 7 samples
-capture the pressure ramp-up (0 → 540), while AS11 started recording
+captured the pressure ramp-up (0 → 540), while AS11 started recording
 after pressure was already stable (359 → 530).
 
 | Signal | Correlation | Mean error | Notes |
@@ -165,17 +178,18 @@ All fixes were applied to `main/edf_gen.c`:
 
 ---
 
-## 5. Recommendation
+## 5. Recommendation — ⚠ UPDATED
 
-No further code changes are needed for data quality. The remaining
-differences are either:
+The ~13 s capture-start offset described in §3.1–3.3 has been **fixed**
+(recording now starts at TherapyStart). Remaining differences are:
 
-- **Cosmetic** — JSON `.0` formatting, CRC1 from 13 s time offset.
-- **Inherent to capture architecture** — therapy-start detection lag
-  causes a 13 s capture offset; graphs align near-perfectly when
-  corrected.
+- **Cosmetic** — JSON `.0` formatting, CRC1 from ~5–9 s time offset
+  (AS11 internal processing delay, not fixable without AS11 RPC).
 - **Not safely fixable** — STR `Flow.95` 1-LSB rounding without raw
   spool data.
+- **EDF record count** — Now uses ceiling division (no sample dropping).
+- **STR MaskOff** — Now uses MaskOn+duration (MaskOn for 0-duration),
+  matching AS11 exactly.
 
 The generated EDF files are as close to identical to AS11 as physically
 possible given the independent capture path.
