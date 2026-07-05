@@ -69,3 +69,9 @@ void session_writer_set_device_info(const char *addr, const char *client_id);
 
 /* Crash recovery: scan for interrupted sessions and finalise them. */
 void session_writer_recover(void);
+
+/* Check whether an _SNC ValueChange notification has been received since
+ * the last call.  Returns true and stores the new value in *out_value
+ * (if non-NULL), then clears the flag.  Used by post_therapy to detect
+ * when the AS11 has updated its Summary spool without polling. */
+bool session_writer_snc_changed(int64_t *out_value);

@@ -782,10 +782,12 @@ typedef struct {
         int n;
     } metrics[64];
     bool has_metric[64];
-    /* Session entries from field 1 (MaskOn/MaskOff events) */
+    /* Session entries from Summary spool field 6 (SessionModeEntries).
+     * Each entry has: sub-field 1 = MaskOn timestamp (epoch ms),
+     * sub-field 2 = per-session duration in minutes (NOT therapy mode). */
     struct {
-        int64_t ts;    /* sub-field 1: timestamp (epoch ms) */
-        int64_t mode;  /* sub-field 2: session mode */
+        int64_t ts;            /* sub-field 1: MaskOn timestamp (epoch ms) */
+        int64_t duration_min;  /* sub-field 2: per-session duration (minutes) */
     } session_entries[20];
     int n_session_entries;
 } summary_ctx_t;
@@ -803,8 +805,8 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
     } else if (f->field == SUM_F_SESSION_MODE && f->wire == 2 && f->data && f->len > 0) {
         /* SessionModeEntries (field 6): repeated wrapper submessages.
          * Each wrapper (sub-field 1, wire 2) contains:
-         *   sub-sub-field 1 (varint) = timestamp (epoch ms)
-         *   sub-sub-field 2 (varint) = session mode */
+         *   sub-sub-field 1 (varint) = MaskOn timestamp (epoch ms)
+         *   sub-sub-field 2 (varint) = per-session duration (minutes) */
         size_t pos = 0;
         while (pos < f->len && ctx->n_session_entries < 20) {
             uint64_t tag = pb_decode_varint(f->data, f->len, &pos);
@@ -818,7 +820,7 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
                 const uint8_t *inner = f->data + lpos;
                 size_t inner_len = (size_t)flen;
                 pos = lpos + flen;
-                int64_t ts = 0, mode = 0;
+                int64_t ts = 0, duration_min = 0;
                 size_t ip = 0;
                 while (ip < inner_len) {
                     uint64_t itag = pb_decode_varint(inner, inner_len, &ip);
@@ -828,7 +830,7 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
                     if (isw == 0) {
                         int64_t val = (int64_t)pb_decode_varint(inner, inner_len, &ip);
                         if (isf == 1) ts = val;
-                        else if (isf == 2) mode = val;
+                        else if (isf == 2) duration_min = val;
                     } else if (isw == 2) {
                         size_t ilpos = ip;
                         uint64_t ilen = pb_decode_varint(inner, inner_len, &ilpos);
@@ -842,7 +844,7 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
                     }
                 }
                 ctx->session_entries[ctx->n_session_entries].ts = ts;
-                ctx->session_entries[ctx->n_session_entries].mode = mode;
+                ctx->session_entries[ctx->n_session_entries].duration_min = duration_min;
                 ctx->n_session_entries++;
             } else if (sw == 2) {
                 size_t lpos = pos;
@@ -1221,18 +1223,11 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
     int64_t noon_epoch_ms = (int64_t)t * 1000;
 
     /* [1-3] MaskOn/MaskOff/MaskEvents from session entries.
-     * Session entries are all MaskOn (session start) timestamps.
-     * MaskOff is computed as MaskOn + per_session_duration, where
-     * per_session_duration = DurationMin / SessionCount. */
+     * Each session entry has: ts = MaskOn timestamp, duration_min = session
+     * duration in minutes. MaskOff = MaskOn + duration_min (when > 0).
+     * When duration_min == 0, MaskOff is -1 (sentinel, session too short). */
     int mask_on_count = 0;
     int mask_off_count = 0;
-
-    int duration_min = (int)get_scalar(ctx, SUM_F_DURATION_MIN, 0);
-    int session_count = (int)get_scalar(ctx, SUM_F_SESSION_COUNT, 0);
-    if (session_count <= 0)
-        session_count = ctx->n_session_entries;
-    int per_session_min = (session_count > 0)
-        ? ((duration_min + session_count - 1) / session_count) : 0;
 
     for (int i = 0; i < ctx->n_session_entries && mask_on_count < 20; i++) {
         int64_t ev_ms = ctx->session_entries[i].ts;
@@ -1244,7 +1239,10 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
             mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
         mask_on_count++;
 
-        int off_min = min_from_noon + (ctx->session_entries[i].mode != 0 ? per_session_min : 0);
+        /* MaskOff = MaskOn + per-session duration (from spool, verified
+         * against AS11 export). duration_min == 0 → sentinel -1. */
+        int dur = (int)ctx->session_entries[i].duration_min;
+        int off_min = (dur > 0) ? (min_from_noon + dur) : -1;
         if (mask_off_count == 0)
             str_values[2] = (int16_t)off_min;
         else

@@ -1938,13 +1938,24 @@ static void reconnect_task(void *arg)
     }
     ESP_LOGI(TAG, "reconnect: NTP synced, proceeding with stream setup");
 
-    /* ---- Subscribe to therapy events (encrypted) ---- */
-    rpc = malloc(512);
-    snprintf(rpc, 512,
+    /* ---- Subscribe to therapy events (encrypted) ----
+     * Four event selectors:
+     *   TherapyEvents-RespiratoryEvents  — apnea/hypopnea events (EVE.edf)
+     *   UsageEvents-TherapyStatusEvents  — TherapyStart/Stop, MaskOn/Off
+     *   SystemActivityEvents-FrequentActivityEvents — PressureStart/Stop,
+     *     CooldownStarted, StandbyStarted, etc.  PressureStart signals that
+     *     pressure has begun ramping — used to gate BRP/PLD recording.
+     *   _SNC — Summary spool update counter.  Pushes ValueChange when the
+     *     AS11 writes new Summary data (nor:1:/Summary.bin).  Used to detect
+     *     when Summary spool is fresh after TherapyStop without polling. */
+    rpc = malloc(700);
+    snprintf(rpc, 700,
              "{\"id\":13,\"jsonrpc\":\"1.0\",\"method\":\"SubscribeEvent\","
              "\"params\":{\"dataIds\":["
              "\"TherapyEvents-RespiratoryEvents\","
-             "\"UsageEvents-TherapyStatusEvents\""
+             "\"UsageEvents-TherapyStatusEvents\","
+             "\"SystemActivityEvents-FrequentActivityEvents\","
+             "\"_SNC\""
              "]}}");
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {

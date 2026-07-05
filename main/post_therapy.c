@@ -23,6 +23,7 @@
 
 #include "post_therapy.h"
 #include "as11_ble.h"
+#include "session_writer.h"
 #include "sd_storage.h"
 
 #include <stdio.h>
@@ -587,21 +588,50 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
     return errors > 0 ? ESP_FAIL : ESP_OK;
 }
 
-/* Retry pulling the current day's Summary spool until it's fresh or timeout.
- * Called from a low-priority task (core 0) so it doesn't block EDF generation
- * of other files or new therapy notifications.
+/* Wait for the AS11 to update its Summary spool after TherapyStop, then
+ * pull the fresh data.  Called from a low-priority task (core 0).
  *
- * Retries every 3 seconds for up to 2 minutes (40 attempts).
+ * The AS11 pushes an _SNC ValueChange EventNotification when it writes
+ * new Summary data (nor:1:/Summary.bin).  We subscribe to "_SNC" in the
+ * SubscribeEvent call and detect the push in session_writer's notification
+ * handler.  This function polls session_writer_snc_changed() every 3 seconds
+ * (just checking a flag — no BLE RPC needed) and pulls the spool when the
+ * flag is set.
+ *
+ * Fallback: if no _SNC notification arrives within 2 minutes (e.g.
+ * subscription wasn't accepted, or BLE dropped the notification), we
+ * pull the spool blindly on the last attempt and proceed with available
+ * data.
+ *
  * Returns true if the spool became fresh, false if still stale after timeout. */
 bool post_therapy_wait_spool_current(int64_t end_epoch_ms, int64_t clock_drift_ms)
 {
     const int max_attempts = 40;
     const int retry_delay_ms = 3000;
 
+    /* Clear any stale _SNC flag from before this session's TherapyStop. */
+    session_writer_snc_changed(NULL);
+
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
 
-        ESP_LOGI(TAG, "spool_refresh: attempt %d/%d", attempt, max_attempts);
+        /* Check if _SNC ValueChange notification was received (push from AS11). */
+        int64_t snc_val = 0;
+        if (session_writer_snc_changed(&snc_val)) {
+            ESP_LOGI(TAG, "spool_refresh: _SNC ValueChange received (%lld) "
+                     "on attempt %d, pulling spool",
+                     (long long)snc_val, attempt);
+        } else if (attempt < max_attempts) {
+            ESP_LOGD(TAG, "spool_refresh: no _SNC change yet (attempt %d/%d)",
+                     attempt, max_attempts);
+            continue;  /* keep waiting for the push notification */
+        } else {
+            ESP_LOGW(TAG, "spool_refresh: no _SNC notification after %d attempts, "
+                     "pulling spool as fallback", attempt);
+        }
+
+        ESP_LOGI(TAG, "spool_refresh: pulling spool (attempt %d/%d)",
+                 attempt, max_attempts);
 
         esp_err_t ret = refresh_today_summary_spool(end_epoch_ms, clock_drift_ms);
         if (ret == ESP_ERR_INVALID_STATE) {
