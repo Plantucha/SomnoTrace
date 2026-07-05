@@ -534,10 +534,10 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     }
 
     /* Total samples (per channel) and record count.
-     * EDF records are 60 seconds each.  Sessions shorter than 60 seconds
-     * produce 0 data records — the AS11 does not write a file at all. */
+     * EDF records are 60 seconds each.  Use ceiling division so the
+     * partial last record is preserved (zero-padded) rather than dropped. */
     uint32_t total_samples = hdr.sample_count;
-    int total_records = total_samples / spr[0];
+    int total_records = (int)((total_samples + spr[0] - 1) / spr[0]);
     if (total_records < 0) total_records = 0;
 
     /* AS11 does not write BRP/PLD/SA2 EDF files for sessions shorter than
@@ -1224,8 +1224,8 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
 
     /* [1-3] MaskOn/MaskOff/MaskEvents from session entries.
      * Each session entry has: ts = MaskOn timestamp, duration_min = session
-     * duration in minutes. MaskOff = MaskOn + duration_min (when > 0).
-     * When duration_min == 0, MaskOff is -1 (sentinel, session too short). */
+     * duration in minutes. MaskOff = MaskOn + duration_min.
+     * The AS11 writes MaskOff = MaskOn (not -1) for 0-duration sessions. */
     int mask_on_count = 0;
     int mask_off_count = 0;
 
@@ -1240,9 +1240,9 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
         mask_on_count++;
 
         /* MaskOff = MaskOn + per-session duration (from spool, verified
-         * against AS11 export). duration_min == 0 → sentinel -1. */
+         * against AS11 export). 0-duration → MaskOff = MaskOn. */
         int dur = (int)ctx->session_entries[i].duration_min;
-        int off_min = (dur > 0) ? (min_from_noon + dur) : -1;
+        int off_min = min_from_noon + dur;
         if (mask_off_count == 0)
             str_values[2] = (int16_t)off_min;
         else

@@ -11,8 +11,9 @@
 Findings from comparing firmware-generated EDF files against AS11 native
 exports. Covers: the true meaning of Summary spool `SessionModeEntries`
 field 2 (per-session duration, not therapy mode), MaskOff calculation,
-pressure stabilisation signalling via RPC events, and `_SNC` variable
-tracking for Summary spool update detection.
+pressure stabilisation signalling via RPC events, `_SNC` variable
+tracking for Summary spool update detection, EDF record count calculation,
+and STR MaskOff alignment for 0-duration sessions.
 
 ## 2. SessionModeEntries — "mode" field is per-session duration
 
@@ -36,8 +37,12 @@ values. **100% match** across all entries:
 
 ```
 MaskOff = MaskOn + duration   (when duration > 0)
-MaskOff = -1 (sentinel)       (when duration == 0)
+MaskOff = MaskOn              (when duration == 0)
 ```
+
+The AS11 writes MaskOff = MaskOn for 0-duration sessions (not -1).
+Previously the firmware used -1, which caused MaskOn/MaskOff array
+misalignment in STR.edf for multi-session days with 0-duration entries.
 
 ### Spool timestamp reference
 
@@ -180,7 +185,10 @@ therapy profile (MOP setting) for the Mode field.
 - [x] SystemActivityEvents-FrequentActivityEvents subscription added (for event logging)
 - [x] BRP/PLD/SA2 recording starts at TherapyStart, matching AS11 export behavior
 - [x] _SNC push notification subscription for Summary update detection
+- [x] _SNC subscription verified end-to-end with live session logs
 - [x] Fallback timeout retained (2 min)
+- [x] EDF record count uses ceiling division (no sample dropping)
+- [x] MaskOff = MaskOn for 0-duration sessions (matches AS11, fixes STR alignment)
 
 ## 8. Changelog
 
@@ -194,6 +202,9 @@ therapy profile (MOP setting) for the Mode field.
   TherapyStart (5-9s after CSL), NOT at PressureStart. Reverted
   PressureStart gating on BRP/PLD. Removed pressure_started flag.
   Updated unresolved items.
+- 2026-07-05: _SNC subscription verified working with live session logs.
+  Fixed EDF sample dropping (ceiling division for record count).
+  Fixed STR MaskOff for 0-duration sessions (MaskOff=MaskOn, not -1).
 
 ## 9. Unresolved items — to revisit
 
@@ -242,24 +253,19 @@ this is correct.
 use it for noon-day calculations. Low priority since timezone is
 typically set correctly on both devices.
 
-### 9.4 _SNC subscription acceptance not verified
+### 9.4 _SNC subscription — verified working
 
-The `_SNC` variable is used as a `dataId` in `SubscribeEvent`, confirmed
-by another developer's capture of `_SNC` `ValueChange` push notifications.
-However, we have not yet verified that the AS11 accepts `"_SNC"` as a
-dataId in the same `SubscribeEvent` call alongside the three event-profile
-selectors. If the AS11 rejects it (returns `valid: false` for `"_SNC"`),
-the firmware will not receive push notifications and will fall back to the
-2-minute timeout + blind spool pull.
+Confirmed end-to-end with live session logs (Jul 5, 2026):
+1. `reconnect: SubscribeEvent response received` — subscription accepted ✓
+2. `>>> _SNC ValueChange: 1103` — initial value at connect ✓
+3. `>>> _SNC ValueChange: 1104` — during therapy (Summary updated mid-session) ✓
+4. `>>> _SNC ValueChange: 1105` — after TherapyStop (Summary finalized) ✓
+5. `spool_is_current: ... → FRESH` — spool pull triggered correctly ✓
 
-**Impact:** Low — the 2-minute fallback ensures the spool is pulled
-regardless. The push notification just makes it faster (~230ms vs 2 min).
+The AS11 accepts `"_SNC"` as a dataId in `SubscribeEvent` alongside the
+three event-profile selectors. Push notifications arrive reliably.
 
-**To verify:** Run new code and check logs for:
-1. `reconnect: SubscribeEvent response received` — subscription accepted
-2. `>>> _SNC ValueChange: N` — push notification received
-3. `spool_refresh: _SNC ValueChange received` — post_therapy acted on it
-4. `spool_refresh: spool is CURRENT` — spool was fresh after pull
+**Status:** Resolved. No further action needed.
 
 ### 9.5 BRP recording end time
 
