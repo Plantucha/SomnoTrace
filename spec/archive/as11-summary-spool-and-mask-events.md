@@ -86,18 +86,40 @@ The `SystemActivityEvents-FrequentActivityEvents` event selector
 
 ### AS11 BRP recording start
 
-The AS11 starts BRP.edf recording approximately at TherapyStart time
-(~3 minutes before MaskOn). The firmware was starting recording earlier
-(~7.5 minutes before TherapyStart) due to BLE connection + stream setup
-overhead, capturing idle pre-therapy data.
+The AS11 starts BRP.edf recording at **TherapyStart** (CSL timestamp),
+not at PressureStart. Archive analysis confirms:
+
+| Session | CSL (TherapyStart) | BRP start | Gap |
+|---------|-------------------|-----------|-----|
+| Mar 29  | 01:13:05 | 01:13:12 | 7s |
+| Mar 30  | 23:37:40 | 23:37:47 | 7s |
+| Mar 31  | 22:27:38 | 22:27:44 | 6s |
+| Jul 4 #1| 00:01:03 | 00:01:12 | 9s |
+| Jul 4 #2| 03:38:35 | 03:38:41 | 6s |
+| Jul 4 #3| 06:26:24 | 06:26:32 | 8s |
+| Jul 5   | 00:04:38 | 00:04:43 | 5s |
+
+BRP always starts 5-9s after TherapyStart (internal AS11 processing
+delay). BRP ends at TherapyStop ≈ MaskOff time. BRP duration (nrecs ×
+60s) matches STR Duration (±1 min rounding).
+
+The firmware was previously starting recording at BLE reconnect time
+(~7.5 min before TherapyStart) due to stream setup overhead. The fix
+is to record from TherapyStart (session_writer_start) to TherapyStop
+(session_writer_stop), which is already the existing session lifecycle.
 
 ### Fix
 
-Subscribe to `SystemActivityEvents-FrequentActivityEvents` to receive
-`PressureStart` events. Use `PressureStart` as the signal to begin
-recording BRP/PLD data. Discard stream data received before
-`PressureStart`. SA2 (oximetry) data is recorded from session start
-since it comes from the external O2 Ring, not the AS11.
+No PressureStart gating is needed. BRP/PLD/SA2 all record from
+TherapyStart to TherapyStop, matching AS11 export behavior. The
+`SystemActivityEvents-FrequentActivityEvents` subscription is retained
+for event logging (PressureStart, PressureStop, CooldownStarted, etc.)
+but is not used to gate data recording.
+
+The original problem (recording starting ~7.5 min before TherapyStart)
+was likely caused by the auto-start fallback detecting idle baseline
+flow as "active therapy" — this is addressed by the existing
+`has_therapy_pressure` check (pressure > 4 cmH2O required).
 
 ## 5. _SNC Variable for Summary Update Detection
 
@@ -155,9 +177,9 @@ therapy profile (MOP setting) for the Mode field.
 - [x] Mode derived from settings.json ActiveTherapyProfile
 - [x] MaskOff calculated as MaskOn + per-session duration from spool
 - [x] SessionModeEntries sub-field 2 documented as duration_min
-- [x] SystemActivityEvents-FrequentActivityEvents subscription added
-- [x] BRP recording starts at PressureStart, not at stream start
-- [x] _SNC polling for Summary update detection
+- [x] SystemActivityEvents-FrequentActivityEvents subscription added (for event logging)
+- [x] BRP/PLD/SA2 recording starts at TherapyStart, matching AS11 export behavior
+- [x] _SNC push notification subscription for Summary update detection
 - [x] Fallback timeout retained (2 min)
 
 ## 8. Changelog
@@ -168,6 +190,10 @@ therapy profile (MOP setting) for the Mode field.
 - 2026-07-05: Switched _SNC from Get RPC polling to SubscribeEvent push
   notifications (confirmed by other developer's capture of _SNC
   ValueChange EventNotification).
+- 2026-07-05: Archive analysis of AS11 exports confirms BRP starts at
+  TherapyStart (5-9s after CSL), NOT at PressureStart. Reverted
+  PressureStart gating on BRP/PLD. Removed pressure_started flag.
+  Updated unresolved items.
 
 ## 9. Unresolved items — to revisit
 
@@ -177,20 +203,16 @@ available.
 
 ### 9.1 BRP start timestamp offset
 
-The firmware starts BLE stream subscriptions at reconnect time, before
-`PressureStart` arrives. BRP/PLD recording is now gated on
-`pressure_started`, but there is still a small latency between the AS11
-internally recording `PressureStart` and the firmware receiving the
-`EventNotification` (~1-2 seconds due to BLE notification dispatch).
-This means the first BRP sample timestamp may be off by 1-2 seconds
-compared to the AS11's own BRP.edf.
+Archive analysis confirms the AS11 starts BRP 5-9s after TherapyStart
+(CSL timestamp). The firmware starts recording at TherapyStart event
+receipt, which has ~1-2s BLE notification latency. Net offset vs AS11
+BRP: firmware BRP starts ~3-7s earlier than AS11 BRP (AS11 has 5-9s
+internal delay, firmware has 1-2s notification delay).
 
-**Impact:** Low — BRP data itself is correct, only the absolute start
-timestamp shifts by a few seconds.
+**Impact:** Low — a few seconds difference at the start of BRP.edf.
+The extra samples are idle/baseline data before pressure ramps.
 
-**Possible fix:** None practical without deeper AS11 internal timing
-knowledge. The AS11 does not expose its internal recording start time
-via RPC.
+**Status:** Resolved by archive analysis. No further action needed.
 
 ### 9.2 Current-day MaskOff (live, before spool pull)
 
@@ -233,47 +255,30 @@ the firmware will not receive push notifications and will fall back to the
 **Impact:** Low — the 2-minute fallback ensures the spool is pulled
 regardless. The push notification just makes it faster (~230ms vs 2 min).
 
-**To verify:** Check the `SubscribeEvent` response for the `valid` flag
-associated with `"_SNC"`. Currently the firmware logs the response but
-does not parse per-selector `valid` flags.
+**To verify:** Run new code and check logs for:
+1. `reconnect: SubscribeEvent response received` — subscription accepted
+2. `>>> _SNC ValueChange: N` — push notification received
+3. `spool_refresh: _SNC ValueChange received` — post_therapy acted on it
+4. `spool_refresh: spool is CURRENT` — spool was fresh after pull
 
-### 9.5 PressureStart event timing vs AS11 BRP start
+### 9.5 BRP recording end time
 
-The AS11's own BRP.edf recording starts at a specific internal trigger
-(presumably `PressureStart`). The firmware now gates on the same event,
-but the AS11 may start recording a fixed number of samples before or
-after the `PressureStart` notification is dispatched. This has not been
-verified by comparing exact first-sample timestamps.
+Archive analysis confirms BRP ends at TherapyStop ≈ MaskOff time.
+BRP duration (nrecs × 60s) matches STR Duration (±1 min rounding).
+The firmware stops recording at TherapyStop (session_writer_stop),
+which matches AS11 behavior.
 
-**Impact:** Low — at most a few samples difference at the start of
-BRP.edf.
+**Status:** Resolved by archive analysis. No further action needed.
 
-**To verify:** Compare first BRP sample timestamp from firmware-generated
-EDF vs AS11-exported EDF for the same session.
+### 9.6 Short sessions without STR entries
 
-### 9.6 PressureStop event not used for recording stop
+Archive analysis found sessions that have BRP/PLD/SA2 files but are
+NOT in STR.edf session entries (e.g., Jul 4 03:38 and 06:26 sessions).
+These are likely very short or interrupted sessions that the AS11
+doesn't count as real therapy sessions for Summary spool purposes.
 
-Currently, BRP/PLD recording stops when `TherapyStop` is received (via
-`session_writer_stop`). The `PressureStop` event arrives ~15 seconds
-after `TherapyStop`. The AS11 may stop BRP recording at `PressureStop`
-rather than `TherapyStop`, meaning the firmware could be recording
-~15 seconds of extra data at the end of the session.
+**Impact:** None for EDF generation — the firmware records all sessions
+and generates EDFs for them. The STR.edf only includes sessions that
+the AS11 considers valid (with MaskOn/duration in Summary spool).
 
-**Impact:** Low — extra data at the end is harmless (EDF generation
-trims to session duration). But if the AS11 stops at `PressureStop`,
-the firmware's BRP.edf could have ~15 seconds more data than the AS11's.
-
-**To verify:** Compare last BRP sample timestamp from firmware-generated
-EDF vs AS11-exported EDF.
-
-### 9.7 Events.snt for current day — PressureStart/Stop not written
-
-`PressureStart` and `PressureStop` events are detected by
-`check_event_notification` and used to set/clear `s_pressure_started`,
-but they are not explicitly written to `events.snt` (they fall through
-to the "Other events" path at line 1245 of session_writer.c, which does
-write them if a session is active). This should be fine, but it's worth
-verifying that these events are actually logged for debugging purposes.
-
-**Impact:** None for EDF generation — PressureStart/Stop are not used
-in STR.edf or EVE.edf. Only useful for post-hoc debugging.
+**Status:** Observed but not an issue. Expected behavior.

@@ -120,14 +120,11 @@ struct session_writer {
     uint8_t pld_countdown;     /* decimation: write PLD every 10th notification */
 
     /* events: simple JSON line file, flushed with data */
-
-    bool     pressure_started;  /* true after PressureStart event received */
 };
 
 static session_writer_t *s_active = NULL;
 static SemaphoreHandle_t s_active_mutex = NULL;
 static bool s_therapy_stopped = false;  /* set on TherapyStop, cleared on TherapyStart */
-static bool s_pressure_started = false; /* set on PressureStart, cleared on PressureStop */
 
 /* _SNC (Summary update counter) tracking — set when ValueChange
  * notification is received via the _SNC event subscription. */
@@ -396,11 +393,6 @@ session_writer_t *session_writer_start(void)
     s->pld_countdown = 1;  /* first notification writes PLD immediately */
     s->sa2_countdown = 1;  /* first notification writes SA2 immediately */
 
-    /* Inherit pressure state from module-level flag (set by PressureStart
-     * event). If PressureStart arrived before session start, recording
-     * begins immediately. Otherwise BRP/PLD are gated until PressureStart. */
-    s->pressure_started = s_pressure_started;
-
     make_session_id(s->session_id, sizeof(s->session_id));
 
     /* Compute noon-day folder (YYYYMMDD) from local time.
@@ -603,8 +595,7 @@ void session_writer_set_device_info(const char *addr, const char *client_id)
 /* Check an EventNotification for therapy start/stop events.
  * The AS11 sends EventNotification with params.dataId="UsageEvents-TherapyStatusEvents"
  * and params.events[] containing objects with an "event" field.
- * Returns true if a therapy start/stop event is found.
- * Also detects PressureStart/PressureStop from SystemActivityEvents-FrequentActivityEvents. */
+ * Returns true if a therapy start/stop event is found. */
 static bool check_event_notification(const cJSON *msg, bool *out_start, bool *out_stop)
 {
     *out_start = false;
@@ -627,12 +618,6 @@ static bool check_event_notification(const cJSON *msg, bool *out_start, bool *ou
             *out_start = true;
         } else if (strcmp(event->valuestring, "TherapyStop") == 0) {
             *out_stop = true;
-        } else if (strcmp(event->valuestring, "PressureStart") == 0) {
-            s_pressure_started = true;
-            ESP_LOGI(TAG, ">>> PRESSURE START detected");
-        } else if (strcmp(event->valuestring, "PressureStop") == 0) {
-            s_pressure_started = false;
-            ESP_LOGI(TAG, ">>> PRESSURE STOP detected");
         }
     }
     return *out_start || *out_stop;
@@ -847,12 +832,9 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         if (press_vals[j] > 200) has_therapy_pressure = true;
     }
 
-    /* Edge case: auto-start session if flow and pressure indicate active therapy.
-     * If we detect therapy pressure (>4 cmH2O), set s_pressure_started so
-     * BRP/PLD recording begins immediately — PressureStart was missed. */
+    /* Edge case: auto-start session if flow and pressure indicate active therapy */
     if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped && has_active_flow && has_therapy_pressure) {
         ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
-        s_pressure_started = true;
         bsp_display_set_therapy_active(true);
         s = session_writer_start();
     }
@@ -866,11 +848,12 @@ void session_writer_on_stream_data_raw(const char *json, int len)
      * appended in lockstep at the SAME cumulative buffer position.  Missing
      * samples in either channel use the -1 sentinel.
      *
-     * Gated on pressure_started: the AS11 starts BRP recording at
-     * PressureStart (when pressure begins ramping).  Pre-pressure stream
-     * data is idle noise and is discarded to match AS11 export behavior. */
-    if (s->pressure_started) {
-    uint32_t base = s->brp_buf_count;
+     * Recording starts at TherapyStart (session_writer_start) and ends at
+     * TherapyStop (session_writer_stop), matching AS11 export behavior.
+     * Archive analysis confirms BRP starts ~5-9s after TherapyStart and
+     * ends at TherapyStop ≈ MaskOff time. */
+    {
+        uint32_t base = s->brp_buf_count;
         int n_pairs = flow_n > press_n ? flow_n : press_n;
         for (int j = 0; j < n_pairs && base + j < 1500; j++) {
             s->brp_flow[base + j]  = (j < flow_n)  ? flow_vals[j]  : -1;
@@ -897,10 +880,8 @@ void session_writer_on_stream_data_raw(const char *json, int len)
 
     /* PLD: 12 channels, all 0.5 Hz (2s natural interval).
      * Decimate to 0.5 Hz — write every 10th notification (5 Hz / 10 = 0.5 Hz).
-     * Unsupported signals are absent from StreamData — channels stay -1.
-     * Gated on pressure_started: PLD channels (mask pressure, leak, etc.)
-     * are only meaningful during active therapy pressure. */
-    if (s->pressure_started && --s->pld_countdown == 0) {
+     * Unsupported signals are absent from StreamData — channels stay -1. */
+    if (--s->pld_countdown == 0) {
         s->pld_countdown = 10;
         bool any_found = false;
         for (int k = 0; k < 12; k++) {
@@ -1221,18 +1202,12 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         bool start = false, stop = false;
         check_event_notification(msg, &start, &stop);
 
-        /* Propagate pressure state to active session (PressureStart may
-         * arrive after TherapyStart, when session is already active). */
-        if (s && s->active)
-            s->pressure_started = s_pressure_started;
-
         /* Handle stop first so that a single message containing both
          * TherapyStart + TherapyStop (quick start/stop) doesn't leave
          * the display stuck in graph mode. */
         if (stop) {
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
             s_therapy_stopped = true;
-            s_pressure_started = false;
             bsp_display_set_therapy_active(false);
             if (s && s->active) {
                 write_event(s, msg);
