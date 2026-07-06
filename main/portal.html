@@ -520,6 +520,7 @@ uPlot library and /api/session/data endpoint required.
 <div class="status-grid">
 <div class="card info-list">
 <div class="card-title">System Status</div>
+<div class="info-row"><span class="info-label">Firmware</span><span class="info-value" id="status-fw">--</span></div>
 <div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="status-uptime">--</span></div>
 <div class="info-row"><span class="info-label">Local IP</span><span class="info-value" id="status-ip">--</span></div>
 <div class="info-row"><span class="info-label">Timezone</span><span class="info-value" id="status-tz">--</span></div>
@@ -1023,6 +1024,7 @@ function loadStatus() {
 
 function loadStatusTab(d) {
   function setEl(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
+  setEl('status-fw', d.fw_ver || '--');
   setEl('status-ip', d.ip || '--');
   setEl('status-tz', d.tz_name || 'UTC');
   var ntpEl = document.getElementById('status-ntp');

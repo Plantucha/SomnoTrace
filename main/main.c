@@ -36,6 +36,7 @@
 #include "sd_storage.h"
 #include "session_writer.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "ftp.h"
@@ -81,7 +82,10 @@ static void enter_softap(const struct netprov_config *cfg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "SomnoTrace starting up");
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    ESP_LOGI(TAG, "SomnoTrace %s (IDF %s) starting up",
+             app_desc ? app_desc->version : "unknown",
+             app_desc ? app_desc->idf_ver : "?");
 
     /* 1. Power latch — must be first or device powers off on button release. */
     bsp_power_hold();

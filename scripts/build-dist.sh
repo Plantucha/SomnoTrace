@@ -6,7 +6,7 @@
 # The output is named after the project and the current version derived from
 # git tags:
 #   - exactly on a tag:           somnotrace-v1.2.3-merged.bin
-#   - N commits after a tag:      somnotrace-v1.2.3+N-merged.bin
+#   - N commits after a tag:      somnotrace-v1.2.3-dev+N-merged.bin
 #   - uncommitted local changes:  ...+dirty
 #   - no tags yet:                somnotrace-0.0.0+<count>.g<sha>-merged.bin
 #
@@ -44,7 +44,7 @@ version_from_git() {
         if [ "$commits" = "0" ]; then
             printf '%s%s' "$tag" "$dirty"
         else
-            printf '%s+%s%s' "$tag" "$commits" "$dirty"
+            printf '%s-dev+%s%s' "$tag" "$commits" "$dirty"
         fi
     else
         # No tags yet (or not a git repo): fall back to commit count + sha.

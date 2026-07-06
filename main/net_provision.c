@@ -27,6 +27,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_http_server.h"
+#include "esp_app_desc.h"
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -502,18 +503,21 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     esp_wifi_sta_get_rssi(&rssi);
     esp_wifi_get_channel(&primary_chan, &second_chan);
 
-    char resp[700];
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const char *fw_ver = app_desc ? app_desc->version : "unknown";
+
+    char resp[768];
     if (s_portal_mode) {
         snprintf(resp, sizeof(resp),
-                 "{\"mode\":\"setup\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
+                 "{\"mode\":\"setup\",\"fw_ver\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
                  "\"rssi\":%d,\"channel\":%d}",
-                 ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
+                 fw_ver, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
                  rssi, primary_chan);
     } else {
         snprintf(resp, sizeof(resp),
-                 "{\"mode\":\"connected\",\"ip\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
+                 "{\"mode\":\"connected\",\"fw_ver\":\"%s\",\"ip\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
                  "\"rssi\":%d,\"channel\":%d}",
-                 s_connected_ip, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
+                 fw_ver, s_connected_ip, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
                  rssi, primary_chan);
     }
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
