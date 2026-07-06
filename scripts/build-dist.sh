@@ -70,6 +70,12 @@ if [ "${DO_CLEAN}" -eq 1 ]; then
     "${SCRIPT_DIR}/idf.sh" fullclean || true
 fi
 
+# Write the version to a stamp file so CMake reconfigures when it changes.
+# Without this, incremental builds reuse the cached PROJECT_VER from the
+# previous configure and the embedded version goes stale.
+mkdir -p "${PROJECT_DIR}/build"
+echo "${VERSION}" > "${PROJECT_DIR}/build/version.stamp"
+
 echo "==> Building firmware (version: ${VERSION})..."
 "${SCRIPT_DIR}/idf.sh" build
 

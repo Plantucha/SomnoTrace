@@ -69,14 +69,21 @@ message(STATUS "Firmware version: ${FIRMWARE_VERSION}")
 # to populate esp_app_desc_t.version at runtime.  Set it before project()
 # so it's available to all components.  Do NOT pass it as VERSION to
 # project() — CMake requires semantic version format (x.y.z only).
-set(PROJECT_VER "${FIRMWARE_VERSION}")
-
-# Force CMake to reconfigure when git state changes so incremental builds
-# pick up new commits/tags.  Without this, execute_process only runs during
-# full reconfigures and the cached PROJECT_VER goes stale.
-if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/.git/HEAD")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/.git/HEAD")
+# If build-dist.sh wrote a stamp file with the authoritative version, use it
+# instead of the git-derived value.  The stamp file triggers a reconfigure
+# whenever the version changes (CMAKE_CONFIGURE_DEPENDS), which the .git/HEAD
+# approach could not do reliably (HEAD content doesn't change on new commits
+# when on a branch).
+if(EXISTS "${CMAKE_BINARY_DIR}/version.stamp")
+    file(STRINGS "${CMAKE_BINARY_DIR}/version.stamp" _stamp_ver LIMIT_COUNT 1)
+    if(_stamp_ver)
+        set(FIRMWARE_VERSION "${_stamp_ver}")
+        message(STATUS "Firmware version (from stamp): ${FIRMWARE_VERSION}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_BINARY_DIR}/version.stamp")
 endif()
+
+set(PROJECT_VER "${FIRMWARE_VERSION}")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
