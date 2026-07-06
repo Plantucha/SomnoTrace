@@ -1921,9 +1921,19 @@ static void event_field_cb(const pb_field_t *f, void *ud)
     }
 }
 
-/* Map event type code to EDF annotation label. */
-static const char *event_label_map(int type_code)
+/* Map event type code to EDF annotation label.
+ * In CSL mode, only CSR events are emitted; in EVE mode, only respiratory
+ * events are emitted.  This mirrors the AS11's behaviour where EVE.edf
+ * contains respiratory events and CSL.edf contains only CSR events. */
+static const char *event_label_map(int type_code, bool csl_mode)
 {
+    if (csl_mode) {
+        switch (type_code) {
+            case EVT_TYPE_CSR_START:  return "CSR";
+            case EVT_TYPE_CSR_END:    return "CSR";
+            default:                  return NULL;
+        }
+    }
     switch (type_code) {
         case EVT_TYPE_HYPOPNEA_END:         return "Hypopnea";
         case EVT_TYPE_CENTRAL_APNEA_END:    return "Central Apnea";
@@ -1938,7 +1948,8 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                                   const uint8_t *events_data, size_t events_len,
                                   int64_t session_start_ms, int64_t clock_drift_ms,
                                   const char *patient_id, const char *recording_id,
-                                  const char *start_date, const char *start_time)
+                                  const char *start_date, const char *start_time,
+                                  bool csl_mode)
 {
     char path[350];
     strncpy(path, edf_path, sizeof(path) - 1);
@@ -2026,7 +2037,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                 if (pos + flen > event_list_len) break;
                 event_record_t evt = {0};
                 pb_iter(event_list + pos, (size_t)flen, event_field_cb, &evt);
-                if (event_label_map(evt.type_code)) {
+                if (event_label_map(evt.type_code, csl_mode)) {
                     event_count++;
                 }
                 pos += flen;
@@ -2125,7 +2136,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                 pb_iter(event_list + pos, (size_t)flen, event_field_cb, &evt);
                 pos += flen;
 
-                const char *label = event_label_map(evt.type_code);
+                const char *label = event_label_map(evt.type_code, csl_mode);
                 if (!label) continue;
 
                 /* Compute onset (seconds from session start).
@@ -2741,19 +2752,20 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     if (generate_eve_edf(eve_path, events_data, events_len,
                          start_epoch_ms, clock_drift_ms,
                          patient_id, eve_recording_id,
-                         start_date, start_time) != ESP_OK) {
+                         start_date, start_time, false) != ESP_OK) {
         errors++;
     }
 
     /* ── Generate CSL.edf (CSR event log) ──
-     * For sessions with no CSR events, CSL.edf is byte-identical to
-     * EVE.edf (contains only the "Recording starts" marker). */
+     * CSL.edf contains only CSR (Cheyne-Stokes Respiration) events.
+     * For sessions with no CSR events, CSL.edf contains only the
+     * "Recording starts" marker record. */
     char csl_path[350];
     snprintf(csl_path, sizeof(csl_path), "%s/%s_CSL.edf", day_dir, ts_prefix);
     if (generate_eve_edf(csl_path, events_data, events_len,
                          start_epoch_ms, clock_drift_ms,
                          patient_id, eve_recording_id,
-                         start_date, start_time) != ESP_OK) {
+                         start_date, start_time, true) != ESP_OK) {
         errors++;
     }
 
