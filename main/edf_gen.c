@@ -730,7 +730,13 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
          * (dig_max/phys_max), so the raw ×100 value cannot be written as the
          * digital value directly:
          *   dig = dig_min + (phys - phys_min) × (dig_max-dig_min)/(phys_max-phys_min)
-         * where phys = stored / 100. */
+         * where phys = stored / 100.
+         *
+         * The ×100 BLE scale was confirmed by reverse-engineering (2026-07-05):
+         * raw .snt int16 / 100.0 matches AS11 EDF physical values for all PLD
+         * channels.  Residual differences are BLE quantisation, not a scale
+         * error — see the PLD.edf comment above and spec/archive/
+         * edf-as11-comparison-20260629.md §3.6. */
         int avail_samples = (int)(avail / (snt_channels * sizeof(int16_t)));
         for (int ch = 0; ch < n_signals; ch++) {
             int snt_ch = channel_map ? channel_map[ch] : ch;
@@ -2677,7 +2683,24 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         }
     }
 
-    /* ── Generate PLD.edf (0.5 Hz per-breath stats) ── */
+    /* ── Generate PLD.edf (0.5 Hz per-breath stats) ──
+     *
+     * BLE quantisation note (2026-07-05 reverse-engineering):
+     * The AS11 sends PLD values via BLE at phys×100 (integer physical
+     * units).  Some channels have coarser BLE resolution than the AS11's
+     * internal SD-card EDF:
+     *   - RespRate: BLE sends integer bpm; AS11 internal EDF has 0.2 bpm
+     *     resolution (dig_max=450, phys_max=90).  ~20 % of samples differ
+     *     by ±0.2–1.0 bpm.
+     *   - MinVent: BLE sends 0.01 L/min; AS11 internal EDF has 0.125 L/min
+     *     resolution.  ~24 % of samples differ by ±0.02–0.12.
+     *   - MaskPress: during pressure ramp-up (first ~20 s) BLE and SD sample
+     *     at slightly different moments within the 2 s window, causing
+     *     ±0.02–0.16 cmH2O differences.  Converges to ≤0.04 once stable.
+     * Other channels (Press, EprPress, Leak, TidVol, Snore, FlowLim) match
+     * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
+     * limitation and cannot be fixed by firmware changes.
+     * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
     {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);

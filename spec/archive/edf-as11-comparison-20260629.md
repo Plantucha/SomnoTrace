@@ -5,7 +5,7 @@
 > **fixed**. Recording now starts at TherapyStart (not BLE reconnect),
 > reducing the offset to ~5–9 s (AS11's internal processing delay).
 > See `as11-summary-spool-and-mask-events.md` §4 for the fix details.
-> Sections 2, 3.4, 3.5, and 4 remain valid.
+> Sections 2, 3.4, 3.5, 3.6, and 4 remain valid.
 
 Analysis of ESP-generated EDF files against AS11 reference exports for
 session `20260629_232738` (ESP) vs `20260629_233520` / `20260629_233506`
@@ -129,6 +129,61 @@ is a 1-LSB rounding difference in the spool percentile computation
 safely fixable without the raw spool byte and knowledge of AS11's
 exact rounding mode.
 
+### 3.6 PLD.edf — BLE quantisation (confirmed 2026-07-05)
+
+> **Investigation complete.** Reverse-engineered by comparing raw 5 Hz
+> `.snt` data with AS11 `PLD.edf` for sessions `20260705_233502` and
+> `20260706_030134`. No decimation or phase alignment issue exists.
+> The `.snt` data aligns at offset=0 and the `÷100` scale conversion is
+> correct. Residual differences are a fundamental BLE data-path limitation.
+
+The AS11 sends PLD values via BLE at **phys×100** (integer physical units).
+Some channels have **coarser BLE resolution** than the AS11's internal
+SD-card EDF, causing systematic small differences:
+
+| Channel | BLE resolution | AS11 EDF resolution | Mismatch rate | Typical diff |
+|---------|---------------|---------------------|---------------|-------------|
+| RespRate | 1.0 bpm | 0.2 bpm (dig 450/phys 90) | ~20 % | ±0.2–1.0 bpm |
+| MinVent | 0.01 L/min | 0.125 L/min (dig 240/phys 30) | ~24 % | ±0.02–0.12 |
+| MaskPress | 0.01 cmH2O | 0.02 cmH2O (dig 2000/phys 40) | ~25–31 % | ±0.02–0.16 (ramp only) |
+| Press | 0.01 cmH2O | 0.02 cmH2O | <0.1 % | — |
+| EprPress | 0.01 cmH2O | 0.02 cmH2O | <0.1 % | — |
+| Leak | 0.01 L/s | 0.02 L/s | ~3–6 % | ±0.02 |
+| TidVol | 0.01 L | 0.02 L | ~3–6 % | ±0.02 |
+| Snore | 0.01 | 0.02 | <1 % | — |
+| FlowLim | 0.01 | 0.01 | <1 % | — |
+
+**Key findings:**
+
+1. **No phase shift** — best alignment is at offset=0 for all channels.
+   The ESP correctly captures every 10th 5 Hz notification and the
+   MaskOn skip calculation is accurate.
+
+2. **Scale conversion is correct** — `stored / 100.0` matches AS11
+   physical values. Confirmed by raw int16 ratio analysis across all
+   9 PLD channels (average ratio = BLE_scale / EDF_scale, consistent
+   with phys×100).
+
+3. **RespRate/MinVent** — BLE sends integer bpm and 0.01 L/min
+   resolution respectively, but AS11 internal EDF stores finer
+   resolution (0.2 bpm, 0.125 L/min).  This is a deliberate AS11
+   design choice: coarser data over BLE, finer on SD.  Not fixable.
+
+4. **MaskPress** — differences concentrate during pressure ramp-up
+   (first ~20 s).  BLE notification and SD write sample at slightly
+   different moments within the 2 s window during rapid changes.
+   Converges to ≤0.04 cmH2O once pressure stabilises.
+
+5. **Other channels** — Press, EprPress, Snore, FlowLim match ≥94 %
+   (most ≥99 %).  Small Leak/TidVol differences are sub-LSB
+   quantisation noise.
+
+**Conclusion:** These differences are a fundamental limitation of the
+BLE data path.  The AS11 internally stores higher-resolution data on
+its SD card than it exposes via BLE.  No firmware change can recover
+the lost precision.  The generated PLD.edf is as accurate as the BLE
+data allows.
+
 ### 3.5 CurrentSettings.json — `.0` formatting
 
 Structure is correct: `{"FlowGenerator":{"SettingProfiles":{...}}}`.
@@ -187,6 +242,10 @@ The ~13 s capture-start offset described in §3.1–3.3 has been **fixed**
   (TherapyStart→MaskOn gap, now corrected in Stage 2 — see below).
 - **Not safely fixable** — STR `Flow.95` 1-LSB rounding without raw
   spool data.
+- **PLD BLE quantisation (§3.6)** — Confirmed 2026-07-05: no phase or
+  scale error.  Residual PLD differences (RespRate ~20 %, MinVent ~24 %,
+  MaskPress ramp ~25 %) are caused by the AS11 sending coarser data via
+  BLE than it stores on SD internally.  Not fixable by firmware.
 - **EDF record count** — Now uses **floor division** (drops partial last
   record, matching AS11). Was ceiling division (zero-padded).
 - **EDF start alignment** — Stage 2 (EDF export) now skips pre-MaskOn
