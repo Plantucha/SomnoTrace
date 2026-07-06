@@ -71,6 +71,13 @@ message(STATUS "Firmware version: ${FIRMWARE_VERSION}")
 # project() — CMake requires semantic version format (x.y.z only).
 set(PROJECT_VER "${FIRMWARE_VERSION}")
 
+# Force CMake to reconfigure when git state changes so incremental builds
+# pick up new commits/tags.  Without this, execute_process only runs during
+# full reconfigures and the cached PROJECT_VER goes stale.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/.git/HEAD")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/.git/HEAD")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(somnotrace)
