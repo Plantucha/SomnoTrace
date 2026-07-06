@@ -184,10 +184,15 @@ The ~13 s capture-start offset described in §3.1–3.3 has been **fixed**
 (recording now starts at TherapyStart). Remaining differences are:
 
 - **Cosmetic** — JSON `.0` formatting, CRC1 from ~5–9 s time offset
-  (AS11 internal processing delay, not fixable without AS11 RPC).
+  (TherapyStart→MaskOn gap, now corrected in Stage 2 — see below).
 - **Not safely fixable** — STR `Flow.95` 1-LSB rounding without raw
   spool data.
-- **EDF record count** — Now uses ceiling division (no sample dropping).
+- **EDF record count** — Now uses **floor division** (drops partial last
+  record, matching AS11). Was ceiling division (zero-padded).
+- **EDF start alignment** — Stage 2 (EDF export) now skips pre-MaskOn
+  samples from .snt files and stamps BRP/PLD/SA2 headers with MaskOn
+  NTP time, matching AS11 behaviour. EVE/CSL remain at TherapyStart.
+  See `as11-summary-spool-and-mask-events.md` §4 for details.
 - **STR MaskOff** — Now uses MaskOn+duration (MaskOn for 0-duration),
   matching AS11 exactly.
 

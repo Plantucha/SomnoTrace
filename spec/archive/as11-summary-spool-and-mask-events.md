@@ -89,24 +89,35 @@ The `SystemActivityEvents-FrequentActivityEvents` event selector
 - `TherapyStarted`, `CooldownStarted`, `StandbyStarted`
 - `WarmupStarted`, `RampDownStarted`, `RampDownCompleted`
 
-### AS11 BRP recording start
+### AS11 BRP/PLD/SA2 recording start
 
-The AS11 starts BRP.edf recording at **TherapyStart** (CSL timestamp),
-not at PressureStart. Archive analysis confirms:
+The AS11 starts BRP/PLD/SA2 EDF recording at **MaskOn**, not at
+TherapyStart. The 5-9s gap previously attributed to "internal AS11
+processing delay" is actually the time between TherapyStart (when the
+device starts the therapy session) and MaskOn (when the user puts on the
+mask). Archive analysis with NTP-corrected event timestamps confirms:
 
-| Session | CSL (TherapyStart) | BRP start | Gap |
-|---------|-------------------|-----------|-----|
-| Mar 29  | 01:13:05 | 01:13:12 | 7s |
-| Mar 30  | 23:37:40 | 23:37:47 | 7s |
-| Mar 31  | 22:27:38 | 22:27:44 | 6s |
-| Jul 4 #1| 00:01:03 | 00:01:12 | 9s |
-| Jul 4 #2| 03:38:35 | 03:38:41 | 6s |
-| Jul 4 #3| 06:26:24 | 06:26:32 | 8s |
-| Jul 5   | 00:04:38 | 00:04:43 | 5s |
+| Session | TherapyStart (NTP) | MaskOn (NTP) | BRP start (NTP) | Gap T→M |
+|---------|-------------------|--------------|-----------------|---------|
+| Jul 5 S1| 23:35:02 | 23:35:09.6 | 23:35:09 | 7.6s |
+| Jul 6 S2| 03:01:32 | 03:01:41.6 | 03:01:41 | 9.6s |
 
-BRP always starts 5-9s after TherapyStart (internal AS11 processing
-delay). BRP ends at TherapyStop ≈ MaskOff time. BRP duration (nrecs ×
-60s) matches STR Duration (±1 min rounding).
+BRP/PLD/SA2 EDF start time = MaskOn time (truncated to whole seconds by
+EDF datetime format). The pressure ramp from start pressure (~4-7 cmH2O)
+to target (~10-11 cmH2O) is visible in the first 2-16 seconds of data,
+confirming that recording starts at MaskOn, not at PressureStart (which
+fires ~2s after MaskOn, mid-ramp) or after pressure stabilises.
+
+PLD signals that require computation (RespRate, TidVol, MinVent) show
+zeros for the first 7-8 samples (~14-16s) after MaskOn — this is normal
+(zeros in the data, not a different EDF start). Snore and FlowLim are
+sparse and may show zeros for much longer.
+
+EVE/CSL EDF files start at TherapyStart (not MaskOn).
+
+BRP ends at TherapyStop ≈ MaskOff time. BRP duration (nrecs × 60s)
+matches STR Duration (±1 min rounding). The partial last 60s record is
+**dropped** (floor division), not zero-padded.
 
 The firmware was previously starting recording at BLE reconnect time
 (~7.5 min before TherapyStart) due to stream setup overhead. The fix
@@ -115,16 +126,37 @@ is to record from TherapyStart (session_writer_start) to TherapyStop
 
 ### Fix
 
-No PressureStart gating is needed. BRP/PLD/SA2 all record from
-TherapyStart to TherapyStop, matching AS11 export behavior. The
-`SystemActivityEvents-FrequentActivityEvents` subscription is retained
-for event logging (PressureStart, PressureStop, CooldownStarted, etc.)
-but is not used to gate data recording.
+**Stage 1 (session_writer.c — unchanged):** BRP/PLD/SA2 .snt capture
+starts at TherapyStart and stops at TherapyStop. No changes.
 
-The original problem (recording starting ~7.5 min before TherapyStart)
-was likely caused by the auto-start fallback detecting idle baseline
-flow as "active therapy" — this is addressed by the existing
-`has_therapy_pressure` check (pressure > 4 cmH2O required).
+**Stage 2 (edf_gen.c — EDF export alignment):** The EDF export process
+now aligns to AS11 behaviour:
+
+1. **MaskOn-based start:** `edf_gen_generate()` reads `events.snt` to
+   find the MaskOn event timestamp. It converts to NTP
+   (`maskon_ntp_ms = maskon_as11_ms + clock_drift_ms`) and computes
+   per-stream skip samples:
+   - BRP (25 Hz): `skip = round(offset_ms / 40)`
+   - SA2 (1 Hz): `skip = round(offset_ms / 1000)`
+   - PLD (0.5 Hz): `skip = round(offset_ms / 2000)`
+   The `convert_snt_to_edf()` function seeks past these samples before
+   the record loop, so the EDF data starts at MaskOn.
+
+2. **MaskOn-based EDF header time:** BRP/PLD/SA2 EDF headers use
+   `maskon_ntp_ms` (truncated to seconds) as the start date/time.
+   EVE/CSL continue using `start_epoch_ms` (TherapyStart).
+
+3. **Floor division for record count:** `total_records = total_samples /
+   spr[0]` (was ceiling division). The partial last 60s record is
+   dropped, matching AS11 (which never zero-pads trailing records).
+
+4. **Fallback:** If MaskOn is not found in `events.snt` (e.g. BLE
+   notification missed), the EDF starts at TherapyStart with skip=0.
+   This produces the previous (slightly larger) EDF — safe fallback.
+
+The `SystemActivityEvents-FrequentActivityEvents` subscription is
+retained for event logging (PressureStart, PressureStop, etc.) but is
+not used to gate data recording or EDF export.
 
 ## 5. _SNC Variable for Summary Update Detection
 
@@ -183,11 +215,14 @@ therapy profile (MOP setting) for the Mode field.
 - [x] MaskOff calculated as MaskOn + per-session duration from spool
 - [x] SessionModeEntries sub-field 2 documented as duration_min
 - [x] SystemActivityEvents-FrequentActivityEvents subscription added (for event logging)
-- [x] BRP/PLD/SA2 recording starts at TherapyStart, matching AS11 export behavior
+- [x] BRP/PLD/SA2 .snt capture starts at TherapyStart (Stage 1 — unchanged)
+- [x] BRP/PLD/SA2 EDF export starts at MaskOn (Stage 2 — skip pre-MaskOn samples)
+- [x] BRP/PLD/SA2 EDF header timestamp uses MaskOn NTP time
+- [x] EVE/CSL EDF header timestamp uses TherapyStart NTP time
+- [x] EDF record count uses floor division (partial last record dropped, matching AS11)
 - [x] _SNC push notification subscription for Summary update detection
 - [x] _SNC subscription verified end-to-end with live session logs
 - [x] Fallback timeout retained (2 min)
-- [x] EDF record count uses ceiling division (no sample dropping)
 - [x] MaskOff = MaskOn for 0-duration sessions (matches AS11, fixes STR alignment)
 
 ## 8. Changelog
@@ -205,6 +240,12 @@ therapy profile (MOP setting) for the Mode field.
 - 2026-07-05: _SNC subscription verified working with live session logs.
   Fixed EDF sample dropping (ceiling division for record count).
   Fixed STR MaskOff for 0-duration sessions (MaskOff=MaskOn, not -1).
+- 2026-07-06: Per-signal analysis of AS11 EDFs reveals BRP/PLD/SA2 start
+  at MaskOn (not TherapyStart with internal delay). Pressure ramp is
+  visible in first 2-16s of data. Implemented Stage 2 EDF export
+  alignment: skip pre-MaskOn samples, use MaskOn NTP for header time,
+  switch to floor division (drop partial last record). EVE/CSL remain
+  at TherapyStart. Fallback to TherapyStart if MaskOn event missing.
 
 ## 9. Unresolved items — to revisit
 
@@ -212,18 +253,14 @@ These items remain unreliable or unverified after the current fixes.
 They should be revisited when more data or AS11 protocol knowledge is
 available.
 
-### 9.1 BRP start timestamp offset
+### 9.1 BRP/PLD/SA2 EDF start alignment
 
-Archive analysis confirms the AS11 starts BRP 5-9s after TherapyStart
-(CSL timestamp). The firmware starts recording at TherapyStart event
-receipt, which has ~1-2s BLE notification latency. Net offset vs AS11
-BRP: firmware BRP starts ~3-7s earlier than AS11 BRP (AS11 has 5-9s
-internal delay, firmware has 1-2s notification delay).
+Implemented: EDF export (Stage 2) now skips pre-MaskOn samples from
+.snt files and stamps BRP/PLD/SA2 headers with MaskOn NTP time. The
+.snt capture (Stage 1) still records from TherapyStart to TherapyStop
+— no changes to session_writer.c.
 
-**Impact:** Low — a few seconds difference at the start of BRP.edf.
-The extra samples are idle/baseline data before pressure ramps.
-
-**Status:** Resolved by archive analysis. No further action needed.
+**Status:** Implemented. Needs verification with a live session.
 
 ### 9.2 Current-day MaskOff (live, before spool pull)
 

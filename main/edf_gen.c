@@ -462,6 +462,73 @@ static esp_err_t snt_read_header(FILE *f, snt_header_t *hdr)
  * The EDF format stores all samples for signal 0, then all for signal 1, etc.
  */
 
+/* Find the MaskOn event timestamp from events.snt.
+ *
+ * events.snt contains JSON lines with EventNotification messages.
+ * Each event has "reportTime" (ISO 8601 UTC string, AS11 internal clock)
+ * and "event" label.  We look for the first "MaskOn" event and return
+ * its epoch milliseconds in the AS11 clock domain.
+ *
+ * Returns the AS11-clock epoch ms, or -1 if MaskOn is not found.
+ * The caller converts to NTP by adding clock_drift_ms. */
+static int64_t find_maskon_time_ms(const char *session_dir, const char *session_id)
+{
+    char events_path[350];
+    snprintf(events_path, sizeof(events_path), "%s/%s_events.snt",
+             session_dir, session_id);
+
+    FILE *ef = fopen(events_path, "r");
+    if (!ef) return -1;
+
+    int64_t result = -1;
+    char line[512];
+    while (fgets(line, sizeof(line), ef) && result < 0) {
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) continue;
+        cJSON *params = cJSON_GetObjectItem(msg, "params");
+        if (params) {
+            cJSON *events = cJSON_GetObjectItem(params, "events");
+            if (events && cJSON_IsArray(events)) {
+                int n = cJSON_GetArraySize(events);
+                for (int i = 0; i < n && result < 0; i++) {
+                    cJSON *ev = cJSON_GetArrayItem(events, i);
+                    if (!ev) continue;
+                    cJSON *label = cJSON_GetObjectItem(ev, "event");
+                    if (!label || !cJSON_IsString(label)) continue;
+                    if (strcmp(label->valuestring, "MaskOn") != 0) continue;
+                    cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
+                    if (!rt || !cJSON_IsString(rt)) continue;
+
+                    /* Parse ISO 8601 UTC: "2026-07-05T13:42:42.570Z" */
+                    struct tm ev_tm = {0};
+                    int ms = 0;
+                    sscanf(rt->valuestring, "%d-%d-%dT%d:%d:%d.%dZ",
+                           &ev_tm.tm_year, &ev_tm.tm_mon, &ev_tm.tm_mday,
+                           &ev_tm.tm_hour, &ev_tm.tm_min, &ev_tm.tm_sec, &ms);
+                    ev_tm.tm_year -= 1900;
+                    ev_tm.tm_mon -= 1;
+                    /* Howard Hinnant's date algorithm (public domain). */
+                    int y = ev_tm.tm_year + 1900;
+                    int m = ev_tm.tm_mon + 1;
+                    int d = ev_tm.tm_mday;
+                    y -= m <= 2;
+                    const int era = (y >= 0 ? y : y - 399) / 400;
+                    const unsigned yoe = (unsigned)(y - era * 400);
+                    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+                    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                    int64_t days = (int64_t)era * 146097 + (int)doe - 719468;
+                    int64_t secs = days * 86400 + ev_tm.tm_hour * 3600 +
+                                   ev_tm.tm_min * 60 + ev_tm.tm_sec;
+                    result = secs * 1000 + ms;
+                }
+            }
+        }
+        cJSON_Delete(msg);
+    }
+    fclose(ef);
+    return result;
+}
+
 /* Convert one .snt file to an EDF file.
  *
  * Parameters:
@@ -476,13 +543,17 @@ static esp_err_t snt_read_header(FILE *f, snt_header_t *hdr)
  *   record_dur  - "60.00"
  *   channel_map - array mapping EDF signal index → .snt channel index,
  *                 or NULL if n_signals == snt n_channels (1:1 mapping)
+ *   skip_samples - number of leading samples to skip (per channel), used
+ *                 to align EDF start to MaskOn instead of TherapyStart.
+ *                 0 = start from the beginning of the .snt file.
  */
 static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                     const char *patient_id, const char *recording_id,
                                     const char *start_date, const char *start_time,
                                     const edf_signal_def_t *signals, int n_signals,
                                     const char *record_dur,
-                                    const int *channel_map)
+                                    const int *channel_map,
+                                    uint32_t skip_samples)
 {
     FILE *snt = fopen(snt_path, "rb");
     if (!snt) {
@@ -533,11 +604,21 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         sig[i].samples_per_record = spr[i];
     }
 
-    /* Total samples (per channel) and record count.
-     * EDF records are 60 seconds each.  Use ceiling division so the
-     * partial last record is preserved (zero-padded) rather than dropped. */
+    /* Total samples (per channel) after skipping the leading offset.
+     * The .snt captures from TherapyStart, but AS11 EDFs start at MaskOn.
+     * skip_samples is the number of pre-MaskOn samples to skip.
+     *
+     * EDF records are 60 seconds each.  Use floor division so the partial
+     * last record is dropped, matching AS11 behaviour (AS11 does not
+     * zero-pad trailing partial records). */
     uint32_t total_samples = hdr.sample_count;
-    int total_records = (int)((total_samples + spr[0] - 1) / spr[0]);
+    if (skip_samples > total_samples) {
+        ESP_LOGW(TAG, "%s: skip_samples (%u) > sample_count (%u), clamping",
+                 snt_path, skip_samples, total_samples);
+        skip_samples = total_samples;
+    }
+    total_samples -= skip_samples;
+    int total_records = (int)(total_samples / spr[0]);
     if (total_records < 0) total_records = 0;
 
     /* AS11 does not write BRP/PLD/SA2 EDF files for sessions shorter than
@@ -550,8 +631,20 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "converting %s → %s: %u samples, %d records, %d ch",
-             snt_path, edf_path, total_samples, total_records, n_signals);
+    ESP_LOGI(TAG, "converting %s → %s: %u samples (skip %u), %d records, %d ch",
+             snt_path, edf_path, total_samples, skip_samples, total_records, n_signals);
+
+    /* Seek past the leading samples that precede MaskOn.
+     * .snt data starts at offset sizeof(snt_header_t) and is interleaved
+     * as [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...], so each sample frame is
+     * snt_channels × sizeof(int16_t) bytes. */
+    if (skip_samples > 0) {
+        long skip_bytes = (long)skip_samples * snt_channels * sizeof(int16_t);
+        if (fseek(snt, sizeof(snt_header_t) + skip_bytes, SEEK_SET) != 0) {
+            ESP_LOGW(TAG, "%s: fseek skip failed, starting from beginning", snt_path);
+            fseek(snt, sizeof(snt_header_t), SEEK_SET);
+        }
+    }
 
     /* Create EDF file and write header */
     FILE *edf = fopen(edf_path, "w+b");
@@ -610,8 +703,8 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
 
     for (int rec = 0; rec < total_records; rec++) {
         /* Read one record's worth of interleaved samples from .snt.
-         * The last record may be partial (short session) — zero-pad
-         * the record buffer for any missing samples. */
+         * With floor division the last record is always complete, but
+         * the partial-record handling is retained as a safety net. */
         memset(raw, 0, raw_record_bytes);
         size_t avail = raw_record_bytes;
         /* For the last record, only read what's available */
@@ -2427,19 +2520,62 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     uint8_t *events_data = read_bin_file(events_path, &events_len);
 
     /* ── Build EDF header common fields ──
-     * The per-session EDF headers (BRP/SA2/PLD/EVE/CSL) carry the recording
-     * start timestamp.  We use NTP-corrected time directly so that the
-     * timestamps reflect the real wall-clock time and align with data
-     * from separate devices (e.g. oximeters).
      *
-     * To produce byte-identical files mimicking a real AS11 SD card (which
-     * stamps EDF headers in the machine's own drifting clock), use:
-     *   int64_t edf_start_ms = start_epoch_ms - clock_drift_ms;
+     * The AS11 starts BRP/PLD/SA2 EDF recording at the MaskOn event, not
+     * at TherapyStart.  The .snt files capture from TherapyStart, so we
+     * must skip the pre-MaskOn samples during EDF conversion and stamp the
+     * BRP/PLD/SA2 headers with the MaskOn time.
+     *
+     * EVE/CSL continue to use TherapyStart as their start timestamp.
+     *
+     * We use NTP-corrected time directly so that the timestamps reflect the
+     * real wall-clock time and align with data from separate devices (e.g.
+     * oximeters).  To produce byte-identical files mimicking a real AS11 SD
+     * card (which stamps EDF headers in the machine's own drifting clock),
+     * use:  edf_start_ms = start_epoch_ms - clock_drift_ms;
      * We intentionally correct to NTP instead. */
+
+    /* Find MaskOn event time (AS11 clock) and convert to NTP. */
+    int64_t maskon_as11_ms = find_maskon_time_ms(session_dir, session_id);
+    int64_t maskon_ntp_ms = -1;
+    if (maskon_as11_ms >= 0) {
+        maskon_ntp_ms = maskon_as11_ms + clock_drift_ms;
+        ESP_LOGI(TAG, "MaskOn: AS11=%lldms NTP=%lldms (drift=%lldms)",
+                 (long long)maskon_as11_ms, (long long)maskon_ntp_ms,
+                 (long long)clock_drift_ms);
+    } else {
+        ESP_LOGW(TAG, "MaskOn event not found in events.snt, "
+                      "BRP/PLD/SA2 will start at TherapyStart");
+    }
+
+    /* EDF header start time for BRP/PLD/SA2 = MaskOn (NTP).
+     * Fallback to TherapyStart if MaskOn not found. */
+    int64_t data_edf_start_ms = (maskon_ntp_ms >= 0) ? maskon_ntp_ms : start_epoch_ms;
+    char data_start_date[16], data_start_time[16];
+    format_edf_datetime(data_edf_start_ms, data_start_date, sizeof(data_start_date),
+                        data_start_time, sizeof(data_start_time));
+
+    /* EDF header start time for EVE/CSL = TherapyStart (NTP). */
     int64_t edf_start_ms = start_epoch_ms;
     char start_date[16], start_time[16];
     format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
+
+    /* Compute per-stream skip samples (TherapyStart → MaskOn offset).
+     * skip_samples = round((maskon_ntp_ms - start_epoch_ms) / sample_interval_ms)
+     * where sample_interval_ms = 1000 / (hz_x10 / 10) = 10000 / hz_x10. */
+    uint32_t skip_brp = 0, skip_sa2 = 0, skip_pld = 0;
+    if (maskon_ntp_ms >= 0) {
+        int64_t offset_ms = maskon_ntp_ms - start_epoch_ms;
+        if (offset_ms > 0) {
+            /* BRP: 25 Hz → 40ms interval, SA2: 1 Hz → 1000ms, PLD: 0.5 Hz → 2000ms */
+            skip_brp = (uint32_t)((offset_ms * 25 + 500) / 1000);
+            skip_sa2 = (uint32_t)((offset_ms + 500) / 1000);
+            skip_pld = (uint32_t)((offset_ms + 1000) / 2000);
+            ESP_LOGI(TAG, "skip samples: BRP=%u SA2=%u PLD=%u (offset=%lldms)",
+                     skip_brp, skip_sa2, skip_pld, (long long)offset_ms);
+        }
+    }
 
     /* STR.edf uses the noon-based day date (sessions before noon belong
      * to the previous day's STR.edf). */
@@ -2456,8 +2592,12 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                  tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
     }
 
+    /* Recording ID for BRP/PLD/SA2 uses MaskOn time; for EVE/CSL uses TherapyStart. */
     char recording_id[128];
     format_recording_id(recording_id, sizeof(recording_id),
+                        data_edf_start_ms, ident);
+    char eve_recording_id[128];
+    format_recording_id(eve_recording_id, sizeof(eve_recording_id),
                         edf_start_ms, ident);
 
     /* STR.edf recording_id uses the noon-based day date, not session start. */
@@ -2495,7 +2635,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .prefilter = "", .samples_per_record = 1500 },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, brp_sigs, 2, "60.00", NULL) != ESP_OK) {
+                               data_start_date, data_start_time, brp_sigs, 2, "60.00",
+                               NULL, skip_brp) != ESP_OK) {
             errors++;
         }
     }
@@ -2519,7 +2660,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .invalid_passthrough = true },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, sa2_sigs, 2, "60.00", NULL) != ESP_OK) {
+                               data_start_date, data_start_time, sa2_sigs, 2, "60.00",
+                               NULL, skip_sa2) != ESP_OK) {
             errors++;
         }
     }
@@ -2575,7 +2717,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
          * EDF drops TgtVent(7), IERatio(8), Ti(11). */
         static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, pld_sigs, 9, "60.00", pld_ch_map) != ESP_OK) {
+                               data_start_date, data_start_time, pld_sigs, 9, "60.00",
+                               pld_ch_map, skip_pld) != ESP_OK) {
             errors++;
         }
     }
@@ -2597,7 +2740,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
     if (generate_eve_edf(eve_path, events_data, events_len,
                          start_epoch_ms, clock_drift_ms,
-                         patient_id, recording_id,
+                         patient_id, eve_recording_id,
                          start_date, start_time) != ESP_OK) {
         errors++;
     }
@@ -2609,7 +2752,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     snprintf(csl_path, sizeof(csl_path), "%s/%s_CSL.edf", day_dir, ts_prefix);
     if (generate_eve_edf(csl_path, events_data, events_len,
                          start_epoch_ms, clock_drift_ms,
-                         patient_id, recording_id,
+                         patient_id, eve_recording_id,
                          start_date, start_time) != ESP_OK) {
         errors++;
     }
