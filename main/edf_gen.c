@@ -1894,16 +1894,20 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
 #define EVT_F_END_TS       3   /* end timestamp / reportTime (varint, epoch ms) */
 #define EVT_F_DURATION_MS  4   /* duration in milliseconds (varint, optional) */
 
-/* Event type codes from TherapyEvents-RespiratoryEvents */
+/* Event type codes from TherapyEvents-RespiratoryEvents.
+ * Protobuf3 requires value 0 as the UNKNOWN default; code 1 is a
+ * sentinel that never appears in real event data.  Real events start
+ * at code 2.  Confirmed by cross-referencing AS11 reference EVE.edf
+ * exports against ESP-generated events across 3 sessions. */
 enum {
     EVT_TYPE_NONE = 0,
-    EVT_TYPE_HYPOPNEA_END = 1,
-    EVT_TYPE_CENTRAL_APNEA_END = 2,
-    EVT_TYPE_OBSTRUCTIVE_APNEA_END = 3,
-    EVT_TYPE_APNEA_END = 4,
-    EVT_TYPE_RERA_END = 5,
-    EVT_TYPE_CSR_START = 6,
-    EVT_TYPE_CSR_END = 7,
+    EVT_TYPE_HYPOPNEA_END = 2,
+    EVT_TYPE_CENTRAL_APNEA_END = 3,
+    EVT_TYPE_OBSTRUCTIVE_APNEA_END = 4,
+    EVT_TYPE_APNEA_END = 5,
+    EVT_TYPE_RERA_END = 6,
+    EVT_TYPE_CSR_START = 7,
+    EVT_TYPE_CSR_END = 8,
 };
 
 /* Context for event protobuf iteration */
