@@ -71,6 +71,19 @@ determined to have been incorporated.
 - **Notes:** `zones.json` is fetched by `scripts/gen_tz_db.py` at build time
   and is git-ignored (generated artifact). The data is not modified.
 
+## uPlot
+
+- **Project:** uPlot
+- **Source:** https://github.com/leeoniya/uPlot (tag `v1.6.32`)
+- **Used for:** lightweight time-series charting library for the web UI
+  (CPU/memory graphs on the Status page, session data plots). Served via
+  `/uplot.js` and `/uplot.css` endpoints, embedded in firmware via
+  `target_add_binary_data`.
+- **License:** MIT (Copyright (c) 2022 Leon Sorokin)
+- **Notes:** Vendored in `third_party/uplot/`. Only pre-built distribution
+  files (`uPlot.iife.min.js` ~51 KB, `uPlot.min.css` ~1.9 KB) are included;
+  no source modifications.
+
 ---
 
 ## MIT License (reference text)

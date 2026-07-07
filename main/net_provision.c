@@ -375,7 +375,17 @@ extern const char _binary_zones_json_end[];
 #define ZONES_JSON_START _binary_zones_json_start
 #define ZONES_JSON_LEN   ((size_t)(_binary_zones_json_end - _binary_zones_json_start))
 
-/* portal.html is embedded via CMakeLists.txt target_add_binary_data */
+extern const char _binary_uPlot_iife_min_js_start[];
+extern const char _binary_uPlot_iife_min_js_end[];
+#define UPLOT_JS_START _binary_uPlot_iife_min_js_start
+#define UPLOT_JS_LEN   ((size_t)(_binary_uPlot_iife_min_js_end - _binary_uPlot_iife_min_js_start))
+
+extern const char _binary_uPlot_min_css_start[];
+extern const char _binary_uPlot_min_css_end[];
+#define UPLOT_CSS_START _binary_uPlot_min_css_start
+#define UPLOT_CSS_LEN   ((size_t)(_binary_uPlot_min_css_end - _binary_uPlot_min_css_start))
+
+/* portal.html and uPlot assets are embedded via CMakeLists.txt target_add_binary_data */
 
 
 static esp_err_t redirect_to_portal(httpd_req_t *req)
@@ -446,7 +456,7 @@ static esp_err_t sw_get_handler(httpd_req_t *req)
     const char sw[] =
         "const CACHE_NAME = 'somnotrace-v1';\n"
         "self.addEventListener('install', e => {\n"
-        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(['/', '/manifest.json'])));\n"
+        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(['/', '/manifest.json', '/uplot.js', '/uplot.css'])));\n"
         "});\n"
         "self.addEventListener('fetch', e => {\n"
         "  if (e.request.url.includes('/api/') || e.request.url.includes('/scan') || e.request.url.includes('/save')) {\n"
@@ -456,6 +466,22 @@ static esp_err_t sw_get_handler(httpd_req_t *req)
         "  }\n"
         "});\n";
     httpd_resp_send(req, sw, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t uplot_js_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
+    httpd_resp_send(req, UPLOT_JS_START, UPLOT_JS_LEN);
+    return ESP_OK;
+}
+
+static esp_err_t uplot_css_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/css");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
+    httpd_resp_send(req, UPLOT_CSS_START, UPLOT_CSS_LEN);
     return ESP_OK;
 }
 
@@ -1392,6 +1418,12 @@ static esp_err_t start_webserver(void)
 
     httpd_uri_t sw = { .uri = "/sw.js", .method = HTTP_GET, .handler = sw_get_handler };
     httpd_register_uri_handler(s_httpd, &sw);
+
+    httpd_uri_t uplot_js = { .uri = "/uplot.js", .method = HTTP_GET, .handler = uplot_js_get_handler };
+    httpd_register_uri_handler(s_httpd, &uplot_js);
+
+    httpd_uri_t uplot_css = { .uri = "/uplot.css", .method = HTTP_GET, .handler = uplot_css_get_handler };
+    httpd_register_uri_handler(s_httpd, &uplot_css);
 
     httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
     httpd_register_uri_handler(s_httpd, &status);

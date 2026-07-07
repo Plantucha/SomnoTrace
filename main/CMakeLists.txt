@@ -19,3 +19,5 @@ add_dependencies(${COMPONENT_LIB} tz_db)
 
 target_add_binary_data(${COMPONENT_LIB} "portal.html" TEXT)
 target_add_binary_data(${COMPONENT_LIB} "zones.json" TEXT)
+target_add_binary_data(${COMPONENT_LIB} "../third_party/uplot/dist/uPlot.iife.min.js" TEXT)
+target_add_binary_data(${COMPONENT_LIB} "../third_party/uplot/dist/uPlot.min.css" TEXT)
