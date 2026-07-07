@@ -235,10 +235,10 @@ SomnoTrace
 </a>
 <div class="nav-tabs" id="nav-tabs">
 <button class="tab-btn" onclick="switchTab('dashboard')">Dashboard</button>
-<button class="tab-btn" onclick="switchTab('tab-status')">Status</button>
+<button class="tab-btn active" onclick="switchTab('tab-status')">Status</button>
 <button class="tab-btn" onclick="switchTab('logs')">Logs</button>
 <button class="tab-btn" onclick="switchTab('actions')">Actions</button>
-<button class="tab-btn active" onclick="switchTab('settings')">Settings</button>
+<button class="tab-btn" onclick="switchTab('settings')">Settings</button>
 </div>
 <div class="theme-selector">
 <button class="theme-btn" id="theme-day-btn" onclick="setTheme('day')" title="Day Mode">
@@ -259,7 +259,7 @@ SomnoTrace
 <main>
 
 <!-- ═══════════════ SETTINGS TAB ═══════════════ -->
-<section id="settings" class="tab-content active">
+<section id="settings" class="tab-content">
 
 <!-- Section 1: Connection & Time -->
 <div class="settings-section-header">
@@ -518,7 +518,7 @@ uPlot library and /api/session/data endpoint required.
 </section>
 
 <!-- ═══════════════ STATUS TAB ═══════════════ -->
-<section id="tab-status" class="tab-content sta-only">
+<section id="tab-status" class="tab-content active sta-only">
 <div class="status-grid">
 <div class="card info-list">
 <div class="card-title">System Status</div>
@@ -527,13 +527,21 @@ uPlot library and /api/session/data endpoint required.
 <div class="info-row"><span class="info-label">Local IP</span><span class="info-value" id="status-ip">--</span></div>
 <div class="info-row"><span class="info-label">Timezone</span><span class="info-value" id="status-tz">--</span></div>
 <div class="info-row"><span class="info-label">NTP Sync</span><span class="info-value" id="status-ntp">--</span></div>
-<div class="info-row"><span class="info-label">SD Card</span><span class="info-value" id="status-sd">--</span></div>
-<div class="info-row"><span class="info-label">AirSense 11</span><span class="info-value" id="status-ble">--</span></div>
+<div class="info-row"><span class="info-label">SD Card Free</span><span class="info-value" id="status-sd">--</span></div>
+<div class="info-row"><span class="info-label">Paired data source</span><span class="info-value" id="status-ble">--</span></div>
 <div class="info-row"><span class="info-label">WiFi RSSI</span><span class="info-value" id="status-rssi">--</span></div>
 </div>
 <div class="card" style="display:flex;flex-direction:column">
 <div class="card-title">Device Telemetry</div>
-<div class="chart-placeholder" style="min-height:200px">CPU and RAM telemetry graphs will appear here.<br>Requires /api/status polling and uPlot library.</div>
+<div class="info-row"><span class="info-label">Int. Free</span><span class="info-value" id="stat-ih-free">--</span></div>
+<div class="info-row"><span class="info-label">Int. Min</span><span class="info-value" id="stat-ih-min">--</span></div>
+<div class="info-row"><span class="info-label">Int. LFB</span><span class="info-value" id="stat-ih-lfb">--</span></div>
+<div class="info-row"><span class="info-label">PSRAM Free</span><span class="info-value" id="stat-ps-free">--</span></div>
+<div class="info-row"><span class="info-label">PSRAM Min</span><span class="info-value" id="stat-ps-min">--</span></div>
+<div class="info-row"><span class="info-label">PSRAM LFB</span><span class="info-value" id="stat-ps-lfb">--</span></div>
+<div class="info-row"><span class="info-label">Tasks</span><span class="info-value" id="stat-tasks">--</span></div>
+<div style="margin-top:8px"><div style="font-size:.75rem;color:var(--text-muted);margin-bottom:2px">Internal Heap</div><div id="chart-heap" style="min-height:120px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.8rem">Loading…</div></div>
+<div style="margin-top:8px"><div style="font-size:.75rem;color:var(--text-muted);margin-bottom:2px">PSRAM</div><div id="chart-psram" style="min-height:120px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.8rem">Loading…</div></div>
 </div>
 </div>
 <!-- Recent Upload Activity & Sync History -->
@@ -633,6 +641,8 @@ var PW_SENTINEL_WIFI = '\u2588UNCHANGED\u2588';
 var PW_SENTINEL_UPLOAD = '***';
 
 /* ── Theme ─────────────────────────────────────────────────────── */
+var settingsLoaded = false;
+
 function switchTab(tabId) {
   document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
   document.querySelectorAll('.tab-content').forEach(function(c){ c.classList.remove('active'); });
@@ -650,6 +660,15 @@ function switchTab(tabId) {
   } else {
     document.body.classList.remove('fixed-height');
     disconnectLogStream();
+  }
+  /* Lazy-load Settings tab data on first visit. */
+  if (tabId === 'settings' && !settingsLoaded && !PORTAL_MODE) {
+    settingsLoaded = true;
+    bleRefresh();
+    loadUploadConfig();
+    loadUploadStatus();
+    loadDeviceSettings();
+    scanWifi();
   }
 }
 
@@ -979,12 +998,10 @@ function loadStatus() {
         var nav = document.getElementById('nav-tabs'); if (nav) nav.style.display = '';
         var badge = document.getElementById('setup-badge'); if (badge) badge.style.display = 'none';
         document.querySelectorAll('.sta-only').forEach(function(el) { el.style.display = ''; });
-        bleRefresh();
-        loadUploadConfig();
-        loadUploadStatus();
-        loadDeviceSettings();
+        settingsLoaded = false; /* allow lazy-load on first Settings visit */
       }
       loadStatusTab(d);
+      pushStats(d);
     }
 
     loadTimezones(d.tz_name || '');
@@ -1016,12 +1033,40 @@ function loadStatus() {
       }
     }
 
-    // Trigger scan after loading
-    scanWifi();
+    // WiFi scan is deferred to Settings tab switch
   }).catch(function() {
     renderWifiBlocks();
-    scanWifi();
   });
+}
+
+function formatUptime(s) {
+  if (!s || s < 0) return '--';
+  var d = Math.floor(s / 86400);
+  var h = Math.floor((s % 86400) / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function fmtBytes(b) {
+  if (b == null) return '--';
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+  if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
+function fmtGB(b) {
+  if (b == null || b <= 0) return '0 GB';
+  if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+  return (b / 1024).toFixed(1) + ' KB';
+}
+
+function formatSdSpace(total, free) {
+  if (!total || total <= 0) return 'No SD card';
+  var pct = Math.round((free / total) * 100);
+  return fmtGB(free) + ' free of ' + fmtGB(total) + ' (' + pct + '%)';
 }
 
 function loadStatusTab(d) {
@@ -1035,10 +1080,33 @@ function loadStatusTab(d) {
     ntpEl.style.color = d.ntp_synced ? 'var(--success)' : 'var(--warning)';
   }
   setEl('status-rssi', (d.rssi && d.rssi > -128) ? (d.rssi + ' dBm') : '--');
+  setEl('status-uptime', formatUptime(d.uptime));
+
   var bleEl = document.getElementById('status-ble');
-  if (bleEl) { bleEl.textContent = 'Not paired'; bleEl.style.color = 'var(--text-muted)'; }
-  setEl('status-sd', '--');
-  setEl('status-uptime', '--');
+  if (bleEl) {
+    var st = d.ble_state || 'idle';
+    var labels = {
+      'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
+      'waiting_passkey': 'Waiting passkey', 'confirming': 'Confirming…',
+      'paired': d.ble_name ? d.ble_name : 'Connected', 'error': 'Error'
+    };
+    var colors = {
+      'idle': 'var(--text-muted)', 'scanning': 'var(--warning)', 'connecting': 'var(--warning)',
+      'waiting_passkey': 'var(--warning)', 'confirming': 'var(--warning)',
+      'paired': 'var(--success)', 'error': 'var(--danger)'
+    };
+    bleEl.textContent = labels[st] || st;
+    bleEl.style.color = colors[st] || 'var(--text-muted)';
+  }
+  setEl('status-sd', formatSdSpace(d.sd_total, d.sd_free));
+
+  setEl('stat-ih-free', fmtBytes(d.ih_free));
+  setEl('stat-ih-min', fmtBytes(d.ih_min));
+  setEl('stat-ih-lfb', fmtBytes(d.ih_lfb));
+  setEl('stat-ps-free', fmtBytes(d.ps_free));
+  setEl('stat-ps-min', fmtBytes(d.ps_min));
+  setEl('stat-ps-lfb', fmtBytes(d.ps_lfb));
+  setEl('stat-tasks', d.tasks != null ? d.tasks : '--');
 }
 
 /* ── Save All ──────────────────────────────────────────────────── */
@@ -1496,16 +1564,163 @@ function applyPortalMode() {
   // Theme selector stays visible (per spec)
 }
 
+/* ── Telemetry polling + uPlot charts ──────────────────────────── */
+var statusTimer = null;
+var statsData = { heap: { t: [], free: [], lfb: [] }, psram: { t: [], free: [], lfb: [] } };
+var heapChart = null, psramChart = null;
+var STATS_MAX_AGE = 120; /* seconds — data older than this is trimmed */
+
+function makeChartOpts(width) {
+  var now = Math.floor(Date.now() / 1000);
+  return {
+    width: width,
+    height: 120,
+    padding: [8, 8, 0, 0],
+    series: [
+      { value: function(u, v) { return v == null ? '' : new Date(v * 1000).toLocaleTimeString(); } },
+      { label: 'Free', stroke: '#10b981', width: 1.5, value: function(u, v) { return v != null ? fmtBytes(v) : '--'; } },
+      { label: 'LFB',  stroke: '#3b82f6', width: 1.5, value: function(u, v) { return v != null ? fmtBytes(v) : '--'; } }
+    ],
+    scales: { x: { time: true, min: now - STATS_MAX_AGE, max: now }, y: { auto: true } },
+    axes: [
+      { grid: { stroke: 'rgba(148,163,184,0.15)', width: 1, dash: [2,3] }, ticks: { stroke: 'rgba(148,163,184,0.3)' }, stroke: '#94a3b8', font: '10px sans-serif', size: 26 },
+      { grid: { stroke: 'rgba(148,163,184,0.15)', width: 1, dash: [2,3] }, ticks: { stroke: 'rgba(148,163,184,0.3)' }, stroke: '#94a3b8', font: '10px sans-serif', size: 52,
+        values: function(u, vals) { return vals.map(function(v) { return fmtBytes(v); }); } }
+    ],
+    cursor: {
+      points: { size: 4 }
+    },
+    legend: { show: true, live: true }
+  };
+}
+
+function chartWidth(el) {
+  var w = el.clientWidth;
+  return (w && w > 0) ? w : 320;
+}
+
+/* Custom floating tooltip — works with mouse and touch. */
+var chartTooltip = null;
+function ensureTooltip() {
+  if (chartTooltip) return chartTooltip;
+  chartTooltip = document.createElement('div');
+  chartTooltip.style.cssText = 'position:absolute;display:none;pointer-events:none;' +
+    'background:rgba(15,23,42,0.95);color:#e2e8f0;padding:6px 10px;border-radius:6px;' +
+    'font-size:.75rem;z-index:1000;border:1px solid rgba(148,163,184,0.2);white-space:nowrap;line-height:1.4';
+  document.body.appendChild(chartTooltip);
+  return chartTooltip;
+}
+
+function attachChartTooltip(chart, el) {
+  var tip = ensureTooltip();
+  var over = el.querySelector('.u-over') || el;
+  function showTip(e) {
+    var rect = over.getBoundingClientRect();
+    var cx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+    var cy = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
+    var idx = chart.posToIdx(cx, cy);
+    if (idx == null) { tip.style.display = 'none'; return; }
+    var ts = chart.data[0][idx];
+    var lines = [];
+    for (var i = 1; i < chart.series.length; i++) {
+      var val = chart.data[i][idx];
+      var label = chart.series[i].label;
+      var swatch = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + chart.series[i].stroke + ';margin-right:4px"></span>';
+      lines.push(swatch + label + ': ' + (val != null ? fmtBytes(val) : '--'));
+    }
+    tip.innerHTML = lines.join('<br>') +
+      '<div style="opacity:.6;margin-top:2px">' +
+      (ts != null ? new Date(ts * 1000).toLocaleTimeString() : '') + '</div>';
+    tip.style.display = 'block';
+    tip.style.left = (rect.left + window.pageXOffset + cx + 12) + 'px';
+    tip.style.top = (rect.top + window.pageYOffset + cy - 40) + 'px';
+  }
+  function hideTip() { tip.style.display = 'none'; }
+  over.addEventListener('mousemove', showTip);
+  over.addEventListener('mouseleave', hideTip);
+  over.addEventListener('touchstart', showTip, { passive: true });
+  over.addEventListener('touchmove', showTip, { passive: true });
+  over.addEventListener('touchend', hideTip);
+}
+
+function initStatsCharts() {
+  if (heapChart) return;
+  if (typeof uPlot === 'undefined') { console.error('uPlot library not loaded'); return; }
+  var hEl = document.getElementById('chart-heap');
+  var pEl = document.getElementById('chart-psram');
+  if (!hEl || !pEl) return;
+  /* Clear loading placeholder text before uPlot takes over the element. */
+  hEl.textContent = ''; hEl.style.display = '';
+  pEl.textContent = ''; pEl.style.display = '';
+  try {
+    heapChart = new uPlot(makeChartOpts(chartWidth(hEl)),
+      [statsData.heap.t, statsData.heap.free, statsData.heap.lfb], hEl);
+    psramChart = new uPlot(makeChartOpts(chartWidth(pEl)),
+      [statsData.psram.t, statsData.psram.free, statsData.psram.lfb], pEl);
+    attachChartTooltip(heapChart, hEl);
+    attachChartTooltip(psramChart, pEl);
+  } catch (e) {
+    console.error('uPlot init failed', e);
+    heapChart = null; psramChart = null;
+  }
+}
+
+function resizeStatsCharts() {
+  if (heapChart) { var h = document.getElementById('chart-heap'); if (h) heapChart.setSize({ width: chartWidth(h), height: 120 }); }
+  if (psramChart) { var p = document.getElementById('chart-psram'); if (p) psramChart.setSize({ width: chartWidth(p), height: 120 }); }
+}
+window.addEventListener('resize', resizeStatsCharts);
+
+function pushStats(d) {
+  var now = (d.time && typeof d.time === 'string') ? Math.floor(new Date(d.time).getTime() / 1000) : Math.floor(Date.now() / 1000);
+  function push(arr, val) { arr.push(val); }
+  push(statsData.heap.t, now);
+  push(statsData.heap.free, d.ih_free || 0);
+  push(statsData.heap.lfb, d.ih_lfb || 0);
+  push(statsData.psram.t, now);
+  push(statsData.psram.free, d.ps_free || 0);
+  push(statsData.psram.lfb, d.ps_lfb || 0);
+  /* Trim data older than STATS_MAX_AGE seconds. */
+  var cutoff = now - STATS_MAX_AGE;
+  function trim(t, a, b) {
+    while (t.length > 1 && t[0] < cutoff) { t.shift(); a.shift(); b.shift(); }
+  }
+  trim(statsData.heap.t, statsData.heap.free, statsData.heap.lfb);
+  trim(statsData.psram.t, statsData.psram.free, statsData.psram.lfb);
+  /* Create charts lazily once we have data + a laid-out container. */
+  if (!heapChart) initStatsCharts();
+  if (heapChart) {
+    heapChart.setData([statsData.heap.t, statsData.heap.free, statsData.heap.lfb]);
+    heapChart.setScale('x', {min: now - STATS_MAX_AGE, max: now});
+  }
+  if (psramChart) {
+    psramChart.setData([statsData.psram.t, statsData.psram.free, statsData.psram.lfb]);
+    psramChart.setScale('x', {min: now - STATS_MAX_AGE, max: now});
+  }
+}
+
+function pollStatus() {
+  fetch('/api/status').then(function(r) { return r.json(); }).then(function(d) {
+    loadStatusTab(d);
+    pushStats(d);
+  }).catch(function() {});
+}
+
+/* Polling is always-on: one interval, started on boot, never stopped.
+ * One /api/status request every 3s is negligible on the ESP32 and avoids
+ * the fragile start/stop lifecycle tied to tab switching. */
+
 /* ── Boot ──────────────────────────────────────────────────────── */
 window.onload = function() {
   setTheme(localStorage.getItem('somnotrace_theme') || 'night');
   applyPortalMode();
   loadStatus();
   if (!PORTAL_MODE) {
-    bleRefresh();
-    loadUploadConfig();
-    loadUploadStatus();
-    loadDeviceSettings();
+    /* Init charts immediately (grid/axes render before first data point).
+       loadStatus() will feed the first data point via pushStats().
+       Periodic polling starts after a 3s gap — no duplicate fetch. */
+    initStatsCharts();
+    statusTimer = setInterval(pollStatus, 3000);
   }
   // Set today's date for dashboard
   var today = new Date();
@@ -1514,7 +1729,8 @@ window.onload = function() {
     picker.value = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
     updateDateDisplayLabel(picker.value);
   }
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+  /* Defer service worker registration to avoid competing for HTTP sockets during boot. */
+  if ('serviceWorker' in navigator) setTimeout(function() { navigator.serviceWorker.register('/sw.js'); }, 3000);
 };
 </script>
 </body>

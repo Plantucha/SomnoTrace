@@ -9,6 +9,7 @@
 #include "uploader.h"
 #include "edf_gen.h"
 #include "sd_storage.h"
+#include "ff.h"
 #include "log_stream.h"
 #include "device_settings.h"
 
@@ -454,15 +455,29 @@ static esp_err_t sw_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/javascript");
     const char sw[] =
-        "const CACHE_NAME = 'somnotrace-v1';\n"
+        "const CACHE_NAME = 'somnotrace-v2';\n"
         "self.addEventListener('install', e => {\n"
+        "  self.skipWaiting();\n"
         "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(['/', '/manifest.json', '/uplot.js', '/uplot.css'])));\n"
+        "});\n"
+        "self.addEventListener('activate', e => {\n"
+        "  e.waitUntil(caches.keys().then(keys => Promise.all(\n"
+        "    keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))\n"
+        "  )).then(() => self.clients.claim()));\n"
         "});\n"
         "self.addEventListener('fetch', e => {\n"
         "  if (e.request.url.includes('/api/') || e.request.url.includes('/scan') || e.request.url.includes('/save')) {\n"
         "    e.respondWith(fetch(e.request));\n"
         "  } else {\n"
-        "    e.respondWith(caches.match(e.request).then(res => res || fetch(e.request)));\n"
+        "    /* Network-first: always fetch fresh when the device is reachable,\n"
+        "       fall back to cache only when offline. */\n"
+        "    e.respondWith(\n"
+        "      fetch(e.request).then(res => {\n"
+        "        const copy = res.clone();\n"
+        "        caches.open(CACHE_NAME).then(c => c.put(e.request, copy)).catch(() => {});\n"
+        "        return res;\n"
+        "      }).catch(() => caches.match(e.request))\n"
+        "    );\n"
         "  }\n"
         "});\n";
     httpd_resp_send(req, sw, HTTPD_RESP_USE_STRLEN);
@@ -473,7 +488,9 @@ static esp_err_t uplot_js_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
-    httpd_resp_send(req, UPLOT_JS_START, UPLOT_JS_LEN);
+    /* Embedded as TEXT, which appends a NUL terminator. Use STRLEN so the
+     * trailing NUL is not sent (a stray NUL breaks JS parsing). */
+    httpd_resp_send(req, UPLOT_JS_START, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -481,7 +498,7 @@ static esp_err_t uplot_css_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/css");
     httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
-    httpd_resp_send(req, UPLOT_CSS_START, UPLOT_CSS_LEN);
+    httpd_resp_send(req, UPLOT_CSS_START, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -532,19 +549,81 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     const esp_app_desc_t *app_desc = esp_app_get_description();
     const char *fw_ver = app_desc ? app_desc->version : "unknown";
 
-    char resp[768];
+    uint32_t uptime_s = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
+
+    /* BLE status (only in connected mode — no BLE in setup/SoftAP) */
+    const char *ble_state = "idle";
+    bool ble_paired = false;
+    char ble_name[64] = "";
+    char ble_addr[24] = "";
+    if (!s_portal_mode) {
+        ble_state = as11_ble_get_status();
+        ble_paired = as11_ble_is_paired();
+        if (ble_paired) {
+            cJSON *info = as11_ble_get_paired_info();
+            if (info) {
+                cJSON *name = cJSON_GetObjectItem(info, "name");
+                cJSON *addr = cJSON_GetObjectItem(info, "addr");
+                if (name && cJSON_IsString(name))
+                    strlcpy(ble_name, name->valuestring, sizeof(ble_name));
+                if (addr && cJSON_IsString(addr))
+                    strlcpy(ble_addr, addr->valuestring, sizeof(ble_addr));
+                cJSON_Delete(info);
+            }
+        }
+    }
+
+    /* Heap stats */
+    uint32_t ih_free  = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t ih_min   = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t ih_lfb   = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    uint32_t ps_free  = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t ps_min   = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t ps_lfb   = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    uint32_t n_tasks  = (uint32_t)uxTaskGetNumberOfTasks();
+
+    /* SD card free space (f_getfree reads cached FSInfo — very cheap, no disk I/O) */
+    uint64_t sd_total = 0, sd_free = 0;
+    if (sd_storage_is_ready()) {
+        FATFS *fs = NULL;
+        DWORD free_clst = 0;
+        if (f_getfree("0:", &free_clst, &fs) == FR_OK && fs) {
+            sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
+            sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
+        }
+    }
+
+    char resp[1024];
     if (s_portal_mode) {
         snprintf(resp, sizeof(resp),
                  "{\"mode\":\"setup\",\"fw_ver\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
-                 "\"rssi\":%d,\"channel\":%d}",
+                 "\"rssi\":%d,\"channel\":%d,"
+                 "\"uptime\":%lu,"
+                 "\"ih_free\":%lu,\"ih_min\":%lu,\"ih_lfb\":%lu,"
+                 "\"ps_free\":%lu,\"ps_min\":%lu,\"ps_lfb\":%lu,\"tasks\":%lu,"
+                 "\"sd_total\":%llu,\"sd_free\":%llu}",
                  fw_ver, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
-                 rssi, primary_chan);
+                 rssi, primary_chan,
+                 (unsigned long)uptime_s,
+                 (unsigned long)ih_free, (unsigned long)ih_min, (unsigned long)ih_lfb,
+                 (unsigned long)ps_free, (unsigned long)ps_min, (unsigned long)ps_lfb,
+                 (unsigned long)n_tasks,
+                 (unsigned long long)sd_total, (unsigned long long)sd_free);
     } else {
         snprintf(resp, sizeof(resp),
                  "{\"mode\":\"connected\",\"fw_ver\":\"%s\",\"ip\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
-                 "\"rssi\":%d,\"channel\":%d}",
+                 "\"rssi\":%d,\"channel\":%d,"
+                 "\"uptime\":%lu,\"ble_state\":\"%s\",\"ble_paired\":%s,\"ble_name\":\"%s\",\"ble_addr\":\"%s\","
+                 "\"ih_free\":%lu,\"ih_min\":%lu,\"ih_lfb\":%lu,"
+                 "\"ps_free\":%lu,\"ps_min\":%lu,\"ps_lfb\":%lu,\"tasks\":%lu,"
+                 "\"sd_total\":%llu,\"sd_free\":%llu}",
                  fw_ver, s_connected_ip, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
-                 rssi, primary_chan);
+                 rssi, primary_chan,
+                 (unsigned long)uptime_s, ble_state, ble_paired ? "true" : "false", ble_name, ble_addr,
+                 (unsigned long)ih_free, (unsigned long)ih_min, (unsigned long)ih_lfb,
+                 (unsigned long)ps_free, (unsigned long)ps_min, (unsigned long)ps_lfb,
+                 (unsigned long)n_tasks,
+                 (unsigned long long)sd_total, (unsigned long long)sd_free);
     }
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
