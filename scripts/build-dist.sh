@@ -68,7 +68,7 @@ OTA_NAME="${PROJECT_NAME}-${VERSION}-ota.bin"
 if [ "${DO_CLEAN}" -eq 1 ]; then
     echo "==> Clean build requested: running fullclean..."
     rm -f "${PROJECT_DIR}/sdkconfig"
-    rm -rf "${PROJECT_DIR}/managed_components"
+    rm -rf "${PROJECT_DIR}/managed_components" 2>/dev/null || sudo rm -rf "${PROJECT_DIR}/managed_components" 2>/dev/null || true
     "${SCRIPT_DIR}/idf.sh" fullclean || true
 fi
 
