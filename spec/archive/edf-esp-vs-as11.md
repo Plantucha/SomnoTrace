@@ -130,15 +130,19 @@ the EDF verbatim instead of being scaled. This matches AS11 behaviour.
 - **Header time:** TherapyStart (not MaskOn)
 - **Records:** `1 + event_count` (1 for "Recording starts" + one annotation
   per event)
-- **Events included:** Respiratory events only (types 1–5: Hypopnea, Central
-  Apnea, Obstructive Apnea, Apnea, Arousal)
-- **Match:** Byte-identical data
+- **Events included:** Respiratory events only (types 2–6: Hypopnea, Central
+  Apnea, Obstructive Apnea, Apnea, Arousal). Code 0 is the protobuf3 UNKNOWN
+  default; code 1 is a sentinel that never appears in real spool data.
+- **Match:** Byte-identical data (onsets, durations, and labels confirmed across
+  3 sessions against AS11 reference exports, 2026-07-08)
 
 ### CSL.edf — CSR events
 
 - **Source:** Same `resp_events.bin` as EVE.edf
 - **Header time:** TherapyStart
-- **Events included:** CSR events only (types 6–7: CSR start/end)
+- **Events included:** CSR events only (types 7–8: CSR start/end). Note: CSR
+  codes are extrapolated from the +1 pattern; no CSR events have been observed
+  in test sessions to confirm.
 - **Gotcha — event filtering:** EVE.edf and CSL.edf both read from the same
   `resp_events.bin`. A `csl_mode` flag in `generate_eve_edf()` filters
   events: CSL.edf includes only CSR events, EVE.edf includes only
