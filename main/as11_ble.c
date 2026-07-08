@@ -2134,7 +2134,8 @@ esp_err_t as11_ble_confirm_pair(const char *passkey)
 {
     if (!passkey || !*passkey) return ESP_ERR_INVALID_ARG;
     strlcpy(s_passkey, passkey, sizeof(s_passkey));
-    TaskHandle_t h = psram_task_create(confirm_task, "as11_confirm", 8192, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    TaskHandle_t h = NULL;
+    xTaskCreate(confirm_task, "as11_confirm", 8192, NULL, 5, &h);
     if (!h) {
         return ESP_ERR_NO_MEM;
     }

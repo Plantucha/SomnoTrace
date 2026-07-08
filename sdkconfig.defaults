@@ -19,12 +19,13 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# Lowered from 16384 now that CONFIG_SPI_FLASH_AUTO_SUSPEND (below) removes
-# the underlying crash mechanism (cache disabled during flash ops) that
-# this threshold was protecting against project-wide.  4096 is chosen so
-# that only small/DMA-adjacent allocations stay forced-internal; the httpd
-# worker (8192B stack), uploader/BLE task stacks, and most heap allocations
-# (cJSON buffers, HTTP response buffers, etc.) now default to PSRAM.
+# Lowered from 16384 to allow more heap allocations (httpd worker stack,
+# cJSON buffers, HTTP response buffers, etc.) to use PSRAM.  4096 keeps
+# only small/DMA-adjacent allocations forced-internal.
+# NOTE: CONFIG_SPI_FLASH_AUTO_SUSPEND does NOT make it safe for tasks that
+# do flash erase/write (LittleFS, NVS commit) to have PSRAM stacks —
+# esp_ota_get_running_partition() → spi_flash_cache2phys() still freezes
+# caches.  Such tasks (uploader, confirm_task) must use internal RAM stacks.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 

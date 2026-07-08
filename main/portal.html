@@ -1475,7 +1475,7 @@ function connectLogStream() {
       if (lines[i].length > 0) logLines.push(lines[i]);
     }
     if (logLines.length > LOG_MAX_LINES) logLines = logLines.slice(-LOG_MAX_LINES);
-    renderLogTerminal();
+    renderLogTerminal(true);
     setLogConnStatus('connected');
   }).catch(function() {}).then(function() {
     /* Open WebSocket for real-time log push. */
@@ -1515,7 +1515,7 @@ function disconnectLogStream() {
   setLogConnStatus('disconnected');
 }
 
-function renderLogTerminal() {
+function renderLogTerminal(forceScroll) {
   var term = document.getElementById('log-terminal');
   if (!term) return;
   var lines = logFilterQuery
@@ -1523,7 +1523,7 @@ function renderLogTerminal() {
     : logLines;
   term.textContent = lines.join('\n');
   /* Auto-scroll to bottom unless user has scrolled up deliberately. */
-  var atBottom = (term.scrollHeight - term.scrollTop - term.clientHeight) < 80;
+  var atBottom = forceScroll || (term.scrollHeight - term.scrollTop - term.clientHeight) < 80;
   if (atBottom) term.scrollTop = term.scrollHeight;
 }
 
