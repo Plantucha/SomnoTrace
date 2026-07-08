@@ -594,13 +594,24 @@ esp_err_t uploader_init(void)
     s_queue = xQueueCreate(UPLOAD_QUEUE_LEN, sizeof(upload_event_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
 
-    /* 8. Start upload task on core 0 (same as BLE, but low priority) */
-    BaseType_t xret = xTaskCreatePinnedToCore(
-        upload_task, "uploader", UPLOAD_TASK_STACK, NULL,
-        UPLOAD_TASK_PRIORITY, NULL, 0);
+    /* 8. Start upload task on core 0 (same as BLE, but low priority).
+     * PSRAM stack: CONFIG_SPI_FLASH_AUTO_SUSPEND keeps the cache enabled
+     * during LittleFS/NVS flash operations (mutex-based dispatch instead
+     * of disabling cache), so a PSRAM-backed stack no longer crashes here.
+     * TCB must stay in internal RAM (FreeRTOS requirement). */
+    StackType_t *upload_stack = heap_caps_malloc(UPLOAD_TASK_STACK, MALLOC_CAP_SPIRAM);
+    StaticTask_t *upload_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    TaskHandle_t upload_handle = NULL;
+    if (upload_stack && upload_tcb) {
+        upload_handle = xTaskCreateStaticPinnedToCore(
+            upload_task, "uploader", UPLOAD_TASK_STACK, NULL,
+            UPLOAD_TASK_PRIORITY, upload_stack, upload_tcb, 0);
+    }
 
-    if (xret != pdPASS) {
+    if (!upload_handle) {
         ESP_LOGE(TAG, "failed to create upload task");
+        free(upload_stack);
+        free(upload_tcb);
         return ESP_ERR_NO_MEM;
     }
 

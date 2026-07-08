@@ -22,6 +22,7 @@
 #include "esp_wifi.h"
 #include "driver/ledc.h"
 #include "device_settings.h"
+#include "psram_task.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -519,7 +520,7 @@ esp_err_t bsp_display_init(void)
      * task ever touches the framebuffer or the LCD panel. */
     s_state_mutex = xSemaphoreCreateMutex();
     if (s_state_mutex) {
-        xTaskCreate(display_task, "display", DISPLAY_TASK_STACK, NULL, 4, &s_display_task);
+        s_display_task = psram_task_create(display_task, "display", DISPLAY_TASK_STACK, NULL, 4, tskNO_AFFINITY, NULL, NULL);
     } else {
         ESP_LOGE(TAG, "state mutex alloc failed, display task not started");
     }

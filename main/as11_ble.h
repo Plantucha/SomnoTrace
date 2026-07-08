@@ -71,7 +71,7 @@ const char *as11_ble_get_error(void);
 /* Return true if credentials are stored in NVS (device was previously paired). */
 bool as11_ble_is_paired(void);
 
-/* Return a cJSON object with paired device info from NVS.
+/* Return a cJSON object with paired device info from the in-RAM cache.
  * Keys: "addr", "name", "clientId". NULL if not paired.
  * Caller must call cJSON_Delete(). */
 cJSON *as11_ble_get_paired_info(void);

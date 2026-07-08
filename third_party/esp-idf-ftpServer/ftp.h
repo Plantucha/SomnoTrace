@@ -36,6 +36,8 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
 
 #include <stdio.h>
 #include <dirent.h>
@@ -208,7 +210,13 @@ bool ftp_stop_requested();
 void ftp_task(void *pvParameters);
 
 static inline void ftp_server_start(void) {
-    xTaskCreate(ftp_task, "ftp_srv", 1024*6, NULL, 2, NULL);
+    StackType_t *stack = heap_caps_malloc(1024*6, MALLOC_CAP_SPIRAM);
+    StaticTask_t *tcb  = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (stack && tcb) {
+        xTaskCreateStaticPinnedToCore(ftp_task, "ftp_srv", 1024*6, NULL, 2, stack, tcb, tskNO_AFFINITY);
+    } else {
+        free(stack); free(tcb);
+    }
 }
 
 #endif /* FTP_H_ */

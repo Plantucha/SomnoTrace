@@ -59,6 +59,7 @@
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "psram_task.h"
 
 #include "mbedtls/sha256.h"
 #include "mbedtls/bignum.h"
@@ -199,6 +200,17 @@ static spool_collector_t *s_spool_collector = NULL;
 /* Encrypted session state (set after reconnect or pairing). */
 static uint8_t s_session_key[32];       /* AES-256 key */
 static bool s_session_encrypted = false;
+
+/* In-RAM cache of paired device credentials.  Loaded once at init from NVS,
+ * updated on pair/forget.  Eliminates NVS reads from the HTTP /api/status
+ * hot path (as11_ble_is_paired / as11_ble_get_paired_info). */
+static struct {
+    char addr[24];
+    char name[32];
+    char client_id[64];
+    char pair_key[65];
+    bool valid;
+} s_pair_cache;
 
 static char s_target_name[32];
 static ble_addr_t s_target_addr;
@@ -531,24 +543,6 @@ static int on_mtu(uint16_t conn, const struct ble_gatt_error *err,
     return 0;
 }
 
-static int on_svc(uint16_t conn, const struct ble_gatt_error *err,
-                  const struct ble_gatt_svc *svc, void *arg)
-{
-    (void)conn; (void)arg;
-    if (err && err->status == 0 && svc) {
-        s_svc_start = svc->start_handle;
-        s_svc_end = svc->end_handle;
-    }
-    if (err && (err->status == BLE_HS_EDONE)) {
-        s_op_status = (s_svc_end != 0) ? 0 : BLE_HS_ENOENT;
-        xSemaphoreGive(s_op_sem);
-    } else if (err && err->status != 0) {
-        s_op_status = err->status;
-        xSemaphoreGive(s_op_sem);
-    }
-    return 0;
-}
-
 /* No-op callback for full GATT discovery — generates the same ATT traffic
  * as BlueZ's automatic database discovery (Read By Group Type for all
  * primary services).  We don't store the results; we just need the AS11
@@ -613,30 +607,6 @@ static int on_all_chr(uint16_t conn, const struct ble_gatt_error *err,
     }
     if (err && err->status == BLE_HS_EDONE) {
         s_op_status = 0;
-        xSemaphoreGive(s_op_sem);
-    } else if (err && err->status != 0) {
-        s_op_status = err->status;
-        xSemaphoreGive(s_op_sem);
-    }
-    return 0;
-}
-
-static int on_chr(uint16_t conn, const struct ble_gatt_error *err,
-                  const struct ble_gatt_chr *chr, void *arg)
-{
-    (void)conn; (void)arg;
-    if (err && err->status == 0 && chr) {
-        char uuid_str[37];
-        ble_uuid_to_str(&chr->uuid.u, uuid_str);
-        ESP_LOGI(TAG, "Discovered char: %s (val_handle=%d, props=0x%02x)", uuid_str, chr->val_handle, chr->properties);
-        if (ble_uuid_cmp(&chr->uuid.u, &UUID_TX.u) == 0) {
-            s_tx_handle = chr->val_handle;
-        } else if (ble_uuid_cmp(&chr->uuid.u, &UUID_RX.u) == 0) {
-            s_rx_handle = chr->val_handle;
-        }
-    }
-    if (err && err->status == BLE_HS_EDONE) {
-        s_op_status = (s_tx_handle && s_rx_handle) ? 0 : BLE_HS_ENOENT;
         xSemaphoreGive(s_op_sem);
     } else if (err && err->status != 0) {
         s_op_status = err->status;
@@ -1178,7 +1148,6 @@ static esp_err_t srp_compute(const char *server_pk_hex, const char *salt_hex,
                              const char *passkey,
                              char m1_hex_out[65], char *server_conf_check /*64+1*/)
 {
-    int64_t t0 = esp_timer_get_time();
     esp_err_t result = ESP_FAIL;
     uint8_t N_pad[SRP_PAD], g_pad[SRP_PAD], B_pad[SRP_PAD];
     uint8_t salt[64];
@@ -1305,6 +1274,13 @@ static esp_err_t nvs_save_pairing(const char *addr, const char *name,
     nvs_set_str(h, NVS_K_PAIRKEY, pair_key);
     e = nvs_commit(h);
     nvs_close(h);
+    if (e == ESP_OK) {
+        strlcpy(s_pair_cache.addr, addr, sizeof(s_pair_cache.addr));
+        strlcpy(s_pair_cache.name, name, sizeof(s_pair_cache.name));
+        strlcpy(s_pair_cache.client_id, client_id, sizeof(s_pair_cache.client_id));
+        strlcpy(s_pair_cache.pair_key, pair_key, sizeof(s_pair_cache.pair_key));
+        s_pair_cache.valid = true;
+    }
     return e;
 }
 
@@ -1314,53 +1290,27 @@ static bool nvs_get_str_opt(nvs_handle_t h, const char *key, char *out, size_t c
     return nvs_get_str(h, key, out, &len) == ESP_OK && out[0] != '\0';
 }
 
+/* Load paired credentials from NVS into the in-RAM cache.  Called once at
+ * init so that as11_ble_is_paired() and as11_ble_get_paired_info() can
+ * serve from RAM without touching flash on every HTTP /api/status poll. */
+static void pair_cache_load(void)
+{
+    memset(&s_pair_cache, 0, sizeof(s_pair_cache));
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    bool ok = nvs_get_str_opt(h, NVS_K_CLIENTID, s_pair_cache.client_id,
+                              sizeof(s_pair_cache.client_id));
+    nvs_get_str_opt(h, NVS_K_ADDR, s_pair_cache.addr, sizeof(s_pair_cache.addr));
+    nvs_get_str_opt(h, NVS_K_NAME, s_pair_cache.name, sizeof(s_pair_cache.name));
+    nvs_get_str_opt(h, NVS_K_PAIRKEY, s_pair_cache.pair_key,
+                    sizeof(s_pair_cache.pair_key));
+    nvs_close(h);
+    s_pair_cache.valid = ok;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Worker tasks                                                      */
 /* ------------------------------------------------------------------ */
-static uint16_t s_svc_changed_cccd = 0;
-
-static int on_svc_changed_dsc(uint16_t conn, const struct ble_gatt_error *err,
-                              uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc,
-                              void *arg)
-{
-    (void)conn; (void)chr_val_handle; (void)arg;
-    if (err && err->status == 0 && dsc) {
-        const ble_uuid16_t cccd = BLE_UUID16_INIT(0x2902);
-        if (ble_uuid_cmp(&dsc->uuid.u, &cccd.u) == 0) {
-            if (s_svc_changed_cccd == 0) {
-                s_svc_changed_cccd = dsc->handle;
-                ESP_LOGI(TAG, "Found Service Changed CCCD at handle %d", s_svc_changed_cccd);
-            }
-        }
-    }
-    if (err && err->status == BLE_HS_EDONE) {
-        s_op_status = 0;
-        xSemaphoreGive(s_op_sem);
-    } else if (err && err->status != 0) {
-        s_op_status = err->status;
-        xSemaphoreGive(s_op_sem);
-    }
-    return 0;
-}
-
-static uint16_t s_svc_changed_handle = 0;
-static int on_svc_changed_chr(uint16_t conn, const struct ble_gatt_error *err,
-                              const struct ble_gatt_chr *chr, void *arg)
-{
-    (void)conn; (void)arg;
-    if (err && err->status == 0 && chr) {
-        s_svc_changed_handle = chr->val_handle;
-    }
-    if (err && err->status == BLE_HS_EDONE) {
-        s_op_status = 0;
-        xSemaphoreGive(s_op_sem);
-    } else if (err && err->status != 0) {
-        s_op_status = err->status;
-        xSemaphoreGive(s_op_sem);
-    }
-    return 0;
-}
-
 /* --- do_connect_and_discover ---
  * Mirrors the exact GATT sequence from the btmon capture of a successful
  * Python/BlueZ pairing session.  Order matters — the AS11 appears to be
@@ -1695,7 +1645,7 @@ static void confirm_task(void *arg)
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     vTaskDelay(pdMS_TO_TICKS(500));
-    xTaskCreate(reconnect_task, "as11_reconn", 8192, NULL, 5, NULL);
+    psram_task_create(reconnect_task, "as11_reconn", 8192, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     vTaskDelete(NULL);
 }
 
@@ -1718,26 +1668,24 @@ static void reconnect_task(void *arg)
         return;
     }
 
-    /* Load saved pairing info from NVS */
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
-        ESP_LOGD(TAG, "reconnect: no NVS pairing");
+    /* Use cached pairing info (loaded at init or after pairing). */
+    if (!s_pair_cache.valid) {
+        ESP_LOGD(TAG, "reconnect: no cached pairing");
         vTaskDelete(NULL);
         return;
     }
 
-    char addr_str[24] = {0};
-    char name_str[32] = {0};
-    char cid_str[64]  = {0};
-    char pair_key_hex[65] = {0};
-    nvs_get_str_opt(h, NVS_K_ADDR, addr_str, sizeof(addr_str));
-    nvs_get_str_opt(h, NVS_K_NAME, name_str, sizeof(name_str));
-    nvs_get_str_opt(h, NVS_K_CLIENTID, cid_str, sizeof(cid_str));
-    nvs_get_str_opt(h, NVS_K_PAIRKEY, pair_key_hex, sizeof(pair_key_hex));
-    nvs_close(h);
+    char addr_str[24];
+    char name_str[32];
+    char cid_str[64];
+    char pair_key_hex[65];
+    strlcpy(addr_str, s_pair_cache.addr, sizeof(addr_str));
+    strlcpy(name_str, s_pair_cache.name, sizeof(name_str));
+    strlcpy(cid_str, s_pair_cache.client_id, sizeof(cid_str));
+    strlcpy(pair_key_hex, s_pair_cache.pair_key, sizeof(pair_key_hex));
 
     if (addr_str[0] == '\0' || cid_str[0] == '\0' || pair_key_hex[0] == '\0') {
-        ESP_LOGD(TAG, "reconnect: incomplete NVS pairing");
+        ESP_LOGD(TAG, "reconnect: incomplete pairing cache");
         vTaskDelete(NULL);
         return;
     }
@@ -2076,7 +2024,7 @@ esp_err_t as11_ble_init(void)
     /* Create notification queue and processing task */
     s_notif_queue = xQueueCreate(NOTIF_QUEUE_LEN, sizeof(notif_item_t));
     if (!s_notif_queue) return ESP_ERR_NO_MEM;
-    xTaskCreate(notif_proc_task, "notif_proc", 8192, NULL, 10, &s_notif_task);
+    s_notif_task = psram_task_create(notif_proc_task, "notif_proc", 8192, NULL, 10, tskNO_AFFINITY, NULL, NULL);
     ESP_LOGI(TAG, "notification processing task started");
 
     esp_err_t ret = nimble_port_init();
@@ -2094,13 +2042,17 @@ esp_err_t as11_ble_init(void)
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "BLE initialised");
 
+    /* Load saved pairing credentials into RAM cache so that HTTP /api/status
+     * can check paired state without touching NVS on every request. */
+    pair_cache_load();
+
     /* If we have saved pairing credentials, auto-reconnect to the AS11
      * in the background. The reconnect task waits for host sync, loads
      * the address from NVS, connects, discovers GATT services, and
      * enables notifications — no SRP key exchange needed. */
     if (as11_ble_is_paired()) {
         ESP_LOGI(TAG, "saved pairing found, auto-reconnecting...");
-        xTaskCreate(reconnect_task, "as11_reconn", 8192, NULL, 5, NULL);
+        psram_task_create(reconnect_task, "as11_reconn", 8192, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     }
 
     return ESP_OK;
@@ -2171,7 +2123,8 @@ esp_err_t as11_ble_start_pair(const char *addr_str)
     }
 
     s_error[0] = '\0';
-    if (xTaskCreate(pair_task, "as11_pair", 8192, NULL, 5, NULL) != pdPASS) {
+    TaskHandle_t h = psram_task_create(pair_task, "as11_pair", 8192, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    if (!h) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -2181,7 +2134,8 @@ esp_err_t as11_ble_confirm_pair(const char *passkey)
 {
     if (!passkey || !*passkey) return ESP_ERR_INVALID_ARG;
     strlcpy(s_passkey, passkey, sizeof(s_passkey));
-    if (xTaskCreate(confirm_task, "as11_confirm", 8192, NULL, 5, NULL) != pdPASS) {
+    TaskHandle_t h = psram_task_create(confirm_task, "as11_confirm", 8192, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    if (!h) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -2202,28 +2156,16 @@ const char *as11_ble_get_error(void)
 
 bool as11_ble_is_paired(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
-    char buf[64];
-    bool ok = nvs_get_str_opt(h, NVS_K_CLIENTID, buf, sizeof(buf));
-    nvs_close(h);
-    return ok;
+    return s_pair_cache.valid;
 }
 
 cJSON *as11_ble_get_paired_info(void)
 {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return NULL;
-    char addr[24] = "", name[32] = "", cid[64] = "";
-    bool ok = nvs_get_str_opt(h, NVS_K_CLIENTID, cid, sizeof(cid));
-    nvs_get_str_opt(h, NVS_K_ADDR, addr, sizeof(addr));
-    nvs_get_str_opt(h, NVS_K_NAME, name, sizeof(name));
-    nvs_close(h);
-    if (!ok) return NULL;
+    if (!s_pair_cache.valid) return NULL;
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "addr", addr);
-    cJSON_AddStringToObject(o, "name", name);
-    cJSON_AddStringToObject(o, "clientId", cid);
+    cJSON_AddStringToObject(o, "addr", s_pair_cache.addr);
+    cJSON_AddStringToObject(o, "name", s_pair_cache.name);
+    cJSON_AddStringToObject(o, "clientId", s_pair_cache.client_id);
     return o;
 }
 
@@ -2235,6 +2177,9 @@ esp_err_t as11_ble_forget(void)
     nvs_erase_all(h);
     e = nvs_commit(h);
     nvs_close(h);
+    if (e == ESP_OK) {
+        memset(&s_pair_cache, 0, sizeof(s_pair_cache));
+    }
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }

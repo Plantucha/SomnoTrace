@@ -32,6 +32,7 @@
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "psram_task.h"
 
 static const char *TAG = "netprov";
 
@@ -507,125 +508,110 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     struct netprov_config cfg;
     bool has_cfg = netprov_load_config(&cfg);
 
-    char ssids_json[256] = "";
-    char has_pass_json[64] = "";
-    int added = 0;
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "mode", s_portal_mode ? "setup" : "connected");
+
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    cJSON_AddStringToObject(resp, "fw_ver", app_desc ? app_desc->version : "unknown");
+
+    if (!s_portal_mode) {
+        cJSON_AddStringToObject(resp, "ip", s_connected_ip);
+    }
+
+    /* Wi-Fi SSIDs */
+    cJSON *ssids_arr = cJSON_AddArrayToObject(resp, "ssids");
+    cJSON *has_pass_arr = cJSON_AddArrayToObject(resp, "has_pass");
     if (has_cfg) {
         for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
             if (cfg.wifi[i].ssid[0] != '\0') {
-                char item[80];
-                snprintf(item, sizeof(item), "%s\"%s\"", added > 0 ? "," : "", cfg.wifi[i].ssid);
-                strlcat(ssids_json, item, sizeof(ssids_json));
-                char hp[8];
-                snprintf(hp, sizeof(hp), "%s%s", added > 0 ? "," : "", cfg.wifi[i].pass[0] ? "true" : "false");
-                strlcat(has_pass_json, hp, sizeof(has_pass_json));
-                added++;
+                cJSON_AddItemToArray(ssids_arr, cJSON_CreateString(cfg.wifi[i].ssid));
+                cJSON_AddItemToArray(has_pass_arr, cJSON_CreateBool(cfg.wifi[i].pass[0] != '\0'));
             }
         }
     }
 
-    httpd_resp_set_type(req, "application/json");
-    char tz_str[64];
-    char tz_name[40];
+    /* Time / timezone */
+    char tz_str[64], tz_name[40];
     time_sync_get_timezone(tz_str, sizeof(tz_str));
     time_sync_get_tz_name(tz_name, sizeof(tz_name));
-    bool synced = time_sync_is_synced();
-    char time_str[32] = "";
+    cJSON_AddStringToObject(resp, "tz_name", tz_name);
+    cJSON_AddBoolToObject(resp, "ntp_synced", time_sync_is_synced());
     time_t now = time(NULL);
     if (now > 1700000000) {
         struct tm tm_info;
         localtime_r(&now, &tm_info);
-        strftime(time_str, sizeof(time_str), "\"%Y-%m-%dT%H:%M:%S\"", &tm_info);
+        char time_str[32];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm_info);
+        cJSON_AddStringToObject(resp, "time", time_str);
     } else {
-        strlcpy(time_str, "null", sizeof(time_str));
+        cJSON_AddNullToObject(resp, "time");
     }
 
+    /* Wi-Fi radio */
     int rssi = -128;
     uint8_t primary_chan = 0;
     wifi_second_chan_t second_chan;
     esp_wifi_sta_get_rssi(&rssi);
     esp_wifi_get_channel(&primary_chan, &second_chan);
+    cJSON_AddNumberToObject(resp, "rssi", rssi);
+    cJSON_AddNumberToObject(resp, "channel", primary_chan);
 
-    const esp_app_desc_t *app_desc = esp_app_get_description();
-    const char *fw_ver = app_desc ? app_desc->version : "unknown";
-
+    /* Uptime */
     uint32_t uptime_s = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
+    cJSON_AddNumberToObject(resp, "uptime", uptime_s);
 
-    /* BLE status (only in connected mode — no BLE in setup/SoftAP) */
-    const char *ble_state = "idle";
-    bool ble_paired = false;
-    char ble_name[64] = "";
-    char ble_addr[24] = "";
+    /* BLE status (only in connected mode) */
     if (!s_portal_mode) {
-        ble_state = as11_ble_get_status();
-        ble_paired = as11_ble_is_paired();
-        if (ble_paired) {
+        cJSON *ble = cJSON_AddObjectToObject(resp, "ble");
+        cJSON_AddStringToObject(ble, "state", as11_ble_get_status());
+        cJSON_AddStringToObject(ble, "error", as11_ble_get_error());
+        cJSON_AddBoolToObject(ble, "paired", as11_ble_is_paired());
+        if (as11_ble_is_paired()) {
             cJSON *info = as11_ble_get_paired_info();
             if (info) {
-                cJSON *name = cJSON_GetObjectItem(info, "name");
-                cJSON *addr = cJSON_GetObjectItem(info, "addr");
-                if (name && cJSON_IsString(name))
-                    strlcpy(ble_name, name->valuestring, sizeof(ble_name));
-                if (addr && cJSON_IsString(addr))
-                    strlcpy(ble_addr, addr->valuestring, sizeof(ble_addr));
-                cJSON_Delete(info);
+                cJSON_AddItemToObject(ble, "device", info);
             }
         }
     }
 
-    /* Heap stats */
-    uint32_t ih_free  = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    uint32_t ih_min   = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    uint32_t ih_lfb   = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    uint32_t ps_free  = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    uint32_t ps_min   = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
-    uint32_t ps_lfb   = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    uint32_t n_tasks  = (uint32_t)uxTaskGetNumberOfTasks();
+    /* Upload status (only in connected mode) */
+    if (!s_portal_mode) {
+        char *up_json = NULL;
+        if (uploader_get_status_json(&up_json) == ESP_OK && up_json) {
+            cJSON *up_obj = cJSON_Parse(up_json);
+            if (up_obj) {
+                cJSON_AddItemToObject(resp, "uploads", up_obj);
+            }
+            free(up_json);
+        }
+    }
 
-    /* SD card free space (f_getfree reads cached FSInfo — very cheap, no disk I/O) */
-    uint64_t sd_total = 0, sd_free = 0;
+    /* Heap stats */
+    cJSON_AddNumberToObject(resp, "ih_free", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(resp, "ih_min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(resp, "ih_lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(resp, "ps_free", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(resp, "ps_min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(resp, "ps_lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(resp, "tasks", (double)uxTaskGetNumberOfTasks());
+
+    /* SD card free space */
     if (sd_storage_is_ready()) {
         FATFS *fs = NULL;
         DWORD free_clst = 0;
         if (f_getfree("0:", &free_clst, &fs) == FR_OK && fs) {
-            sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
-            sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
+            uint64_t sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
+            uint64_t sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
+            cJSON_AddNumberToObject(resp, "sd_total", (double)sd_total);
+            cJSON_AddNumberToObject(resp, "sd_free", (double)sd_free);
         }
     }
 
-    char resp[1024];
-    if (s_portal_mode) {
-        snprintf(resp, sizeof(resp),
-                 "{\"mode\":\"setup\",\"fw_ver\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
-                 "\"rssi\":%d,\"channel\":%d,"
-                 "\"uptime\":%lu,"
-                 "\"ih_free\":%lu,\"ih_min\":%lu,\"ih_lfb\":%lu,"
-                 "\"ps_free\":%lu,\"ps_min\":%lu,\"ps_lfb\":%lu,\"tasks\":%lu,"
-                 "\"sd_total\":%llu,\"sd_free\":%llu}",
-                 fw_ver, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
-                 rssi, primary_chan,
-                 (unsigned long)uptime_s,
-                 (unsigned long)ih_free, (unsigned long)ih_min, (unsigned long)ih_lfb,
-                 (unsigned long)ps_free, (unsigned long)ps_min, (unsigned long)ps_lfb,
-                 (unsigned long)n_tasks,
-                 (unsigned long long)sd_total, (unsigned long long)sd_free);
-    } else {
-        snprintf(resp, sizeof(resp),
-                 "{\"mode\":\"connected\",\"fw_ver\":\"%s\",\"ip\":\"%s\",\"ssids\":[%s],\"has_pass\":[%s],\"tz_name\":\"%s\",\"time\":%s,\"ntp_synced\":%s,"
-                 "\"rssi\":%d,\"channel\":%d,"
-                 "\"uptime\":%lu,\"ble_state\":\"%s\",\"ble_paired\":%s,\"ble_name\":\"%s\",\"ble_addr\":\"%s\","
-                 "\"ih_free\":%lu,\"ih_min\":%lu,\"ih_lfb\":%lu,"
-                 "\"ps_free\":%lu,\"ps_min\":%lu,\"ps_lfb\":%lu,\"tasks\":%lu,"
-                 "\"sd_total\":%llu,\"sd_free\":%llu}",
-                 fw_ver, s_connected_ip, ssids_json, has_pass_json, tz_name, time_str, synced ? "true" : "false",
-                 rssi, primary_chan,
-                 (unsigned long)uptime_s, ble_state, ble_paired ? "true" : "false", ble_name, ble_addr,
-                 (unsigned long)ih_free, (unsigned long)ih_min, (unsigned long)ih_lfb,
-                 (unsigned long)ps_free, (unsigned long)ps_min, (unsigned long)ps_lfb,
-                 (unsigned long)n_tasks,
-                 (unsigned long long)sd_total, (unsigned long long)sd_free);
-    }
-    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    char *json_str = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(json_str);
     return ESP_OK;
 }
 
@@ -716,7 +702,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
     /* Start a new scan in a background task */
     s_scan_running = true;
     s_scan_done = false;
-    BaseType_t ret = xTaskCreate(wifi_scan_task, "wifi_scan", 4096, NULL, 3, NULL);
+    BaseType_t ret = (psram_task_create(wifi_scan_task, "wifi_scan", 4096, NULL, 3, tskNO_AFFINITY, NULL, NULL) != NULL) ? pdPASS : pdFAIL;
     if (ret != pdPASS) {
         s_scan_running = false;
         httpd_resp_send(req, "[]", HTTPD_RESP_USE_STRLEN);
@@ -808,22 +794,6 @@ static esp_err_t ble_confirm_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t ble_status_handler(httpd_req_t *req)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "state", as11_ble_get_status());
-    cJSON_AddStringToObject(o, "error", as11_ble_get_error());
-    cJSON_AddBoolToObject(o, "paired", as11_ble_is_paired());
-    cJSON *info = as11_ble_get_paired_info();
-    if (info) cJSON_AddItemToObject(o, "device", info);
-    char *json = cJSON_PrintUnformatted(o);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-    cJSON_free(json);
-    cJSON_Delete(o);
-    return ESP_OK;
-}
-
 static esp_err_t ble_forget_handler(httpd_req_t *req)
 {
     as11_ble_forget();
@@ -844,7 +814,7 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
+    psram_task_create(reboot_task, "reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -930,7 +900,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     httpd_resp_sendstr(req,
         "<html><body style=\"font-family:sans-serif\">Saved. Rebooting to connect...</body></html>");
 
-    xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
+    psram_task_create(reboot_task, "reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -1155,19 +1125,6 @@ static esp_err_t upload_config_post_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-static esp_err_t upload_status_get_handler(httpd_req_t *req)
-{
-    char *json = NULL;
-    if (uploader_get_status_json(&json) != ESP_OK || !json) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-    free(json);
     return ESP_OK;
 }
 
@@ -1401,62 +1358,68 @@ static void recreate_edfs_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* HTTP handlers for actions. Each responds immediately and runs work in a task. */
+/* HTTP handler for consolidated actions. Body: {"action":"reset-state|delete-edfs|reset-all|recreate-edfs"} */
 
-static esp_err_t action_reset_state_handler(httpd_req_t *req)
+static esp_err_t actions_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "action: reset upload state");
-    uploader_reset_state();
-    scan_and_queue_uploads();
+    char body[256];
+    int total = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int received = 0;
+    while (received < total) {
+        int r = httpd_req_recv(req, body + received, total - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    body[received] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+    const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(root, "action"));
+    if (!action) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing 'action'");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = ESP_OK;
+    if (strcmp(action, "reset-state") == 0) {
+        ESP_LOGI(TAG, "action: reset upload state");
+        uploader_reset_state();
+        scan_and_queue_uploads();
+    } else if (strcmp(action, "delete-edfs") == 0) {
+        ESP_LOGI(TAG, "action: delete all EDF files");
+        recursive_delete(SD_SDCARD_DIR);
+    } else if (strcmp(action, "reset-all") == 0) {
+        ESP_LOGI(TAG, "action: reset all (state + SDCARD + .sessions)");
+        uploader_reset_state();
+        recursive_delete(SD_SDCARD_DIR);
+        recursive_delete(SD_SESSIONS_DIR);
+    } else if (strcmp(action, "recreate-edfs") == 0) {
+        ESP_LOGI(TAG, "action: recreate EDFs");
+        TaskHandle_t h = psram_task_create(recreate_edfs_task, "recreate_edfs", 16384, NULL, 5, 1, NULL, NULL);
+        if (!h) {
+            err = ESP_ERR_NO_MEM;
+        }
+    } else {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown action");
+        return ESP_FAIL;
+    }
+
+    cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true}");
-    return ESP_OK;
-}
-
-static esp_err_t action_delete_edfs_handler(httpd_req_t *req)
-{
-    ESP_LOGI(TAG, "action: delete all EDF files");
-    recursive_delete(SD_SDCARD_DIR);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true}");
-    return ESP_OK;
-}
-
-static esp_err_t action_reset_all_handler(httpd_req_t *req)
-{
-    ESP_LOGI(TAG, "action: reset all (state + SDCARD + .sessions)");
-    uploader_reset_state();
-    recursive_delete(SD_SDCARD_DIR);
-    recursive_delete(SD_SESSIONS_DIR);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true}");
-    return ESP_OK;
-}
-
-static esp_err_t action_recreate_edfs_handler(httpd_req_t *req)
-{
-    ESP_LOGI(TAG, "action: recreate EDFs");
-    /* Run in a background task with PSRAM stack (EDF gen needs 10KB+).
-     * Internal-RAM stacks fragment the heap and cause SDMMC DMA allocation
-     * failures — see the same pattern in session_writer.c stop_task. */
-    const uint32_t stack_size = 16384;
-    StackType_t *stack = heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM);
-    StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-    if (!stack || !tcb) {
-        free(stack); free(tcb);
+    if (err == ESP_OK) {
+        httpd_resp_sendstr(req, "{\"ok\":true}");
+    } else {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_FAIL;
     }
-    TaskHandle_t h = xTaskCreateStaticPinnedToCore(
-        recreate_edfs_task, "recreate_edfs", stack_size, NULL, 5,
-        stack, tcb, 1);
-    if (!h) {
-        free(stack); free(tcb);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "task create failed");
-        return ESP_FAIL;
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -1470,9 +1433,9 @@ static esp_err_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 30;
+    config.max_uri_handlers = 35;
     config.stack_size = 8192;
-    config.max_open_sockets = 7;
+    config.max_open_sockets = 10;
 
     ESP_LOGI(TAG, "starting httpd: stack=%d, handlers=%d, internal free=%u",
              config.stack_size, config.max_uri_handlers,
@@ -1515,16 +1478,14 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &scan);
     httpd_register_uri_handler(s_httpd, &save);
 
-    /* AirSense 11 BLE pairing endpoints */
+    /* AirSense 11 BLE pairing endpoints (status folded into /api/status) */
     httpd_uri_t ble_scan = { .uri = "/api/ble/scan", .method = HTTP_GET, .handler = ble_scan_handler };
     httpd_uri_t ble_pair = { .uri = "/api/ble/pair", .method = HTTP_POST, .handler = ble_pair_handler };
     httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
-    httpd_uri_t ble_stat = { .uri = "/api/ble/status", .method = HTTP_GET, .handler = ble_status_handler };
     httpd_uri_t ble_forget = { .uri = "/api/ble/forget", .method = HTTP_POST, .handler = ble_forget_handler };
     httpd_register_uri_handler(s_httpd, &ble_scan);
     httpd_register_uri_handler(s_httpd, &ble_pair);
     httpd_register_uri_handler(s_httpd, &ble_conf);
-    httpd_register_uri_handler(s_httpd, &ble_stat);
     httpd_register_uri_handler(s_httpd, &ble_forget);
 
     /* EZShare-compatible file server endpoints */
@@ -1533,13 +1494,11 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &dir_hdl);
     httpd_register_uri_handler(s_httpd, &dl_hdl);
 
-    /* Upload configuration and status endpoints */
+    /* Upload configuration endpoints (status folded into /api/status) */
     httpd_uri_t up_cfg_get = { .uri = "/api/uploads/config", .method = HTTP_GET, .handler = upload_config_get_handler };
     httpd_uri_t up_cfg_post = { .uri = "/api/uploads/config", .method = HTTP_POST, .handler = upload_config_post_handler };
-    httpd_uri_t up_status = { .uri = "/api/uploads/status", .method = HTTP_GET, .handler = upload_status_get_handler };
     httpd_register_uri_handler(s_httpd, &up_cfg_get);
     httpd_register_uri_handler(s_httpd, &up_cfg_post);
-    httpd_register_uri_handler(s_httpd, &up_status);
 
     /* Device settings endpoints (brightness, LCD therapy mode) */
     httpd_uri_t dev_get = { .uri = "/api/device/settings", .method = HTTP_GET, .handler = device_settings_get_handler };
@@ -1551,15 +1510,9 @@ static esp_err_t start_webserver(void)
     httpd_uri_t reboot_post = { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler };
     httpd_register_uri_handler(s_httpd, &reboot_post);
 
-    /* Actions endpoints (Reset State, Delete EDFs, Reset All, Recreate EDFs) */
-    httpd_uri_t act_reset_state = { .uri = "/api/actions/reset-state", .method = HTTP_POST, .handler = action_reset_state_handler };
-    httpd_uri_t act_delete_edfs = { .uri = "/api/actions/delete-edfs", .method = HTTP_POST, .handler = action_delete_edfs_handler };
-    httpd_uri_t act_reset_all = { .uri = "/api/actions/reset-all", .method = HTTP_POST, .handler = action_reset_all_handler };
-    httpd_uri_t act_recreate = { .uri = "/api/actions/recreate-edfs", .method = HTTP_POST, .handler = action_recreate_edfs_handler };
-    httpd_register_uri_handler(s_httpd, &act_reset_state);
-    httpd_register_uri_handler(s_httpd, &act_delete_edfs);
-    httpd_register_uri_handler(s_httpd, &act_reset_all);
-    httpd_register_uri_handler(s_httpd, &act_recreate);
+    /* Consolidated actions endpoint */
+    httpd_uri_t actions = { .uri = "/api/actions", .method = HTTP_POST, .handler = actions_handler };
+    httpd_register_uri_handler(s_httpd, &actions);
 
     /* Log stream endpoints (SSE, download, level control) */
     log_stream_register_handlers(s_httpd);
@@ -1702,7 +1655,7 @@ esp_err_t netprov_start_portal(const struct netprov_config *cfg, char *ap_ip_out
 
     ESP_LOGI(TAG, "SoftAP '%s' up at " IPSTR, s_ap_ssid, IP2STR(&ip_info.ip));
 
-    xTaskCreate(netprov_dns_task, "dns", 4096, NULL, 5, NULL);
+    psram_task_create(netprov_dns_task, "dns", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     return start_webserver();
 }
 

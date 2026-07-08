@@ -157,7 +157,6 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
     /* Parse headers by temporarily null-terminating each line */
     size_t content_length = 0;
     bool chunked = false;
-    bool connection_close = false;
 
     char *line = buf;
     char *body_start = header_end;
@@ -173,9 +172,6 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
         }
         if (strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
             if (strstr(line, "chunked")) chunked = true;
-        }
-        if (strncasecmp(line, "Connection:", 11) == 0) {
-            if (strstr(line, "close")) connection_close = true;
         }
 
         *eol = '\r';

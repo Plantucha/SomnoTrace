@@ -1084,11 +1084,12 @@ function loadStatusTab(d) {
 
   var bleEl = document.getElementById('status-ble');
   if (bleEl) {
-    var st = d.ble_state || 'idle';
+    var ble = d.ble || {};
+    var st = ble.state || 'idle';
     var labels = {
       'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
       'waiting_passkey': 'Waiting passkey', 'confirming': 'Confirming…',
-      'paired': d.ble_name ? d.ble_name : 'Connected', 'error': 'Error'
+      'paired': (ble.device && ble.device.name) ? ble.device.name : 'Connected', 'error': 'Error'
     };
     var colors = {
       'idle': 'var(--text-muted)', 'scanning': 'var(--warning)', 'connecting': 'var(--warning)',
@@ -1268,26 +1269,28 @@ function blePoll() {
   bleRefresh();
 }
 function bleRefresh() {
-  fetch('/api/ble/status').then(function(r){ return r.json(); }).then(function(d) {
+  fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
+    var ble = d.ble;
+    if (!ble) return;
     var paired = document.getElementById('ble-paired');
     var unp = document.getElementById('ble-unpaired');
     var fgt = document.getElementById('btn-ble-forget');
     var pg = document.getElementById('ble-passkey-group');
 
-    if (d.state === 'waiting_passkey') { pg.style.display = 'block'; bleStatusMsg('Enter the code shown on your CPAP screen'); return; }
-    if (d.state === 'connecting') { bleStatusMsg('Connecting to device…'); return; }
-    if (d.state === 'confirming') { bleStatusMsg('Verifying code…'); return; }
-    if (d.state === 'error') { if (blePollTimer) clearInterval(blePollTimer); if (pg) pg.style.display = 'none'; bleStatusMsg('Error: ' + (d.error || 'pairing failed')); return; }
+    if (ble.state === 'waiting_passkey') { pg.style.display = 'block'; bleStatusMsg('Enter the code shown on your CPAP screen'); return; }
+    if (ble.state === 'connecting') { bleStatusMsg('Connecting to device…'); return; }
+    if (ble.state === 'confirming') { bleStatusMsg('Verifying code…'); return; }
+    if (ble.state === 'error') { if (blePollTimer) clearInterval(blePollTimer); if (pg) pg.style.display = 'none'; bleStatusMsg('Error: ' + (ble.error || 'pairing failed')); return; }
 
-    if (d.paired) {
+    if (ble.paired) {
       if (blePollTimer) clearInterval(blePollTimer);
       if (paired) paired.style.display = 'block';
       if (unp) unp.style.display = 'none';
       if (fgt) fgt.style.display = '';
       if (pg) pg.style.display = 'none';
       var dn = document.getElementById('ble-dev-name');
-      if (dn) dn.textContent = (d.device && d.device.name) || 'AirSense 11';
-      bleStatusMsg(d.state === 'paired' ? 'Paired successfully' : '');
+      if (dn) dn.textContent = (ble.device && ble.device.name) || 'AirSense 11';
+      bleStatusMsg(ble.state === 'paired' ? 'Paired successfully' : '');
     } else {
       if (paired) paired.style.display = 'none';
       if (unp) unp.style.display = 'block';
@@ -1383,12 +1386,14 @@ function loadUploadConfig() {
 }
 
 function loadUploadStatus() {
-  fetch('/api/uploads/status').then(function(r){ return r.json(); }).then(function(d) {
+  fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
+    var up = d.uploads;
+    if (!up) return;
     var el = document.getElementById('upload-status');
     if (!el) return;
-    if (!d.days || !d.days.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload days yet.</div>'; return; }
+    if (!up.days || !up.days.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload days yet.</div>'; return; }
     var h = '';
-    d.days.forEach(function(dy) {
+    up.days.forEach(function(dy) {
       h += '<div style="margin-bottom:8px;padding:8px;border:1px solid var(--card-border);border-radius:8px">';
       h += '<strong>' + dy.day + '</strong><br>';
       if (dy.backends) {
@@ -1425,7 +1430,11 @@ function execAction(action, confirmMsg) {
   if (!confirm(confirmMsg)) return;
   var statusEl = document.getElementById('action-status');
   if (statusEl) { statusEl.textContent = 'Working…'; statusEl.className = 'status-msg'; }
-  fetch('/api/actions/' + action, { method: 'POST' })
+  fetch('/api/actions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: action })
+  })
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (d.ok) {
@@ -1441,7 +1450,8 @@ function execAction(action, confirmMsg) {
 }
 
 /* ── Logs ──────────────────────────────────────────────────────── */
-var logEvtSource = null;
+var logWs = null;
+var logWsReconnectTimer = null;
 var logLines = [];                /* master list of all received lines */
 var LOG_MAX_LINES = 512;         /* cap to prevent DOM explosion */
 var logFilterQuery = '';
@@ -1450,24 +1460,58 @@ function setLogConnStatus(state) {
   var el = document.getElementById('log-conn-status');
   if (!el) return;
   if (state === 'connected')   { el.textContent = '● Connected';    el.style.color = 'var(--success)'; }
+  else if (state === 'connecting') { el.textContent = '● Loading history…'; el.style.color = 'var(--warning)'; }
   else if (state === 'error')  { el.textContent = '● Reconnecting…'; el.style.color = 'var(--warning)'; }
   else                         { el.textContent = '● Disconnected';  el.style.color = 'var(--text-muted)'; }
 }
 
 function connectLogStream() {
-  if (logEvtSource) return;
-  logEvtSource = new EventSource('/api/logs/stream');
-  logEvtSource.onopen = function() { setLogConnStatus('connected'); };
-  logEvtSource.onmessage = function(e) {
-    logLines.push(e.data);
+  if (logWs) return;
+  logLines = [];
+  setLogConnStatus('connecting');
+  fetch('/api/logs/history').then(function(r) { return r.text(); }).then(function(text) {
+    var lines = text.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].length > 0) logLines.push(lines[i]);
+    }
     if (logLines.length > LOG_MAX_LINES) logLines = logLines.slice(-LOG_MAX_LINES);
     renderLogTerminal();
-  };
-  logEvtSource.onerror = function() { setLogConnStatus('error'); };
+    setLogConnStatus('connected');
+  }).catch(function() {}).then(function() {
+    /* Open WebSocket for real-time log push. */
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    logWs = new WebSocket(proto + '//' + location.host + '/api/logs/ws');
+    logWs.onopen = function() {
+      setLogConnStatus('connected');
+    };
+    logWs.onmessage = function(ev) {
+      var lines = ev.data.split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        if (lines[i].length > 0) logLines.push(lines[i]);
+      }
+      if (logLines.length > LOG_MAX_LINES) logLines = logLines.slice(-LOG_MAX_LINES);
+      renderLogTerminal();
+    };
+    logWs.onclose = function() {
+      logWs = null;
+      setLogConnStatus('error');
+      /* Auto-reconnect after 2 seconds. */
+      if (!logWsReconnectTimer) {
+        logWsReconnectTimer = setTimeout(function() {
+          logWsReconnectTimer = null;
+          connectLogStream();
+        }, 2000);
+      }
+    };
+    logWs.onerror = function() {
+      /* onclose will fire after this. */
+    };
+  });
 }
 
 function disconnectLogStream() {
-  if (logEvtSource) { logEvtSource.close(); logEvtSource = null; }
+  if (logWsReconnectTimer) { clearTimeout(logWsReconnectTimer); logWsReconnectTimer = null; }
+  if (logWs) { logWs.onclose = null; logWs.close(); logWs = null; }
   setLogConnStatus('disconnected');
 }
 

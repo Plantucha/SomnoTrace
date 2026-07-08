@@ -46,6 +46,7 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
+#include "psram_task.h"
 
 static const char *TAG = "session";
 
@@ -479,7 +480,7 @@ session_writer_t *session_writer_start(void)
     xSemaphoreGive(s_active_mutex);
 
     /* Start flush task */
-    xTaskCreate(flush_task, "session_flush", FLUSH_TASK_STACK, s, 5, &s->flush_task_handle);
+    s->flush_task_handle = psram_task_create(flush_task, "session_flush", FLUSH_TASK_STACK, s, 5, tskNO_AFFINITY, NULL, NULL);
 
     ESP_LOGI(TAG, "=== SESSION STARTED: %s ===", s->session_id);
     ESP_LOGI(TAG, "dir: %s", s->dir);
@@ -1216,7 +1217,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                  * Stack 8KB: stop_task does session finalisation + post-therapy
                  * spool pulls (BLE I/O, not CPU-heavy).  EDF generation runs
                  * in a separate task on core 1 (see edf_task). */
-                xTaskCreate(stop_task, "session_stop", 8192, s, 15, NULL);
+                psram_task_create(stop_task, "session_stop", 8192, s, 15, tskNO_AFFINITY, NULL, NULL);
                 s = NULL;
             }
         }

@@ -19,12 +19,29 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
+# Lowered from 16384 now that CONFIG_SPI_FLASH_AUTO_SUSPEND (below) removes
+# the underlying crash mechanism (cache disabled during flash ops) that
+# this threshold was protecting against project-wide.  4096 is chosen so
+# that only small/DMA-adjacent allocations stay forced-internal; the httpd
+# worker (8192B stack), uploader/BLE task stacks, and most heap allocations
+# (cJSON buffers, HTTP response buffers, etc.) now default to PSRAM.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 
 # Flash: 16 MB, recommended for OTA + EDF staging. Adjust to your module.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Flash auto-suspend: keeps the SPI cache (and PSRAM cache) enabled during
+# flash erase/write operations.  Without this, any task with a PSRAM stack
+# that calls NVS or LittleFS APIs crashes with
+# "assert esp_task_stack_is_sane_cache_disabled()" because the cache is
+# disabled mid-operation.  With this enabled, the flash op is suspended
+# when the cache needs access, and PSRAM remains reachable throughout.
+# Our XMC flash (mfr 0x20) supports suspend per SFDP; the IDF checks at
+# runtime.  Even if a chip lacks suspend, the cache stays enabled (the op
+# just blocks longer) — no crash.
+CONFIG_SPI_FLASH_AUTO_SUSPEND=y
 
 # Custom partition table (OTA + 16MB)
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -50,6 +67,11 @@ CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 # Mobile browsers send very long headers during captive-portal detection.
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
 CONFIG_HTTPD_MAX_URI_LEN=512
+
+# WebSocket support for real-time log streaming (/api/logs/ws). Frames are
+# pushed via httpd_ws_send_frame_async from a forwarder task, so the single
+# httpd worker task is never blocked servicing the connection.
+CONFIG_HTTPD_WS_SUPPORT=y
 
 # BLE: NimBLE host.  We are a central (GATT client) for AirSense 11, but
 # ROLE_PERIPHERAL + GATT_SERVER must also be enabled so that NimBLE compiles
@@ -83,6 +105,7 @@ CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=24
 # CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG is not set
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
 
 # SD card (SDMMC 4-bit mode on GPIO 13-18)
 CONFIG_SDMMC_MAX_BLK_LEN=512

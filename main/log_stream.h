@@ -1,5 +1,5 @@
 /*
- * SomnoTrace - Log stream: ring-buffered log capture with SSE delivery
+ * SomnoTrace - Log stream: ring-buffered log capture with WebSocket delivery
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  *
  * This file is part of SomnoTrace.
@@ -40,10 +40,13 @@ extern "C" {
 void log_stream_init(void);
 
 /**
- * Register the three log-related HTTP endpoints on the given server:
+ * Register the log-related HTTP endpoints on the given server:
  *
- *   GET  /api/logs/stream   — SSE event stream (text/event-stream)
+ *   GET  /api/logs/ws        — WebSocket real-time log push (text frames)
+ *   GET  /api/logs/recent    — polling fallback for live log lines (JSON)
  *   GET  /api/logs/download  — plain-text download of buffered logs
+ *   GET  /api/logs/history   — plain-text history from SD card files
+ *   GET  /api/logs/level     — get current log level (JSON)
  *   POST /api/logs/level     — change runtime log level (JSON body)
  */
 void log_stream_register_handlers(httpd_handle_t server);
