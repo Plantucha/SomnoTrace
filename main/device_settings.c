@@ -156,5 +156,11 @@ esp_err_t device_settings_save_json(const char *json_str)
     /* Apply brightness immediately */
     bsp_display_set_brightness(cfg.brightness);
 
+    /* If therapy is active, re-evaluate backlight based on the new mode */
+    if (bsp_display_is_therapy_active()) {
+        bool lcd_off = (cfg.lcd_therapy_mode == LCD_THERAPY_OFF);
+        bsp_display_set_backlight(!lcd_off);
+    }
+
     return device_settings_save(&cfg);
 }

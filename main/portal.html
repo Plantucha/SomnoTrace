@@ -193,6 +193,18 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .settings-grid-2col{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
 .card-desc{font-size:.82rem;color:var(--text-muted);line-height:1.4;margin:-4px 0 14px 0}
 
+/* ── Advanced / Collapsible settings ───────────────────────────── */
+.advanced-section details{background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:10px 14px;margin-top:14px}
+.advanced-section summary{cursor:pointer;font-weight:600;font-size:.85rem;color:var(--text-muted);list-style:none;display:flex;align-items:center;gap:6px;user-select:none}
+.advanced-section summary::-webkit-details-marker{display:none}
+.advanced-section summary::before{content:"▸";font-size:.8rem;transition:transform .2s}
+.advanced-section details[open] summary::before{transform:rotate(90deg)}
+
+/* ── Real-time setting status label ────────────────────────────── */
+.setting-status{font-size:.78rem;font-weight:500;color:var(--text-muted);margin-left:6px;transition:color .2s}
+.setting-status.ok{color:var(--success)}
+.setting-status.err{color:var(--danger)}
+
 /* ── Responsive ────────────────────────────────────────────────── */
 @media(max-width:768px){
 .status-grid,.settings-grid-2col{grid-template-columns:1fr}
@@ -285,10 +297,15 @@ Wi-Fi Configuration
 <select id="tz-select" class="form-control" data-dirty="false" onchange="markDirty(this)"></select>
 <input type="hidden" id="tz-str">
 </div>
-<div class="form-group" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--card-border)">
+<div class="advanced-section" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--card-border)">
+<details>
+<summary>Advanced settings</summary>
+<div class="form-group" style="margin-top:12px">
 <label>NTP Server</label>
 <p class="card-desc" style="margin:2px 0 8px 0">Leave empty to use automatic NTP (DHCP or public servers). Enter a hostname or IP to use a custom NTP server exclusively.</p>
 <input type="text" id="ntp-server" class="form-control" placeholder="Auto (DHCP / public NTP)" data-dirty="false" oninput="markDirty(this)">
+</div>
+</details>
 </div>
 </div>
 
@@ -461,22 +478,32 @@ SD Card File Access (FTP)
 </div>
 </div>
 
-<!-- Hardware Preferences -->
-<div class="card sta-only" style="margin-top:8px">
-<div class="card-title">Hardware Preferences</div>
-<div class="settings-grid-2col">
+<!-- Display (real-time, no reboot needed) -->
+<div class="settings-section-header sta-only">
+<span class="step-num">5</span> Display
+</div>
+<div class="card advanced-section sta-only" style="border-left-color:var(--accent-ble)">
+<div class="card-title">
+<svg viewBox="0 0 24 24" style="fill:var(--accent-ble)"><path d="M21 2H3a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7v2H8v2h8v-2h-2v-2h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zm0 14H3V4h18v12z"/></svg>
+Display
+</div>
+<p class="card-desc">These settings are applied immediately and do not require a reboot.</p>
+<details>
+<summary>Display settings</summary>
+<div class="settings-grid-2col" style="margin-top:12px">
 <div class="form-group">
-<label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">50%</span></label>
+<label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">50%</span><span id="brightness-status" class="setting-status"></span></label>
 <input type="range" id="lcd-brightness" class="form-control" min="1" max="100" value="50" style="padding:0" oninput="onBrightnessInput(this.value)">
 </div>
 <div class="form-group">
-<label>LCD During Therapy</label>
-<select id="lcd-therapy-mode" class="form-control" onchange="onLcdTherapyModeChange()">
-<option value="0">Live Graph</option>
-<option value="1">Off (no backlight)</option>
+<label>During sleep display mode <span id="therapy-status" class="setting-status"></span></label>
+<select id="lcd-therapy-mode" class="form-control" onchange="onLcdTherapyModeChange(this)">
+<option value="0">Show live graph</option>
+<option value="1">Backlight off</option>
 </select>
 </div>
 </div>
+</details>
 </div>
 
 <!-- Sticky Floating Save & Reboot Bar -->
@@ -667,11 +694,13 @@ function switchTab(tabId) {
     disconnectLogStream();
   }
   /* Lazy-load Settings tab data on first visit. */
-  if (tabId === 'settings' && !settingsLoaded && !PORTAL_MODE) {
+  if (tabId === 'settings' && !settingsLoaded) {
     settingsLoaded = true;
-    bleRefresh();
-    loadUploadConfig();
-    loadUploadStatus();
+    if (!PORTAL_MODE) {
+      bleRefresh();
+      loadUploadConfig();
+      loadUploadStatus();
+    }
     loadDeviceSettings();
     scanWifi();
   }
@@ -703,7 +732,7 @@ function togglePw(id) {
 }
 
 /* ── Dirty State Tracking ──────────────────────────────────────── */
-var isDirty = { wifi: false, upload: false, tz: false, device: false };
+var isDirty = { wifi: false, upload: false, tz: false };
 
 function markDirty(el) {
   if (el) el.setAttribute('data-dirty', 'true');
@@ -718,6 +747,12 @@ function markDirty(el) {
       isDirty.wifi = true;
     }
   }
+  updateSaveButton();
+}
+
+function clearDirty() {
+  isDirty = { wifi: false, upload: false, tz: false };
+  document.querySelectorAll('[data-dirty="true"]').forEach(function(el) { el.setAttribute('data-dirty', 'false'); });
   updateSaveButton();
 }
 
@@ -745,7 +780,7 @@ function updateSaveButton() {
   var btn = document.getElementById('btn-save');
   var footer = document.getElementById('save-footer');
   var msg = document.getElementById('save-msg');
-  var dirty = isDirty.wifi || isDirty.upload || isDirty.tz || isDirty.device;
+  var dirty = isDirty.wifi || isDirty.upload || isDirty.tz;
   if (btn) btn.disabled = !dirty;
   if (footer) {
     if (dirty) footer.classList.add('dirty');
@@ -1211,17 +1246,6 @@ function saveAll() {
     );
   }
 
-  // Device settings (LCD therapy mode — brightness is already saved live)
-  if (isDirty.device) {
-    var devBody = {
-      brightness: parseInt(valOf('lcd-brightness')) || 50,
-      lcd_therapy_mode: parseInt(valOf('lcd-therapy-mode')) || 0
-    };
-    promises.push(
-      fetch('/api/device/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(devBody) })
-    );
-  }
-
   if (promises.length === 0) {
     if (statusEl) { statusEl.textContent = 'No changes to save'; statusEl.className = 'status-msg'; }
     return;
@@ -1229,8 +1253,7 @@ function saveAll() {
 
   Promise.all(promises).then(function() {
     if (statusEl) { statusEl.textContent = 'Saved! Rebooting…'; statusEl.className = 'status-msg success'; }
-    isDirty = { wifi: false, upload: false, tz: false, device: false };
-    updateSaveButton();
+    clearDirty();
     /* Trigger actual reboot after a short delay to let the response reach the client */
     setTimeout(function() {
       fetch('/api/reboot', { method: 'POST' }).catch(function() {});
@@ -1323,9 +1346,17 @@ function bleRefresh() {
 /* ── Device Settings (brightness, LCD therapy mode) ────────────── */
 var brightnessTimer = null;
 
+function setStatus(id, text, ok) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'setting-status' + (ok ? ' ok' : ok === false ? ' err' : '');
+}
+
 function onBrightnessInput(val) {
   var label = document.getElementById('brightness-val');
   if (label) label.textContent = val + '%';
+  setStatus('brightness-status', '…', null);
   /* Debounce the POST so we don't spam the device while dragging */
   if (brightnessTimer) clearTimeout(brightnessTimer);
   brightnessTimer = setTimeout(function() {
@@ -1334,22 +1365,25 @@ function onBrightnessInput(val) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ brightness: parseInt(val) })
     }).then(function() {
-      if (label) label.textContent = val + '% ✓';
-      setTimeout(function() {
-        if (label) label.textContent = val + '%';
-      }, 1000);
+      setStatus('brightness-status', '✓', true);
     }).catch(function() {
-      if (label) label.textContent = val + '% ✗';
-      setTimeout(function() {
-        if (label) label.textContent = val + '%';
-      }, 1500);
+      setStatus('brightness-status', '✗', false);
     });
   }, 200);
 }
 
-function onLcdTherapyModeChange() {
-  isDirty.device = true;
-  updateSaveButton();
+function onLcdTherapyModeChange(sel) {
+  var mode = sel ? parseInt(sel.value) || 0 : 0;
+  setStatus('therapy-status', '…', null);
+  fetch('/api/device/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ lcd_therapy_mode: mode })
+  }).then(function() {
+    setStatus('therapy-status', '✓', true);
+  }).catch(function() {
+    setStatus('therapy-status', '✗', false);
+  });
 }
 
 function loadDeviceSettings() {
@@ -1626,7 +1660,8 @@ function applyPortalMode() {
   if (badge) badge.style.display = 'inline-block';
   // Hide all STA-only elements
   document.querySelectorAll('.sta-only').forEach(function(el) { el.style.display = 'none'; });
-  // Theme selector stays visible (per spec)
+  // In portal mode the only usable tab is Settings; switch to it now
+  switchTab('settings');
 }
 
 /* ── Telemetry polling + uPlot charts ──────────────────────────── */
