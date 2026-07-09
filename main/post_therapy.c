@@ -553,7 +553,10 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
         errors++;
     }
 
-    /* 2. Pull TherapyEvents-RespiratoryEvents spool → <prefix>_resp_events.bin */
+    /* 2. Pull TherapyEvents-RespiratoryEvents spool → <prefix>_resp_events.bin
+     * TODO: This spool pull is no longer needed for EVE.edf/CSL.edf generation
+     * (those now read from events.snt). It remains as a diagnostic backup.
+     * Removing it would save ~1-2 s of BLE time at session end. */
     if (collect_resp_events(session_dir, file_prefix, from_dt) != ESP_OK) {
         errors++;
     }

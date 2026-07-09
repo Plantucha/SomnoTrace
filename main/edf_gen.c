@@ -471,6 +471,38 @@ static esp_err_t snt_read_header(FILE *f, snt_header_t *hdr)
  *
  * Returns the AS11-clock epoch ms, or -1 if MaskOn is not found.
  * The caller converts to NTP by adding clock_drift_ms. */
+static int64_t parse_iso8601_utc_ms(const char *iso_str)
+{
+    if (!iso_str) return -1;
+    struct tm ev_tm = {0};
+    int ms = 0;
+    int n = sscanf(iso_str, "%d-%d-%dT%d:%d:%d.%dZ",
+                   &ev_tm.tm_year, &ev_tm.tm_mon, &ev_tm.tm_mday,
+                   &ev_tm.tm_hour, &ev_tm.tm_min, &ev_tm.tm_sec, &ms);
+    if (n < 6) {
+        n = sscanf(iso_str, "%d-%d-%dT%d:%d:%dZ",
+                   &ev_tm.tm_year, &ev_tm.tm_mon, &ev_tm.tm_mday,
+                   &ev_tm.tm_hour, &ev_tm.tm_min, &ev_tm.tm_sec);
+        if (n < 6) return -1;
+        ms = 0;
+    }
+    ev_tm.tm_year -= 1900;
+    ev_tm.tm_mon -= 1;
+    /* Howard Hinnant's date algorithm (public domain). */
+    int y = ev_tm.tm_year + 1900;
+    int m = ev_tm.tm_mon + 1;
+    int d = ev_tm.tm_mday;
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = (int64_t)era * 146097 + (int)doe - 719468;
+    int64_t secs = days * 86400 + ev_tm.tm_hour * 3600 +
+                   ev_tm.tm_min * 60 + ev_tm.tm_sec;
+    return secs * 1000 + ms;
+}
+
 static int64_t find_maskon_time_ms(const char *session_dir, const char *session_id)
 {
     char events_path[350];
@@ -499,27 +531,8 @@ static int64_t find_maskon_time_ms(const char *session_dir, const char *session_
                     cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
                     if (!rt || !cJSON_IsString(rt)) continue;
 
-                    /* Parse ISO 8601 UTC: "2026-07-05T13:42:42.570Z" */
-                    struct tm ev_tm = {0};
-                    int ms = 0;
-                    sscanf(rt->valuestring, "%d-%d-%dT%d:%d:%d.%dZ",
-                           &ev_tm.tm_year, &ev_tm.tm_mon, &ev_tm.tm_mday,
-                           &ev_tm.tm_hour, &ev_tm.tm_min, &ev_tm.tm_sec, &ms);
-                    ev_tm.tm_year -= 1900;
-                    ev_tm.tm_mon -= 1;
-                    /* Howard Hinnant's date algorithm (public domain). */
-                    int y = ev_tm.tm_year + 1900;
-                    int m = ev_tm.tm_mon + 1;
-                    int d = ev_tm.tm_mday;
-                    y -= m <= 2;
-                    const int era = (y >= 0 ? y : y - 399) / 400;
-                    const unsigned yoe = (unsigned)(y - era * 400);
-                    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-                    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-                    int64_t days = (int64_t)era * 146097 + (int)doe - 719468;
-                    int64_t secs = days * 86400 + ev_tm.tm_hour * 3600 +
-                                   ev_tm.tm_min * 60 + ev_tm.tm_sec;
-                    result = secs * 1000 + ms;
+                    int64_t ts = parse_iso8601_utc_ms(rt->valuestring);
+                    if (ts >= 0) result = ts;
                 }
             }
         }
@@ -1858,10 +1871,10 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
 }
 
 /* ════════════════════════════════════════════════════════════════════
- *  Section 7: EVE.edf generation from respiratory events spool
+ *  Section 7: EVE.edf / CSL.edf generation from events.snt stream
  * ════════════════════════════════════════════════════════════════════
  *
- * EVE.edf is an EDF+D annotation file containing respiratory event
+ * EVE.edf and CSL.edf are EDF+D annotation files containing event
  * annotations.  Each data record contains:
  *   - 62 bytes: EDF+ TAL annotation payload
  *   - 2 bytes:  little-endian CRC16 over the 62 payload bytes
@@ -1869,93 +1882,45 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
  * The first record is always a "Recording starts" marker.
  * Subsequent records contain one event TAL each.
  *
- * Event labels (from edf_annotations.md):
- *   HypopneaEnd     → "Hypopnea"
- *   CentralApneaEnd → "Central Apnea"
+ * Event labels (from edf_annotations.md and live notifications):
+ *   HypopneaEnd         → "Hypopnea"
+ *   CentralApneaEnd     → "Central Apnea"
  *   ObstructiveApneaEnd → "Obstructive Apnea"
- *   ApneaEnd        → "Apnea"
- *   ReraEnd         → "Arousal"
+ *   ApneaEnd            → "Apnea"
+ *   ReraEnd             → "Arousal"
+ *   CsrStart / CsrEnd   → "CSR" (in CSL mode)
+ *
+ * All timestamps inside events.snt reportTime are in AS11 clock time.
+ * We apply clock_drift_ms (NTP - AS11) so that onset timestamps reflect
+ * seconds elapsed from session_start_ms (NTP-corrected start of therapy).
  */
 
-/* Event protobuf field numbers (from rpc_spools.md event family).
- * The spool wire format is:
- *   top-level field 4 (wire 2) → outer wrapper
- *     inner field 1 (wire 2) → inner wrapper
- *       repeated field 1 (wire 2) → individual event records
- *         field 1 (varint) = event type code
- *         field 2 (varint) = timestamp (may be start or reportTime)
- *         field 3 (varint) = end timestamp / reportTime
- *         field 4 (varint) = duration in ms (optional)
- * Note: docs label field 2 as "start" but real AS11 EDF output places
- * the annotation onset at the event END (reportTime).  We use field 3
- * as the primary onset source with field 2 as fallback. */
-#define EVT_F_TYPE_CODE    1   /* event type code (varint) */
-#define EVT_F_START_TS     2   /* timestamp (varint, epoch ms) */
-#define EVT_F_END_TS       3   /* end timestamp / reportTime (varint, epoch ms) */
-#define EVT_F_DURATION_MS  4   /* duration in milliseconds (varint, optional) */
-
-/* Event type codes from TherapyEvents-RespiratoryEvents.
- * Protobuf3 requires value 0 as the UNKNOWN default; code 1 is a
- * sentinel that never appears in real event data.  Real events start
- * at code 2.  Confirmed by cross-referencing AS11 reference EVE.edf
- * exports against ESP-generated events across 3 sessions. */
-enum {
-    EVT_TYPE_NONE = 0,
-    EVT_TYPE_HYPOPNEA_END = 2,
-    EVT_TYPE_CENTRAL_APNEA_END = 3,
-    EVT_TYPE_OBSTRUCTIVE_APNEA_END = 4,
-    EVT_TYPE_APNEA_END = 5,
-    EVT_TYPE_RERA_END = 6,
-    EVT_TYPE_CSR_START = 7,
-    EVT_TYPE_CSR_END = 8,
-};
-
-/* Context for event protobuf iteration */
-typedef struct {
-    int64_t start_ts_ms;
-    int64_t end_ts_ms;
-    int type_code;
-    int64_t duration_ms;
-} event_record_t;
-
-static void event_field_cb(const pb_field_t *f, void *ud)
+static const char *event_label_map_str(const char *ev_name, bool csl_mode)
 {
-    event_record_t *evt = (event_record_t *)ud;
-    if (f->wire != 0) return;
-    int64_t val = pb_varint_val(f);
-    switch (f->field) {
-        case EVT_F_TYPE_CODE:   evt->type_code = (int)val; break;
-        case EVT_F_START_TS:    evt->start_ts_ms = val; break;
-        case EVT_F_END_TS:      evt->end_ts_ms = val; break;
-        case EVT_F_DURATION_MS: evt->duration_ms = val; break;
-    }
-}
-
-/* Map event type code to EDF annotation label.
- * In CSL mode, only CSR events are emitted; in EVE mode, only respiratory
- * events are emitted.  This mirrors the AS11's behaviour where EVE.edf
- * contains respiratory events and CSL.edf contains only CSR events. */
-static const char *event_label_map(int type_code, bool csl_mode)
-{
+    if (!ev_name) return NULL;
     if (csl_mode) {
-        switch (type_code) {
-            case EVT_TYPE_CSR_START:  return "CSR";
-            case EVT_TYPE_CSR_END:    return "CSR";
-            default:                  return NULL;
+        if (strcmp(ev_name, "CsrStart") == 0 || strcmp(ev_name, "CsrEnd") == 0 ||
+            strcmp(ev_name, "CSRStart") == 0 || strcmp(ev_name, "CSREnd") == 0) {
+            return "CSR";
         }
+        return NULL;
     }
-    switch (type_code) {
-        case EVT_TYPE_HYPOPNEA_END:         return "Hypopnea";
-        case EVT_TYPE_CENTRAL_APNEA_END:    return "Central Apnea";
-        case EVT_TYPE_OBSTRUCTIVE_APNEA_END:return "Obstructive Apnea";
-        case EVT_TYPE_APNEA_END:            return "Apnea";
-        case EVT_TYPE_RERA_END:             return "Arousal";
-        default:                            return NULL;
-    }
+    if (strcmp(ev_name, "HypopneaEnd") == 0)          return "Hypopnea";
+    if (strcmp(ev_name, "CentralApneaEnd") == 0)      return "Central Apnea";
+    if (strcmp(ev_name, "ObstructiveApneaEnd") == 0)  return "Obstructive Apnea";
+    if (strcmp(ev_name, "ApneaEnd") == 0)             return "Apnea";
+    if (strcmp(ev_name, "ReraEnd") == 0)              return "Arousal";
+    return NULL;
 }
+
+typedef struct {
+    int64_t onset_sec;
+    int64_t dur_sec;
+    const char *label;
+} snt_event_t;
 
 static esp_err_t generate_eve_edf(const char *edf_path,
-                                  const uint8_t *events_data, size_t events_len,
+                                  const char *snt_path,
                                   int64_t session_start_ms, int64_t clock_drift_ms,
                                   const char *patient_id, const char *recording_id,
                                   const char *start_date, const char *start_time,
@@ -1965,108 +1930,88 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     strncpy(path, edf_path, sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
-    /* Parse events from the protobuf spool data.
-     * The spool has two wrapper levels: outer field 4 → inner field 1 →
-     * repeated event records (each field 1 inside the inner wrapper). */
+    size_t capacity = 128;
+    size_t count = 0;
+    snt_event_t *ev_list = malloc(capacity * sizeof(snt_event_t));
+    if (!ev_list) {
+        ESP_LOGE(TAG, "generate_eve_edf: out of memory");
+        return ESP_ERR_NO_MEM;
+    }
 
-    /* Helper: extract inner event data from the two-level wrapper.
-     * Returns pointer to the inner event-list data and its length,
- * or NULL if the wrapper structure is not recognised. */
-    const uint8_t *event_list = NULL;
-    size_t event_list_len = 0;
-    if (events_data && events_len > 0) {
-        /* Outer level: find field 4 (wire 2) */
-        size_t pos = 0;
-        while (pos < events_len) {
-            uint64_t tag = pb_decode_varint(events_data, events_len, &pos);
-            int field = (int)(tag >> 3);
-            int wire = (int)(tag & 0x07);
-            if (field == 0) break;
-            if (wire == 2) {
-                size_t lpos = pos;
-                uint64_t flen = pb_decode_varint(events_data, events_len, &lpos);
-                pos = lpos;
-                if (pos + flen > events_len) break;
-                if (field == 4) {
-                    /* Outer wrapper found — parse inner field 1 */
-                    const uint8_t *outer = events_data + pos;
-                    size_t outer_len = (size_t)flen;
-                    size_t opos = 0;
-                    while (opos < outer_len) {
-                        uint64_t otag = pb_decode_varint(outer, outer_len, &opos);
-                        int ofield = (int)(otag >> 3);
-                        int owire = (int)(otag & 0x07);
-                        if (ofield == 0) break;
-                        if (owire == 2) {
-                            size_t ilpos = opos;
-                            uint64_t ilen = pb_decode_varint(outer, outer_len, &ilpos);
-                            opos = ilpos;
-                            if (opos + ilen > outer_len) break;
-                            if (ofield == 1) {
-                                event_list = outer + opos;
-                                event_list_len = (size_t)ilen;
+    FILE *ef = fopen(snt_path, "r");
+    if (ef) {
+        char line[512];
+        while (fgets(line, sizeof(line), ef)) {
+            cJSON *msg = cJSON_Parse(line);
+            if (!msg) continue;
+            cJSON *params = cJSON_GetObjectItem(msg, "params");
+            if (params) {
+                cJSON *data_id = cJSON_GetObjectItem(params, "dataId");
+                if (data_id && cJSON_IsString(data_id)) {
+                    /* For EVE.edf, filter TherapyEvents-RespiratoryEvents.
+                     * For CSL.edf, scan all dataIds (harmless — CSR events
+                     * are delivered under TherapyEvents-RespiratoryEvents,
+                     * so the label filter in event_label_map_str does the
+                     * real work).  Could be tightened to only that dataId. */
+                    if (csl_mode || strcmp(data_id->valuestring, "TherapyEvents-RespiratoryEvents") == 0) {
+                        cJSON *events = cJSON_GetObjectItem(params, "events");
+                        if (events && cJSON_IsArray(events)) {
+                            int n = cJSON_GetArraySize(events);
+                            for (int i = 0; i < n; i++) {
+                                cJSON *ev = cJSON_GetArrayItem(events, i);
+                                if (!ev) continue;
+                                cJSON *label_j = cJSON_GetObjectItem(ev, "event");
+                                if (!label_j || !cJSON_IsString(label_j)) continue;
+                                const char *label = event_label_map_str(label_j->valuestring, csl_mode);
+                                if (!label) continue;
+                                cJSON *rt_j = cJSON_GetObjectItem(ev, "reportTime");
+                                if (!rt_j || !cJSON_IsString(rt_j)) continue;
+
+                                int64_t as11_ts_ms = parse_iso8601_utc_ms(rt_j->valuestring);
+                                if (as11_ts_ms < 0) continue;
+
+                                int64_t event_ntp_ms = as11_ts_ms + clock_drift_ms;
+                                int64_t onset_sec = (event_ntp_ms - session_start_ms) / 1000;
+                                if (onset_sec < 0) onset_sec = 0;
+
+                                int64_t dur_sec = 0;
+                                cJSON *dur_j = cJSON_GetObjectItem(ev, "durationSeconds");
+                                if (dur_j && cJSON_IsNumber(dur_j)) {
+                                    dur_sec = dur_j->valueint;
+                                    if (dur_sec < 0) dur_sec = 0;
+                                }
+
+                                if (count >= capacity) {
+                                    size_t new_cap = capacity * 2;
+                                    snt_event_t *tmp = realloc(ev_list, new_cap * sizeof(snt_event_t));
+                                    if (tmp) {
+                                        ev_list = tmp;
+                                        capacity = new_cap;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                ev_list[count].onset_sec = onset_sec;
+                                ev_list[count].dur_sec = dur_sec;
+                                ev_list[count].label = label;
+                                count++;
                             }
-                            opos += ilen;
-                        } else if (owire == 0) {
-                            pb_decode_varint(outer, outer_len, &opos);
-                        } else if (owire == 1) {
-                            opos += 8;
-                        } else if (owire == 5) {
-                            opos += 4;
-                        } else {
-                            break;
                         }
                     }
                 }
-                pos += flen;
-            } else if (wire == 0) {
-                pb_decode_varint(events_data, events_len, &pos);
-            } else if (wire == 1) {
-                pos += 8;
-            } else if (wire == 5) {
-                pos += 4;
-            } else {
-                break;
             }
+            cJSON_Delete(msg);
         }
+        fclose(ef);
+    } else {
+        ESP_LOGW(TAG, "generate_eve_edf: cannot open %s: %s", snt_path, strerror(errno));
     }
 
-    /* Count events we can decode */
-    int event_count = 0;
-    if (event_list && event_list_len > 0) {
-        size_t pos = 0;
-        while (pos < event_list_len) {
-            uint64_t tag = pb_decode_varint(event_list, event_list_len, &pos);
-            int field = (int)(tag >> 3);
-            int wire = (int)(tag & 0x07);
-            if (field == 0) break;
-            if (wire == 2) {
-                size_t lpos = pos;
-                uint64_t flen = pb_decode_varint(event_list, event_list_len, &lpos);
-                pos = lpos;
-                if (pos + flen > event_list_len) break;
-                event_record_t evt = {0};
-                pb_iter(event_list + pos, (size_t)flen, event_field_cb, &evt);
-                if (event_label_map(evt.type_code, csl_mode)) {
-                    event_count++;
-                }
-                pos += flen;
-            } else if (wire == 0) {
-                pb_decode_varint(event_list, event_list_len, &pos);
-            } else if (wire == 1) {
-                pos += 8;
-            } else if (wire == 5) {
-                pos += 4;
-            } else {
-                break;
-            }
-        }
-    }
+    /* Total records = 1 (Recording starts) + count */
+    int total_records = 1 + (int)count;
 
-    /* Total records = 1 (Recording starts) + event_count */
-    int total_records = 1 + event_count;
-
-    ESP_LOGI(TAG, "EVE.edf: %d events, %d total records", event_count, total_records);
+    ESP_LOGI(TAG, "%s: %d events from %s, %d total records",
+             csl_mode ? "CSL.edf" : "EVE.edf", (int)count, snt_path, total_records);
 
     /* EVE.edf signal definitions: EDF Annotations only.
      * edf_write_header auto-appends Crc16 as the last signal,
@@ -2085,6 +2030,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     FILE *edf = fopen(path, "w+b");
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
+        free(ev_list);
         return ESP_FAIL;
     }
 
@@ -2095,6 +2041,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     if (header_bytes < 0) {
         ESP_LOGE(TAG, "EVE.edf: edf_write_header failed");
         fclose(edf);
+        free(ev_list);
         return ESP_FAIL;
     }
 
@@ -2103,7 +2050,6 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     {
         uint8_t payload[62];
         memset(payload, 0, 62);
-        /* EDF+ TAL: +0\x14\x14\x00 +0\x15 0\x14 Recording starts\x14\x00... */
         int p = 0;
         payload[p++] = '+';
         payload[p++] = '0';
@@ -2121,7 +2067,6 @@ static esp_err_t generate_eve_edf(const char *edf_path,
         payload[p++] = 0x14;
         payload[p++] = 0x00;
 
-        /* CRC16 over the 62-byte payload (little-endian) */
         uint16_t crc = crc16_ccitt(payload, 62);
         fwrite(payload, 1, 62, edf);
         uint8_t crc_bytes[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
@@ -2129,92 +2074,47 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     }
 
     /* Subsequent records: one event per record */
-    if (event_list && event_list_len > 0) {
-        size_t pos = 0;
-        while (pos < event_list_len) {
-            uint64_t tag = pb_decode_varint(event_list, event_list_len, &pos);
-            int field = (int)(tag >> 3);
-            int wire = (int)(tag & 0x07);
-            if (field == 0) break;
-            if (wire == 2) {
-                size_t lpos = pos;
-                uint64_t flen = pb_decode_varint(event_list, event_list_len, &lpos);
-                pos = lpos;
-                if (pos + flen > event_list_len) break;
+    for (size_t i = 0; i < count; i++) {
+        uint8_t payload[62];
+        memset(payload, 0, 62);
+        int p = 0;
+        /* Empty timekeeping TAL */
+        payload[p++] = '+';
+        payload[p++] = '0';
+        payload[p++] = 0x14;
+        payload[p++] = 0x14;
+        payload[p++] = 0x00;
 
-                event_record_t evt = {0};
-                pb_iter(event_list + pos, (size_t)flen, event_field_cb, &evt);
-                pos += flen;
+        /* Event TAL: +onset\x15duration\x14label\x14\x00 */
+        char onset_str[24];
+        snprintf(onset_str, sizeof(onset_str), "+%lld", (long long)ev_list[i].onset_sec);
+        memcpy(payload + p, onset_str, strlen(onset_str));
+        p += strlen(onset_str);
+        payload[p++] = 0x15;  /* duration separator */
+        char dur_str[24];
+        snprintf(dur_str, sizeof(dur_str), "%lld", (long long)ev_list[i].dur_sec);
+        memcpy(payload + p, dur_str, strlen(dur_str));
+        p += strlen(dur_str);
+        payload[p++] = 0x14;
+        size_t max_copy = 62 - p - 3;
+        size_t label_len = strlen(ev_list[i].label);
+        if (label_len > max_copy) label_len = max_copy;
+        memcpy(payload + p, ev_list[i].label, label_len);
+        p += label_len;
+        payload[p++] = 0x14;
+        payload[p++] = 0x00;
 
-                const char *label = event_label_map(evt.type_code, csl_mode);
-                if (!label) continue;
-
-                /* Compute onset (seconds from session start).
-                 * Real AS11 EDF files place the onset at the END of the event
-                 * (reportTime), not the start — confirmed by cross-referencing
-                 * EVE onsets with BRP flow data: flow is flat (apnea) at
-                 * onset-duration and resumes at onset.
-                 * Use end_ts_ms (protobuf field 3) as the primary source;
-                 * fall back to start_ts_ms (field 2) if end is absent, since
-                 * some spool records may only populate field 2.
-                 * Timestamps are in AS11 internal time; apply clock_drift_ms
-                 * to convert to NTP time before computing the offset. */
-                int64_t report_ts_ms = evt.end_ts_ms ? evt.end_ts_ms : evt.start_ts_ms;
-                int64_t event_ntp_ms = report_ts_ms + clock_drift_ms;
-                int64_t onset_sec = (event_ntp_ms - session_start_ms) / 1000;
-                if (onset_sec < 0) onset_sec = 0;
-
-                /* Duration: spool gives milliseconds, EDF wants seconds */
-                int64_t dur_sec = evt.duration_ms / 1000;
-
-                /* Build TAL payload */
-                uint8_t payload[62];
-                memset(payload, 0, 62);
-                int p = 0;
-                /* Empty timekeeping TAL */
-                payload[p++] = '+';
-                payload[p++] = '0';
-                payload[p++] = 0x14;
-                payload[p++] = 0x14;
-                payload[p++] = 0x00;
-
-                /* Event TAL: +onset\x15duration\x14label\x14\x00 */
-                char onset_str[24];
-                snprintf(onset_str, sizeof(onset_str), "+%lld", (long long)onset_sec);
-                memcpy(payload + p, onset_str, strlen(onset_str));
-                p += strlen(onset_str);
-                payload[p++] = 0x15;  /* duration separator */
-                char dur_str[24];
-                snprintf(dur_str, sizeof(dur_str), "%lld", (long long)dur_sec);
-                memcpy(payload + p, dur_str, strlen(dur_str));
-                p += strlen(dur_str);
-                payload[p++] = 0x14;
-                memcpy(payload + p, label, strlen(label));
-                p += strlen(label);
-                payload[p++] = 0x14;
-                payload[p++] = 0x00;
-
-                /* CRC16 (little-endian) */
-                uint16_t crc = crc16_ccitt(payload, 62);
-                fwrite(payload, 1, 62, edf);
-                uint8_t crc_bytes[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
-                fwrite(crc_bytes, 1, 2, edf);
-            } else if (wire == 0) {
-                pb_decode_varint(event_list, event_list_len, &pos);
-            } else if (wire == 1) {
-                pos += 8;
-            } else if (wire == 5) {
-                pos += 4;
-            } else {
-                break;
-            }
-        }
+        uint16_t crc = crc16_ccitt(payload, 62);
+        fwrite(payload, 1, 62, edf);
+        uint8_t crc_bytes[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
+        fwrite(crc_bytes, 1, 2, edf);
     }
 
+    free(ev_list);
     fsync(fileno(edf));
     fclose(edf);
 
-    ESP_LOGI(TAG, "EVE.edf generated: %s (%d events)", path, event_count);
+    ESP_LOGI(TAG, "%s generated: %s (%d events)", csl_mode ? "CSL.edf" : "EVE.edf", path, (int)count);
     return ESP_OK;
 }
 
@@ -2534,11 +2434,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     ESP_LOGI(TAG, "settings.json: path=%s %s", settings_path,
              settings ? "loaded OK" : "FAILED to load");
 
-    /* Read respiratory events spool data for EVE.edf */
-    char events_path[330];
-    snprintf(events_path, sizeof(events_path), "%s/%s_resp_events.bin", session_dir, session_id);
-    size_t events_len = 0;
-    uint8_t *events_data = read_bin_file(events_path, &events_len);
+    /* Path to events.snt for EVE.edf / CSL.edf generation */
+    char events_snt_path[330];
+    snprintf(events_snt_path, sizeof(events_snt_path), "%s/%s_events.snt", session_dir, session_id);
 
     /* ── Build EDF header common fields ──
      *
@@ -2771,25 +2669,25 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         errors++;
     }
 
-    /* ── Generate EVE.edf from respiratory events spool ──
-     * Event timestamps in the spool are in AS11 internal time.
+    /* ── Generate EVE.edf from events.snt ──
+     * Event timestamps in events.snt are in AS11 internal time.
      * clock_drift_ms is applied to convert them to NTP time. */
     char eve_path[350];
     snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
-    if (generate_eve_edf(eve_path, events_data, events_len,
+    if (generate_eve_edf(eve_path, events_snt_path,
                          start_epoch_ms, clock_drift_ms,
                          patient_id, eve_recording_id,
                          start_date, start_time, false) != ESP_OK) {
         errors++;
     }
 
-    /* ── Generate CSL.edf (CSR event log) ──
+    /* ── Generate CSL.edf (CSR event log) from events.snt ──
      * CSL.edf contains only CSR (Cheyne-Stokes Respiration) events.
      * For sessions with no CSR events, CSL.edf contains only the
      * "Recording starts" marker record. */
     char csl_path[350];
     snprintf(csl_path, sizeof(csl_path), "%s/%s_CSL.edf", day_dir, ts_prefix);
-    if (generate_eve_edf(csl_path, events_data, events_len,
+    if (generate_eve_edf(csl_path, events_snt_path,
                          start_epoch_ms, clock_drift_ms,
                          patient_id, eve_recording_id,
                          start_date, start_time, true) != ESP_OK) {
@@ -2827,7 +2725,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* ── Cleanup ── */
     if (ident) cJSON_Delete(ident);
     if (settings) cJSON_Delete(settings);
-    free(events_data);
+    /* events_data no longer used */
 
     ESP_LOGI(TAG, "=== EDF GENERATION DONE (%d errors) ===", errors);
     return errors > 0 ? ESP_FAIL : ESP_OK;
