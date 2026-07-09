@@ -1332,6 +1332,7 @@ void session_writer_recover(void)
             uint32_t brp_samples = 0, sa2_samples = 0, pld_samples = 0, brp_mm_samples = 0;
             int64_t start_epoch_ms = 0;
             snt_header_t hdr;
+            bool got_valid_header = false;
 
             snprintf(path, sizeof(path), "%s/%s_brp.snt", day_path, prefix);
             FILE *f = fopen(path, "rb");
@@ -1339,8 +1340,18 @@ void session_writer_recover(void)
                 if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC) {
                     brp_samples = hdr.sample_count;
                     start_epoch_ms = hdr.start_epoch_ms;
+                    got_valid_header = true;
                 }
                 fclose(f);
+            }
+
+            /* Skip sessions with no readable .snt header (0-byte files from
+             * crash before FATFS flush).  No data was written, and defaulting
+             * start_epoch_ms to 0 produces invalid 19691231 EDF folders. */
+            if (!got_valid_header) {
+                ESP_LOGW(TAG, "skipping interrupted session %s/%s — no valid .snt header (crash before flush?)",
+                         ent->d_name, prefix);
+                continue;
             }
 
             snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", day_path, prefix);

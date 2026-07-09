@@ -1291,6 +1291,16 @@ static void recreate_edfs_task(void *arg)
                 cJSON *j_end = cJSON_GetObjectItem(j, "end_epoch_ms");
                 cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
                 if (j_start && cJSON_IsNumber(j_start)) {
+                    int64_t epoch = (int64_t)j_start->valuedouble;
+                    /* Skip sessions with invalid timestamps (epoch 0 or pre-2000).
+                     * These result from crash-recovery on 0-byte .snt files and
+                     * would generate bogus 19691231 EDF folders. */
+                    if (epoch < 946684800000LL) {  /* < 2000-01-01T00:00:00Z */
+                        ESP_LOGW(TAG, "recreate_edfs: skipping %s (invalid start_epoch_ms=%lld)",
+                                 session_id, (long long)epoch);
+                        cJSON_Delete(j);
+                        continue;
+                    }
                     recreate_session_t *s = &sessions[n_sessions++];
                     strlcpy(s->session_dir, day_dir, sizeof(s->session_dir));
                     strlcpy(s->session_id, session_id, sizeof(s->session_id));

@@ -2390,6 +2390,13 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         ESP_LOGW(TAG, "SD not ready, skipping EDF generation");
         return ESP_ERR_INVALID_STATE;
     }
+    /* Reject sessions with invalid timestamps — these result from crash
+     * recovery on 0-byte .snt files and would produce bogus 19691231 folders. */
+    if (start_epoch_ms < 946684800000LL) {  /* < 2000-01-01T00:00:00Z */
+        ESP_LOGW(TAG, "invalid start_epoch_ms=%lld, skipping EDF generation for %s",
+                 (long long)start_epoch_ms, session_id);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     ESP_LOGI(TAG, "=== EDF GENERATION START ===");
     ESP_LOGI(TAG, "session=%s id=%s drift=%lldms",
