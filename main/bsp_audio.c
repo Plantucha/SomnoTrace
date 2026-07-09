@@ -46,13 +46,15 @@ static const char *TAG = "bsp_audio";
 #define I2S_MCLK_PIN    8
 #define I2S_BCLK_PIN    9
 #define I2S_WS_PIN      10
-#define I2S_DOUT_PIN    11   /* ASDOUT — data to codec DAC */
-#define I2S_DIN_PIN     12   /* DSDIN — data from codec ADC (unused) */
+#define I2S_DOUT_PIN    12   /* DSDIN — ESP data out to codec DAC */
+#define I2S_DIN_PIN     11   /* ASDOUT — codec ADC data in to ESP (unused) */
 
 #define PA_PIN          7    /* NS4150B amplifier enable */
 
-/* ES8311 I2C address (CE=0) */
-#define ES8311_ADDR     0x30
+/* ES8311 I2C 7-bit address (CE=0).
+ * Espressif headers use 0x30 (8-bit), but the new I2C master API
+ * expects 7-bit addresses: 0x30 >> 1 = 0x18. */
+#define ES8311_ADDR     0x18
 
 /* ── ES8311 register addresses ────────────────────────────────────── */
 #define ES8311_RESET_REG00          0x00
@@ -111,7 +113,7 @@ static esp_err_t es8311_init(void)
     ret |= es_write_reg(ES8311_GPIO_REG44, 0x08);
     ret |= es_write_reg(ES8311_GPIO_REG44, 0x08);
 
-    /* Clock reset sequence */
+    /* Clock reset sequence — match Espressif es8311_open sequence */
     ret |= es_write_reg(ES8311_CLK_MANAGER_REG01, 0x30);
     ret |= es_write_reg(ES8311_CLK_MANAGER_REG02, 0x00);
     ret |= es_write_reg(ES8311_CLK_MANAGER_REG03, 0x10);
@@ -133,7 +135,7 @@ static esp_err_t es8311_init(void)
     ret |= es_write_reg(ES8311_SYSTEM_REG13, 0x10);
     ret |= es_write_reg(ES8311_ADC_REG1B, 0x0A);
     ret |= es_write_reg(ES8311_ADC_REG1C, 0x6A);
-    ret |= es_write_reg(ES8311_GPIO_REG44, 0x08);
+    ret |= es_write_reg(ES8311_GPIO_REG44, 0x58);  /* internal ref (ADCL + DACR) */
 
     /* ── Configure sample rate: 16 kHz, MCLK = 4096000 ─── */
     /* REG02: pre_div=1 (0<<5), pre_multi=1 (0<<3) → 0x00 */
@@ -206,6 +208,23 @@ esp_err_t bsp_audio_init(void)
         return ret;
     }
 
+    /* Give the bus a moment to settle after GPIO reconfiguration */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Probe for ES8311; also scan bus for diagnostics if not found */
+    esp_err_t probe = i2c_master_probe(bus_handle, ES8311_ADDR, 100);
+    ESP_LOGI(TAG, "I2C probe 0x%02X: %s", ES8311_ADDR, probe == ESP_OK ? "OK" : esp_err_to_name(probe));
+    if (probe != ESP_OK) {
+        ESP_LOGW(TAG, "ES8311 not found, scanning bus...");
+        for (uint8_t addr = 1; addr < 0x80; addr++) {
+            if (i2c_master_probe(bus_handle, addr, 50) == ESP_OK) {
+                ESP_LOGW(TAG, "  found device at 0x%02X", addr);
+            }
+        }
+        ESP_LOGW(TAG, "  bus scan complete");
+        return ESP_ERR_NOT_FOUND;
+    }
+
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = ES8311_ADDR,
@@ -219,7 +238,10 @@ esp_err_t bsp_audio_init(void)
 
     /* ── ES8311 codec ─── */
     ret = es8311_init();
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ES8311 init failed, audio will be unavailable");
+        return ret;
+    }
 
     /* ── PA enable GPIO ─── */
     gpio_config_t pa_cfg = {
@@ -300,7 +322,7 @@ esp_err_t bsp_audio_beep(int freq_hz, int duration_ms, uint8_t volume)
 
     int half = period_samples;
     for (int i = 0; i < period_samples; i++) {
-        int16_t val = (i < half / 2) ? 12000 : -12000;
+        int16_t val = (i < half / 2) ? 16000 : -16000;
         buf[i * 2]     = val;   /* left */
         buf[i * 2 + 1] = val;   /* right */
     }

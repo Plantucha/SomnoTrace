@@ -178,9 +178,15 @@ void app_main(void)
             };
             show_status("Error", fail_lines, 2);
 
-            /* Sound audible alarm: 10 seconds at medium volume */
-            bsp_audio_init();
-            bsp_audio_beep(880, 10000, 50);
+            /* Sound audible alarm: 5 beeps of 1s on / 1s off, loud */
+            if (bsp_audio_init() == ESP_OK) {
+                for (int i = 0; i < 5; i++) {
+                    bsp_audio_beep(880, 1000, 60);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+            } else {
+                ESP_LOGE(TAG, "audio init failed — silent reboot");
+            }
 
             /* Hard reboot */
             vTaskDelay(pdMS_TO_TICKS(500));

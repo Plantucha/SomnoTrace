@@ -86,8 +86,8 @@ determined to have been incorporated.
 
 ## ES8311 codec driver reference
 
-- **Project:** ESP-ADF / ESP-BSP ES8311 driver
-- **Source:** https://github.com/espressif/esp-bsp (components/es8311)
+- **Project:** ESP-ADF esp_codec_dev ES8311 driver
+- **Source:** https://github.com/espressif/esp-adf (components/esp_codec_dev/device/es8311)
 - **Referenced for:** ES8311 register initialization sequence, clock
   coefficient table, and I2S format configuration for DAC playback.
 - **License:** Apache-2.0
