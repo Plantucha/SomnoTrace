@@ -1066,7 +1066,12 @@ function fmtGB(b) {
 function formatSdSpace(total, free) {
   if (!total || total <= 0) return 'No SD card';
   var pct = Math.round((free / total) * 100);
-  return fmtGB(free) + ' free of ' + fmtGB(total) + ' (' + pct + '%)';
+  function g(b) {
+    if (b >= 1073741824) return (b / 1073741824).toFixed(1) + 'GB';
+    if (b >= 1048576) return (b / 1048576).toFixed(1) + 'MB';
+    return (b / 1024).toFixed(1) + 'KB';
+  }
+  return g(free) + '/' + g(total) + ' free (' + pct + '%)';
 }
 
 function loadStatusTab(d) {
