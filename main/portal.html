@@ -285,6 +285,11 @@ Wi-Fi Configuration
 <select id="tz-select" class="form-control" data-dirty="false" onchange="markDirty(this)"></select>
 <input type="hidden" id="tz-str">
 </div>
+<div class="form-group" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--card-border)">
+<label>NTP Server</label>
+<p class="card-desc" style="margin:2px 0 8px 0">Leave empty to use automatic NTP (DHCP or public servers). Enter a hostname or IP to use a custom NTP server exclusively.</p>
+<input type="text" id="ntp-server" class="form-control" placeholder="Auto (DHCP / public NTP)" data-dirty="false" oninput="markDirty(this)">
+</div>
 </div>
 
 <!-- Section 2: Medical Devices (Data Sources) -->
@@ -703,7 +708,7 @@ var isDirty = { wifi: false, upload: false, tz: false, device: false };
 function markDirty(el) {
   if (el) el.setAttribute('data-dirty', 'true');
   // Determine which section
-  if (el && el.id === 'tz-select') {
+  if (el && (el.id === 'tz-select' || el.id === 'ntp-server')) {
     isDirty.tz = true;
   } else {
     var card = el ? el.closest('.card') : null;
@@ -1006,6 +1011,13 @@ function loadStatus() {
 
     loadTimezones(d.tz_name || '');
 
+    /* Populate NTP server field */
+    var ntpInput = document.getElementById('ntp-server');
+    if (ntpInput) {
+      ntpInput.value = d.ntp_server || '';
+      ntpInput.setAttribute('data-dirty', 'false');
+    }
+
     /* Background-load full timezone list after page is interactive.
      * The dropdown already shows the current TZ from /api/status. */
     setTimeout(function() { loadTimezoneList(d.tz_name || ''); }, 2000);
@@ -1147,17 +1159,21 @@ function saveAll() {
     var tzHidden = document.getElementById('tz-str');
     if (tzSel && tzSel.value) body += '&tz_name=' + encodeURIComponent(tzSel.value);
     if (tzHidden && tzHidden.value) body += '&tz_str=' + encodeURIComponent(tzHidden.value);
+    var ntpInput = document.getElementById('ntp-server');
+    if (ntpInput) body += '&ntp_srv=' + encodeURIComponent(ntpInput.value.trim());
 
     promises.push(
       fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
     );
   } else if (isDirty.tz) {
-    // Timezone-only change — don't touch WiFi config
+    // Timezone/NTP-only change — don't touch WiFi config
     var tzSel = document.getElementById('tz-select');
     var tzHidden = document.getElementById('tz-str');
+    var ntpInput = document.getElementById('ntp-server');
     var tzBody = '';
     if (tzSel && tzSel.value) tzBody += '&tz_name=' + encodeURIComponent(tzSel.value);
     if (tzHidden && tzHidden.value) tzBody += '&tz_str=' + encodeURIComponent(tzHidden.value);
+    if (ntpInput) tzBody += '&ntp_srv=' + encodeURIComponent(ntpInput.value.trim());
     if (tzBody) {
       tzBody = 'tz_only=1' + tzBody;
       promises.push(

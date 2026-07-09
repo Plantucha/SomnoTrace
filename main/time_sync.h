@@ -40,5 +40,17 @@ esp_err_t time_sync_set_timezone(const char *tz_str, const char *tz_name);
 void time_sync_get_timezone(char *tz_str, size_t tz_str_len);
 void time_sync_get_tz_name(char *tz_name, size_t tz_name_len);
 
+/* Get/set custom NTP server hostname, stored in NVS.
+ * Pass NULL or empty string to clear (revert to auto/DHCP mode).
+ * When set, time_sync_init uses this server exclusively. */
+esp_err_t time_sync_set_ntp_server(const char *server);
+void time_sync_get_ntp_server(char *server, size_t server_len);
+
 /* Returns true if system time has been synchronised via NTP. */
 bool time_sync_is_synced(void);
+
+/* Block until the initial NTP sync succeeds or all attempts are exhausted.
+ * Makes up to 3 attempts with 15-second timeouts. Returns true on success.
+ * Must be called after time_sync_init(). Subsequent periodic re-syncs do
+ * not trigger the failure path. */
+bool time_sync_wait_initial(void);

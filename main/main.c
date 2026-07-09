@@ -44,6 +44,7 @@
 #include "uploader.h"
 #include "log_stream.h"
 #include "device_settings.h"
+#include "bsp_audio.h"
 
 
 static const char *TAG = "somnotrace";
@@ -164,6 +165,27 @@ void app_main(void)
         bsp_display_set_wifi_connected(true);
         netprov_start_connected_server(ip);
         time_sync_init();
+
+        /* ── Initial NTP sync with failure handling ─── */
+        bool ntp_ok = time_sync_wait_initial();
+        if (!ntp_ok) {
+            ESP_LOGE(TAG, "initial NTP sync failed — alarm + reboot");
+
+            /* Show failure message on screen */
+            const char *fail_lines[] = {
+                "NTP Sync Failed",
+                "Rebooting...",
+            };
+            show_status("Error", fail_lines, 2);
+
+            /* Sound audible alarm: 10 seconds at medium volume */
+            bsp_audio_init();
+            bsp_audio_beep(880, 10000, 50);
+
+            /* Hard reboot */
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
 
         if (sd_storage_is_ready()) {
             /* Configure FTP server from uploader config (NVS) */

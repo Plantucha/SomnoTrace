@@ -84,6 +84,17 @@ determined to have been incorporated.
   files (`uPlot.iife.min.js` ~51 KB, `uPlot.min.css` ~1.9 KB) are included;
   no source modifications.
 
+## ES8311 codec driver reference
+
+- **Project:** ESP-ADF / ESP-BSP ES8311 driver
+- **Source:** https://github.com/espressif/esp-bsp (components/es8311)
+- **Referenced for:** ES8311 register initialization sequence, clock
+  coefficient table, and I2S format configuration for DAC playback.
+- **License:** Apache-2.0
+- **Notes:** Clean-room implementation in `main/bsp_audio.c`. No source
+  code was copied; only register addresses and initialization values
+  (protocol facts) were used.
+
 ---
 
 ## MIT License (reference text)

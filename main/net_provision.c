@@ -530,11 +530,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         }
     }
 
-    /* Time / timezone */
-    char tz_str[64], tz_name[40];
+    /* Time / timezone / NTP */
+    char tz_str[64], tz_name[40], ntp_srv[64];
     time_sync_get_timezone(tz_str, sizeof(tz_str));
     time_sync_get_tz_name(tz_name, sizeof(tz_name));
+    time_sync_get_ntp_server(ntp_srv, sizeof(ntp_srv));
     cJSON_AddStringToObject(resp, "tz_name", tz_name);
+    cJSON_AddStringToObject(resp, "ntp_server", ntp_srv);
     cJSON_AddBoolToObject(resp, "ntp_synced", time_sync_is_synced());
     time_t now = time(NULL);
     if (now > 1700000000) {
@@ -894,6 +896,14 @@ static esp_err_t save_post_handler(httpd_req_t *req)
         form_get(body, "tz_name", tz_name_val, sizeof(tz_name_val));
         time_sync_set_timezone(tz_str_val, tz_name_val);
         ESP_LOGI(TAG, "saved timezone %s (%s)", tz_name_val, tz_str_val);
+    }
+
+    /* Save custom NTP server if present (empty string = auto mode) */
+    char ntp_srv_val[64] = { 0 };
+    if (form_get(body, "ntp_srv", ntp_srv_val, sizeof(ntp_srv_val))) {
+        time_sync_set_ntp_server(ntp_srv_val);
+        ESP_LOGI(TAG, "saved NTP server: %s",
+                 ntp_srv_val[0] ? ntp_srv_val : "(auto)");
     }
 
     httpd_resp_set_type(req, "text/html");
