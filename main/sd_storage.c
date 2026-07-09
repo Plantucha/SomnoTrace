@@ -87,6 +87,7 @@ esp_err_t sd_storage_init(void)
     mkdir(SD_SESSIONS_DIR, 0775);
     mkdir(SD_STREAMS_DIR, 0775);
     mkdir(SD_SUMMARIES_DIR, 0775);
+    mkdir(SD_MOUNT_POINT "/.logs", 0775);
 
     /* Create ResMed-compatible export directory tree */
     mkdir(SD_SDCARD_DIR, 0775);

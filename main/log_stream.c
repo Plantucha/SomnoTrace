@@ -55,9 +55,9 @@ static const char *TAG = "log_stream";
 
 #define LOG_DIR             SD_MOUNT_POINT "/.logs"
 #define LOG_FILE_PREFIX     "somnotrace.log."
-#define LOG_MAX_FILES       3
-#define LOG_FILE_MAX_SIZE   (40 * 1024)   /* 40 KB per file */
-#define LOG_TOTAL_MAX       (LOG_FILE_MAX_SIZE * LOG_MAX_FILES)  /* 120 KB */
+#define LOG_MAX_FILES       4
+#define LOG_FILE_MAX_SIZE   (128 * 1024)  /* 128 KB per file */
+#define LOG_TOTAL_MAX       (LOG_FILE_MAX_SIZE * LOG_MAX_FILES)  /* 512 KB */
 #define WRITEBUF_SIZE       (8 * 1024)    /* PSRAM write buffer */
 #define FLUSH_INTERVAL_MS   2000          /* flush at least every 2 s */
 #define FLUSH_THRESHOLD     4096          /* flush when buffer reaches 4 KB */
@@ -154,14 +154,14 @@ static void rotate_logs(void)
     char path[64];
 
     /* Delete the oldest file (somnotrace.log.2) */
-    snprintf(path, sizeof(path), "%s%s%d", LOG_DIR, LOG_FILE_PREFIX, LOG_MAX_FILES - 1);
+    snprintf(path, sizeof(path), "%s/%s%d", LOG_DIR, LOG_FILE_PREFIX, LOG_MAX_FILES - 1);
     remove(path);
 
     /* Shift: .1 -> .2, .0 -> .1 */
     for (int i = LOG_MAX_FILES - 2; i >= 0; i--) {
         char old_path[64], new_path[64];
-        snprintf(old_path, sizeof(old_path), "%s%s%d", LOG_DIR, LOG_FILE_PREFIX, i);
-        snprintf(new_path, sizeof(new_path), "%s%s%d", LOG_DIR, LOG_FILE_PREFIX, i + 1);
+        snprintf(old_path, sizeof(old_path), "%s/%s%d", LOG_DIR, LOG_FILE_PREFIX, i);
+        snprintf(new_path, sizeof(new_path), "%s/%s%d", LOG_DIR, LOG_FILE_PREFIX, i + 1);
         rename(old_path, new_path);
     }
 }
@@ -170,7 +170,7 @@ static void rotate_logs(void)
 static long log_file_size(void)
 {
     char path[64];
-    snprintf(path, sizeof(path), "%s%s0", LOG_DIR, LOG_FILE_PREFIX);
+    snprintf(path, sizeof(path), "%s/%s0", LOG_DIR, LOG_FILE_PREFIX);
     struct stat st;
     if (stat(path, &st) == 0) return st.st_size;
     return 0;
@@ -204,7 +204,7 @@ static void log_flush_task(void *arg)
 
         /* Open current log file for append. */
         char path[64];
-        snprintf(path, sizeof(path), "%s%s0", LOG_DIR, LOG_FILE_PREFIX);
+        snprintf(path, sizeof(path), "%s/%s0", LOG_DIR, LOG_FILE_PREFIX);
         FILE *f = fopen(path, "ab");
         if (!f) {
             ESP_LOGE(TAG, "flush: cannot open %s (errno %d)", path, errno);
@@ -240,7 +240,7 @@ static void log_flush_task(void *arg)
                 rotate_logs();
                 cur_size = 0;
                 total_written = 0;
-                snprintf(path, sizeof(path), "%s%s0", LOG_DIR, LOG_FILE_PREFIX);
+                snprintf(path, sizeof(path), "%s/%s0", LOG_DIR, LOG_FILE_PREFIX);
                 f = fopen(path, "ab");
                 if (!f) break;
             }
@@ -565,7 +565,7 @@ static esp_err_t logs_history_handler(httpd_req_t *req)
     if (s_sd_ready || sd_storage_is_ready()) {
         for (int i = LOG_MAX_FILES - 1; i >= 0; i--) {
             char path[64];
-            snprintf(path, sizeof(path), "%s%s%d", LOG_DIR, LOG_FILE_PREFIX, i);
+            snprintf(path, sizeof(path), "%s/%s%d", LOG_DIR, LOG_FILE_PREFIX, i);
             FILE *f = fopen(path, "rb");
             if (!f) continue;
 
@@ -628,7 +628,7 @@ static esp_err_t logs_download_handler(httpd_req_t *req)
     if (s_sd_ready || sd_storage_is_ready()) {
         for (int i = LOG_MAX_FILES - 1; i >= 0; i--) {
             char path[64];
-            snprintf(path, sizeof(path), "%s%s%d", LOG_DIR, LOG_FILE_PREFIX, i);
+            snprintf(path, sizeof(path), "%s/%s%d", LOG_DIR, LOG_FILE_PREFIX, i);
             FILE *f = fopen(path, "rb");
             if (!f) continue;
 
