@@ -503,45 +503,6 @@ static int64_t parse_iso8601_utc_ms(const char *iso_str)
     return secs * 1000 + ms;
 }
 
-static int64_t find_maskon_time_ms(const char *session_dir, const char *session_id)
-{
-    char events_path[350];
-    snprintf(events_path, sizeof(events_path), "%s/%s_events.snt",
-             session_dir, session_id);
-
-    FILE *ef = fopen(events_path, "r");
-    if (!ef) return -1;
-
-    int64_t result = -1;
-    char line[512];
-    while (fgets(line, sizeof(line), ef) && result < 0) {
-        cJSON *msg = cJSON_Parse(line);
-        if (!msg) continue;
-        cJSON *params = cJSON_GetObjectItem(msg, "params");
-        if (params) {
-            cJSON *events = cJSON_GetObjectItem(params, "events");
-            if (events && cJSON_IsArray(events)) {
-                int n = cJSON_GetArraySize(events);
-                for (int i = 0; i < n && result < 0; i++) {
-                    cJSON *ev = cJSON_GetArrayItem(events, i);
-                    if (!ev) continue;
-                    cJSON *label = cJSON_GetObjectItem(ev, "event");
-                    if (!label || !cJSON_IsString(label)) continue;
-                    if (strcmp(label->valuestring, "MaskOn") != 0) continue;
-                    cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
-                    if (!rt || !cJSON_IsString(rt)) continue;
-
-                    int64_t ts = parse_iso8601_utc_ms(rt->valuestring);
-                    if (ts >= 0) result = ts;
-                }
-            }
-        }
-        cJSON_Delete(msg);
-    }
-    fclose(ef);
-    return result;
-}
-
 /* Convert one .snt file to an EDF file.
  *
  * Parameters:
@@ -618,8 +579,6 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     }
 
     /* Total samples (per channel) after skipping the leading offset.
-     * The .snt captures from TherapyStart, but AS11 EDFs start at MaskOn.
-     * skip_samples is the number of pre-MaskOn samples to skip.
      *
      * EDF records are 60 seconds each.  Use floor division so the partial
      * last record is dropped, matching AS11 behaviour (AS11 does not
@@ -634,11 +593,24 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     int total_records = (int)(total_samples / spr[0]);
     if (total_records < 0) total_records = 0;
 
-    /* AS11 does not write BRP/PLD/SA2 EDF files for sessions shorter than
-     * one data record (60 seconds).  Skip file creation to match. */
+    /* AS11 writes header-only (0-record) BRP/PLD/SA2 EDF files for sessions
+     * shorter than one data record (60 seconds).  Write the header with
+     * num_records=0 to match, rather than skipping file creation. */
     if (total_records == 0) {
-        ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), skipping EDF",
+        ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), writing header-only EDF",
                  snt_path, total_samples, spr[0]);
+        FILE *edf = fopen(edf_path, "w+b");
+        if (!edf) {
+            ESP_LOGE(TAG, "cannot create %s: %s", edf_path, strerror(errno));
+            free(spr); free(sig);
+            fclose(snt);
+            return ESP_FAIL;
+        }
+        edf_write_header(edf, patient_id, recording_id,
+                         start_date, start_time,
+                         0, record_dur, "EDF", sig, n_signals);
+        fsync(fileno(edf));
+        fclose(edf);
         free(spr); free(sig);
         fclose(snt);
         return ESP_OK;
@@ -647,7 +619,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     ESP_LOGI(TAG, "converting %s → %s: %u samples (skip %u), %d records, %d ch",
              snt_path, edf_path, total_samples, skip_samples, total_records, n_signals);
 
-    /* Seek past the leading samples that precede MaskOn.
+    /* Seek past skipped leading samples.
      * .snt data starts at offset sizeof(snt_header_t) and is interleaved
      * as [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...], so each sample frame is
      * snt_channels × sizeof(int16_t) bytes. */
@@ -774,6 +746,17 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                     int idig = (int)(dig < 0 ? dig - 0.5 : dig + 0.5);
                     if (idig > INT16_MAX) idig = INT16_MAX;
                     if (idig < INT16_MIN) idig = INT16_MIN;
+                    /* Clamp to the signal's valid digital range when not
+                     * in invalid-passthrough mode.  This prevents the -1
+                     * BLE sentinel ("no data yet") from leaking through the
+                     * scaling for signals whose k factor maps -1/100 back to
+                     * -1 (e.g. MaskPress with k=50 → -0.5 → rounds to -1).
+                     * Signals that use the -1 sentinel (FlowLim, SA2 SpO2/Pulse)
+                     * have invalid_passthrough=true and bypass this clamp. */
+                    if (!passthrough) {
+                        if (idig > sig[ch].dig_max) idig = sig[ch].dig_max;
+                        if (idig < sig[ch].dig_min) idig = sig[ch].dig_min;
+                    }
                     record_buf[ch * samples_per_record + s] = (int16_t)idig;
                 } else {
                     /* Pad trailing samples of a partial record.  For
@@ -1420,17 +1403,19 @@ static void build_current_day_record(str_day_record_t *rec,
     /* [1-3] MaskOn/MaskOff/MaskEvents from events.snt.
      * events.snt contains JSON lines with EventNotification messages.
      * Each event has "reportTime" (ISO 8601 UTC string) and "event" label.
-     * Map: MaskOn → MaskOn, TherapyStop → MaskOff (AS11 doesn't send MaskOff
-     * for short sessions, TherapyStop is the closest equivalent). */
+     * Prefer MaskOn/MaskOff; fall back to TherapyStart/TherapyStop only if
+     * MaskOn/MaskOff are not present (e.g. very short sessions). */
     int mask_on_count = 0;
     int mask_off_count = 0;
+    int16_t ts_start_min = -1;  /* TherapyStart as fallback for MaskOn */
+    int16_t ts_stop_min = -1;   /* TherapyStop as fallback for MaskOff */
 
     char events_path[350];
     snprintf(events_path, sizeof(events_path), "%s/%s_events.snt", session_dir, session_id);
     FILE *ef = fopen(events_path, "r");
     if (ef) {
         char line[512];
-        while (fgets(line, sizeof(line), ef) && mask_on_count < 20 && mask_off_count < 20) {
+        while (fgets(line, sizeof(line), ef) && (mask_on_count < 20 || mask_off_count < 20)) {
             cJSON *msg = cJSON_Parse(line);
             if (!msg) continue;
             cJSON *params = cJSON_GetObjectItem(msg, "params");
@@ -1470,22 +1455,24 @@ static void build_current_day_record(str_day_record_t *rec,
                         int64_t ev_ms = secs * 1000 + ms;
                         int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
 
-                        if ((strcmp(label->valuestring, "MaskOn") == 0 ||
-                             strcmp(label->valuestring, "TherapyStart") == 0) &&
+                        if (strcmp(label->valuestring, "MaskOn") == 0 &&
                             mask_on_count < 20) {
                             if (mask_on_count == 0)
                                 rec->values[1] = (int16_t)min_from_noon;
                             else
                                 rec->mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
                             mask_on_count++;
-                        } else if ((strcmp(label->valuestring, "MaskOff") == 0 ||
-                                    strcmp(label->valuestring, "TherapyStop") == 0) &&
+                        } else if (strcmp(label->valuestring, "MaskOff") == 0 &&
                                    mask_off_count < 20) {
                             if (mask_off_count == 0)
                                 rec->values[2] = (int16_t)min_from_noon;
                             else
                                 rec->mask_off_extra[mask_off_count - 1] = (int16_t)min_from_noon;
                             mask_off_count++;
+                        } else if (strcmp(label->valuestring, "TherapyStart") == 0) {
+                            ts_start_min = (int16_t)min_from_noon;
+                        } else if (strcmp(label->valuestring, "TherapyStop") == 0) {
+                            ts_stop_min = (int16_t)min_from_noon;
                         }
                     }
                 }
@@ -1495,21 +1482,32 @@ static void build_current_day_record(str_day_record_t *rec,
         fclose(ef);
     }
 
-    /* Fallback: use session start/end as MaskOn/MaskOff */
+    /* Fallback: use TherapyStart/TherapyStop if no MaskOn/MaskOff found,
+     * then fall back to session start/end times. */
     if (mask_on_count == 0) {
-        int start_min = tm_start.tm_hour * 60 + tm_start.tm_min - 720;
-        if (start_min < 0) start_min += 1440;
-        rec->values[1] = (int16_t)start_min;
-        mask_on_count = 1;
+        if (ts_start_min >= 0) {
+            rec->values[1] = ts_start_min;
+            mask_on_count = 1;
+        } else {
+            int start_min = tm_start.tm_hour * 60 + tm_start.tm_min - 720;
+            if (start_min < 0) start_min += 1440;
+            rec->values[1] = (int16_t)start_min;
+            mask_on_count = 1;
+        }
     }
     if (mask_off_count == 0) {
-        time_t end_t = (time_t)(end_epoch_ms / 1000);
-        struct tm tm_end;
-        localtime_r(&end_t, &tm_end);
-        int end_min = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
-        if (end_min < 0) end_min += 1440;
-        rec->values[2] = (int16_t)end_min;
-        mask_off_count = 1;
+        if (ts_stop_min >= 0) {
+            rec->values[2] = ts_stop_min;
+            mask_off_count = 1;
+        } else {
+            time_t end_t = (time_t)(end_epoch_ms / 1000);
+            struct tm tm_end;
+            localtime_r(&end_t, &tm_end);
+            int end_min = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
+            if (end_min < 0) end_min += 1440;
+            rec->values[2] = (int16_t)end_min;
+            mask_off_count = 1;
+        }
     }
     rec->values[3] = (int16_t)(mask_on_count > mask_off_count ? mask_on_count : mask_off_count);
 
@@ -2447,12 +2445,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
 
     /* ── Build EDF header common fields ──
      *
-     * The AS11 starts BRP/PLD/SA2 EDF recording at the MaskOn event, not
-     * at TherapyStart.  The .snt files capture from TherapyStart, so we
-     * must skip the pre-MaskOn samples during EDF conversion and stamp the
-     * BRP/PLD/SA2 headers with the MaskOn time.
-     *
-     * EVE/CSL continue to use TherapyStart as their start timestamp.
+     * All EDF file types (BRP/PLD/SA2/EVE/CSL) use TherapyStart as their
+     * start timestamp, matching AS11 behaviour.  The .snt files capture
+     * from TherapyStart, so no sample skipping is needed.
      *
      * We use NTP-corrected time directly so that the timestamps reflect the
      * real wall-clock time and align with data from separate devices (e.g.
@@ -2460,48 +2455,10 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * card (which stamps EDF headers in the machine's own drifting clock),
      * use:  edf_start_ms = start_epoch_ms - clock_drift_ms;
      * We intentionally correct to NTP instead. */
-
-    /* Find MaskOn event time (AS11 clock) and convert to NTP. */
-    int64_t maskon_as11_ms = find_maskon_time_ms(session_dir, session_id);
-    int64_t maskon_ntp_ms = -1;
-    if (maskon_as11_ms >= 0) {
-        maskon_ntp_ms = maskon_as11_ms + clock_drift_ms;
-        ESP_LOGI(TAG, "MaskOn: AS11=%lldms NTP=%lldms (drift=%lldms)",
-                 (long long)maskon_as11_ms, (long long)maskon_ntp_ms,
-                 (long long)clock_drift_ms);
-    } else {
-        ESP_LOGW(TAG, "MaskOn event not found in events.snt, "
-                      "BRP/PLD/SA2 will start at TherapyStart");
-    }
-
-    /* EDF header start time for BRP/PLD/SA2 = MaskOn (NTP).
-     * Fallback to TherapyStart if MaskOn not found. */
-    int64_t data_edf_start_ms = (maskon_ntp_ms >= 0) ? maskon_ntp_ms : start_epoch_ms;
-    char data_start_date[16], data_start_time[16];
-    format_edf_datetime(data_edf_start_ms, data_start_date, sizeof(data_start_date),
-                        data_start_time, sizeof(data_start_time));
-
-    /* EDF header start time for EVE/CSL = TherapyStart (NTP). */
     int64_t edf_start_ms = start_epoch_ms;
     char start_date[16], start_time[16];
     format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
-
-    /* Compute per-stream skip samples (TherapyStart → MaskOn offset).
-     * skip_samples = round((maskon_ntp_ms - start_epoch_ms) / sample_interval_ms)
-     * where sample_interval_ms = 1000 / (hz_x10 / 10) = 10000 / hz_x10. */
-    uint32_t skip_brp = 0, skip_sa2 = 0, skip_pld = 0;
-    if (maskon_ntp_ms >= 0) {
-        int64_t offset_ms = maskon_ntp_ms - start_epoch_ms;
-        if (offset_ms > 0) {
-            /* BRP: 25 Hz → 40ms interval, SA2: 1 Hz → 1000ms, PLD: 0.5 Hz → 2000ms */
-            skip_brp = (uint32_t)((offset_ms * 25 + 500) / 1000);
-            skip_sa2 = (uint32_t)((offset_ms + 500) / 1000);
-            skip_pld = (uint32_t)((offset_ms + 1000) / 2000);
-            ESP_LOGI(TAG, "skip samples: BRP=%u SA2=%u PLD=%u (offset=%lldms)",
-                     skip_brp, skip_sa2, skip_pld, (long long)offset_ms);
-        }
-    }
 
     /* STR.edf uses the noon-based day date (sessions before noon belong
      * to the previous day's STR.edf). */
@@ -2518,12 +2475,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                  tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
     }
 
-    /* Recording ID for BRP/PLD/SA2 uses MaskOn time; for EVE/CSL uses TherapyStart. */
+    /* Recording ID uses TherapyStart for all file types. */
     char recording_id[128];
     format_recording_id(recording_id, sizeof(recording_id),
-                        data_edf_start_ms, ident);
-    char eve_recording_id[128];
-    format_recording_id(eve_recording_id, sizeof(eve_recording_id),
                         edf_start_ms, ident);
 
     /* STR.edf recording_id uses the noon-based day date, not session start. */
@@ -2561,8 +2515,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .prefilter = "", .samples_per_record = 1500 },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               data_start_date, data_start_time, brp_sigs, 2, "60.00",
-                               NULL, skip_brp) != ESP_OK) {
+                               start_date, start_time, brp_sigs, 2, "60.00",
+                               NULL, 0) != ESP_OK) {
             errors++;
         }
     }
@@ -2586,8 +2540,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .invalid_passthrough = true },
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               data_start_date, data_start_time, sa2_sigs, 2, "60.00",
-                               NULL, skip_sa2) != ESP_OK) {
+                               start_date, start_time, sa2_sigs, 2, "60.00",
+                               NULL, 0) != ESP_OK) {
             errors++;
         }
     }
@@ -2651,7 +2605,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
             { .label = "FlowLim.2s", .transducer = "",
               .unit = "", .phys_min = 0.0, .phys_max = 1.0,
               .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 30 },
+              .prefilter = "", .samples_per_record = 30,
+              .invalid_passthrough = true },
         };
         /* PLD .snt has 12 channels but AS11 EDF (VID=3) only has 9.
          * Channel order in .snt: 0=MaskPress, 1=Press, 2=EprPress, 3=Leak,
@@ -2660,8 +2615,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
          * EDF drops TgtVent(7), IERatio(8), Ti(11). */
         static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               data_start_date, data_start_time, pld_sigs, 9, "60.00",
-                               pld_ch_map, skip_pld) != ESP_OK) {
+                               start_date, start_time, pld_sigs, 9, "60.00",
+                               pld_ch_map, 0) != ESP_OK) {
             errors++;
         }
     }
@@ -2676,29 +2631,56 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         errors++;
     }
 
+    /* ── Check if session is long enough for EVE/CSL ──
+     * AS11 does not write EVE.edf or CSL.edf for sessions shorter than
+     * one data record (60 seconds).  Match this behaviour by checking
+     * the BRP .snt sample count — if it's less than one record's worth
+     * (1500 samples at 25 Hz), skip EVE/CSL generation. */
+    bool session_too_short = false;
+    {
+        char brp_snt[300];
+        snprintf(brp_snt, sizeof(brp_snt), "%s/%s_brp.snt", session_dir, session_id);
+        FILE *bf = fopen(brp_snt, "rb");
+        if (bf) {
+            snt_header_t bhdr;
+            if (snt_read_header(bf, &bhdr) == ESP_OK) {
+                int brp_spr = 1500;  /* BRP samples per 60s record */
+                if (bhdr.sample_count < (uint32_t)brp_spr) {
+                    session_too_short = true;
+                    ESP_LOGI(TAG, "session %s too short (%u BRP samples < %d), "
+                             "skipping EVE/CSL", session_id,
+                             (unsigned)bhdr.sample_count, brp_spr);
+                }
+            }
+            fclose(bf);
+        }
+    }
+
     /* ── Generate EVE.edf from events.snt ──
      * Event timestamps in events.snt are in AS11 internal time.
      * clock_drift_ms is applied to convert them to NTP time. */
-    char eve_path[350];
-    snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
-    if (generate_eve_edf(eve_path, events_snt_path,
-                         start_epoch_ms, clock_drift_ms,
-                         patient_id, eve_recording_id,
-                         start_date, start_time, false) != ESP_OK) {
-        errors++;
-    }
+    if (!session_too_short) {
+        char eve_path[350];
+        snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
+        if (generate_eve_edf(eve_path, events_snt_path,
+                             start_epoch_ms, clock_drift_ms,
+                             patient_id, recording_id,
+                             start_date, start_time, false) != ESP_OK) {
+            errors++;
+        }
 
-    /* ── Generate CSL.edf (CSR event log) from events.snt ──
-     * CSL.edf contains only CSR (Cheyne-Stokes Respiration) events.
-     * For sessions with no CSR events, CSL.edf contains only the
-     * "Recording starts" marker record. */
-    char csl_path[350];
-    snprintf(csl_path, sizeof(csl_path), "%s/%s_CSL.edf", day_dir, ts_prefix);
-    if (generate_eve_edf(csl_path, events_snt_path,
-                         start_epoch_ms, clock_drift_ms,
-                         patient_id, eve_recording_id,
-                         start_date, start_time, true) != ESP_OK) {
-        errors++;
+        /* ── Generate CSL.edf (CSR event log) from events.snt ──
+         * CSL.edf contains only CSR (Cheyne-Stokes Respiration) events.
+         * For sessions with no CSR events, CSL.edf contains only the
+         * "Recording starts" marker record. */
+        char csl_path[350];
+        snprintf(csl_path, sizeof(csl_path), "%s/%s_CSL.edf", day_dir, ts_prefix);
+        if (generate_eve_edf(csl_path, events_snt_path,
+                             start_epoch_ms, clock_drift_ms,
+                             patient_id, recording_id,
+                             start_date, start_time, true) != ESP_OK) {
+            errors++;
+        }
     }
 
     /* ── Generate Identification.json + .crc ── */
@@ -2717,6 +2699,48 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         char *settings_str = cJSON_PrintUnformatted(cs_root);
         cJSON_Delete(cs_root);
         if (settings_str) {
+            /* cJSON drops ".0" for integer-valued doubles (e.g. 7.0 → 7),
+             * but AS11 preserves it for pressure/temperature fields.
+             * Post-process the string to add ".0" back for known float
+             * fields so the output matches AS11 byte-for-byte. */
+            static const char *const float_fields[] = {
+                "StartPressure", "MaxPressure", "MinPressure",
+                "SetPressure", "HeatedTubeTemperature", NULL
+            };
+            for (int fi = 0; float_fields[fi]; fi++) {
+                char pattern[64];
+                snprintf(pattern, sizeof(pattern), "\"%s\":", float_fields[fi]);
+                size_t plen = strlen(pattern);
+                char *p = settings_str;
+                while ((p = strstr(p, pattern)) != NULL) {
+                    char *val_start = p + plen;
+                    /* Skip optional minus sign */
+                    char *v = val_start;
+                    if (*v == '-') v++;
+                    /* Check if value is purely integer (all digits, no '.') */
+                    char *scan = v;
+                    while (*scan >= '0' && *scan <= '9') scan++;
+                    if (scan > v && *scan != '.') {
+                        /* Integer value — insert ".0" before the terminator */
+                        size_t insert_pos = scan - settings_str;
+                        size_t tail_len = strlen(scan) + 1; /* includes NUL */
+                        /* Realloc to make room for 2 extra bytes */
+                        size_t old_len = strlen(settings_str);
+                        char *tmp = realloc(settings_str, old_len + 3);
+                        if (tmp) {
+                            settings_str = tmp;
+                            memmove(settings_str + insert_pos + 2,
+                                    settings_str + insert_pos, tail_len);
+                            settings_str[insert_pos] = '.';
+                            settings_str[insert_pos + 1] = '0';
+                        }
+                        p = settings_str + insert_pos + 2;
+                    } else {
+                        p = scan;
+                    }
+                }
+            }
+            size_t slen = strlen(settings_str);
             char cs_path[300];
             snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", SD_SDCARD_SETTINGS);
             FILE *csf = fopen(cs_path, "w");
@@ -2724,6 +2748,21 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                 fputs(settings_str, csf);
                 fclose(csf);
                 ESP_LOGI(TAG, "wrote %s", cs_path);
+            }
+            /* Write CurrentSettings.crc (CRC-32 LE, same format as Identification.crc) */
+            snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.crc", SD_SDCARD_SETTINGS);
+            csf = fopen(cs_path, "wb");
+            if (csf) {
+                uint32_t cs_crc = crc32_ieee((const uint8_t *)settings_str, slen);
+                uint8_t crc_bytes[4] = {
+                    (uint8_t)(cs_crc & 0xFF),
+                    (uint8_t)((cs_crc >> 8) & 0xFF),
+                    (uint8_t)((cs_crc >> 16) & 0xFF),
+                    (uint8_t)((cs_crc >> 24) & 0xFF),
+                };
+                fwrite(crc_bytes, 1, 4, csf);
+                fclose(csf);
+                ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", cs_path, (unsigned)cs_crc);
             }
             free(settings_str);
         }

@@ -49,6 +49,7 @@
  *     Identification.crc     ← CRC-32 of Identification.json
  *     SETTINGS/
  *       CurrentSettings.json ← Latest settings snapshot
+ *       CurrentSettings.crc  ← CRC-32 of CurrentSettings.json
  *     DATALOG/
  *       YYYYMMDD/            ← Noon-based day folder
  *         <prefix>_BRP.edf   ← Breath waveform 25 Hz (from brp.snt)
