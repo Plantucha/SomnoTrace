@@ -201,6 +201,13 @@ static spool_collector_t *s_spool_collector = NULL;
 static uint8_t s_session_key[32];       /* AES-256 key */
 static bool s_session_encrypted = false;
 
+/* When true, the next BLE_GAP_EVENT_DISCONNECT will NOT trigger
+ * auto-reconnect.  Set before intentional ble_gap_terminate() calls
+ * (user disconnect, forget pairing, pairing-flow disconnect before
+ * reconnect_task).  Cleared on successful connect and in the disconnect
+ * handler after the auto-reconnect decision is made. */
+static bool s_manual_disconnect = false;
+
 /* In-RAM cache of paired device credentials.  Loaded once at init from NVS,
  * updated on pair/forget.  Eliminates NVS reads from the HTTP /api/status
  * hot path (as11_ble_is_paired / as11_ble_get_paired_info). */
@@ -839,6 +846,8 @@ static void handle_notify(const uint8_t *data, int len)
     }
 }
 
+static void auto_reconnect_task(void *arg);
+
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -912,6 +921,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_connect_status = event->connect.status;
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            s_manual_disconnect = false;
         }
         xSemaphoreGive(s_connect_sem);
         return 0;
@@ -919,6 +929,35 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGW(TAG, "disconnected (reason=%d)", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        s_session_encrypted = false;
+
+        /* Auto-reconnect if we have valid pairing info, the disconnect
+         * was not intentional, and we were in the PAIRED state.
+         *
+         * Without auto-reconnect, a transient BLE link loss during therapy
+         * causes us to miss the TherapyStop event.  The session then stays
+         * open and the next TherapyStart merges into it, producing a single
+         * glued session instead of two separate ones.
+         *
+         * s_manual_disconnect is set before every intentional
+         * ble_gap_terminate() call (user disconnect, forget pairing,
+         * confirm_task before its own reconnect_task launch) to suppress
+         * this auto-reconnect.
+         *
+         * reconnect_task failure paths set state to ERROR or IDLE before
+         * calling ble_gap_terminate, so the state check here prevents
+         * recursive auto-reconnect when session setup fails. */
+        if (s_pair_cache.valid && !s_manual_disconnect &&
+            strcmp(s_state, AS11_STATUS_PAIRED) == 0) {
+            ESP_LOGI(TAG, "auto-reconnect: unexpected disconnect while paired, "
+                         "launching reconnect");
+            psram_task_create(auto_reconnect_task, "as11_reconn", 8192,
+                              NULL, 5, tskNO_AFFINITY, NULL, NULL);
+        } else {
+            ESP_LOGI(TAG, "auto-reconnect: skipped (pairing=%d manual=%d state=%s)",
+                     s_pair_cache.valid, s_manual_disconnect, s_state);
+        }
+        s_manual_disconnect = false;
         return 0;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -1640,7 +1679,10 @@ static void confirm_task(void *arg)
 
     /* Disconnect the pairing link; reconnect_task will re-establish
      * the connection with encrypted session + stream subscriptions.
-     * Without this, therapy data never flows until a manual reboot. */
+     * Without this, therapy data never flows until a manual reboot.
+     * Set s_manual_disconnect so the GAP disconnect event doesn't
+     * launch a duplicate auto_reconnect_task. */
+    s_manual_disconnect = true;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
@@ -1703,11 +1745,29 @@ static void reconnect_task(void *arg)
 
     set_state(AS11_STATUS_CONNECTING);
 
-    if (do_connect_and_discover() != ESP_OK) {
-        ESP_LOGW(TAG, "reconnect: connect/discover failed: %s", as11_ble_get_error());
+    /* Retry connect+discover with backoff.  The AS11 may not be immediately
+     * available after a disconnect — it needs a few seconds to restart
+     * advertising.  We try up to 3 times with increasing delays. */
+    bool connected = false;
+    for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
+        if (attempt > 1) {
+            int delay_s = attempt * 2;
+            ESP_LOGI(TAG, "reconnect: retry %d/3 in %ds", attempt, delay_s);
+            vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+        }
+        if (do_connect_and_discover() == ESP_OK) {
+            connected = true;
+            break;
+        }
+        ESP_LOGW(TAG, "reconnect: connect/discover attempt %d/3 failed: %s",
+                 attempt, as11_ble_get_error());
         if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         }
+    }
+    if (!connected) {
+        ESP_LOGE(TAG, "reconnect: all connect attempts failed");
         set_state(AS11_STATUS_IDLE);
         vTaskDelete(NULL);
         return;
@@ -1975,6 +2035,38 @@ static void reconnect_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* ------------------------------------------------------------------
+ *  Auto-reconnect wrapper — launched from BLE_GAP_EVENT_DISCONNECT
+ *  when an unexpected disconnect occurs while paired.  Adds an
+ *  initial delay (AS11 needs time to restart advertising) then
+ *  delegates to reconnect_task which has its own retry loop.
+ * ------------------------------------------------------------------ */
+static void auto_reconnect_task(void *arg)
+{
+    (void)arg;
+
+    /* Wait a few seconds before attempting to reconnect.  The AS11
+     * typically needs 2-5 seconds after a disconnect before it
+     * advertises again.  We check every second whether the pairing
+     * is still valid or the user has disconnected, and abort if so. */
+    for (int i = 3; i > 0; i--) {
+        ESP_LOGI(TAG, "auto-reconnect in %ds...", i);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!s_pair_cache.valid || s_manual_disconnect) {
+            ESP_LOGI(TAG, "auto-reconnect: aborted during wait "
+                         "(pairing=%d manual=%d)",
+                     s_pair_cache.valid, s_manual_disconnect);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    /* reconnect_task handles the full connect + encrypted session +
+     * stream setup.  It calls vTaskDelete(NULL) internally, so this
+     * task is cleaned up when reconnect_task finishes. */
+    reconnect_task(arg);
+}
+
 
 static void on_sync(void)
 {
@@ -2181,6 +2273,7 @@ esp_err_t as11_ble_forget(void)
     if (e == ESP_OK) {
         memset(&s_pair_cache, 0, sizeof(s_pair_cache));
     }
+    s_manual_disconnect = true;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
@@ -2190,6 +2283,7 @@ esp_err_t as11_ble_forget(void)
 
 esp_err_t as11_ble_disconnect(void)
 {
+    s_manual_disconnect = true;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ESP_LOGI(TAG, "disconnecting BLE (conn_handle=%d)", s_conn_handle);
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
