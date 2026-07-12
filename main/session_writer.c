@@ -125,7 +125,12 @@ struct session_writer {
 
 static session_writer_t *s_active = NULL;
 static SemaphoreHandle_t s_active_mutex = NULL;
-static bool s_therapy_stopped = false;  /* set on TherapyStop, cleared on TherapyStart */
+/* Set to true on TherapyStop, false on TherapyStart.
+ * Used by the auto-start logic in session_writer_on_stream_data_raw to
+ * prevent starting a new session from flow/pressure data alone when therapy
+ * has been explicitly stopped.  Without this, the residual pressure decay
+ * after TherapyStop could trigger a spurious auto-start. */
+static bool s_therapy_stopped = false;
 
 /* _SNC (Summary update counter) tracking — set when ValueChange
  * notification is received via the _SNC event subscription. */
@@ -370,9 +375,19 @@ session_writer_t *session_writer_start(void)
         return NULL;
     }
 
+    /* Stop any previously active session BEFORE creating a new one.
+     * We must NOT hold s_active_mutex while calling session_writer_stop(),
+     * because session_writer_stop() itself takes s_active_mutex — using a
+     * regular (non-recursive) mutex would deadlock.
+     *
+     * Instead: grab s_active under the mutex, clear it, release the mutex,
+     * then stop the previous session without holding the lock. */
     xSemaphoreTake(s_active_mutex, portMAX_DELAY);
-    if (s_active) {
-        session_writer_t *prev = s_active;
+    session_writer_t *prev = s_active;
+    s_active = NULL;
+    xSemaphoreGive(s_active_mutex);
+
+    if (prev) {
         ESP_LOGW(TAG, "session already active, stopping previous");
         session_writer_stop(prev);
         free(prev);
@@ -380,14 +395,12 @@ session_writer_t *session_writer_start(void)
 
     session_writer_t *s = calloc(1, sizeof(session_writer_t));
     if (!s) {
-        xSemaphoreGive(s_active_mutex);
         return NULL;
     }
 
     s->mutex = xSemaphoreCreateMutex();
     if (!s->mutex) {
         free(s);
-        xSemaphoreGive(s_active_mutex);
         return NULL;
     }
 
@@ -406,7 +419,6 @@ session_writer_t *session_writer_start(void)
     if (mkdir(s->dir, 0775) != 0 && errno != EEXIST) {
         ESP_LOGE(TAG, "failed to create noon-day dir %s: %s", s->dir, strerror(errno));
         free(s);
-        xSemaphoreGive(s_active_mutex);
         return NULL;
     }
 
@@ -431,7 +443,6 @@ session_writer_t *session_writer_start(void)
             if (stat(check_path, &st) == 0) {
                 ESP_LOGE(TAG, "cannot find unique session prefix for %s", s->session_id);
                 free(s);
-                xSemaphoreGive(s_active_mutex);
                 return NULL;
             }
         }
@@ -470,12 +481,16 @@ session_writer_t *session_writer_start(void)
 
     if (!s->brp.f_l0 || !s->sa2.f_l0 || !s->pld.f_l0) {
         ESP_LOGE(TAG, "failed to open .snt files");
+        /* No mutex held — safe to call session_writer_stop directly. */
         session_writer_stop(s);
         free(s);
-        xSemaphoreGive(s_active_mutex);
         return NULL;
     }
 
+    /* Publish the new session as s_active.  This is the only point where
+     * s_active is set; notif_proc_task and stream_data_raw will now route
+     * data to this session. */
+    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
     s_active = s;
     xSemaphoreGive(s_active_mutex);
 
@@ -492,10 +507,29 @@ esp_err_t session_writer_stop(session_writer_t *s)
 {
     if (!s) return ESP_OK;
 
-    /* Query AS11 clock BEFORE taking s_active_mutex.
-     * This blocks on the RPC response, which is processed by notif_proc_task.
-     * If we held s_active_mutex here, a TherapyStart in notif_proc_task would
-     * block on the mutex and be unable to process the GetDateTime response. */
+    /* Clear s_active and mark session inactive BEFORE the GetDateTime RPC.
+     *
+     * The GetDateTime RPC blocks ~50-100ms waiting for the AS11 response,
+     * which is processed by notif_proc_task.  If s_active still points to
+     * this session during that window, a TherapyStart notification arriving
+     * in notif_proc_task would see s->active==true and NOT create a new
+     * session — the new therapy's stream data and TherapyStart event would
+     * be written to the old (closing) session's .snt files, gluing two
+     * sessions together.
+     *
+     * By clearing s_active first (under the mutex, then releasing it), any
+     * TherapyStart during the RPC will correctly start a new session via
+     * session_writer_start().  The old session's flush/close continues in
+     * parallel on this thread, operating on the local pointer s, which is
+     * safe because s->active=false prevents new data writes. */
+    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
+    s->active = false;
+    if (s_active == s) s_active = NULL;
+    xSemaphoreGive(s_active_mutex);
+
+    /* Query AS11 clock (blocks on RPC — s_active is already clear, so
+     * notif_proc_task can process the response and any TherapyStart
+     * without interfering with this stop). */
     int64_t end_epoch_ms = (int64_t)time(NULL) * 1000;
     int64_t as11_ms = 0;
     int64_t clock_drift_ms = 0;
@@ -520,9 +554,8 @@ esp_err_t session_writer_stop(session_writer_t *s)
         }
     }
 
-    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
-
-    s->active = false;
+    /* No mutex needed here — s_active is already cleared and s->active=false
+     * prevents concurrent writers from using this session. */
     s->end_time_us = esp_timer_get_time();
     s->end_epoch_ms = end_epoch_ms;
     if (have_drift) s->clock_drift_ms = clock_drift_ms;
@@ -563,7 +596,7 @@ esp_err_t session_writer_stop(session_writer_t *s)
              (unsigned)s->sa2.sample_count,
              (unsigned)s->pld.sample_count);
 
-    if (s_active == s) s_active = NULL;
+    /* s_active was already cleared above (before GetDateTime RPC). */
 
     if (s->mutex) vSemaphoreDelete(s->mutex);
     /* NOTE: s is NOT freed here — the caller (stop_task) needs to read
@@ -571,7 +604,6 @@ esp_err_t session_writer_stop(session_writer_t *s)
      * The caller is responsible for calling free(s). */
     s->mutex = NULL;  /* prevent double-delete */
 
-    xSemaphoreGive(s_active_mutex);
     return ESP_OK;
 }
 
@@ -1198,14 +1230,29 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
 
     ESP_LOGD(TAG, "notification: %s", method_str);
 
-    /* Handle EventNotification: check for TherapyStart/TherapyStop */
+    /* Handle EventNotification: check for TherapyStart/TherapyStop.
+     *
+     * Session lifecycle (confirmed from AS11 logs 2026-07-11):
+     *   - TherapyStop and TherapyStart are separate EventNotifications,
+     *     typically 1-5 minutes apart for short mask-off breaks.
+     *   - Each creates a separate .snt session and separate EDF files.
+     *   - The AS11 sends MaskOn ~7s after TherapyStart; .snt recording
+     *     starts at TherapyStart, so BRP/PLD/SA2 EDF files use skip_samples
+     *     to align to MaskOn (see edf_gen.c).
+     *
+     * Race condition note: session_writer_stop() now clears s_active BEFORE
+     * the GetDateTime RPC, so a TherapyStart arriving during that ~50ms
+     * window will correctly create a new session instead of writing to the
+     * closing session's files (which was the primary "session gluing" cause
+     * for short inter-session breaks). */
     if (strcmp(method_str, "EventNotification") == 0) {
         bool start = false, stop = false;
         check_event_notification(msg, &start, &stop);
 
         /* Handle stop first so that a single message containing both
          * TherapyStart + TherapyStop (quick start/stop) doesn't leave
-         * the display stuck in graph mode. */
+         * the display stuck in graph mode.  After stop, s is set to NULL
+         * so the start handler below will create a fresh session. */
         if (stop) {
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
             s_therapy_stopped = true;
