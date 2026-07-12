@@ -544,6 +544,46 @@ static int64_t find_mask_on_time(const char *events_snt_path)
     return mask_on_ms;
 }
 
+/* Find the last MaskOff event timestamp in events.snt.
+ * Returns AS11-clock epoch ms, or -1 if MaskOff is not found.
+ * We scan for the last (not first) MaskOff because a session may contain
+ * multiple MaskOn/MaskOff pairs (brief mask removals within one session).
+ * The caller converts to NTP by adding clock_drift_ms. */
+static int64_t find_mask_off_time(const char *events_snt_path)
+{
+    FILE *f = fopen(events_snt_path, "r");
+    if (!f) return -1;
+
+    int64_t mask_off_ms = -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) continue;
+        cJSON *params = cJSON_GetObjectItem(msg, "params");
+        if (params) {
+            cJSON *events = cJSON_GetObjectItem(params, "events");
+            if (events && cJSON_IsArray(events)) {
+                int n = cJSON_GetArraySize(events);
+                for (int i = 0; i < n; i++) {
+                    cJSON *ev = cJSON_GetArrayItem(events, i);
+                    if (!ev) continue;
+                    cJSON *label = cJSON_GetObjectItem(ev, "event");
+                    if (!label || !cJSON_IsString(label)) continue;
+                    if (strcmp(label->valuestring, "MaskOff") == 0) {
+                        cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
+                        if (rt && cJSON_IsString(rt)) {
+                            mask_off_ms = parse_iso8601_utc_ms(rt->valuestring);
+                        }
+                    }
+                }
+            }
+        }
+        cJSON_Delete(msg);
+    }
+    fclose(f);
+    return mask_off_ms;
+}
+
 /* Convert one .snt file to an EDF file.
  *
  * Parameters:
@@ -561,6 +601,9 @@ static int64_t find_mask_on_time(const char *events_snt_path)
  *   skip_samples - number of leading samples to skip (per channel), used
  *                 to align EDF start to MaskOn instead of TherapyStart.
  *                 0 = start from the beginning of the .snt file.
+ *   max_samples  - maximum number of samples (per channel) to include
+ *                 after skipping, used to truncate the end to MaskOff.
+ *                 0 = use all remaining samples (no end truncation).
  */
 static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                     const char *patient_id, const char *recording_id,
@@ -568,7 +611,8 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                     const edf_signal_def_t *signals, int n_signals,
                                     const char *record_dur,
                                     const int *channel_map,
-                                    uint32_t skip_samples)
+                                    uint32_t skip_samples,
+                                    uint32_t max_samples)
 {
     FILE *snt = fopen(snt_path, "rb");
     if (!snt) {
@@ -631,6 +675,16 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         skip_samples = total_samples;
     }
     total_samples -= skip_samples;
+    /* Truncate the end to MaskOff if max_samples is specified.
+     * AS11 EDF data spans MaskOn→MaskOff, but .snt captures TherapyStart→
+     * TherapyStop.  Without this, the EDF includes ~53-57s of post-MaskOff
+     * data (mask-off ramp-down before TherapyStop), which can create an
+     * extra 60-second record that AS11 doesn't have. */
+    if (max_samples > 0 && max_samples < total_samples) {
+        ESP_LOGI(TAG, "%s: truncating %u → %u samples (MaskOff end-trim)",
+                 snt_path, total_samples, max_samples);
+        total_samples = max_samples;
+    }
     int total_records = (int)(total_samples / spr[0]);
     if (total_records < 0) total_records = 0;
 
@@ -2508,6 +2562,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* MaskOn timestamp (for BRP/PLD/SA2) — falls back to TherapyStart */
     int64_t maskon_start_ms = start_epoch_ms;
     uint32_t brp_skip = 0, sa2_skip = 0, pld_skip = 0;
+    uint32_t brp_max = 0, sa2_max = 0, pld_max = 0;
     {
         int64_t maskon_as11 = find_mask_on_time(events_snt_path);
         if (maskon_as11 > 0) {
@@ -2534,6 +2589,34 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         } else {
             ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
                          "for BRP/PLD/SA2");
+        }
+
+        /* MaskOff timestamp (for BRP/PLD/SA2 end truncation).
+         * AS11 EDF data spans MaskOn→MaskOff, but .snt captures TherapyStart→
+         * TherapyStop.  We need to truncate the tail to match MaskOff. */
+        int64_t maskoff_as11 = find_mask_off_time(events_snt_path);
+        if (maskoff_as11 > 0) {
+            int64_t maskoff_ntp = maskoff_as11 + clock_drift_ms;
+            if (maskoff_ntp > maskon_start_ms && maskoff_ntp < end_epoch_ms) {
+                int64_t dur_ms = maskoff_ntp - maskon_start_ms;
+                brp_max = (uint32_t)(dur_ms * 25 / 1000);   /* 25 Hz */
+                sa2_max = (uint32_t)(dur_ms * 1 / 1000);     /* 1 Hz */
+                pld_max = (uint32_t)(dur_ms / 2000);         /* 0.5 Hz */
+                ESP_LOGI(TAG, "MaskOff: as11=%lld ntp=%lld dur_ms=%lld "
+                             "brp_max=%u sa2_max=%u pld_max=%u",
+                         (long long)maskoff_as11, (long long)maskoff_ntp,
+                         (long long)dur_ms,
+                         (unsigned)brp_max, (unsigned)sa2_max,
+                         (unsigned)pld_max);
+            } else {
+                ESP_LOGW(TAG, "MaskOff NTP time %lld out of range "
+                             "[%lld, %lld], no end truncation",
+                         (long long)maskoff_ntp,
+                         (long long)maskon_start_ms,
+                         (long long)end_epoch_ms);
+            }
+        } else {
+            ESP_LOGI(TAG, "MaskOff not found in events.snt, no end truncation");
         }
     }
     char maskon_date[16], maskon_time[16];
@@ -2602,7 +2685,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
                                maskon_date, maskon_time, brp_sigs, 2, "60.00",
-                               NULL, brp_skip) != ESP_OK) {
+                               NULL, brp_skip, brp_max) != ESP_OK) {
             errors++;
         }
     }
@@ -2627,7 +2710,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
                                maskon_date, maskon_time, sa2_sigs, 2, "60.00",
-                               NULL, sa2_skip) != ESP_OK) {
+                               NULL, sa2_skip, sa2_max) != ESP_OK) {
             errors++;
         }
     }
@@ -2702,7 +2785,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
                                maskon_date, maskon_time, pld_sigs, 9, "60.00",
-                               pld_ch_map, pld_skip) != ESP_OK) {
+                               pld_ch_map, pld_skip, pld_max) != ESP_OK) {
             errors++;
         }
     }
