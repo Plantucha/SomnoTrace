@@ -503,6 +503,47 @@ static int64_t parse_iso8601_utc_ms(const char *iso_str)
     return secs * 1000 + ms;
 }
 
+/* Find the first MaskOn event timestamp in events.snt.
+ * Returns AS11-clock epoch ms, or -1 if MaskOn is not found.
+ * The caller converts to NTP by adding clock_drift_ms. */
+static int64_t find_mask_on_time(const char *events_snt_path)
+{
+    FILE *f = fopen(events_snt_path, "r");
+    if (!f) return -1;
+
+    int64_t mask_on_ms = -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) continue;
+        cJSON *params = cJSON_GetObjectItem(msg, "params");
+        if (params) {
+            cJSON *events = cJSON_GetObjectItem(params, "events");
+            if (events && cJSON_IsArray(events)) {
+                int n = cJSON_GetArraySize(events);
+                for (int i = 0; i < n; i++) {
+                    cJSON *ev = cJSON_GetArrayItem(events, i);
+                    if (!ev) continue;
+                    cJSON *label = cJSON_GetObjectItem(ev, "event");
+                    if (!label || !cJSON_IsString(label)) continue;
+                    if (strcmp(label->valuestring, "MaskOn") == 0) {
+                        cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
+                        if (rt && cJSON_IsString(rt)) {
+                            mask_on_ms = parse_iso8601_utc_ms(rt->valuestring);
+                            cJSON_Delete(msg);
+                            fclose(f);
+                            return mask_on_ms;
+                        }
+                    }
+                }
+            }
+        }
+        cJSON_Delete(msg);
+    }
+    fclose(f);
+    return mask_on_ms;
+}
+
 /* Convert one .snt file to an EDF file.
  *
  * Parameters:
@@ -2443,11 +2484,13 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     char events_snt_path[330];
     snprintf(events_snt_path, sizeof(events_snt_path), "%s/%s_events.snt", session_dir, session_id);
 
-    /* ── Build EDF header common fields ──
+    /* ── Build EDF header timestamps ──
      *
-     * All EDF file types (BRP/PLD/SA2/EVE/CSL) use TherapyStart as their
-     * start timestamp, matching AS11 behaviour.  The .snt files capture
-     * from TherapyStart, so no sample skipping is needed.
+     * AS11 uses two different start timestamps:
+     *   - EVE/CSL: TherapyStart (session start event)
+     *   - BRP/PLD/SA2: MaskOn (mask detected, ~7s after TherapyStart)
+     * The .snt files capture from TherapyStart, so BRP/PLD/SA2 need
+     * skip_samples to discard pre-MaskOn data.
      *
      * We use NTP-corrected time directly so that the timestamps reflect the
      * real wall-clock time and align with data from separate devices (e.g.
@@ -2455,10 +2498,50 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * card (which stamps EDF headers in the machine's own drifting clock),
      * use:  edf_start_ms = start_epoch_ms - clock_drift_ms;
      * We intentionally correct to NTP instead. */
+
+    /* TherapyStart timestamp (for EVE/CSL) */
     int64_t edf_start_ms = start_epoch_ms;
     char start_date[16], start_time[16];
     format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
+
+    /* MaskOn timestamp (for BRP/PLD/SA2) — falls back to TherapyStart */
+    int64_t maskon_start_ms = start_epoch_ms;
+    uint32_t brp_skip = 0, sa2_skip = 0, pld_skip = 0;
+    {
+        int64_t maskon_as11 = find_mask_on_time(events_snt_path);
+        if (maskon_as11 > 0) {
+            int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
+            if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
+                maskon_start_ms = maskon_ntp;
+                int64_t skip_ms = maskon_ntp - start_epoch_ms;
+                brp_skip = (uint32_t)(skip_ms * 25 / 1000);   /* 25 Hz */
+                sa2_skip = (uint32_t)(skip_ms * 1 / 1000);     /* 1 Hz */
+                pld_skip = (uint32_t)(skip_ms / 2000);         /* 0.5 Hz */
+                ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
+                             "brp_skip=%u sa2_skip=%u pld_skip=%u",
+                         (long long)maskon_as11, (long long)maskon_ntp,
+                         (long long)skip_ms,
+                         (unsigned)brp_skip, (unsigned)sa2_skip,
+                         (unsigned)pld_skip);
+            } else {
+                ESP_LOGW(TAG, "MaskOn NTP time %lld out of session range "
+                             "[%lld, %lld], using TherapyStart",
+                         (long long)maskon_ntp,
+                         (long long)start_epoch_ms,
+                         (long long)end_epoch_ms);
+            }
+        } else {
+            ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
+                         "for BRP/PLD/SA2");
+        }
+    }
+    char maskon_date[16], maskon_time[16];
+    format_edf_datetime(maskon_start_ms, maskon_date, sizeof(maskon_date),
+                        maskon_time, sizeof(maskon_time));
+    char maskon_ts_prefix[32];
+    session_timestamp(maskon_start_ms, maskon_ts_prefix,
+                      sizeof(maskon_ts_prefix));
 
     /* STR.edf uses the noon-based day date (sessions before noon belong
      * to the previous day's STR.edf). */
@@ -2475,10 +2558,13 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                  tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
     }
 
-    /* Recording ID uses TherapyStart for all file types. */
-    char recording_id[128];
+    /* Recording ID: TherapyStart for EVE/CSL, MaskOn for BRP/PLD/SA2. */
+    char recording_id[128];       /* TherapyStart-based (EVE/CSL) */
     format_recording_id(recording_id, sizeof(recording_id),
                         edf_start_ms, ident);
+    char maskon_recording_id[128]; /* MaskOn-based (BRP/PLD/SA2) */
+    format_recording_id(maskon_recording_id, sizeof(maskon_recording_id),
+                        maskon_start_ms, ident);
 
     /* STR.edf recording_id uses the noon-based day date, not session start. */
     char str_recording_id[128];
@@ -2502,7 +2588,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, ts_prefix);
+        snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, maskon_ts_prefix);
 
         edf_signal_def_t brp_sigs[] = {
             { .label = "Flow.40ms", .transducer = "",
@@ -2514,9 +2600,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .dig_min = 0, .dig_max = 2000,
               .prefilter = "", .samples_per_record = 1500 },
         };
-        if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, brp_sigs, 2, "60.00",
-                               NULL, 0) != ESP_OK) {
+        if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                               maskon_date, maskon_time, brp_sigs, 2, "60.00",
+                               NULL, brp_skip) != ESP_OK) {
             errors++;
         }
     }
@@ -2525,7 +2611,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, ts_prefix);
+        snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
 
         edf_signal_def_t sa2_sigs[] = {
             { .label = "Pulse.1s", .transducer = "",
@@ -2539,9 +2625,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .prefilter = "", .samples_per_record = 60,
               .invalid_passthrough = true },
         };
-        if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, sa2_sigs, 2, "60.00",
-                               NULL, 0) != ESP_OK) {
+        if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                               maskon_date, maskon_time, sa2_sigs, 2, "60.00",
+                               NULL, sa2_skip) != ESP_OK) {
             errors++;
         }
     }
@@ -2567,7 +2653,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, ts_prefix);
+        snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
 
         edf_signal_def_t pld_sigs[] = {
             { .label = "MaskPress.2s", .transducer = "",
@@ -2614,9 +2700,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
          * 9=Snore, 10=FlowLim, 11=Ti
          * EDF drops TgtVent(7), IERatio(8), Ti(11). */
         static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
-        if (convert_snt_to_edf(snt_path, edf_path, patient_id, recording_id,
-                               start_date, start_time, pld_sigs, 9, "60.00",
-                               pld_ch_map, 0) != ESP_OK) {
+        if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                               maskon_date, maskon_time, pld_sigs, 9, "60.00",
+                               pld_ch_map, pld_skip) != ESP_OK) {
             errors++;
         }
     }
