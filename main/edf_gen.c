@@ -1398,10 +1398,15 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
  * Returns the MaskEvents count. */
 static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
                                  int16_t *mask_on_extra, int16_t *mask_off_extra,
-                                 int64_t period_start_ms)
+                                 int64_t period_start_ms, int64_t clock_drift_ms)
 {
-    /* [0] Date: days from Unix epoch (noon-based day of period_start) */
-    time_t t = (time_t)(period_start_ms / 1000);
+    /* Summary timestamps are in AS11 time.  STR.edf is deliberately exported
+     * in NTP time so its session intervals match the NTP-based EDF headers,
+     * filenames, and event annotations. */
+    int64_t ntp_period_start_ms = period_start_ms + clock_drift_ms;
+
+    /* [0] Date: days from Unix epoch (noon-based NTP day of PeriodStart) */
+    time_t t = (time_t)(ntp_period_start_ms / 1000);
     struct tm tm;
     localtime_r(&t, &tm);
     if (tm.tm_hour < 12) t -= 86400;
@@ -1420,8 +1425,8 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
     int mask_off_count = 0;
 
     for (int i = 0; i < ctx->n_session_entries && mask_on_count < 20; i++) {
-        int64_t ev_ms = ctx->session_entries[i].ts;
-        int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
+        int64_t event_ntp_ms = ctx->session_entries[i].ts + clock_drift_ms;
+        int min_from_noon = (int)((event_ntp_ms - noon_epoch_ms) / 60000);
 
         if (mask_on_count == 0)
             str_values[1] = (int16_t)min_from_noon;
@@ -1442,14 +1447,14 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
 
     /* Fallback: use PeriodStart/PeriodEnd if no session entries */
     if (mask_on_count == 0 && ctx->has_scalar[SUM_F_PERIOD_START]) {
-        int64_t ps = ctx->scalars[SUM_F_PERIOD_START];
-        int min_from_noon = (int)((ps - noon_epoch_ms) / 60000);
+        int64_t ps_ntp = ctx->scalars[SUM_F_PERIOD_START] + clock_drift_ms;
+        int min_from_noon = (int)((ps_ntp - noon_epoch_ms) / 60000);
         str_values[1] = (int16_t)min_from_noon;
         mask_on_count = 1;
     }
     if (mask_off_count == 0 && ctx->has_scalar[SUM_F_PERIOD_END]) {
-        int64_t pe = ctx->scalars[SUM_F_PERIOD_END];
-        int min_from_noon = (int)((pe - noon_epoch_ms) / 60000);
+        int64_t pe_ntp = ctx->scalars[SUM_F_PERIOD_END] + clock_drift_ms;
+        int min_from_noon = (int)((pe_ntp - noon_epoch_ms) / 60000);
         str_values[2] = (int16_t)min_from_noon;
         mask_off_count = 1;
     }
@@ -1475,6 +1480,7 @@ static void build_current_day_record(str_day_record_t *rec,
                                      const char *session_id,
                                      int64_t start_epoch_ms,
                                      int64_t end_epoch_ms,
+                                     int64_t clock_drift_ms,
                                      const cJSON *settings_json)
 {
     memset(rec->values, 0xFF, STR_DATA_COUNT * sizeof(int16_t));
@@ -1547,8 +1553,8 @@ static void build_current_day_record(str_day_record_t *rec,
                         int64_t days = (int64_t)era * 146097 + (int)doe - 719468;
                         int64_t secs = days * 86400 + ev_tm.tm_hour * 3600 +
                                        ev_tm.tm_min * 60 + ev_tm.tm_sec;
-                        int64_t ev_ms = secs * 1000 + ms;
-                        int min_from_noon = (int)((ev_ms - noon_epoch_ms) / 60000);
+                        int64_t event_ntp_ms = secs * 1000 + ms + clock_drift_ms;
+                        int min_from_noon = (int)((event_ntp_ms - noon_epoch_ms) / 60000);
 
                         if (strcmp(label->valuestring, "MaskOn") == 0 &&
                             mask_on_count < 20) {
@@ -1622,6 +1628,69 @@ static void build_current_day_record(str_day_record_t *rec,
              mask_on_count, mask_off_count, rec->values[4]);
 }
 
+/* Resolve the drift for one AS11 Summary noon-day.  Session metadata stores
+ * the drift measured when that session stopped; choose the session closest to
+ * the Summary PeriodStart.  This lets cumulative STR.edf keep historical days
+ * NTP-corrected even after the AS11 clock changes later. */
+static int64_t resolve_summary_drift(const char *as11_day_label,
+                                     int64_t period_start_ms,
+                                     int64_t fallback_drift_ms)
+{
+    DIR *streams_dir = opendir(SD_STREAMS_DIR);
+    if (!streams_dir) return fallback_drift_ms;
+
+    int64_t resolved_drift_ms = fallback_drift_ms;
+    int64_t best_distance_ms = INT64_MAX;
+    struct dirent *day_ent;
+    while ((day_ent = readdir(streams_dir)) != NULL) {
+        if (strlen(day_ent->d_name) != 8) continue;
+
+        char stream_day_path[300];
+        snprintf(stream_day_path, sizeof(stream_day_path), "%s/%s",
+                 SD_STREAMS_DIR, day_ent->d_name);
+        DIR *stream_day_dir = opendir(stream_day_path);
+        if (!stream_day_dir) continue;
+
+        struct dirent *session_ent;
+        while ((session_ent = readdir(stream_day_dir)) != NULL) {
+            size_t name_len = strlen(session_ent->d_name);
+            if (name_len < 13 ||
+                strcmp(session_ent->d_name + name_len - 13, "_session.json") != 0) {
+                continue;
+            }
+
+            char session_path[600];
+            snprintf(session_path, sizeof(session_path), "%s/%s",
+                     stream_day_path, session_ent->d_name);
+            cJSON *session = read_json_file(session_path);
+            if (!session) continue;
+
+            cJSON *start_j = cJSON_GetObjectItem(session, "start_epoch_ms");
+            cJSON *drift_j = cJSON_GetObjectItem(session, "clock_drift_ms");
+            if (cJSON_IsNumber(start_j) && cJSON_IsNumber(drift_j)) {
+                int64_t start_ntp_ms = (int64_t)start_j->valuedouble;
+                int64_t drift_ms = (int64_t)drift_j->valuedouble;
+                int64_t start_as11_ms = start_ntp_ms - drift_ms;
+                char session_as11_day[16];
+                noon_day_folder(start_as11_ms, session_as11_day,
+                                sizeof(session_as11_day));
+                if (strcmp(session_as11_day, as11_day_label) == 0) {
+                    int64_t distance_ms = llabs(start_as11_ms - period_start_ms);
+                    if (distance_ms < best_distance_ms) {
+                        best_distance_ms = distance_ms;
+                        resolved_drift_ms = drift_ms;
+                    }
+                }
+            }
+            cJSON_Delete(session);
+        }
+        closedir(stream_day_dir);
+    }
+    closedir(streams_dir);
+
+    return resolved_drift_ms;
+}
+
 /* Generate multi-record STR.edf from per-day summary spool files.
  * Scans .sessions/summaries/ for *.spool files, parses each into a
  * daily STR record, and writes them all into a single STR.edf at
@@ -1634,7 +1703,8 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                                   const cJSON *settings_json,
                                   const char *session_dir,
                                   const char *session_id,
-                                  int64_t start_epoch_ms, int64_t end_epoch_ms)
+                                  int64_t start_epoch_ms, int64_t end_epoch_ms,
+                                  int64_t clock_drift_ms)
 {
     (void)start_date;  /* computed internally from oldest record */
     /* ── Scan .sessions/summaries/ for per-day .spool files ── */
@@ -1704,14 +1774,20 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         memset(rec->mask_on_extra, 0xFF, sizeof(rec->mask_on_extra));
         memset(rec->mask_off_extra, 0xFF, sizeof(rec->mask_off_extra));
 
+        char as11_day_label[16];
+        noon_day_folder(period_start, as11_day_label, sizeof(as11_day_label));
+        int64_t record_drift_ms = resolve_summary_drift(as11_day_label,
+                                                        period_start,
+                                                        clock_drift_ms);
         build_str_mask_events(ctx, rec->values, rec->mask_on_extra,
-                              rec->mask_off_extra, period_start);
+                              rec->mask_off_extra, period_start, record_drift_ms);
         build_str_data_values(ctx, rec->values, settings_json);
-        rec->period_start = period_start;
+        rec->period_start = period_start + record_drift_ms;
         n_records++;
 
-        ESP_LOGI(TAG, "STR.edf: parsed %s (PeriodStart=%lld, Duration=%d)",
-                 nm, (long long)period_start, rec->values[4]);
+        ESP_LOGI(TAG, "STR.edf: parsed %s (PeriodStart=%lld, drift=%lld, Duration=%d)",
+                 nm, (long long)period_start, (long long)record_drift_ms,
+                 rec->values[4]);
     }
     closedir(dir);
 
@@ -1739,7 +1815,8 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                  current_day_label);
         build_current_day_record(&records[n_records], session_dir,
                                  session_id,
-                                 start_epoch_ms, end_epoch_ms, settings_json);
+                                 start_epoch_ms, end_epoch_ms, clock_drift_ms,
+                                 settings_json);
         n_records++;
     }
 
@@ -1983,9 +2060,9 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
  *   ReraEnd             → "Arousal"
  *   CsrStart / CsrEnd   → "CSR" (in CSL mode)
  *
- * All timestamps inside events.snt reportTime are in AS11 clock time.
- * We apply clock_drift_ms (NTP - AS11) so that onset timestamps reflect
- * seconds elapsed from session_start_ms (NTP-corrected start of therapy).
+ * All timestamps inside events.snt reportTime are in the AS11 clock domain.
+ * Convert them with clock_drift_ms (NTP - AS11) before calculating annotation
+ * onsets relative to the NTP-corrected EDF header start time.
  */
 
 static const char *event_label_map_str(const char *ev_name, bool csl_mode)
@@ -2506,8 +2583,12 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     mkdir(SD_SDCARD_DATALOG, 0775);
     mkdir(SD_SDCARD_SETTINGS, 0775);
 
-    /* Create date subdirectory inside DATALOG (noon-based day folder).
-     * AS11 native layout: DATALOG/YYYYMMDD/YYYYMMDD_HHMMSS_TYPE.edf */
+    /* The SDCARD export uses NTP-corrected time throughout: DATALOG days,
+     * filenames, EDF headers, STR session boundaries, and annotations must
+     * agree so importers group sessions correctly and graphs show real time. */
+
+    /* Create date subdirectory inside DATALOG (noon-based NTP day).
+     * Layout: DATALOG/YYYYMMDD/YYYYMMDD_HHMMSS_TYPE.edf */
     char day_folder[16];
     noon_day_folder(start_epoch_ms, day_folder, sizeof(day_folder));
 
@@ -2515,7 +2596,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_SDCARD_DATALOG, day_folder);
     mkdir(day_dir, 0775);
 
-    /* Session timestamp prefix for EDF filenames (same as session_id) */
+    /* Session timestamp prefix for EVE/CSL EDF filenames (NTP TherapyStart). */
     char ts_prefix[32];
     session_timestamp(start_epoch_ms, ts_prefix, sizeof(ts_prefix));
 
@@ -2546,20 +2627,16 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * The .snt files capture from TherapyStart, so BRP/PLD/SA2 need
      * skip_samples to discard pre-MaskOn data.
      *
-     * We use NTP-corrected time directly so that the timestamps reflect the
-     * real wall-clock time and align with data from separate devices (e.g.
-     * oximeters).  To produce byte-identical files mimicking a real AS11 SD
-     * card (which stamps EDF headers in the machine's own drifting clock),
-     * use:  edf_start_ms = start_epoch_ms - clock_drift_ms;
-     * We intentionally correct to NTP instead. */
+     * SDCARD EDF headers and filenames use NTP time.  The STR generator
+     * applies the same correction to its AS11-derived MaskOn/MaskOff values. */
 
-    /* TherapyStart timestamp (for EVE/CSL) */
+    /* TherapyStart timestamp (for EVE/CSL, NTP clock domain). */
     int64_t edf_start_ms = start_epoch_ms;
     char start_date[16], start_time[16];
     format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
 
-    /* MaskOn timestamp (for BRP/PLD/SA2) — falls back to TherapyStart */
+    /* MaskOn timestamp (for BRP/PLD/SA2, NTP clock domain). */
     int64_t maskon_start_ms = start_epoch_ms;
     uint32_t brp_skip = 0, sa2_skip = 0, pld_skip = 0;
     uint32_t brp_max = 0, sa2_max = 0, pld_max = 0;
@@ -2796,7 +2873,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     if (generate_str_edf(SD_SDCARD_DIR, patient_id, str_recording_id,
                          str_start_date, settings,
                          session_dir, session_id,
-                         start_epoch_ms, end_epoch_ms) != ESP_OK) {
+                         start_epoch_ms, end_epoch_ms, clock_drift_ms) != ESP_OK) {
         errors++;
     }
 
@@ -2826,8 +2903,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     }
 
     /* ── Generate EVE.edf from events.snt ──
-     * Event timestamps in events.snt are in AS11 internal time.
-     * clock_drift_ms is applied to convert them to NTP time. */
+     * Both event onsets and the EDF header use NTP-corrected time. */
     if (!session_too_short) {
         char eve_path[350];
         snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
