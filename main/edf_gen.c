@@ -221,6 +221,46 @@ static void edf_write_field(char *buf, int width, const char *text)
     }
 }
 
+static bool write_all(FILE *f, const void *data, size_t len)
+{
+    return fwrite(data, 1, len, f) == len;
+}
+
+static FILE *open_atomic_file(const char *path, char *tmp_path, size_t tmp_path_len)
+{
+    int written = snprintf(tmp_path, tmp_path_len, "%s.tmp", path);
+    if (written < 0 || (size_t)written >= tmp_path_len) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    unlink(tmp_path);
+    return fopen(tmp_path, "wb");
+}
+
+static esp_err_t finalize_atomic_file(FILE *f, const char *tmp_path, const char *path)
+{
+    int saved_errno = 0;
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0) {
+        saved_errno = errno;
+        unlink(tmp_path);
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
+    if (rename(tmp_path, path) != 0) {
+        saved_errno = errno;
+        unlink(tmp_path);
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static void discard_atomic_file(FILE *f, const char *tmp_path)
+{
+    if (f) fclose(f);
+    if (tmp_path) unlink(tmp_path);
+}
+
 /* Signal metadata definition. */
 typedef struct {
     const char *label;      /* 16 chars */
@@ -406,14 +446,11 @@ static int edf_write_header(FILE *f, const char *patient_id,
     pid[80] = '\0';
     memcpy(hdr + 8, pid, 80);
 
-    /* Write fixed header */
-    fwrite(hdr, 1, 256, f);
-
-    /* Write signal header blocks */
-    fwrite(sigblock, 1, 256 * total, f);
+    bool written = write_all(f, hdr, sizeof(hdr)) &&
+                   write_all(f, sigblock, 256 * total);
 
     free(sigblock);
-    return header_bytes;
+    return written ? header_bytes : -1;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -694,18 +731,23 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     if (total_records == 0) {
         ESP_LOGI(TAG, "%s: short session (%u samples < %d spr), writing header-only EDF",
                  snt_path, total_samples, spr[0]);
-        FILE *edf = fopen(edf_path, "w+b");
+        char tmp_path[380];
+        FILE *edf = open_atomic_file(edf_path, tmp_path, sizeof(tmp_path));
         if (!edf) {
             ESP_LOGE(TAG, "cannot create %s: %s", edf_path, strerror(errno));
             free(spr); free(sig);
             fclose(snt);
             return ESP_FAIL;
         }
-        edf_write_header(edf, patient_id, recording_id,
-                         start_date, start_time,
-                         0, record_dur, "EDF", sig, n_signals);
-        fsync(fileno(edf));
-        fclose(edf);
+        if (edf_write_header(edf, patient_id, recording_id,
+                             start_date, start_time,
+                             0, record_dur, "EDF", sig, n_signals) < 0 ||
+            finalize_atomic_file(edf, tmp_path, edf_path) != ESP_OK) {
+            ESP_LOGE(TAG, "cannot write %s: %s", edf_path, strerror(errno));
+            free(spr); free(sig);
+            fclose(snt);
+            return ESP_FAIL;
+        }
         free(spr); free(sig);
         fclose(snt);
         return ESP_OK;
@@ -727,7 +769,8 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     }
 
     /* Create EDF file and write header */
-    FILE *edf = fopen(edf_path, "w+b");
+    char tmp_path[380];
+    FILE *edf = open_atomic_file(edf_path, tmp_path, sizeof(tmp_path));
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", edf_path, strerror(errno));
         fclose(snt);
@@ -741,7 +784,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     if (header_bytes < 0) {
         ESP_LOGE(TAG, "edf_write_header failed for %s", edf_path);
         free(spr); free(sig);
-        fclose(edf);
+        discard_atomic_file(edf, tmp_path);
         fclose(snt);
         return ESP_FAIL;
     }
@@ -776,7 +819,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     if (!raw || !record_buf) {
         ESP_LOGE(TAG, "malloc record buffers failed");
         free(raw); free(record_buf); free(spr); free(sig);
-        fclose(edf);
+        discard_atomic_file(edf, tmp_path);
         fclose(snt);
         return ESP_ERR_NO_MEM;
     }
@@ -796,8 +839,11 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         }
         if (avail > 0) {
             if (fread(raw, 1, avail, snt) != avail) {
-                ESP_LOGW(TAG, "short read at record %d, stopping", rec);
-                break;
+                ESP_LOGW(TAG, "short read at record %d", rec);
+                free(raw); free(record_buf); free(spr); free(sig);
+                discard_atomic_file(edf, tmp_path);
+                fclose(snt);
+                return ESP_FAIL;
             }
         }
 
@@ -863,12 +909,22 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         }
 
         /* Write de-interleaved signal data to EDF */
-        fwrite(record_buf, sizeof(int16_t), record_data_samples, edf);
+        if (!write_all(edf, record_buf, record_bytes)) {
+            free(raw); free(record_buf); free(spr); free(sig);
+            discard_atomic_file(edf, tmp_path);
+            fclose(snt);
+            return ESP_FAIL;
+        }
 
         /* Compute CRC16 over the signal data bytes and write as int16 */
         uint16_t crc = crc16_ccitt((uint8_t *)record_buf, record_bytes);
         int16_t crc_val = (int16_t)crc;
-        fwrite(&crc_val, sizeof(int16_t), 1, edf);
+        if (!write_all(edf, &crc_val, sizeof(crc_val))) {
+            free(raw); free(record_buf); free(spr); free(sig);
+            discard_atomic_file(edf, tmp_path);
+            fclose(snt);
+            return ESP_FAIL;
+        }
     }
 
     free(raw);
@@ -876,8 +932,11 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     free(spr);
     free(sig);
 
-    fsync(fileno(edf));
-    fclose(edf);
+    if (finalize_atomic_file(edf, tmp_path, edf_path) != ESP_OK) {
+        ESP_LOGE(TAG, "cannot finalize %s: %s", edf_path, strerror(errno));
+        fclose(snt);
+        return ESP_FAIL;
+    }
     fclose(snt);
     ESP_LOGI(TAG, "EDF conversion complete: %s", edf_path);
     return ESP_OK;
@@ -1632,15 +1691,24 @@ static void build_current_day_record(str_day_record_t *rec,
  * the drift measured when that session stopped; choose the session closest to
  * the Summary PeriodStart.  This lets cumulative STR.edf keep historical days
  * NTP-corrected even after the AS11 clock changes later. */
-static int64_t resolve_summary_drift(const char *as11_day_label,
-                                     int64_t period_start_ms,
-                                     int64_t fallback_drift_ms)
-{
-    DIR *streams_dir = opendir(SD_STREAMS_DIR);
-    if (!streams_dir) return fallback_drift_ms;
+typedef struct {
+    int64_t start_as11_ms;
+    int64_t drift_ms;
+    char as11_day[16];
+} session_drift_entry_t;
 
-    int64_t resolved_drift_ms = fallback_drift_ms;
-    int64_t best_distance_ms = INT64_MAX;
+/* Build an in-memory index of all session drift entries by scanning
+ * .sessions/streams/ once.  Returns a malloc'd array (caller frees) or
+ * NULL on failure.  *out_count receives the number of entries. */
+static session_drift_entry_t *build_session_drift_index(int *out_count)
+{
+    *out_count = 0;
+    DIR *streams_dir = opendir(SD_STREAMS_DIR);
+    if (!streams_dir) return NULL;
+
+    int cap = 0, n = 0;
+    session_drift_entry_t *entries = NULL;
+
     struct dirent *day_ent;
     while ((day_ent = readdir(streams_dir)) != NULL) {
         if (strlen(day_ent->d_name) != 8) continue;
@@ -1668,19 +1736,24 @@ static int64_t resolve_summary_drift(const char *as11_day_label,
             cJSON *start_j = cJSON_GetObjectItem(session, "start_epoch_ms");
             cJSON *drift_j = cJSON_GetObjectItem(session, "clock_drift_ms");
             if (cJSON_IsNumber(start_j) && cJSON_IsNumber(drift_j)) {
+                if (n >= cap) {
+                    int new_cap = cap ? cap * 2 : 16;
+                    session_drift_entry_t *tmp = realloc(entries,
+                        new_cap * sizeof(session_drift_entry_t));
+                    if (!tmp) {
+                        cJSON_Delete(session);
+                        continue;
+                    }
+                    entries = tmp;
+                    cap = new_cap;
+                }
                 int64_t start_ntp_ms = (int64_t)start_j->valuedouble;
                 int64_t drift_ms = (int64_t)drift_j->valuedouble;
-                int64_t start_as11_ms = start_ntp_ms - drift_ms;
-                char session_as11_day[16];
-                noon_day_folder(start_as11_ms, session_as11_day,
-                                sizeof(session_as11_day));
-                if (strcmp(session_as11_day, as11_day_label) == 0) {
-                    int64_t distance_ms = llabs(start_as11_ms - period_start_ms);
-                    if (distance_ms < best_distance_ms) {
-                        best_distance_ms = distance_ms;
-                        resolved_drift_ms = drift_ms;
-                    }
-                }
+                entries[n].start_as11_ms = start_ntp_ms - drift_ms;
+                entries[n].drift_ms = drift_ms;
+                noon_day_folder(entries[n].start_as11_ms, entries[n].as11_day,
+                                sizeof(entries[n].as11_day));
+                n++;
             }
             cJSON_Delete(session);
         }
@@ -1688,6 +1761,28 @@ static int64_t resolve_summary_drift(const char *as11_day_label,
     }
     closedir(streams_dir);
 
+    *out_count = n;
+    return entries;
+}
+
+/* Look up the best-matching drift for a given AS11 noon-day and PeriodStart
+ * from the in-memory index.  Falls back to fallback_drift_ms if no match. */
+static int64_t lookup_drift(const session_drift_entry_t *entries, int n_entries,
+                            const char *as11_day_label,
+                            int64_t period_start_ms,
+                            int64_t fallback_drift_ms)
+{
+    int64_t resolved_drift_ms = fallback_drift_ms;
+    int64_t best_distance_ms = INT64_MAX;
+
+    for (int i = 0; i < n_entries; i++) {
+        if (strcmp(entries[i].as11_day, as11_day_label) != 0) continue;
+        int64_t distance_ms = llabs(entries[i].start_as11_ms - period_start_ms);
+        if (distance_ms < best_distance_ms) {
+            best_distance_ms = distance_ms;
+            resolved_drift_ms = entries[i].drift_ms;
+        }
+    }
     return resolved_drift_ms;
 }
 
@@ -1714,21 +1809,13 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         return ESP_FAIL;
     }
 
-    /* Collect up to 30 day records (30-day lookback window). */
-    str_day_record_t *records = calloc(30, sizeof(str_day_record_t));
-    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
-    edf_signal_def_t *str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
-    if (!records || !ctx || !str_sigs) {
-        ESP_LOGE(TAG, "STR.edf: malloc failed");
-        free(records); free(ctx); free(str_sigs);
-        closedir(dir);
-        return ESP_ERR_NO_MEM;
-    }
-
-    int n_records = 0;
+    /* First pass: collect all spool filenames, sort, keep newest 30.
+     * readdir order is non-deterministic, so we must collect all names
+     * and sort to ensure deterministic day selection. */
+    char (*spool_names)[15] = NULL;
+    int n_spool = 0, spool_cap = 0;
     struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL && n_records < 30) {
-        /* Match YYYYMMDD.spool (8 digits + ".spool") */
+    while ((ent = readdir(dir)) != NULL) {
         const char *nm = ent->d_name;
         size_t nlen = strlen(nm);
         if (nlen != 14 || strcmp(nm + 8, ".spool") != 0) continue;
@@ -1737,6 +1824,59 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
             if (nm[i] < '0' || nm[i] > '9') { digits_ok = false; break; }
         }
         if (!digits_ok) continue;
+
+        if (n_spool >= spool_cap) {
+            int new_cap = spool_cap ? spool_cap * 2 : 16;
+            char (*tmp)[15] = realloc(spool_names, new_cap * sizeof(*spool_names));
+            if (!tmp) {
+                ESP_LOGE(TAG, "STR.edf: spool name array realloc failed");
+                free(spool_names);
+                closedir(dir);
+                return ESP_ERR_NO_MEM;
+            }
+            spool_names = tmp;
+            spool_cap = new_cap;
+        }
+        strncpy(spool_names[n_spool], nm, 14);
+        spool_names[n_spool][14] = '\0';
+        n_spool++;
+    }
+    closedir(dir);
+
+    /* Sort filenames lexicographically — YYYYMMDD.spool sorts chronologically */
+    for (int i = 0; i < n_spool - 1; i++) {
+        for (int j = i + 1; j < n_spool; j++) {
+            if (strcmp(spool_names[j], spool_names[i]) < 0) {
+                char tmp[15];
+                strcpy(tmp, spool_names[i]);
+                strcpy(spool_names[i], spool_names[j]);
+                strcpy(spool_names[j], tmp);
+            }
+        }
+    }
+
+    /* Keep only the newest 30 (trim from the front) */
+    int start_idx = n_spool > 30 ? n_spool - 30 : 0;
+
+    str_day_record_t *records = calloc(30, sizeof(str_day_record_t));
+    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
+    edf_signal_def_t *str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
+    if (!records || !ctx || !str_sigs) {
+        ESP_LOGE(TAG, "STR.edf: malloc failed");
+        free(records); free(ctx); free(str_sigs);
+        free(spool_names);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Build session drift index once (avoids O(days × sessions) dir scans). */
+    int n_drift_entries = 0;
+    session_drift_entry_t *drift_index = build_session_drift_index(&n_drift_entries);
+    ESP_LOGI(TAG, "STR.edf: drift index: %d session entries", n_drift_entries);
+
+    /* Second pass: parse the selected spool files */
+    int n_records = 0;
+    for (int si = start_idx; si < n_spool; si++) {
+        const char *nm = spool_names[si];
 
         /* Read the spool file */
         char spool_path[300];
@@ -1776,9 +1916,10 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
 
         char as11_day_label[16];
         noon_day_folder(period_start, as11_day_label, sizeof(as11_day_label));
-        int64_t record_drift_ms = resolve_summary_drift(as11_day_label,
-                                                        period_start,
-                                                        clock_drift_ms);
+        int64_t record_drift_ms = lookup_drift(drift_index, n_drift_entries,
+                                                as11_day_label,
+                                                period_start,
+                                                clock_drift_ms);
         build_str_mask_events(ctx, rec->values, rec->mask_on_extra,
                               rec->mask_off_extra, period_start, record_drift_ms);
         build_str_data_values(ctx, rec->values, settings_json);
@@ -1789,7 +1930,8 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                  nm, (long long)period_start, (long long)record_drift_ms,
                  rec->values[4]);
     }
-    closedir(dir);
+    free(spool_names);
+    free(drift_index);
 
     /* Check if the current day is already covered by a spool record.
      * If not, synthesize a record from the current session's data. */
@@ -1931,7 +2073,8 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     char path[300];
     snprintf(path, sizeof(path), "%s/STR.edf", sdcard_dir);
 
-    FILE *edf = fopen(path, "w+b");
+    char tmp_path[380];
+    FILE *edf = open_atomic_file(path, tmp_path, sizeof(tmp_path));
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
         free(records); free(ctx); free(str_sigs);
@@ -1994,7 +2137,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                                         "EDF", str_sigs, STR_DATA_COUNT);
     if (header_bytes < 0) {
         ESP_LOGE(TAG, "STR.edf: edf_write_header failed");
-        fclose(edf);
+        discard_atomic_file(edf, tmp_path);
         free(records); free(ctx); free(str_sigs);
         return ESP_FAIL;
     }
@@ -2018,19 +2161,32 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         }
         if (rec_pos != 115) {
             ESP_LOGE(TAG, "STR.edf: internal error: rec_pos=%d != 115", rec_pos);
-            fclose(edf);
+            discard_atomic_file(edf, tmp_path);
             free(records); free(ctx); free(str_sigs);
             return ESP_FAIL;
         }
 
         uint16_t crc = crc16_ccitt((uint8_t *)rec_buf, 115 * sizeof(int16_t));
-        fwrite(rec_buf, sizeof(int16_t), 115, edf);
+        if (!write_all(edf, rec_buf, 115 * sizeof(int16_t))) {
+            ESP_LOGE(TAG, "STR.edf: write failed at record %d", r);
+            discard_atomic_file(edf, tmp_path);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
         int16_t crc_val = (int16_t)crc;
-        fwrite(&crc_val, sizeof(int16_t), 1, edf);
+        if (!write_all(edf, &crc_val, sizeof(crc_val))) {
+            ESP_LOGE(TAG, "STR.edf: CRC write failed at record %d", r);
+            discard_atomic_file(edf, tmp_path);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
     }
 
-    fsync(fileno(edf));
-    fclose(edf);
+    if (finalize_atomic_file(edf, tmp_path, path) != ESP_OK) {
+        ESP_LOGE(TAG, "cannot finalize %s: %s", path, strerror(errno));
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "STR.edf generated: %s (%d records)", path, n_records);
 
@@ -2097,6 +2253,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                                   bool csl_mode)
 {
     char path[350];
+    char tmp_path[380];
     strncpy(path, edf_path, sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
@@ -2118,12 +2275,11 @@ static esp_err_t generate_eve_edf(const char *edf_path,
             if (params) {
                 cJSON *data_id = cJSON_GetObjectItem(params, "dataId");
                 if (data_id && cJSON_IsString(data_id)) {
-                    /* For EVE.edf, filter TherapyEvents-RespiratoryEvents.
-                     * For CSL.edf, scan all dataIds (harmless — CSR events
-                     * are delivered under TherapyEvents-RespiratoryEvents,
-                     * so the label filter in event_label_map_str does the
-                     * real work).  Could be tightened to only that dataId. */
-                    if (csl_mode || strcmp(data_id->valuestring, "TherapyEvents-RespiratoryEvents") == 0) {
+                    /* Both EVE.edf and CSL.edf source from TherapyEvents-
+                     * RespiratoryEvents.  CSR events are delivered under
+                     * this same dataId, so the label filter in
+                     * event_label_map_str handles the EVE/CSL distinction. */
+                    if (strcmp(data_id->valuestring, "TherapyEvents-RespiratoryEvents") == 0) {
                         cJSON *events = cJSON_GetObjectItem(params, "events");
                         if (events && cJSON_IsArray(events)) {
                             int n = cJSON_GetArraySize(events);
@@ -2177,6 +2333,37 @@ static esp_err_t generate_eve_edf(const char *edf_path,
         ESP_LOGW(TAG, "generate_eve_edf: cannot open %s: %s", snt_path, strerror(errno));
     }
 
+    /* Sort events by onset_sec (stable enough — ties keep insertion order).
+     * events.snt lines may arrive out of order due to BLE retransmits or
+     * _SNC spool replay, so we must sort for deterministic EDF output. */
+    for (size_t i = 0; i + 1 < count; i++) {
+        for (size_t j = i + 1; j < count; j++) {
+            if (ev_list[j].onset_sec < ev_list[i].onset_sec) {
+                snt_event_t tmp = ev_list[i];
+                ev_list[i] = ev_list[j];
+                ev_list[j] = tmp;
+            }
+        }
+    }
+
+    /* Deduplicate: remove events with identical onset_sec and label.
+     * BLE may deliver the same event in multiple _SNC notifications. */
+    size_t dedup_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (dedup_count > 0 &&
+            ev_list[dedup_count - 1].onset_sec == ev_list[i].onset_sec &&
+            strcmp(ev_list[dedup_count - 1].label, ev_list[i].label) == 0) {
+            continue;
+        }
+        ev_list[dedup_count++] = ev_list[i];
+    }
+    if (dedup_count < count) {
+        ESP_LOGI(TAG, "%s: deduplicated %zu duplicate events (%zu → %zu)",
+                 csl_mode ? "CSL.edf" : "EVE.edf", count - dedup_count,
+                 count, dedup_count);
+    }
+    count = dedup_count;
+
     /* Total records = 1 (Recording starts) + count */
     int total_records = 1 + (int)count;
 
@@ -2197,7 +2384,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
     eve_sigs[0].prefilter = "";
     eve_sigs[0].samples_per_record = 31;  /* 62 bytes / 2 bytes per sample */
 
-    FILE *edf = fopen(path, "w+b");
+    FILE *edf = open_atomic_file(path, tmp_path, sizeof(tmp_path));
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
         free(ev_list);
@@ -2210,7 +2397,7 @@ static esp_err_t generate_eve_edf(const char *edf_path,
                                         "EDF+D", eve_sigs, 1);
     if (header_bytes < 0) {
         ESP_LOGE(TAG, "EVE.edf: edf_write_header failed");
-        fclose(edf);
+        discard_atomic_file(edf, tmp_path);
         free(ev_list);
         return ESP_FAIL;
     }
@@ -2238,9 +2425,15 @@ static esp_err_t generate_eve_edf(const char *edf_path,
         payload[p++] = 0x00;
 
         uint16_t crc = crc16_ccitt(payload, 62);
-        fwrite(payload, 1, 62, edf);
         uint8_t crc_bytes[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
-        fwrite(crc_bytes, 1, 2, edf);
+        if (!write_all(edf, payload, 62) ||
+            !write_all(edf, crc_bytes, 2)) {
+            ESP_LOGE(TAG, "%s: write failed at Recording starts record",
+                     csl_mode ? "CSL.edf" : "EVE.edf");
+            discard_atomic_file(edf, tmp_path);
+            free(ev_list);
+            return ESP_FAIL;
+        }
     }
 
     /* Subsequent records: one event per record */
@@ -2275,14 +2468,22 @@ static esp_err_t generate_eve_edf(const char *edf_path,
         payload[p++] = 0x00;
 
         uint16_t crc = crc16_ccitt(payload, 62);
-        fwrite(payload, 1, 62, edf);
         uint8_t crc_bytes[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
-        fwrite(crc_bytes, 1, 2, edf);
+        if (!write_all(edf, payload, 62) ||
+            !write_all(edf, crc_bytes, 2)) {
+            ESP_LOGE(TAG, "%s: write failed at event %zu",
+                     csl_mode ? "CSL.edf" : "EVE.edf", i);
+            discard_atomic_file(edf, tmp_path);
+            free(ev_list);
+            return ESP_FAIL;
+        }
     }
 
     free(ev_list);
-    fsync(fileno(edf));
-    fclose(edf);
+    if (finalize_atomic_file(edf, tmp_path, path) != ESP_OK) {
+        ESP_LOGE(TAG, "cannot finalize %s: %s", path, strerror(errno));
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "%s generated: %s (%d events)", csl_mode ? "CSL.edf" : "EVE.edf", path, (int)count);
     return ESP_OK;
@@ -2397,21 +2598,28 @@ static esp_err_t generate_identification(const char *edf_dir,
         return ESP_FAIL;
     }
 
-    /* Write Identification.json to EDF dir */
+    /* Write Identification.json to EDF dir (atomic) */
     char path[300];
+    char tmp_path[380];
+    size_t json_len = strlen(json_str);
     snprintf(path, sizeof(path), "%s/Identification.json", edf_dir);
-    FILE *f = fopen(path, "w");
+    FILE *f = open_atomic_file(path, tmp_path, sizeof(tmp_path));
     if (f) {
-        fputs(json_str, f);
-        fclose(f);
-        ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)strlen(json_str));
+        if (write_all(f, json_str, json_len) &&
+            finalize_atomic_file(f, tmp_path, path) == ESP_OK) {
+            ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)json_len);
+        } else {
+            ESP_LOGE(TAG, "cannot write %s: %s", path, strerror(errno));
+            discard_atomic_file(f, tmp_path);
+        }
+    } else {
+        ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
     }
 
-    /* Compute CRC-32 and write as 4-byte binary little-endian */
-    size_t json_len = strlen(json_str);
+    /* Compute CRC-32 and write as 4-byte binary little-endian (atomic) */
     uint32_t crc = crc32_ieee((const uint8_t *)json_str, json_len);
     snprintf(path, sizeof(path), "%s/Identification.crc", edf_dir);
-    f = fopen(path, "wb");
+    f = open_atomic_file(path, tmp_path, sizeof(tmp_path));
     if (f) {
         uint8_t crc_bytes[4] = {
             (uint8_t)(crc & 0xFF),
@@ -2419,9 +2627,15 @@ static esp_err_t generate_identification(const char *edf_dir,
             (uint8_t)((crc >> 16) & 0xFF),
             (uint8_t)((crc >> 24) & 0xFF),
         };
-        fwrite(crc_bytes, 1, 4, f);
-        fclose(f);
-        ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", path, (unsigned)crc);
+        if (write_all(f, crc_bytes, 4) &&
+            finalize_atomic_file(f, tmp_path, path) == ESP_OK) {
+            ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", path, (unsigned)crc);
+        } else {
+            ESP_LOGE(TAG, "cannot write %s: %s", path, strerror(errno));
+            discard_atomic_file(f, tmp_path);
+        }
+    } else {
+        ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
     }
 
     free(json_str);
@@ -2987,16 +3201,23 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
             }
             size_t slen = strlen(settings_str);
             char cs_path[300];
+            char cs_tmp[380];
             snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", SD_SDCARD_SETTINGS);
-            FILE *csf = fopen(cs_path, "w");
+            FILE *csf = open_atomic_file(cs_path, cs_tmp, sizeof(cs_tmp));
             if (csf) {
-                fputs(settings_str, csf);
-                fclose(csf);
-                ESP_LOGI(TAG, "wrote %s", cs_path);
+                if (write_all(csf, settings_str, slen) &&
+                    finalize_atomic_file(csf, cs_tmp, cs_path) == ESP_OK) {
+                    ESP_LOGI(TAG, "wrote %s", cs_path);
+                } else {
+                    ESP_LOGE(TAG, "cannot write %s: %s", cs_path, strerror(errno));
+                    discard_atomic_file(csf, cs_tmp);
+                }
+            } else {
+                ESP_LOGE(TAG, "cannot create %s: %s", cs_path, strerror(errno));
             }
             /* Write CurrentSettings.crc (CRC-32 LE, same format as Identification.crc) */
             snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.crc", SD_SDCARD_SETTINGS);
-            csf = fopen(cs_path, "wb");
+            csf = open_atomic_file(cs_path, cs_tmp, sizeof(cs_tmp));
             if (csf) {
                 uint32_t cs_crc = crc32_ieee((const uint8_t *)settings_str, slen);
                 uint8_t crc_bytes[4] = {
@@ -3005,9 +3226,15 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                     (uint8_t)((cs_crc >> 16) & 0xFF),
                     (uint8_t)((cs_crc >> 24) & 0xFF),
                 };
-                fwrite(crc_bytes, 1, 4, csf);
-                fclose(csf);
-                ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", cs_path, (unsigned)cs_crc);
+                if (write_all(csf, crc_bytes, 4) &&
+                    finalize_atomic_file(csf, cs_tmp, cs_path) == ESP_OK) {
+                    ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", cs_path, (unsigned)cs_crc);
+                } else {
+                    ESP_LOGE(TAG, "cannot write %s: %s", cs_path, strerror(errno));
+                    discard_atomic_file(csf, cs_tmp);
+                }
+            } else {
+                ESP_LOGE(TAG, "cannot create %s: %s", cs_path, strerror(errno));
             }
             free(settings_str);
         }
