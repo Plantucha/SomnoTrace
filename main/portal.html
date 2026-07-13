@@ -492,8 +492,8 @@ Display
 <summary>Display settings</summary>
 <div class="settings-grid-2col" style="margin-top:12px">
 <div class="form-group">
-<label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">50%</span><span id="brightness-status" class="setting-status"></span></label>
-<input type="range" id="lcd-brightness" class="form-control" min="1" max="100" value="50" style="padding:0" oninput="onBrightnessInput(this.value)">
+<label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">15%</span><span id="brightness-status" class="setting-status"></span></label>
+<input type="range" id="lcd-brightness" class="form-control" min="0.5" max="20" step="0.5" value="15" style="padding:0" oninput="onBrightnessInput(this.value)">
 </div>
 <div class="form-group">
 <label>During sleep display mode <span id="therapy-status" class="setting-status"></span></label>
@@ -1363,7 +1363,7 @@ function onBrightnessInput(val) {
     fetch('/api/device/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ brightness: parseInt(val) })
+      body: JSON.stringify({ brightness: Math.round(parseFloat(val) * 2) })
     }).then(function() {
       setStatus('brightness-status', '✓', true);
     }).catch(function() {
@@ -1390,9 +1390,9 @@ function loadDeviceSettings() {
   fetch('/api/device/settings').then(function(r){ return r.json(); }).then(function(d) {
     var br = document.getElementById('lcd-brightness');
     if (br && typeof d.brightness === 'number') {
-      br.value = d.brightness;
+      br.value = (d.brightness / 2).toString();
       var label = document.getElementById('brightness-val');
-      if (label) label.textContent = d.brightness + '%';
+      if (label) label.textContent = (d.brightness / 2) + '%';
     }
     var mode = document.getElementById('lcd-therapy-mode');
     if (mode && typeof d.lcd_therapy_mode === 'number') {
