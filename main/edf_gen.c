@@ -1529,7 +1529,15 @@ typedef struct {
     int16_t values[STR_DATA_COUNT];
     int16_t mask_on_extra[20];
     int16_t mask_off_extra[20];
-    int64_t period_start;  /* for chronological sorting */
+    int64_t period_start;       /* NTP-corrected — used for data values and sorting */
+    int64_t period_start_as11;  /* Raw AS11 clock — used ONLY for noon-day labelling.
+                                 * Rationale (audit §5.9): AS11 sets PeriodStart to
+                                 * exactly noon in its own clock.  After NTP drift
+                                 * correction (~7–8 min) this lands just before noon,
+                                 * causing noon_day_folder() to shift every record one
+                                 * day back.  Using the raw AS11 value for day labels
+                                 * keeps spool-day names aligned with STR records
+                                 * while all data timestamps remain NTP-corrected. */
 } str_day_record_t;
 
 /* Build a STR record for the current day from session data (events.snt,
@@ -1548,6 +1556,8 @@ static void build_current_day_record(str_day_record_t *rec,
     memset(rec->mask_on_extra, 0xFF, sizeof(rec->mask_on_extra));
     memset(rec->mask_off_extra, 0xFF, sizeof(rec->mask_off_extra));
     rec->period_start = start_epoch_ms;
+    /* Reverse NTP correction for day labelling (see struct comment). */
+    rec->period_start_as11 = start_epoch_ms - clock_drift_ms;
 
     /* [0] Date: days from Unix epoch (noon-based day of session start) */
     time_t start_t = (time_t)(start_epoch_ms / 1000);
@@ -1926,6 +1936,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                               rec->mask_off_extra, period_start, record_drift_ms);
         build_str_data_values(ctx, rec->values, settings_json);
         rec->period_start = period_start + record_drift_ms;
+        rec->period_start_as11 = period_start;  /* raw AS11 for day labelling */
         n_records++;
 
         ESP_LOGI(TAG, "STR.edf: parsed %s (PeriodStart=%lld, drift=%lld, Duration=%d)",
@@ -1936,15 +1947,21 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     free(drift_index);
 
     /* Check if the current day is already covered by a spool record.
-     * If not, synthesize a record from the current session's data. */
+     * If not, synthesize a record from the current session's data.
+     *
+     * Day labelling uses the raw AS11 PeriodStart (period_start_as11)
+     * deliberately — see the period_start_as11 comment in str_day_record_t.
+     * The current session day label is derived from its AS11-domain noon-day
+     * (start_epoch_ms - clock_drift_ms) to stay in the same label domain. */
     char current_day_label[16];
-    noon_day_folder(start_epoch_ms, current_day_label, sizeof(current_day_label));
+    noon_day_folder(start_epoch_ms - clock_drift_ms, current_day_label,
+                    sizeof(current_day_label));
     ESP_LOGI(TAG, "STR.edf: current day label=%s (start_epoch_ms=%lld)",
              current_day_label, (long long)start_epoch_ms);
     bool current_day_found = false;
     for (int i = 0; i < n_records; i++) {
         char rec_day[16];
-        noon_day_folder(records[i].period_start, rec_day, sizeof(rec_day));
+        noon_day_folder(records[i].period_start_as11, rec_day, sizeof(rec_day));
         ESP_LOGI(TAG, "STR.edf: record[%d] day=%s (period_start=%lld)",
                  i, rec_day, (long long)records[i].period_start);
         if (strcmp(rec_day, current_day_label) == 0) {
@@ -2086,11 +2103,15 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     /* STR.edf uses 12.00.00 noon as start time.
      * The start date must correspond to the oldest record (records[0] after
      * sorting), not the current session — otherwise SleepHQ misaligns every
-     * record by the offset between the header date and the actual first day. */
+     * record by the offset between the header date and the actual first day.
+     *
+     * We use period_start_as11 (raw AS11 clock) for the header date to keep
+     * the day label consistent with spool-day names — see §5.9 comment in
+     * str_day_record_t. */
     const char *str_start_time = "12.00.00";
     char str_date[32];
     {
-        time_t t = (time_t)(records[0].period_start / 1000);
+        time_t t = (time_t)(records[0].period_start_as11 / 1000);
         struct tm tm;
         localtime_r(&t, &tm);
         if (tm.tm_hour < 12) {
@@ -2108,7 +2129,8 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
      * format is "Startdate DD-MMM-YYYY X X X SRN=...". */
     char fixed_recording_id[128];
     {
-        time_t t = (time_t)(records[0].period_start / 1000);
+        /* Use AS11-domain period_start to match the header date label above. */
+        time_t t = (time_t)(records[0].period_start_as11 / 1000);
         struct tm tm;
         localtime_r(&t, &tm);
         if (tm.tm_hour < 12) {
