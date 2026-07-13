@@ -246,6 +246,8 @@ static esp_err_t finalize_atomic_file(FILE *f, const char *tmp_path, const char 
         errno = saved_errno;
         return ESP_FAIL;
     }
+    /* FATFS does not support rename-over-existing — remove target first. */
+    unlink(path);
     if (rename(tmp_path, path) != 0) {
         saved_errno = errno;
         unlink(tmp_path);
@@ -2605,12 +2607,13 @@ static esp_err_t generate_identification(const char *edf_dir,
     snprintf(path, sizeof(path), "%s/Identification.json", edf_dir);
     FILE *f = open_atomic_file(path, tmp_path, sizeof(tmp_path));
     if (f) {
-        if (write_all(f, json_str, json_len) &&
-            finalize_atomic_file(f, tmp_path, path) == ESP_OK) {
-            ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)json_len);
-        } else {
+        if (!write_all(f, json_str, json_len)) {
             ESP_LOGE(TAG, "cannot write %s: %s", path, strerror(errno));
             discard_atomic_file(f, tmp_path);
+        } else if (finalize_atomic_file(f, tmp_path, path) != ESP_OK) {
+            ESP_LOGE(TAG, "cannot finalize %s: %s", path, strerror(errno));
+        } else {
+            ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)json_len);
         }
     } else {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
@@ -2627,12 +2630,13 @@ static esp_err_t generate_identification(const char *edf_dir,
             (uint8_t)((crc >> 16) & 0xFF),
             (uint8_t)((crc >> 24) & 0xFF),
         };
-        if (write_all(f, crc_bytes, 4) &&
-            finalize_atomic_file(f, tmp_path, path) == ESP_OK) {
-            ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", path, (unsigned)crc);
-        } else {
+        if (!write_all(f, crc_bytes, 4)) {
             ESP_LOGE(TAG, "cannot write %s: %s", path, strerror(errno));
             discard_atomic_file(f, tmp_path);
+        } else if (finalize_atomic_file(f, tmp_path, path) != ESP_OK) {
+            ESP_LOGE(TAG, "cannot finalize %s: %s", path, strerror(errno));
+        } else {
+            ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", path, (unsigned)crc);
         }
     } else {
         ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
@@ -3205,12 +3209,13 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
             snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", SD_SDCARD_SETTINGS);
             FILE *csf = open_atomic_file(cs_path, cs_tmp, sizeof(cs_tmp));
             if (csf) {
-                if (write_all(csf, settings_str, slen) &&
-                    finalize_atomic_file(csf, cs_tmp, cs_path) == ESP_OK) {
-                    ESP_LOGI(TAG, "wrote %s", cs_path);
-                } else {
+                if (!write_all(csf, settings_str, slen)) {
                     ESP_LOGE(TAG, "cannot write %s: %s", cs_path, strerror(errno));
                     discard_atomic_file(csf, cs_tmp);
+                } else if (finalize_atomic_file(csf, cs_tmp, cs_path) != ESP_OK) {
+                    ESP_LOGE(TAG, "cannot finalize %s: %s", cs_path, strerror(errno));
+                } else {
+                    ESP_LOGI(TAG, "wrote %s", cs_path);
                 }
             } else {
                 ESP_LOGE(TAG, "cannot create %s: %s", cs_path, strerror(errno));
@@ -3226,12 +3231,13 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                     (uint8_t)((cs_crc >> 16) & 0xFF),
                     (uint8_t)((cs_crc >> 24) & 0xFF),
                 };
-                if (write_all(csf, crc_bytes, 4) &&
-                    finalize_atomic_file(csf, cs_tmp, cs_path) == ESP_OK) {
-                    ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", cs_path, (unsigned)cs_crc);
-                } else {
+                if (!write_all(csf, crc_bytes, 4)) {
                     ESP_LOGE(TAG, "cannot write %s: %s", cs_path, strerror(errno));
                     discard_atomic_file(csf, cs_tmp);
+                } else if (finalize_atomic_file(csf, cs_tmp, cs_path) != ESP_OK) {
+                    ESP_LOGE(TAG, "cannot finalize %s: %s", cs_path, strerror(errno));
+                } else {
+                    ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", cs_path, (unsigned)cs_crc);
                 }
             } else {
                 ESP_LOGE(TAG, "cannot create %s: %s", cs_path, strerror(errno));
