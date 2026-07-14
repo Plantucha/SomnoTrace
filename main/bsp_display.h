@@ -20,7 +20,7 @@ void bsp_display_push_flow(float flow_lpm);
 bool bsp_display_is_therapy_active(void);
 
 /* Backlight control (LEDC PWM on GPIO 46).
- * set_brightness: 1-40 (half-percent units: 1=0.5%, 40=20.0%), applied immediately.
+ * set_brightness: 1-200 (tenth-percent units: 1=0.1%, 200=20.0%), applied immediately.
  * set_backlight: hard on/off (used for therapy LCD-off mode).
  * get_brightness: returns last set brightness value. */
 void bsp_display_set_brightness(uint8_t percent);

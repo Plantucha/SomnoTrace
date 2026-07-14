@@ -36,10 +36,11 @@ static const char *TAG = "dev_settings";
 #define NVS_KEY_BRIGHTNESS   "bright"
 #define NVS_KEY_LCD_THERAPY  "lcd_thr"
 
-/* Brightness stored in half-percent units: 1=0.5%, 40=20.0% */
-#define DEFAULT_BRIGHTNESS       30  /* 15.0% */
-#define MIN_BRIGHTNESS           1   /* 0.5% */
-#define MAX_BRIGHTNESS           40  /* 20.0% */
+/* Brightness stored in tenth-percent units: 1=0.1%, 200=20.0%
+ * Discrete steps: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 (roughly 2x each) */
+#define DEFAULT_BRIGHTNESS       100 /* 10.0% */
+#define MIN_BRIGHTNESS           1   /* 0.1% */
+#define MAX_BRIGHTNESS           200 /* 20.0% */
 
 static device_settings_t s_settings;
 
@@ -68,7 +69,7 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     nvs_close(h);
     memcpy(&s_settings, cfg, sizeof(s_settings));
     ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u",
-             s_settings.brightness, s_settings.brightness / 2.0,
+             s_settings.brightness, s_settings.brightness / 10.0,
              s_settings.lcd_therapy_mode);
     return ESP_OK;
 }
@@ -89,7 +90,7 @@ esp_err_t device_settings_save(const device_settings_t *cfg)
     if (ret == ESP_OK) {
         memcpy(&s_settings, cfg, sizeof(s_settings));
         ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u",
-                 s_settings.brightness, s_settings.brightness / 2.0,
+                 s_settings.brightness, s_settings.brightness / 10.0,
                  s_settings.lcd_therapy_mode);
     }
     return ret;

@@ -49,7 +49,7 @@
 #define BL_LEDC_RESOLUTION  LEDC_TIMER_10_BIT  /* 0-1023 duty */
 #define BL_DUTY_MAX         ((1 << 10) - 1)    /* 1023 */
 
-static uint8_t s_brightness = 30;   /* current brightness (half-percent units: 1=0.5%, 40=20%) */
+static uint8_t s_brightness = 100;  /* current brightness (tenth-percent: 1=0.1%, 200=20%) */
 static bool s_backlight_on = true;  /* backlight hardware state */
 
 static const char *TAG = "bsp_display";
@@ -451,7 +451,7 @@ esp_err_t bsp_display_init(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&bl_ch));
     s_backlight_on = true;
-    s_brightness = 30;
+    s_brightness = 100;
 
     s_flush_done = xSemaphoreCreateCounting(LCD_STRIP_BUFS, 0);
 
@@ -560,11 +560,11 @@ void bsp_display_set_as11_paired(bool paired)
 void bsp_display_set_brightness(uint8_t percent)
 {
     if (percent < 1) percent = 1;
-    if (percent > 40) percent = 40;
+    if (percent > 200) percent = 200;
     s_brightness = percent;
     if (s_backlight_on) {
-        /* percent is in half-percent units (1=0.5%), so divide by 200 not 100 */
-        uint32_t duty = (uint32_t)(percent) * BL_DUTY_MAX / 200;
+        /* percent is in tenth-percent units (1=0.1%), so divide by 1000 */
+        uint32_t duty = (uint32_t)(percent) * BL_DUTY_MAX / 1000;
         ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
     }
@@ -575,7 +575,7 @@ void bsp_display_set_backlight(bool on)
     if (on == s_backlight_on) return;
     s_backlight_on = on;
     if (on) {
-        uint32_t duty = (uint32_t)(s_brightness) * BL_DUTY_MAX / 200;
+        uint32_t duty = (uint32_t)(s_brightness) * BL_DUTY_MAX / 1000;
         ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
     } else {

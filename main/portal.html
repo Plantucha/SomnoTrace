@@ -492,8 +492,8 @@ Display
 <summary>Display settings</summary>
 <div class="settings-grid-2col" style="margin-top:12px">
 <div class="form-group">
-<label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">15%</span><span id="brightness-status" class="setting-status"></span></label>
-<input type="range" id="lcd-brightness" class="form-control" min="0.5" max="20" step="0.5" value="15" style="padding:0" oninput="onBrightnessInput(this.value)">
+<label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">10</span><span id="brightness-status" class="setting-status"></span></label>
+<input type="range" id="lcd-brightness" class="form-control" min="0" max="7" step="1" value="6" style="padding:0" oninput="onBrightnessInput(this.value)">
 </div>
 <div class="form-group">
 <label>During sleep display mode <span id="therapy-status" class="setting-status"></span></label>
@@ -1353,9 +1353,13 @@ function setStatus(id, text, ok) {
   el.className = 'setting-status' + (ok ? ' ok' : ok === false ? ' err' : '');
 }
 
+var BRIGHTNESS_STEPS = [1, 2, 5, 10, 20, 50, 100, 200]; /* tenth-percent: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 */
+var BRIGHTNESS_LABELS = ['0.1', '0.2', '0.5', '1', '2', '5', '10', '20'];
+
 function onBrightnessInput(val) {
+  var idx = parseInt(val) || 0;
   var label = document.getElementById('brightness-val');
-  if (label) label.textContent = val + '%';
+  if (label) label.textContent = BRIGHTNESS_LABELS[idx];
   setStatus('brightness-status', '…', null);
   /* Debounce the POST so we don't spam the device while dragging */
   if (brightnessTimer) clearTimeout(brightnessTimer);
@@ -1363,7 +1367,7 @@ function onBrightnessInput(val) {
     fetch('/api/device/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ brightness: Math.round(parseFloat(val) * 2) })
+      body: JSON.stringify({ brightness: BRIGHTNESS_STEPS[idx] })
     }).then(function() {
       setStatus('brightness-status', '✓', true);
     }).catch(function() {
@@ -1390,9 +1394,11 @@ function loadDeviceSettings() {
   fetch('/api/device/settings').then(function(r){ return r.json(); }).then(function(d) {
     var br = document.getElementById('lcd-brightness');
     if (br && typeof d.brightness === 'number') {
-      br.value = (d.brightness / 2).toString();
+      var idx = BRIGHTNESS_STEPS.indexOf(d.brightness);
+      if (idx < 0) idx = 6; /* fallback to 10% */
+      br.value = idx;
       var label = document.getElementById('brightness-val');
-      if (label) label.textContent = (d.brightness / 2) + '%';
+      if (label) label.textContent = BRIGHTNESS_LABELS[idx];
     }
     var mode = document.getElementById('lcd-therapy-mode');
     if (mode && typeof d.lcd_therapy_mode === 'number') {

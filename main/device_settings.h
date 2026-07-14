@@ -34,7 +34,7 @@ typedef enum {
 } lcd_therapy_mode_t;
 
 typedef struct {
-    uint8_t brightness;        /* half-percent units: 1=0.5%, 40=20.0% */
+    uint8_t brightness;        /* tenth-percent units: 1=0.1%, 200=20.0% */
     lcd_therapy_mode_t lcd_therapy_mode;
 } device_settings_t;
 
