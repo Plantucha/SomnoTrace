@@ -623,6 +623,58 @@ static int64_t find_mask_off_time(const char *events_snt_path)
     return mask_off_ms;
 }
 
+/* Find the first _ZLE ValueChange rising-edge timestamp in events.snt.
+ * _ZLE is boolean: value=1 (rising edge) means the AS11 starts accepting
+ * valid flow data; value=0 (falling edge) means it stops.  We only match
+ * the rising edge (value=1) for EDF start alignment.
+ *
+ * Returns NTP epoch ms (from the injected "ntpTimeMs" field), or -1 if
+ * no rising-edge _ZLE is found.  Unlike find_mask_on_time() which returns
+ * AS11-clock time and requires clock_drift_ms compensation, this returns
+ * NTP time directly because the timestamp is captured at notification receipt.
+ *
+ * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
+static int64_t find_zle_time(const char *events_snt_path)
+{
+    FILE *f = fopen(events_snt_path, "r");
+    if (!f) return -1;
+
+    int64_t zle_ms = -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) continue;
+        cJSON *params = cJSON_GetObjectItem(msg, "params");
+        if (params) {
+            cJSON *data_id = cJSON_GetObjectItem(params, "dataId");
+            if (data_id && cJSON_IsString(data_id) &&
+                strcmp(data_id->valuestring, "_ZLE") == 0) {
+                cJSON *events = cJSON_GetObjectItem(params, "events");
+                if (events && cJSON_IsArray(events)) {
+                    cJSON *ev = cJSON_GetArrayItem(events, 0);
+                    if (ev) {
+                        /* Only match rising edge: value == 1 */
+                        cJSON *val = cJSON_GetObjectItem(ev, "value");
+                        if (val && cJSON_IsNumber(val) &&
+                            (int)val->valuedouble == 1) {
+                            cJSON *ntp = cJSON_GetObjectItem(ev, "ntpTimeMs");
+                            if (ntp && cJSON_IsNumber(ntp)) {
+                                zle_ms = (int64_t)ntp->valuedouble;
+                                cJSON_Delete(msg);
+                                fclose(f);
+                                return zle_ms;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cJSON_Delete(msg);
+    }
+    fclose(f);
+    return zle_ms;
+}
+
 /* Convert one .snt file to an EDF file.
  *
  * Parameters:
@@ -2863,9 +2915,11 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      *
      * AS11 uses two different start timestamps:
      *   - EVE/CSL: TherapyStart (session start event)
-     *   - BRP/PLD/SA2: MaskOn (mask detected, ~7s after TherapyStart)
+     *   - BRP/PLD/SA2: _ZLE (Zero Leak Estimate) gating signal, falling
+     *     back to MaskOn if _ZLE is unavailable.  _ZLE is the AS11's
+     *     actual data gating signal; MaskOn is ~7s after TherapyStart.
      * The .snt files capture from TherapyStart, so BRP/PLD/SA2 need
-     * skip_samples to discard pre-MaskOn data.
+     * skip_samples to discard pre-_ZLE/pre-MaskOn data.
      *
      * SDCARD EDF headers and filenames use NTP time.  The STR generator
      * applies the same correction to its AS11-derived MaskOn/MaskOff values. */
@@ -2876,36 +2930,64 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
 
-    /* MaskOn timestamp (for BRP/PLD/SA2, NTP clock domain). */
+    /* BRP/PLD/SA2 start timestamp (NTP clock domain).
+     * Prefer _ZLE (Zero Leak Estimate) ValueChange — the AS11's actual
+     * data gating signal — over MaskOn.  Fall back to MaskOn if _ZLE
+     * is not available (e.g. older sessions or subscription not accepted).
+     * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
     int64_t maskon_start_ms = start_epoch_ms;
     uint32_t brp_skip = 0, sa2_skip = 0, pld_skip = 0;
     uint32_t brp_max = 0, sa2_max = 0, pld_max = 0;
     {
-        int64_t maskon_as11 = find_mask_on_time(events_snt_path);
-        if (maskon_as11 > 0) {
-            int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
-            if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
-                maskon_start_ms = maskon_ntp;
-                int64_t skip_ms = maskon_ntp - start_epoch_ms;
-                brp_skip = (uint32_t)(skip_ms * 25 / 1000);   /* 25 Hz */
-                sa2_skip = (uint32_t)(skip_ms * 1 / 1000);     /* 1 Hz */
-                pld_skip = (uint32_t)(skip_ms / 2000);         /* 0.5 Hz */
-                ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
-                             "brp_skip=%u sa2_skip=%u pld_skip=%u",
-                         (long long)maskon_as11, (long long)maskon_ntp,
-                         (long long)skip_ms,
-                         (unsigned)brp_skip, (unsigned)sa2_skip,
-                         (unsigned)pld_skip);
-            } else {
-                ESP_LOGW(TAG, "MaskOn NTP time %lld out of session range "
-                             "[%lld, %lld], using TherapyStart",
-                         (long long)maskon_ntp,
+        int64_t zle_ntp = find_zle_time(events_snt_path);
+        if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms) {
+            maskon_start_ms = zle_ntp;
+            int64_t skip_ms = zle_ntp - start_epoch_ms;
+            brp_skip = (uint32_t)(skip_ms * 25 / 1000);   /* 25 Hz */
+            sa2_skip = (uint32_t)(skip_ms * 1 / 1000);     /* 1 Hz */
+            pld_skip = (uint32_t)(skip_ms / 2000);         /* 0.5 Hz */
+            ESP_LOGI(TAG, "_ZLE: ntp=%lld skip_ms=%lld "
+                         "brp_skip=%u sa2_skip=%u pld_skip=%u",
+                     (long long)zle_ntp, (long long)skip_ms,
+                     (unsigned)brp_skip, (unsigned)sa2_skip,
+                     (unsigned)pld_skip);
+        } else {
+            if (zle_ntp > 0) {
+                ESP_LOGW(TAG, "_ZLE NTP time %lld out of session range "
+                             "[%lld, %lld], falling back to MaskOn",
+                         (long long)zle_ntp,
                          (long long)start_epoch_ms,
                          (long long)end_epoch_ms);
+            } else {
+                ESP_LOGI(TAG, "_ZLE not found in events.snt, using MaskOn");
             }
-        } else {
-            ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
-                         "for BRP/PLD/SA2");
+            /* Fall back to MaskOn */
+            int64_t maskon_as11 = find_mask_on_time(events_snt_path);
+            if (maskon_as11 > 0) {
+                int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
+                if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
+                    maskon_start_ms = maskon_ntp;
+                    int64_t skip_ms = maskon_ntp - start_epoch_ms;
+                    brp_skip = (uint32_t)(skip_ms * 25 / 1000);   /* 25 Hz */
+                    sa2_skip = (uint32_t)(skip_ms * 1 / 1000);     /* 1 Hz */
+                    pld_skip = (uint32_t)(skip_ms / 2000);         /* 0.5 Hz */
+                    ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
+                                 "brp_skip=%u sa2_skip=%u pld_skip=%u",
+                             (long long)maskon_as11, (long long)maskon_ntp,
+                             (long long)skip_ms,
+                             (unsigned)brp_skip, (unsigned)sa2_skip,
+                             (unsigned)pld_skip);
+                } else {
+                    ESP_LOGW(TAG, "MaskOn NTP time %lld out of session range "
+                                 "[%lld, %lld], using TherapyStart",
+                             (long long)maskon_ntp,
+                             (long long)start_epoch_ms,
+                             (long long)end_epoch_ms);
+                }
+            } else {
+                ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
+                             "for BRP/PLD/SA2");
+            }
         }
 
         /* MaskOff timestamp (for BRP/PLD/SA2 end truncation).

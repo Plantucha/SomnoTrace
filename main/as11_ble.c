@@ -1955,7 +1955,12 @@ static void reconnect_task(void *arg)
      *     pressure has begun ramping — used to gate BRP/PLD recording.
      *   _SNC — Summary spool update counter.  Pushes ValueChange when the
      *     AS11 writes new Summary data (nor:1:/Summary.bin).  Used to detect
-     *     when Summary spool is fresh after TherapyStop without polling. */
+     *     when Summary spool is fresh after TherapyStop without polling.
+     *   _ZLE — Zero Leak Estimate.  Boolean state variable that gates
+     *     BRP/PLD data writing on the AS11.  ValueChange notifications
+     *     signal when the AS11 starts/stops accepting valid flow data,
+     *     providing a more accurate EDF start alignment than MaskOn.
+     * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
     rpc = malloc(700);
     snprintf(rpc, 700,
              "{\"id\":13,\"jsonrpc\":\"1.0\",\"method\":\"SubscribeEvent\","
@@ -1963,7 +1968,8 @@ static void reconnect_task(void *arg)
              "\"TherapyEvents-RespiratoryEvents\","
              "\"UsageEvents-TherapyStatusEvents\","
              "\"SystemActivityEvents-FrequentActivityEvents\","
-             "\"_SNC\""
+             "\"_SNC\","
+             "\"_ZLE\""
              "]}}");
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {

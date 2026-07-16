@@ -120,6 +120,31 @@ struct session_writer {
     uint32_t pld_buf_count;
     uint8_t pld_countdown;     /* decimation: write PLD every 10th notification */
 
+    /* ── Missing-packet compensation ────────────────────────────────
+     * StreamData notifications include a "startTime" ISO8601 timestamp
+     * for the first sample in each report.  Under normal operation the
+     * gap between consecutive notifications is ~200ms (reportIntervalMs).
+     * A dropped BLE notification produces a gap of ~400ms+, which we
+     * detect by comparing startTime values.
+     *
+     * Compensation strategy (per signal type):
+     *   BRP (25Hz waveform): insert -1 sentinels — fabricated data
+     *     could mimic apnea/hypopnea, so missing data must be visible.
+     *   SA2 (1Hz vitals):    hold previous value — HR/SpO2 change over
+     *     minutes; a 200ms-1s gap is clinically negligible.
+     *   PLD (0.5Hz metrics):  hold previous value — all PLD signals are
+     *     2-second summaries that change slowly; holding is a tiny error.
+     *
+     * See: https://github.com/ilyakruchinin/SomnoTrace/issues/20 */
+    int64_t  prev_stream_ms;     /* ms-since-midnight from last startTime */
+    bool     prev_stream_ms_valid;  /* false until first notification */
+    int16_t  last_hr;            /* last known HR for hold-on-gap */
+    int16_t  last_spo2;          /* last known SpO2 for hold-on-gap */
+    int16_t  last_pld[12];       /* last known PLD row for hold-on-gap */
+    bool     last_hr_valid;      /* true after first HR sample received */
+    bool     last_spo2_valid;
+    bool     last_pld_valid;
+
     /* events: simple JSON line file, flushed with data */
 };
 
@@ -406,6 +431,13 @@ session_writer_t *session_writer_start(void)
 
     s->pld_countdown = 1;  /* first notification writes PLD immediately */
     s->sa2_countdown = 1;  /* first notification writes SA2 immediately */
+
+    /* Missing-packet compensation: no previous startTime until first
+     * notification arrives; no cached values to hold until first sample. */
+    s->prev_stream_ms_valid = false;
+    s->last_hr_valid = false;
+    s->last_spo2_valid = false;
+    s->last_pld_valid = false;
 
     make_session_id(s->session_id, sizeof(s->session_id));
 
@@ -764,6 +796,26 @@ static int match_key(const char *key, int klen)
     return -1;
 }
 
+/* Parse the time portion of an ISO8601 "startTime" string into
+ * milliseconds-since-midnight.  The AS11 always uses the format
+ * "YYYY-MM-DDTHH:MM:SS.mmmZ" (fixed-width, UTC).  We extract only
+ * the H/M/S/ms fields — sufficient for detecting 200ms gaps between
+ * consecutive StreamData notifications without a full date parser.
+ *
+ * Returns -1 if the string is too short or malformed. */
+static int64_t parse_starttime_ms(const char *s, int len)
+{
+    /* Minimum: "YYYY-MM-DDTHH:MM:SS.mmmZ" = 24 chars */
+    if (len < 24) return -1;
+    /* Sanity: check digit positions */
+    if (s[11] < '0' || s[11] > '9') return -1;
+    int h   = (s[11] - '0') * 10 + (s[12] - '0');
+    int m   = (s[14] - '0') * 10 + (s[15] - '0');
+    int sec = (s[17] - '0') * 10 + (s[18] - '0');
+    int ms  = (s[20] - '0') * 100 + (s[21] - '0') * 10 + (s[22] - '0');
+    return (int64_t)h * 3600000 + m * 60000 + sec * 1000 + ms;
+}
+
 /* Fast-path: process StreamData from raw JSON in a single linear pass.
  *
  * StartStream sends short tags (_RFL, _MKP, _MKF, etc.) but the AS11
@@ -798,8 +850,12 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     int16_t pld_vals[12] = {0}; bool pld_found[12] = {false};
     int16_t hr_val = 0;     bool hr_found = false;
     int16_t spo2_val = 0;   bool spo2_found = false;
+    int64_t cur_stream_ms = -1;   /* startTime parsed from this notification */
 
-    /* Single-pass scan: walk JSON, extract all key→array pairs */
+    /* Single-pass scan: walk JSON, extract all key→value pairs.
+     * Handles two value types: arrays (signal data) and strings
+     * (startTime).  The scanner peeks at the character after ':' to
+     * decide which path to take. */
     while (p < end) {
         while (p < end && *p != '"') p++;
         if (p >= end) break;
@@ -814,7 +870,23 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         if (p >= end || *p != ':') continue;
         p++;
         while (p < end && (*p == ' ' || *p == '\t')) p++;
-        if (p >= end || *p != '[') continue;
+        if (p >= end) continue;
+
+        /* startTime is a string value — extract for gap detection */
+        if (klen == 9 && strncmp(key_start, "startTime", 9) == 0) {
+            if (*p == '"') {
+                p++;
+                const char *str_start = p;
+                while (p < end && *p != '"') p++;
+                int slen = (int)(p - str_start);
+                if (p < end) p++; /* skip closing quote */
+                cur_stream_ms = parse_starttime_ms(str_start, slen);
+            }
+            continue;
+        }
+
+        /* Signal data is always a JSON array */
+        if (*p != '[') continue;
 
         int id = match_key(key_start, klen);
         if (id < 0) continue;
@@ -876,6 +948,88 @@ void session_writer_on_stream_data_raw(const char *json, int len)
 
     xSemaphoreTake(s->mutex, portMAX_DELAY);
 
+    /* ── Missing-packet compensation ───────────────────────────────
+     * Detect dropped StreamData notifications by comparing the current
+     * startTime to the previous notification's startTime.  Normal gap
+     * is ~200ms (reportIntervalMs).  The AS11 clock has ±3ms jitter,
+     * so we use a threshold of 280ms (>1 sample interval beyond normal)
+     * to flag a gap.  Each missing notification = 5 BRP samples (25Hz ×
+     * 200ms) and advances the SA2/PLD decimation counters by 1.
+     *
+     * Compensation per signal type:
+     *   BRP: insert -1 sentinels (waveform integrity — no fabrication)
+     *   SA2: hold previous HR/SpO2 (slow vitals, change over minutes)
+     *   PLD: hold previous row (2s summaries, change slowly)
+     *
+     * The gap is measured in ms and converted to missing-notification
+     * count via integer division by 200.  This is exact because the
+     * AS11's startTime advances in ~200ms steps. */
+    if (cur_stream_ms >= 0 && s->prev_stream_ms_valid) {
+        int64_t gap = cur_stream_ms - s->prev_stream_ms;
+        /* Handle midnight rollover (86400000 ms/day) */
+        if (gap < 0) gap += 86400000;
+        /* Normal gap ~200ms; threshold 280ms = 200 + 2×40ms sample */
+        if (gap > 280) {
+            int missing = (int)((gap - 100) / 200);
+            if (missing > 0 && missing < 50) {
+                ESP_LOGW(TAG, "StreamData gap: %lldms (%d missing notifications), "
+                         "inserting compensation", (long long)gap, missing);
+
+                /* BRP: insert 5 sentinels per missing notification */
+                for (int m = 0; m < missing; m++) {
+                    uint32_t base = s->brp_buf_count;
+                    if (base + 5 <= 1500) {
+                        for (int j = 0; j < 5; j++) {
+                            s->brp_flow[base + j] = -1;
+                            s->brp_press[base + j] = -1;
+                        }
+                        s->brp_buf_count = base + 5;
+                    }
+                }
+
+                /* SA2: advance decimation counter, hold previous value
+                 * on each wrap.  The counter decrements from 5→0; each
+                 * time it hits 0 we write a sample.  We simulate the
+                 * missed decrements to keep the counter synchronized. */
+                for (int m = 0; m < missing; m++) {
+                    if (s->sa2_countdown <= 1) {
+                        s->sa2_countdown = 5;
+                        if (s->sa2_buf_count < 60) {
+                            s->sa2_hr[s->sa2_buf_count] =
+                                s->last_hr_valid ? s->last_hr : -1;
+                            s->sa2_spo2[s->sa2_buf_count] =
+                                s->last_spo2_valid ? s->last_spo2 : -1;
+                            s->sa2_buf_count++;
+                        }
+                    } else {
+                        s->sa2_countdown--;
+                    }
+                }
+
+                /* PLD: same approach — advance decimation counter,
+                 * hold previous row on each wrap. */
+                for (int m = 0; m < missing; m++) {
+                    if (s->pld_countdown <= 1) {
+                        s->pld_countdown = 10;
+                        if (s->last_pld_valid && s->pld_buf_count < 300) {
+                            for (int k = 0; k < 12; k++)
+                                s->pld_buf[s->pld_buf_count][k] = s->last_pld[k];
+                            s->pld_buf_count++;
+                        }
+                    } else {
+                        s->pld_countdown--;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Update previous startTime for next notification's gap check */
+    if (cur_stream_ms >= 0) {
+        s->prev_stream_ms = cur_stream_ms;
+        s->prev_stream_ms_valid = true;
+    }
+
     /* BRP: PatientFlow + MaskPressure (25 Hz, 40ms natural interval).
      * Flow and pressure arrive together (one value per 40ms tick) and must be
      * appended in lockstep at the SAME cumulative buffer position.  Missing
@@ -906,9 +1060,13 @@ void session_writer_on_stream_data_raw(const char *json, int len)
             s->sa2_spo2[s->sa2_buf_count] = spo2_found ? spo2_val : -1;
             s->sa2_buf_count++;
         }
+        /* Cache last known values for gap hold */
+        if (hr_found) { s->last_hr = hr_val; s->last_hr_valid = true; }
+        if (spo2_found) { s->last_spo2 = spo2_val; s->last_spo2_valid = true; }
     } else if (spo2_found && s->sa2_buf_count > 0) {
         /* Update SpO2 for the most recent SA2 sample */
         s->sa2_spo2[s->sa2_buf_count - 1] = spo2_val;
+        if (spo2_found) { s->last_spo2 = spo2_val; s->last_spo2_valid = true; }
     }
 
     /* PLD: 12 channels, all 0.5 Hz (2s natural interval).
@@ -924,6 +1082,10 @@ void session_writer_on_stream_data_raw(const char *json, int len)
             for (int k = 0; k < 12; k++)
                 s->pld_buf[s->pld_buf_count][k] = pld_found[k] ? pld_vals[k] : -1;
             s->pld_buf_count++;
+            /* Cache last known PLD row for gap hold */
+            for (int k = 0; k < 12; k++)
+                s->last_pld[k] = s->pld_buf[s->pld_buf_count - 1][k];
+            s->last_pld_valid = true;
         }
     }
 
@@ -1301,6 +1463,52 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                     }
                 }
                 return;  /* _SNC notifications are not written to events.snt */
+            }
+            /* _ZLE ValueChange — write to events.snt with injected NTP
+             * timestamp.  The AS11 does not include reportTime in
+             * ValueChange notifications (same as _SNC), so we capture
+             * the NTP time at receipt and inject it as "ntpTimeMs".
+             * The EDF generator uses this to align BRP/PLD/SA2 start
+             * to the AS11's _ZLE gating signal instead of MaskOn.
+             * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
+            if (strcmp(data_id->valuestring, "_ZLE") == 0) {
+                int zle_val = -1;
+                cJSON *events = cJSON_GetObjectItem(params, "events");
+                if (events && cJSON_IsArray(events)) {
+                    cJSON *ev = cJSON_GetArrayItem(events, 0);
+                    if (ev) {
+                        cJSON *val = cJSON_GetObjectItem(ev, "value");
+                        if (val && cJSON_IsNumber(val))
+                            zle_val = (int)val->valuedouble;
+                    }
+                }
+                if (s && s->active) {
+                    cJSON *zle_copy = cJSON_Duplicate(msg, 1);
+                    if (zle_copy) {
+                        cJSON *zle_params = cJSON_GetObjectItem(zle_copy, "params");
+                        if (zle_params) {
+                            cJSON *zle_events = cJSON_GetObjectItem(zle_params, "events");
+                            if (zle_events && cJSON_IsArray(zle_events)) {
+                                cJSON *zle_ev = cJSON_GetArrayItem(zle_events, 0);
+                                if (zle_ev) {
+                                    int64_t ntp_ms = (int64_t)time(NULL) * 1000;
+                                    cJSON_AddNumberToObject(zle_ev, "ntpTimeMs",
+                                                            (double)ntp_ms);
+                                }
+                            }
+                        }
+                        char *json_str = cJSON_PrintUnformatted(zle_copy);
+                        if (json_str) {
+                            fputs(json_str, s->f_events);
+                            fputc('\n', s->f_events);
+                            free(json_str);
+                        }
+                        cJSON_Delete(zle_copy);
+                    }
+                }
+                ESP_LOGI(TAG, ">>> _ZLE ValueChange: %d (%s)",
+                         zle_val, zle_val == 1 ? "rising edge" : "falling edge");
+                return;
             }
         }
 
