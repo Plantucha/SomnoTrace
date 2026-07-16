@@ -145,6 +145,11 @@ struct session_writer {
     bool     last_spo2_valid;
     bool     last_pld_valid;
 
+    /* Session-level gap statistics (logged at session stop) */
+    uint32_t stream_notifications;  /* total StreamData notifications received */
+    uint32_t gap_events;            /* number of gap detections (compensated) */
+    uint32_t gap_missing_total;     /* total missing notifications compensated */
+
     /* events: simple JSON line file, flushed with data */
 };
 
@@ -438,6 +443,9 @@ session_writer_t *session_writer_start(void)
     s->last_hr_valid = false;
     s->last_spo2_valid = false;
     s->last_pld_valid = false;
+    s->stream_notifications = 0;
+    s->gap_events = 0;
+    s->gap_missing_total = 0;
 
     make_session_id(s->session_id, sizeof(s->session_id));
 
@@ -627,6 +635,23 @@ esp_err_t session_writer_stop(session_writer_t *s)
              (unsigned)s->brp.sample_count,
              (unsigned)s->sa2.sample_count,
              (unsigned)s->pld.sample_count);
+
+    /* Stream data quality summary: shows how many notifications were
+     * received, how many gap events were detected and compensated for,
+     * and the effective packet loss rate.  A loss rate of 0.00% means
+     * no dropped notifications; 0.13% is typical for problematic BLE
+     * links.  This helps users assess whether their data is complete. */
+    if (s->stream_notifications > 0) {
+        uint32_t expected = s->stream_notifications + s->gap_missing_total;
+        uint32_t loss_bps = (s->gap_missing_total * 10000) / expected; /* bps = 0.01% units */
+        ESP_LOGI(TAG, "stream quality: %u notifications received, "
+                 "%u gap events, %u missing compensated, "
+                 "loss rate %u.%02u%%",
+                 (unsigned)s->stream_notifications,
+                 (unsigned)s->gap_events,
+                 (unsigned)s->gap_missing_total,
+                 loss_bps / 100, loss_bps % 100);
+    }
 
     /* s_active was already cleared above (before GetDateTime RPC). */
 
@@ -948,6 +973,8 @@ void session_writer_on_stream_data_raw(const char *json, int len)
 
     xSemaphoreTake(s->mutex, portMAX_DELAY);
 
+    s->stream_notifications++;
+
     /* ── Missing-packet compensation ───────────────────────────────
      * Detect dropped StreamData notifications by comparing the current
      * startTime to the previous notification's startTime.  Normal gap
@@ -974,6 +1001,9 @@ void session_writer_on_stream_data_raw(const char *json, int len)
             if (missing > 0 && missing < 50) {
                 ESP_LOGW(TAG, "StreamData gap: %lldms (%d missing notifications), "
                          "inserting compensation", (long long)gap, missing);
+
+                s->gap_events++;
+                s->gap_missing_total += missing;
 
                 /* BRP: insert 5 sentinels per missing notification */
                 for (int m = 0; m < missing; m++) {
