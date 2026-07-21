@@ -119,6 +119,9 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .btn-danger:hover:not(:disabled){background:rgba(248,113,113,.1)}
 
 .btn-sm{padding:7px 12px;font-size:.8rem;border-radius:6px}
+.btn-icon{width:32px;height:32px;padding:0;border-radius:50%;background:rgba(148,163,184,0.15);border:1px solid rgba(148,163,184,0.25);color:var(--text);font-size:1.1rem;line-height:1;backdrop-filter:blur(2px)}
+.btn-icon:hover:not(:disabled){background:rgba(59,130,246,0.2);border-color:var(--primary);color:var(--primary)}
+.btn-icon.active{background:var(--primary);color:#fff;border-color:var(--primary)}
 
 /* ── Password Wrapper ──────────────────────────────────────────── */
 .pw-wrap{position:relative;display:flex;align-items:center}
@@ -540,12 +543,15 @@ Save &amp; Reboot
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">95th% Leak</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green">--</span></div>
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange">--</span></div>
 </div>
-<div class="card" style="flex:1;min-height:400px;display:flex;flex-direction:column">
-<div class="card-title">Therapy Channels</div>
-<div class="chart-placeholder" id="chart-placeholder">
-Therapy charts will appear here when session data endpoints are implemented.<br>
-uPlot library and /api/session/data endpoint required.
+<div class="card dashboard-charts-panel" style="position:relative;padding:16px">
+<div class="chart-controls" style="position:absolute;top:8px;right:8px;z-index:2;display:flex;gap:6px;align-items:center;padding:4px 6px;border-radius:20px;background:rgba(15,23,42,0.35);border:1px solid rgba(148,163,184,0.15);backdrop-filter:blur(2px)">
+<button class="btn btn-icon" onclick="dashboardZoomOut()" title="Zoom out">−</button>
+<button class="btn btn-icon" onclick="dashboardZoomIn()" title="Zoom in">+</button>
+<button class="btn btn-icon" id="dash-scroll-btn" onclick="toggleDashScroll()" title="Pan mode">⇄</button>
+<button class="btn btn-icon" onclick="dashboardZoomReset()" title="Reset">⟲</button>
 </div>
+<div id="chart-breath" style="min-height:290px;position:relative;touch-action:none"></div>
+<div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:6px"></div>
 </div>
 </section>
 
@@ -713,6 +719,8 @@ function setTheme(theme) {
   var btn = document.getElementById('theme-' + theme + '-btn');
   if (btn) btn.classList.add('active');
   localStorage.setItem('somnotrace_theme', theme);
+  /* Re-render dashboard chart so axis/grid colors pick up new theme vars. */
+  if (typeof breathChart !== 'undefined' && breathChart) renderDashboardCharts();
 }
 function getSystemTheme() { var h = new Date().getHours(); return (h >= 8 && h < 20) ? 'day' : 'night'; }
 
@@ -1653,7 +1661,587 @@ function stepDate(days) {
   picker.value = newval;
   handleDateChange(newval);
 }
-function loadSessionData() { console.log('Loading session data for:', document.getElementById('session-date').value); }
+function loadSessionData() { loadDashboardData(); }
+
+/* ── Dashboard charts ────────────────────────────────────────────
+ * Architecture: fetch raw .snt binary files once via /api/session/file,
+ * parse them in JS, and render entirely from client-side RAM.  No
+ * per-zoom API calls.  L1 MinMax (brp_mm) is fetched first for the
+ * overview; L0 raw (brp) is fetched in the background for zoom detail.
+ *
+ * .snt binary format (little-endian):
+ *   32-byte header: magic(u32) version(u8) tier(u8) n_ch(u8) samp_bytes(u8)
+ *                   sample_hz_x10(u16) reserved(u16) start_epoch_ms(i64)
+ *                   sample_count(u32) reserved2(u32)
+ *   L1 MinMax (tier=1, n_ch=4): int16[flow_min, flow_max, press_min, press_max] per record
+ *   L0 raw    (tier=0, n_ch=2): int16[flow, pressure] per record
+ * Flow physical: dig * 0.6 = L/min   Pressure: dig * 0.01 = cmH2O
+ * Invalid marker: v1 dig == -1 -> gap, v2 dig == INT16_MIN -> gap
+ */
+var dashCache = new Map();
+var breathChart = null;
+var dashSessions = [];      /* sorted manifest from /api/sessions */
+var dashSessionData = [];   /* per-session {t: Float64Array, flow: Float64Array, ready: bool} */
+var dashXRange = null;
+var dashNoonDay = '';
+var dashScrollMode = false;
+var dashIsPanning = false;
+var dashLoadId = 0;         /* increment to cancel in-flight loads */
+var dashIsLoading = false;   /* true while SNT files are being downloaded */
+var dashProgrammaticScale = false;  /* guard setScale hook during programmatic updates */
+var FLOW_Y_MIN = -150;
+var FLOW_Y_MAX = 150;
+var SNT_HDR_SIZE = 28;
+var DASH_MAX_DISPLAY = 3000;
+var SNT_MISSING_V1 = -1;
+var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#94a3b8';
+}
+
+function fmtTime(ms) {
+  var d = new Date(ms);
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+function fmtTimeSec(ms) {
+  var d = new Date(ms);
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
+}
+
+function isToday(s) {
+  var d = new Date();
+  return s === d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function noonDayStr(s) { return s ? s.replace(/-/g, '') : ''; }
+function dashChartWidth(el) { var w = el.clientWidth; return (w && w > 0) ? w : 320; }
+function dashSetStatus(m) { var e = document.getElementById('dash-status'); if (e) e.textContent = m; }
+
+/* Compute the full time range from the session manifest (not from data arrays).
+ * This is stable and does not change as data arrives. */
+function dashFullRange() {
+  if (!dashSessions.length) return null;
+  var lo = Infinity, hi = -Infinity;
+  for (var i = 0; i < dashSessions.length; i++) {
+    var s = dashSessions[i];
+    if (!s.start_epoch_ms) continue;
+    if (s.start_epoch_ms < lo) lo = s.start_epoch_ms;
+    var end = s.end_epoch_ms || s.start_epoch_ms;
+    if (end > hi) hi = end;
+  }
+  if (hi === -Infinity) return null;
+  return {min: lo, max: hi};
+}
+
+/* Parse a .snt binary file (ArrayBuffer) into {t: Float64Array, flow: Float64Array}.
+ * For L1 MinMax: uses midpoint (min+max)/2 to show average flow per second.
+ * For L0 raw: direct flow value (actual instantaneous flow at 25 Hz).
+ * Missing-data sentinel: v1 uses -1, v2 uses INT16_MIN → null (gap).
+ * Conversion: dig * 0.6 = L/min (matches LCD therapy graph scaling). */
+function parseSntFlow(buf) {
+  if (!buf || buf.byteLength < 32) return null;
+  var dv = new DataView(buf);
+  var magic = dv.getUint32(0, true);
+  if (magic !== 0x534E5442) return null;
+  var version = dv.getUint8(4);
+  var tier = dv.getUint8(5);
+  var nCh = dv.getUint8(6);
+  var sampleBytes = dv.getUint8(7);
+  var hzX10 = dv.getUint16(8, true);
+  var startLo = dv.getUint32(12, true);
+  var startHi = dv.getInt32(16, true);
+  var startMs = startHi * 4294967296 + startLo;
+  var sampleCount = dv.getUint32(20, true);
+  var msPerRec = Math.round(10000 / hzX10);
+  var recBytes = nCh * sampleBytes;
+  var missing = (version >= 2) ? SNT_MISSING_V2 : SNT_MISSING_V1;
+  /* Auto-detect header size: try 28 (packed sizeof), fallback 32 */
+  var dataOff = SNT_HDR_SIZE;
+  var expectedData = sampleCount * recBytes;
+  if (buf.byteLength - dataOff < expectedData && buf.byteLength - 32 >= expectedData) {
+    dataOff = 32;
+  }
+  var n = Math.min(sampleCount, Math.floor((buf.byteLength - dataOff) / recBytes));
+  if (n <= 0) return null;
+
+  var t = new Float64Array(n);
+  var flow = new Float64Array(n);
+  var flowMin = null, flowMax = null;
+  var isL1 = (tier === 1 && nCh === 4);
+  if (isL1) { flowMin = new Float64Array(n); flowMax = new Float64Array(n); }
+
+  for (var i = 0; i < n; i++) {
+    var off = dataOff + i * recBytes;
+    if (isL1) {
+      var fmn = dv.getInt16(off, true);
+      var fmx = dv.getInt16(off + 2, true);
+      if (fmn === missing && fmx === missing) {
+        flow[i] = NaN; flowMin[i] = NaN; flowMax[i] = NaN;
+      } else {
+        flowMin[i] = (fmn === missing) ? 0 : fmn * 0.6;
+        flowMax[i] = (fmx === missing) ? 0 : fmx * 0.6;
+        flow[i] = (flowMin[i] + flowMax[i]) / 2;
+      }
+    } else {
+      var f = dv.getInt16(off, true);
+      flow[i] = (f === missing) ? NaN : f * 0.6;
+    }
+    t[i] = startMs + i * msPerRec;
+  }
+  return {t: t, flow: flow, flowMin: flowMin, flowMax: flowMax, isL1: isL1};
+}
+
+/* Build display data from per-session arrays with viewport slicing, gap insertion,
+ * overlap precedence (later session wins), and min/max bucket aggregation.
+ * Returns {t: Array, flow: Array} with null separators between sessions.
+ * Each bucket emits two points (min then max) to preserve the waveform envelope
+ * at any zoom level, eliminating aliasing from strided subsampling. */
+function buildDisplayData(range, maxPts) {
+  if (!dashSessionData || !dashSessionData.length) return null;
+  var full = dashFullRange();
+  if (!full) return null;
+  var vMin = range ? range.min : full.min;
+  var vMax = range ? range.max : full.max;
+
+  /* Collect per-session slices within viewport */
+  var slices = [];
+  for (var i = 0; i < dashSessionData.length; i++) {
+    var sd = dashSessionData[i];
+    if (!sd || !sd.ready || !sd.t || !sd.t.length) continue;
+    var sStart = sd.t[0];
+    var sEnd = sd.t[sd.t.length - 1];
+    if (sEnd < vMin || sStart > vMax) continue;
+    var lo = 0, hi = sd.t.length - 1;
+    while (lo < sd.t.length && sd.t[lo] < vMin) lo++;
+    while (hi >= 0 && sd.t[hi] > vMax) hi--;
+    if (lo > hi) continue;
+    slices.push({idx: i, lo: lo, hi: hi, start: sStart});
+  }
+  if (!slices.length) return null;
+
+  /* Sort by start time; later session takes precedence on overlap */
+  slices.sort(function(a, b) { return a.start - b.start; });
+
+  /* Allocate buckets per session proportional to TIME SPAN (not sample count).
+   * This ensures L0 and L1 sessions covering the same duration get the same
+   * number of buckets. Without this, an L0 session (25x more samples than L1)
+   * would hog all buckets during progressive loading, making still-L1 sessions
+   * appear decimated with large gaps. */
+  var totalSpan = 0;
+  for (var si = 0; si < slices.length; si++) {
+    var sd0 = dashSessionData[slices[si].idx];
+    totalSpan += sd0.t[slices[si].hi] - sd0.t[slices[si].lo];
+  }
+  var halfPts = Math.floor(maxPts / 2);
+  var outT = [], outF = [];
+  var prevEnd = -Infinity;
+
+  for (var si = 0; si < slices.length; si++) {
+    var sl = slices[si];
+    var sd = dashSessionData[sl.idx];
+    var sliceLen = sl.hi - sl.lo + 1;
+    var span = sd.t[sl.hi] - sd.t[sl.lo];
+    if (span <= 0) span = 1;
+
+    /* Insert null separator between sessions (gap) */
+    if (outT.length > 0) { outT.push(null); outF.push(null); }
+
+    /* Buckets for this session, proportional to its share of total time span */
+    var sessionBuckets = Math.max(2, Math.floor(halfPts * span / totalSpan));
+    var bucketSize = sliceLen / sessionBuckets;
+    if (bucketSize < 1) bucketSize = 1;
+
+    var overlapStart = prevEnd;
+
+    for (var b = 0; b < sessionBuckets; b++) {
+      var bLo = sl.lo + Math.floor(b * bucketSize);
+      var bHi = Math.min(sl.hi, sl.lo + Math.floor((b + 1) * bucketSize) - 1);
+      if (bLo > bHi) continue;
+
+      /* Scan bucket for min/max */
+      var bMin = Infinity, bMax = -Infinity;
+      var bMid = Math.floor((bLo + bHi) / 2);
+      var hasData = false;
+
+      if (sd.isL1 && sd.flowMin && sd.flowMax) {
+        /* L1: use pre-computed min/max per record */
+        for (var j = bLo; j <= bHi; j++) {
+          if (sd.t[j] <= overlapStart) continue;
+          var mn = sd.flowMin[j], mx = sd.flowMax[j];
+          if (isNaN(mn) || isNaN(mx)) continue;
+          if (mn < bMin) { bMin = mn; hasData = true; }
+          if (mx > bMax) { bMax = mx; hasData = true; }
+        }
+      } else {
+        /* L0: compute min/max from raw flow values */
+        for (var j = bLo; j <= bHi; j++) {
+          if (sd.t[j] <= overlapStart) continue;
+          var v = sd.flow[j];
+          if (isNaN(v)) continue;
+          if (v < bMin) { bMin = v; hasData = true; }
+          if (v > bMax) { bMax = v; hasData = true; }
+        }
+      }
+
+      if (hasData) {
+        var tMid = sd.t[bMid];
+        if (tMid <= overlapStart) tMid = sd.t[bLo];
+        /* Emit min then max at the same timestamp to form a vertical envelope.
+         * uPlot will draw a line from min to max, preserving the waveform shape. */
+        outT.push(tMid); outF.push(bMin);
+        outT.push(tMid); outF.push(bMax);
+      } else if (bLo <= bHi) {
+        /* All-NaN bucket — emit a gap marker */
+        outT.push(sd.t[bMid]); outF.push(NaN);
+      }
+    }
+    prevEnd = sd.t[sl.hi];
+  }
+  return {t: outT, flow: outF};
+}
+
+/* Fetch a binary .snt file via a single sequential GET.
+ * Avoids parallel range requests to reduce socket pressure on the ESP32's
+ * synchronous HTTP server (10 max sockets, shared with WebSocket logs). */
+function fetchSntFile(sessionId, noonDay, type) {
+  var url = '/api/session/file?session=' + sessionId + '&date=' + noonDay + '&type=' + type;
+  return fetch(url).then(function(r) {
+    if (!r.ok) return null;
+    return r.arrayBuffer();
+  }).catch(function() { return null; });
+}
+
+function loadDashboardData() {
+  var picker = document.getElementById('session-date');
+  var dateStr = picker ? picker.value : '';
+  if (!dateStr) return;
+  var noonDay = noonDayStr(dateStr);
+  dashNoonDay = noonDay;
+
+  /* Cancel any in-flight load */
+  var myLoadId = ++dashLoadId;
+  dashIsLoading = true;
+
+  if (!isToday(dateStr) && dashCache.has(noonDay)) {
+    var c = dashCache.get(noonDay);
+    dashSessions = c.sessions;
+    dashSessionData = c.sessionData;
+    dashXRange = null;
+    renderDashboardCharts();
+    dashIsLoading = false;
+    return;
+  }
+
+  dashSetStatus('Loading...');
+  fetch('/api/sessions?date=' + noonDay).then(function(r){
+    if (!r.ok) return r.text().then(function(t){ throw new Error('sessions '+r.status+': '+t); });
+    return r.json();
+  }).then(function(sessions){
+    if (myLoadId !== dashLoadId) return;  /* cancelled */
+    var all = sessions || [];
+    /* Filter out sessions shorter than 60 seconds — they are too short
+     * to be clinically useful and distort the time axis. */
+    dashSessions = all.filter(function(s) {
+      var dur = (s.end_epoch_ms || 0) - (s.start_epoch_ms || 0);
+      return dur >= 60000;
+    });
+    if (!dashSessions.length) {
+      dashSessionData = [];
+      dashSetStatus('No sessions');
+      renderDashboardCharts();
+      dashIsLoading = false;
+      return;
+    }
+
+    /* Initialize per-session data slots */
+    dashSessionData = dashSessions.map(function() { return {t: null, flow: null, ready: false}; });
+
+    /* Full range is derived from the manifest, not from data */
+    var full = dashFullRange();
+    dashXRange = null;  /* initial view = full range */
+
+    /* Step 1: Fetch L1 MinMax sequentially per session, display progressively.
+     * Each session appears in its final fixed horizontal location as soon
+     * as its L1 data is validated. The time axis is set once from the
+     * manifest and never moves. */
+    dashSetStatus('Loading overview...');
+    renderDashboardCharts();  /* render empty chart with correct axis range */
+
+    var l1Chain = Promise.resolve();
+    dashSessions.forEach(function(s, idx) {
+      l1Chain = l1Chain.then(function() {
+        if (myLoadId !== dashLoadId) return;  /* cancelled */
+        return fetchSntFile(s.id, noonDay, 'brp_mm');
+      }).then(function(buf) {
+        if (myLoadId !== dashLoadId) return;  /* cancelled */
+        if (buf) {
+          var parsed = parseSntFlow(buf);
+          if (parsed && parsed.t.length) {
+            dashSessionData[idx] = {t: parsed.t, flow: parsed.flow, flowMin: parsed.flowMin, flowMax: parsed.flowMax, isL1: parsed.isL1, ready: true};
+            updateDashView();
+          }
+        }
+      });
+    });
+
+    return l1Chain.then(function() {
+      if (myLoadId !== dashLoadId) return;  /* cancelled */
+      /* Cache the L1 overview */
+      if (!isToday(dateStr)) {
+        dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
+      }
+      dashSetStatus('Loading detail...');
+
+      /* Step 2: Fetch L0 raw sequentially per session (background).
+       * L0 requests do not begin until all L1 sessions are ready or failed. */
+      var l0Chain = Promise.resolve();
+      dashSessions.forEach(function(s, idx) {
+        l0Chain = l0Chain.then(function() {
+          if (myLoadId !== dashLoadId) return;  /* cancelled */
+          return fetchSntFile(s.id, noonDay, 'brp');
+        }).then(function(buf) {
+          if (myLoadId !== dashLoadId) return;  /* cancelled */
+          if (buf) {
+            var parsed = parseSntFlow(buf);
+            if (parsed && parsed.t.length) {
+              /* Replace L1 with L0 for this session */
+              dashSessionData[idx] = {t: parsed.t, flow: parsed.flow, flowMin: parsed.flowMin, flowMax: parsed.flowMax, isL1: parsed.isL1, ready: true};
+              /* Seamless update: preserve current zoom */
+              updateDashView();
+            }
+          }
+        });
+      });
+
+      return l0Chain.then(function() {
+        if (myLoadId !== dashLoadId) return;  /* cancelled */
+        if (!isToday(dateStr)) {
+          dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
+        }
+        dashSetStatus('');
+        dashIsLoading = false;
+      });
+    });
+  }).catch(function(e){
+    if (myLoadId !== dashLoadId) return;
+    dashSetStatus('Error: '+e.message);
+    dashIsLoading = false;
+    console.error(e);
+  });
+}
+
+function dashApplyXRange(min, max) {
+  var full = dashFullRange();
+  if (!full) return;
+  if (min == null) min = full.min;
+  if (max == null) max = full.max;
+  if (min < full.min) { max += full.min - min; min = full.min; }
+  if (max > full.max) { min -= max - full.max; max = full.max; }
+  if (min < full.min) min = full.min;
+  var span = max - min;
+  if (span < 1000) { var c = (min+max)/2; min = c-500; max = c+500; }
+  if (max - min >= full.max - full.min - 1000) { dashXRange = null; }
+  else { dashXRange = {min: min, max: max}; }
+  updateDashView();
+}
+
+function updateDashView() {
+  if (!breathChart) { renderDashboardCharts(); return; }
+  var full = dashFullRange(); if (!full) return;
+  var cur = dashXRange || full;
+  var src = buildDisplayData(cur, DASH_MAX_DISPLAY);
+  if (!src || !src.t.length) return;
+  /* setData with false = do not auto-scale axes.
+   * Then setScale to move viewport to cur, with programmatic guard
+   * to prevent the setScale hook from re-entering. */
+  dashProgrammaticScale = true;
+  breathChart.setData([src.t, src.flow], false);
+  breathChart.setScale('x', {min: cur.min, max: cur.max});
+  dashProgrammaticScale = false;
+}
+
+function renderDashboardCharts() {
+  if (typeof uPlot === 'undefined') { dashSetStatus('uPlot not loaded'); return; }
+  var el = document.getElementById('chart-breath');
+  if (!el) return;
+  if (breathChart) { breathChart.destroy(); breathChart = null; }
+  el.textContent = ''; el.style.display = '';
+  var full = dashFullRange();
+  var cur = dashXRange || full;
+  var src = buildDisplayData(cur, DASH_MAX_DISPLAY);
+  if (!src || !src.t || src.t.length === 0) {
+    el.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:280px;color:var(--text-muted)">No breathing data</div>';
+    return;
+  }
+  var data = [src.t, src.flow];
+  var xs = cur || (full || {});
+  function currentTimeFmt(u) {
+    var range = (u && u.scales && u.scales.x) ? (u.scales.x.max - u.scales.x.min) : Infinity;
+    return (range < 180000) ? fmtTimeSec : fmtTime;
+  }
+
+  var opts = {
+    width: dashChartWidth(el),
+    height: 280,
+    padding: [6, 8, 0, 0],
+    series: [
+      { label: 'Time', value: function(u, v) { return v == null ? '' : currentTimeFmt(u)(v); } },
+      { label: 'Flow', stroke: '#3b82f6',
+        scale: 'flow', width: 1.2, points: { show: false },
+        spanGaps: false }
+    ],
+    scales: {
+      x: xs,
+      flow: { auto: false, min: FLOW_Y_MIN, max: FLOW_Y_MAX }
+    },
+    axes: [
+      { values: function(u, vals) { var tf = currentTimeFmt(u); return vals.map(function(v){return v==null?'':tf(v);}); }, grid: { stroke: cssVar('--card-border'), width: 0.5, dash: [2,2] }, stroke: cssVar('--text-muted'), font: '10px sans-serif' },
+      { scale: 'flow', size: 28, grid: { stroke: cssVar('--card-border'), width: 0.5, dash: [2,2] }, stroke: cssVar('--text-muted'), font: '9px sans-serif' }
+    ],
+    cursor: {
+      drag: { x: !dashScrollMode, y: false },
+      sync: { key: 'dash', setSeries: true }
+    },
+    legend: { show: false },
+    hooks: {
+      ready: [function(u) { attachDashInteractions(u, el); }],
+      setScale: [function(u, key) {
+        if (key !== 'x' || dashIsPanning || dashProgrammaticScale) return;
+        var newRange = {min: u.scales.x.min, max: u.scales.x.max};
+        dashXRange = newRange;
+        /* Defer rebuild to next frame: uPlot is mid-zoom processing and
+         * calling setData/setScale synchronously corrupts its internal
+         * pixel mapping, causing data to fill only the selected sub-area. */
+        requestAnimationFrame(function() {
+          if (dashProgrammaticScale) return;
+          var src = buildDisplayData(newRange, DASH_MAX_DISPLAY);
+          if (src && src.t.length) {
+            dashProgrammaticScale = true;
+            breathChart.setData([src.t, src.flow], false);
+            breathChart.setScale('x', newRange);
+            dashProgrammaticScale = false;
+          }
+        });
+      }]
+    }
+  };
+  try {
+    breathChart = new uPlot(opts, data, el);
+  } catch(e) { console.error('Breath chart error', e); }
+}
+
+function attachDashInteractions(chart, el) {
+  var over = el.querySelector('.u-over') || el;
+
+  over.addEventListener('dblclick', function(e) {
+    e.preventDefault();
+    dashboardZoomReset();
+  });
+
+  over.addEventListener('wheel', function(e) {
+    e.preventDefault();
+    if (!breathChart) return;
+    var full = dashFullRange(); if (!full) return;
+    var rect = over.getBoundingClientRect();
+    var frac = (e.clientX - rect.left) / rect.width;
+    var cur = dashXRange || full;
+    var span = cur.max - cur.min;
+    if (span < 1) return;
+    var factor = e.deltaY < 0 ? 0.75 : 1.35;
+    var newSpan = Math.max(1000, Math.min(full.max - full.min, span * factor));
+    var centerTime = cur.min + span * frac;
+    var newMin = Math.max(full.min, centerTime - newSpan * frac);
+    var newMax = Math.min(full.max, newMin + newSpan);
+    if (newMax > full.max) { newMax = full.max; newMin = full.max - newSpan; }
+    if (newMin < full.min) newMin = full.min;
+    dashApplyXRange(newMin, newMax);
+  }, { passive: false });
+
+  var isDown = false, startX = 0, startRange = null;
+  function startDrag(clientX) {
+    if (!dashScrollMode) return;
+    isDown = true; startX = clientX; startRange = dashXRange || dashFullRange();
+    dashIsPanning = true;
+  }
+  function moveDrag(clientX) {
+    if (!isDown || !dashScrollMode || !breathChart || !startRange) return;
+    var rect = over.getBoundingClientRect();
+    var px = rect.width;
+    if (!px) return;
+    var frac = (clientX - startX) / px;
+    var span = startRange.max - startRange.min;
+    var shift = -frac * span;
+    var full = dashFullRange();
+    var newMin = startRange.min + shift;
+    var newMax = startRange.max + shift;
+    if (newMin < full.min) { newMax += full.min - newMin; newMin = full.min; }
+    if (newMax > full.max) { newMin -= newMax - full.max; newMax = full.max; }
+    if (newMin < full.min) newMin = full.min;
+    dashXRange = {min: newMin, max: newMax};
+    /* Rebuild data for the new panned range — brings in data from
+     * outside the previous viewport. updateDashView handles both
+     * setData and setScale with programmatic guard. */
+    updateDashView();
+  }
+  function endDrag() { isDown = false; startRange = null; setTimeout(function(){ dashIsPanning = false; }, 50); }
+
+  over.addEventListener('mousedown', function(e) { startDrag(e.clientX); });
+  window.addEventListener('mousemove', function(e) { moveDrag(e.clientX); });
+  window.addEventListener('mouseup', endDrag);
+  over.addEventListener('touchstart', function(e) { if (e.touches && e.touches[0]) startDrag(e.touches[0].clientX); }, { passive: true });
+  window.addEventListener('touchmove', function(e) { if (e.touches && e.touches[0]) moveDrag(e.touches[0].clientX); }, { passive: true });
+  window.addEventListener('touchend', endDrag);
+}
+
+function reloadDashCharts() {
+  var picker = document.getElementById('session-date');
+  var dateStr = picker ? picker.value : '';
+  var noonDay = noonDayStr(dateStr);
+  if (dashCache.has(noonDay)) {
+    var c = dashCache.get(noonDay);
+    dashSessions = c.sessions;
+    dashSessionData = c.sessionData;
+    dashXRange = null;
+  }
+  renderDashboardCharts();
+}
+
+function dashboardZoomReset() {
+  dashXRange = null;
+  renderDashboardCharts();
+  dashSetStatus('');
+}
+
+function dashboardZoomIn() {
+  if (!breathChart) return;
+  var full = dashFullRange(); if (!full) return;
+  var cur = dashXRange || full;
+  var span = cur.max - cur.min;
+  var center = (cur.min + cur.max) / 2;
+  var newSpan = Math.max(1000, span * 0.65);
+  dashApplyXRange(center - newSpan/2, center + newSpan/2);
+}
+
+function dashboardZoomOut() {
+  if (!breathChart) return;
+  var full = dashFullRange(); if (!full) return;
+  var cur = dashXRange || full;
+  var span = cur.max - cur.min;
+  var center = (cur.min + cur.max) / 2;
+  var newSpan = Math.min((full.max - full.min) * 1.5, span * 1.35);
+  if (newSpan >= full.max - full.min || span/60000 >= 180) {
+    dashboardZoomReset();
+    return;
+  }
+  dashApplyXRange(center - newSpan/2, center + newSpan/2);
+}
+
+function toggleDashScroll() {
+  dashScrollMode = !dashScrollMode;
+  var btn = document.getElementById('dash-scroll-btn');
+  if (btn) btn.classList.toggle('active', dashScrollMode);
+  renderDashboardCharts();
+}
 
 /* ── SoftAP Mode ───────────────────────────────────────────────── */
 function applyPortalMode() {
@@ -1775,7 +2363,10 @@ function resizeStatsCharts() {
   if (heapChart) { var h = document.getElementById('chart-heap'); if (h) heapChart.setSize({ width: chartWidth(h), height: 120 }); }
   if (psramChart) { var p = document.getElementById('chart-psram'); if (p) psramChart.setSize({ width: chartWidth(p), height: 120 }); }
 }
-window.addEventListener('resize', resizeStatsCharts);
+function resizeDashboardChart() {
+  if (breathChart) { var b = document.getElementById('chart-breath'); if (b) breathChart.setSize({ width: dashChartWidth(b), height: 280 }); }
+}
+window.addEventListener('resize', function() { resizeStatsCharts(); resizeDashboardChart(); });
 
 function pushStats(d) {
   var now = (d.time && typeof d.time === 'string') ? Math.floor(new Date(d.time).getTime() / 1000) : Math.floor(Date.now() / 1000);
@@ -1806,6 +2397,11 @@ function pushStats(d) {
 }
 
 function pollStatus() {
+  /* Skip status polling while dashboard files are downloading — the
+   * ESP32-S3 shares one radio between BLE (AS11 stream) and Wi-Fi, so
+   * concurrent TCP connections compete for scarce airtime and stall
+   * each other.  Pausing the poll eliminates that competition. */
+  if (dashIsLoading) return;
   fetch('/api/status').then(function(r) { return r.json(); }).then(function(d) {
     loadStatusTab(d);
     pushStats(d);

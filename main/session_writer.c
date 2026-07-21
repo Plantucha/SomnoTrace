@@ -53,11 +53,12 @@ static const char *TAG = "session";
 /* ── .snt file format ─────────────────────────────────────────────── */
 
 #define SNT_MAGIC       0x534E5442u   /* "SNTB" */
-#define SNT_VERSION     1
+#define SNT_VERSION     2
+#define SNT_MISSING     INT16_MIN      /* v2 unambiguous missing-data sentinel */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;            /* 0x534E5442 "SNTB"                  */
-    uint8_t  version;          /* format version (1)                  */
+    uint8_t  version;          /* format version (2)                  */
     uint8_t  tier;             /* 0 = L0 raw, 1 = L1 MinMax          */
     uint8_t  n_channels;       /* channels per record                 */
     uint8_t  sample_bytes;     /* 2 (int16)                           */
@@ -66,9 +67,9 @@ typedef struct __attribute__((packed)) {
     int64_t  start_epoch_ms;  /* session start (NTP clock)           */
     uint32_t sample_count;    /* records written (updated each flush) */
     uint32_t reserved2;
-} snt_header_t;              /* 32 bytes */
+} snt_header_t;              /* 28 bytes (packed) */
 
-#define SNT_HEADER_SIZE  sizeof(snt_header_t)   /* 32 bytes */
+#define SNT_HEADER_SIZE  sizeof(snt_header_t)   /* 28 bytes (packed) */
 
 /* ── Session state ────────────────────────────────────────────────── */
 
@@ -99,6 +100,7 @@ struct session_writer {
     uint32_t brp_mm_count;  /* L1 MinMax records written */
 
     int64_t  clock_drift_ms;   /* NTP time - AS11 device time at session stop */
+    bool     clock_drift_valid; /* true when clock_drift_ms was successfully queried */
 
     /* recent buffer: holds data between flushes */
     SemaphoreHandle_t mutex;
@@ -128,7 +130,7 @@ struct session_writer {
      * detect by comparing startTime values.
      *
      * Compensation strategy (per signal type):
-     *   BRP (25Hz waveform): insert -1 sentinels — fabricated data
+     *   BRP (25Hz waveform): insert SNT_MISSING sentinels — fabricated data
      *     could mimic apnea/hypopnea, so missing data must be visible.
      *   SA2 (1Hz vitals):    hold previous value — HR/SpO2 change over
      *     minutes; a 200ms-1s gap is clinically negligible.
@@ -242,22 +244,22 @@ static void flush_brp(session_writer_t *s)
         uint32_t n_sec = s->brp_buf_count / 25;
         for (uint32_t sec = 0; sec < n_sec; sec++) {
             uint32_t base = sec * 25;
-            int16_t fmn = INT16_MAX, fmx = -1;
-            int16_t pmn = INT16_MAX, pmx = -1;
+            int16_t fmn = INT16_MAX, fmx = INT16_MIN;
+            int16_t pmn = INT16_MAX, pmx = INT16_MIN;
             for (int j = 0; j < 25; j++) {
                 int16_t fv = s->brp_flow[base + j];
                 int16_t pv = s->brp_press[base + j];
-                if (fv != -1) {
+                if (fv != SNT_MISSING) {
                     if (fv < fmn) fmn = fv;
                     if (fv > fmx) fmx = fv;
                 }
-                if (pv != -1) {
+                if (pv != SNT_MISSING) {
                     if (pv < pmn) pmn = pv;
                     if (pv > pmx) pmx = pv;
                 }
             }
-            if (fmn == INT16_MAX) { fmn = fmx = -1; }
-            if (pmn == INT16_MAX) { pmn = pmx = -1; }
+            if (fmn == INT16_MAX) { fmn = fmx = SNT_MISSING; }
+            if (pmn == INT16_MAX) { pmn = pmx = SNT_MISSING; }
             int16_t mm[4] = { fmn, fmx, pmn, pmx };
             fwrite(mm, sizeof(int16_t), 4, s->brp.f_l1);
             s->brp_mm_count++;
@@ -367,9 +369,8 @@ static void write_session_json(session_writer_t *s, const char *state)
     cJSON_AddNumberToObject(root, "sa2_samples", (double)s->sa2.sample_count);
     cJSON_AddNumberToObject(root, "pld_samples", (double)s->pld.sample_count);
 
-    if (s->clock_drift_ms != 0) {
-        cJSON_AddNumberToObject(root, "clock_drift_ms", (double)s->clock_drift_ms);
-    }
+    cJSON_AddNumberToObject(root, "clock_drift_ms", (double)s->clock_drift_ms);
+    cJSON_AddBoolToObject(root, "clock_drift_valid", s->clock_drift_valid);
 
     if (s_device_addr[0]) cJSON_AddStringToObject(root, "as11_device", s_device_addr);
     if (s_client_id[0]) cJSON_AddStringToObject(root, "as11_client_id", s_client_id);
@@ -598,7 +599,7 @@ esp_err_t session_writer_stop(session_writer_t *s)
      * prevents concurrent writers from using this session. */
     s->end_time_us = esp_timer_get_time();
     s->end_epoch_ms = end_epoch_ms;
-    if (have_drift) s->clock_drift_ms = clock_drift_ms;
+    if (have_drift) { s->clock_drift_ms = clock_drift_ms; s->clock_drift_valid = true; }
 
     /* Signal flush_task to exit BEFORE doing any cleanup.
      * flush_task might be sleeping or about to call flush_all.
@@ -775,7 +776,7 @@ static int parse_scaled_array(const char **p, const char *end, int16_t *out, int
         if (s >= end || *s == ']') break;
 
         if (s + 3 < end && s[0] == 'n' && s[1] == 'u' && s[2] == 'l' && s[3] == 'l') {
-            out[count++] = -1;  /* null → -1 sentinel (matches AS11/OSCAR convention) */
+            out[count++] = SNT_MISSING;  /* null → missing sentinel */
             s += 4;
             continue;
         }
@@ -984,7 +985,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
      * 200ms) and advances the SA2/PLD decimation counters by 1.
      *
      * Compensation per signal type:
-     *   BRP: insert -1 sentinels (waveform integrity — no fabrication)
+     *   BRP: insert SNT_MISSING sentinels (waveform integrity — no fabrication)
      *   SA2: hold previous HR/SpO2 (slow vitals, change over minutes)
      *   PLD: hold previous row (2s summaries, change slowly)
      *
@@ -1005,13 +1006,13 @@ void session_writer_on_stream_data_raw(const char *json, int len)
                 s->gap_events++;
                 s->gap_missing_total += missing;
 
-                /* BRP: insert 5 sentinels per missing notification */
+                /* BRP: insert 5 SNT_MISSING sentinels per missing notification */
                 for (int m = 0; m < missing; m++) {
                     uint32_t base = s->brp_buf_count;
                     if (base + 5 <= 1500) {
                         for (int j = 0; j < 5; j++) {
-                            s->brp_flow[base + j] = -1;
-                            s->brp_press[base + j] = -1;
+                            s->brp_flow[base + j] = SNT_MISSING;
+                            s->brp_press[base + j] = SNT_MISSING;
                         }
                         s->brp_buf_count = base + 5;
                     }
@@ -1026,9 +1027,9 @@ void session_writer_on_stream_data_raw(const char *json, int len)
                         s->sa2_countdown = 5;
                         if (s->sa2_buf_count < 60) {
                             s->sa2_hr[s->sa2_buf_count] =
-                                s->last_hr_valid ? s->last_hr : -1;
+                                s->last_hr_valid ? s->last_hr : SNT_MISSING;
                             s->sa2_spo2[s->sa2_buf_count] =
-                                s->last_spo2_valid ? s->last_spo2 : -1;
+                                s->last_spo2_valid ? s->last_spo2 : SNT_MISSING;
                             s->sa2_buf_count++;
                         }
                     } else {
@@ -1063,7 +1064,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     /* BRP: PatientFlow + MaskPressure (25 Hz, 40ms natural interval).
      * Flow and pressure arrive together (one value per 40ms tick) and must be
      * appended in lockstep at the SAME cumulative buffer position.  Missing
-     * samples in either channel use the -1 sentinel.
+     * samples in either channel use the SNT_MISSING sentinel.
      *
      * Recording starts at TherapyStart (session_writer_start) and ends at
      * TherapyStop (session_writer_stop), matching AS11 export behavior.
@@ -1073,8 +1074,8 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         uint32_t base = s->brp_buf_count;
         int n_pairs = flow_n > press_n ? flow_n : press_n;
         for (int j = 0; j < n_pairs && base + j < 1500; j++) {
-            s->brp_flow[base + j]  = (j < flow_n)  ? flow_vals[j]  : -1;
-            s->brp_press[base + j] = (j < press_n) ? press_vals[j] : -1;
+            s->brp_flow[base + j]  = (j < flow_n)  ? flow_vals[j]  : SNT_MISSING;
+            s->brp_press[base + j] = (j < press_n) ? press_vals[j] : SNT_MISSING;
         }
         uint32_t added = (uint32_t)n_pairs;
         if (base + added > 1500) added = 1500 - base;
@@ -1668,6 +1669,7 @@ void session_writer_recover(void)
             if (f) {
                 fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
                            "\"start_epoch_ms\":%lld,"
+                           "\"clock_drift_ms\":0,\"clock_drift_valid\":false,"
                            "\"brp_samples\":%u,\"brp_mm_samples\":%u,"
                            "\"sa2_samples\":%u,\"pld_samples\":%u",
                         prefix,

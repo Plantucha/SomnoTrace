@@ -12,6 +12,7 @@
 #include "ff.h"
 #include "log_stream.h"
 #include "device_settings.h"
+#include "session_graph.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -161,6 +162,7 @@ esp_err_t netprov_init(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
@@ -416,6 +418,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, PORTAL_HTML_START, PORTAL_HTML_LEN);
     return ESP_OK;
 }
@@ -455,6 +458,7 @@ static esp_err_t manifest_get_handler(httpd_req_t *req)
 static esp_err_t sw_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/javascript");
+    httpd_resp_set_hdr(req, "Connection", "close");
     const char sw[] =
         "const CACHE_NAME = 'somnotrace-v2';\n"
         "self.addEventListener('install', e => {\n"
@@ -489,6 +493,7 @@ static esp_err_t uplot_js_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
+    httpd_resp_set_hdr(req, "Connection", "close");
     /* Embedded as TEXT, which appends a NUL terminator. Use STRLEN so the
      * trailing NUL is not sent (a stray NUL breaks JS parsing). */
     httpd_resp_send(req, UPLOT_JS_START, HTTPD_RESP_USE_STRLEN);
@@ -499,14 +504,80 @@ static esp_err_t uplot_css_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/css");
     httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, UPLOT_CSS_START, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
+/* ── Cached status data ────────────────────────────────────────────
+ * These values rarely change but are expensive to query (SD I/O for
+ * f_getfree, flash I/O for NVS).  Caching avoids contending with large
+ * file downloads on the shared SD bus during 3-second status polls. */
+
+#define STATUS_CACHE_SD_MS    600000  /* refresh SD free space every 10 min */
+#define STATUS_CACHE_NVS_MS   120000  /* refresh NVS-backed settings every 2 min */
+
+static struct {
+    /* SD card */
+    uint64_t sd_total;
+    uint64_t sd_free;
+    bool     sd_valid;
+    TickType_t sd_tick;
+    /* NVS config */
+    struct netprov_config cfg;
+    bool     cfg_valid;
+    TickType_t cfg_tick;
+    /* Timezone / NTP */
+    char     tz_name[40];
+    char     ntp_srv[64];
+    TickType_t tz_tick;
+} s_status_cache;
+
+static void status_cache_refresh_sd(void)
+{
+    if (!sd_storage_is_ready()) {
+        s_status_cache.sd_valid = false;
+        return;
+    }
+    FATFS *fs = NULL;
+    DWORD free_clst = 0;
+    if (f_getfree("0:", &free_clst, &fs) == FR_OK && fs) {
+        s_status_cache.sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
+        s_status_cache.sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
+        s_status_cache.sd_valid = true;
+    } else {
+        s_status_cache.sd_valid = false;
+    }
+    s_status_cache.sd_tick = xTaskGetTickCount();
+}
+
+static void status_cache_refresh_nvs(void)
+{
+    s_status_cache.cfg_valid = netprov_load_config(&s_status_cache.cfg);
+    time_sync_get_tz_name(s_status_cache.tz_name, sizeof(s_status_cache.tz_name));
+    time_sync_get_ntp_server(s_status_cache.ntp_srv, sizeof(s_status_cache.ntp_srv));
+    s_status_cache.tz_tick = xTaskGetTickCount();
+}
+
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    struct netprov_config cfg;
-    bool has_cfg = netprov_load_config(&cfg);
+    TickType_t now = xTaskGetTickCount();
+    uint32_t ms = portTICK_PERIOD_MS;
+
+    /* Refresh SD free space at most once per STATUS_CACHE_SD_MS */
+    if (!s_status_cache.sd_valid ||
+        (uint32_t)((now - s_status_cache.sd_tick) * ms) >= STATUS_CACHE_SD_MS) {
+        status_cache_refresh_sd();
+    }
+
+    /* Refresh NVS-backed settings at most once per STATUS_CACHE_NVS_MS */
+    if (!s_status_cache.cfg_valid ||
+        (uint32_t)((now - s_status_cache.tz_tick) * ms) >= STATUS_CACHE_NVS_MS) {
+        status_cache_refresh_nvs();
+    }
+
+    bool has_cfg = s_status_cache.cfg_valid;
+    struct netprov_config *cfg = &s_status_cache.cfg;
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "mode", s_portal_mode ? "setup" : "connected");
@@ -518,30 +589,26 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         cJSON_AddStringToObject(resp, "ip", s_connected_ip);
     }
 
-    /* Wi-Fi SSIDs */
+    /* Wi-Fi SSIDs (from cached NVS config) */
     cJSON *ssids_arr = cJSON_AddArrayToObject(resp, "ssids");
     cJSON *has_pass_arr = cJSON_AddArrayToObject(resp, "has_pass");
     if (has_cfg) {
         for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
-            if (cfg.wifi[i].ssid[0] != '\0') {
-                cJSON_AddItemToArray(ssids_arr, cJSON_CreateString(cfg.wifi[i].ssid));
-                cJSON_AddItemToArray(has_pass_arr, cJSON_CreateBool(cfg.wifi[i].pass[0] != '\0'));
+            if (cfg->wifi[i].ssid[0] != '\0') {
+                cJSON_AddItemToArray(ssids_arr, cJSON_CreateString(cfg->wifi[i].ssid));
+                cJSON_AddItemToArray(has_pass_arr, cJSON_CreateBool(cfg->wifi[i].pass[0] != '\0'));
             }
         }
     }
 
-    /* Time / timezone / NTP */
-    char tz_str[64], tz_name[40], ntp_srv[64];
-    time_sync_get_timezone(tz_str, sizeof(tz_str));
-    time_sync_get_tz_name(tz_name, sizeof(tz_name));
-    time_sync_get_ntp_server(ntp_srv, sizeof(ntp_srv));
-    cJSON_AddStringToObject(resp, "tz_name", tz_name);
-    cJSON_AddStringToObject(resp, "ntp_server", ntp_srv);
+    /* Time / timezone / NTP (from cache) */
+    cJSON_AddStringToObject(resp, "tz_name", s_status_cache.tz_name);
+    cJSON_AddStringToObject(resp, "ntp_server", s_status_cache.ntp_srv);
     cJSON_AddBoolToObject(resp, "ntp_synced", time_sync_is_synced());
-    time_t now = time(NULL);
-    if (now > 1700000000) {
+    time_t now_t = time(NULL);
+    if (now_t > 1700000000) {
         struct tm tm_info;
-        localtime_r(&now, &tm_info);
+        localtime_r(&now_t, &tm_info);
         char time_str[32];
         strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm_info);
         cJSON_AddStringToObject(resp, "time", time_str);
@@ -597,16 +664,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(resp, "ps_lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     cJSON_AddNumberToObject(resp, "tasks", (double)uxTaskGetNumberOfTasks());
 
-    /* SD card free space */
-    if (sd_storage_is_ready()) {
-        FATFS *fs = NULL;
-        DWORD free_clst = 0;
-        if (f_getfree("0:", &free_clst, &fs) == FR_OK && fs) {
-            uint64_t sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
-            uint64_t sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
-            cJSON_AddNumberToObject(resp, "sd_total", (double)sd_total);
-            cJSON_AddNumberToObject(resp, "sd_free", (double)sd_free);
-        }
+    /* SD card free space (from cache — no SD I/O on every poll) */
+    if (s_status_cache.sd_valid) {
+        cJSON_AddNumberToObject(resp, "sd_total", (double)s_status_cache.sd_total);
+        cJSON_AddNumberToObject(resp, "sd_free", (double)s_status_cache.sd_free);
     }
 
     char *json_str = cJSON_PrintUnformatted(resp);
@@ -1069,6 +1130,7 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Connection", "close");
 
     /* Heap-allocate to avoid stack overflow */
     char *buf = malloc(2048);
@@ -1453,7 +1515,7 @@ static esp_err_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 35;
+    config.max_uri_handlers = 36;
     config.stack_size = 8192;
     config.max_open_sockets = 10;
 
@@ -1468,6 +1530,8 @@ static esp_err_t start_webserver(void)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return ESP_FAIL;
     }
+
+    session_graph_init();
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
     httpd_register_uri_handler(s_httpd, &root);
@@ -1536,6 +1600,16 @@ static esp_err_t start_webserver(void)
 
     /* Log stream endpoints (SSE, download, level control) */
     log_stream_register_handlers(s_httpd);
+
+    /* Session graph data endpoints (dashboard charts) */
+    httpd_uri_t sessions_list = { .uri = "/api/sessions", .method = HTTP_GET, .handler = sessions_list_handler };
+    httpd_uri_t session_graph = { .uri = "/api/session/graph", .method = HTTP_GET, .handler = session_graph_handler };
+    httpd_uri_t session_file  = { .uri = "/api/session/file", .method = HTTP_GET, .handler = session_file_handler };
+    httpd_uri_t session_file_head = { .uri = "/api/session/file", .method = HTTP_HEAD, .handler = session_file_handler };
+    httpd_register_uri_handler(s_httpd, &sessions_list);
+    httpd_register_uri_handler(s_httpd, &session_graph);
+    httpd_register_uri_handler(s_httpd, &session_file);
+    httpd_register_uri_handler(s_httpd, &session_file_head);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */

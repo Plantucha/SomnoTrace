@@ -374,15 +374,7 @@ static void process_day(const char *day_folder)
     ESP_LOGI(TAG, "processing day %s", day_folder);
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-
-    /* Ensure day exists in state */
     day_state_t *day = uploader_state_find_or_create(s_state, day_folder);
-
-    /* Dirty: if any backend was ST_OK, reset to ST_PENDING so the whole
-     * day is re-uploaded with the new session data.  This happens here
-     * (on the uploader task's internal stack) rather than in
-     * uploader_on_day_ready() because callers may run on a PSRAM stack
-     * and flash I/O would crash (cache disabled → PSRAM inaccessible). */
     if (day) {
         for (int i = 0; i < day->n_backends; i++) {
             if (day->backends[i].status == ST_OK) {
@@ -391,8 +383,8 @@ static void process_day(const char *day_folder)
             }
         }
     }
+    xSemaphoreGive(s_state_mutex);
 
-    /* Run each configured backend sequentially, skipping those already done */
     for (int i = 0; i < s_n_backends; i++) {
         const upload_backend_t *be = s_backends[i];
         if (!be || !be->is_configured || !be->is_configured()) {
@@ -400,22 +392,21 @@ static void process_day(const char *day_folder)
             continue;
         }
 
-        /* Skip backends that are still pending from a previous failed run
-         * only if they were NOT dirtied above — but since dirtying resets
-         * ST_OK → ST_PENDING, we only skip ST_OK (which shouldn't exist
-         * after dirtying).  In practice, after dirtying all backends are
-         * either ST_PENDING or ST_FAILED, so we process them all. */
+        bool already_ok = false;
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        day = uploader_state_find_or_create(s_state, day_folder);
         if (day) {
             backend_state_t *bs = uploader_state_backend_find_or_create(day, be->name);
-            if (bs && bs->status == ST_OK) {
-                ESP_LOGI(TAG, "  backend %s: already OK, skipping", be->name);
-                continue;
-            }
+            already_ok = bs && bs->status == ST_OK;
+        }
+        xSemaphoreGive(s_state_mutex);
+        if (already_ok) {
+            ESP_LOGI(TAG, "  backend %s: already OK, skipping", be->name);
+            continue;
         }
 
         ESP_LOGI(TAG, "  backend %s: uploading...", be->name);
         upload_result_t result = be->upload_day(day_folder);
-
         upload_status_t st;
         switch (result) {
         case UPLOAD_OK:
@@ -432,7 +423,8 @@ static void process_day(const char *day_folder)
             break;
         }
 
-        /* Update state */
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        day = uploader_state_find_or_create(s_state, day_folder);
         if (day) {
             backend_state_t *bs = uploader_state_backend_find_or_create(day, be->name);
             if (bs) {
@@ -443,8 +435,10 @@ static void process_day(const char *day_folder)
                 }
             }
         }
+        xSemaphoreGive(s_state_mutex);
     }
 
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     uploader_state_save(s_state);
     xSemaphoreGive(s_state_mutex);
 }

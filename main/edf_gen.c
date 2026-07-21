@@ -460,6 +460,13 @@ static int edf_write_header(FILE *f, const char *patient_id,
  * ════════════════════════════════════════════════════════════════════ */
 
 #define SNT_MAGIC 0x534E5442u  /* "SNTB" */
+#define SNT_MISSING_V1  -1       /* v1 missing-data sentinel (ambiguous for BRP flow) */
+#define SNT_MISSING_V2  INT16_MIN /* v2 unambiguous missing-data sentinel */
+
+static inline int16_t snt_missing_for(uint8_t version)
+{
+    return (version >= 2) ? SNT_MISSING_V2 : SNT_MISSING_V1;
+}
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -721,6 +728,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
      * If channel_map is provided, .snt n_channels must be >= max mapped index+1.
      * If channel_map is NULL, require .snt n_channels == n_signals (1:1). */
     int snt_channels = hdr.n_channels;
+    int16_t snt_missing = snt_missing_for(hdr.version);
     if (channel_map) {
         for (int i = 0; i < n_signals; i++) {
             if (channel_map[i] >= snt_channels) {
@@ -929,10 +937,9 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
             for (int s = 0; s < samples_per_record; s++) {
                 if (s < avail_samples) {
                     int16_t stored = raw[s * snt_channels + snt_ch];
-                    /* AS11 marks "no data" samples with the invalid marker
-                     * (-1) rather than scaling them.  Pass the sentinel
-                     * through verbatim for signals that opt in. */
-                    if (passthrough && stored == -1) {
+                    /* Missing-data sentinel: v1 uses -1, v2 uses INT16_MIN.
+                     * Pass the sentinel through verbatim for signals that opt in. */
+                    if (passthrough && stored == snt_missing) {
                         record_buf[ch * samples_per_record + s] = -1;
                         continue;
                     }
@@ -942,11 +949,11 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                     if (idig > INT16_MAX) idig = INT16_MAX;
                     if (idig < INT16_MIN) idig = INT16_MIN;
                     /* Clamp to the signal's valid digital range when not
-                     * in invalid-passthrough mode.  This prevents the -1
+                     * in invalid-passthrough mode.  This prevents the
                      * BLE sentinel ("no data yet") from leaking through the
-                     * scaling for signals whose k factor maps -1/100 back to
-                     * -1 (e.g. MaskPress with k=50 → -0.5 → rounds to -1).
-                     * Signals that use the -1 sentinel (FlowLim, SA2 SpO2/Pulse)
+                     * scaling for signals whose k factor maps the sentinel
+                     * back to -1 (e.g. MaskPress with k=50 → -0.5 → rounds to -1).
+                     * Signals that use the sentinel (FlowLim, SA2 SpO2/Pulse)
                      * have invalid_passthrough=true and bypass this clamp. */
                     if (!passthrough) {
                         if (idig > sig[ch].dig_max) idig = sig[ch].dig_max;

@@ -171,6 +171,12 @@ CONFIG_LWIP_MAX_ACTIVE_TCP=16
 CONFIG_LWIP_MAX_LISTENING_TCP=8
 CONFIG_LWIP_MAX_UDP_PCBS=8
 CONFIG_LWIP_MAX_RAW_PCBS=4
+# TCP send buffer: larger buffer lets send() return quickly by copying data
+# into lwIP's buffer, while actual TX happens asynchronously between BLE
+# coexistence slots.  Default is ~5760 (4*MSS); 32KB allows a full 16KB
+# chunk plus headroom for ACK'd data.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=11680
 
 # NTP time sync: parse DHCP option 42 for NTP servers, allow multiple servers
 # (DHCP-provided + fallback pools). SNTP poll mode re-syncs every hour.

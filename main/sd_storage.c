@@ -44,7 +44,7 @@ esp_err_t sd_storage_init(void)
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_1;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;   /* 20 MHz — safe default */
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  /* 40 MHz max; driver auto-negotiates down if card doesn't support it */
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.clk = GPIO_NUM_16;
