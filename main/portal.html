@@ -36,6 +36,7 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 --danger:#f87171;--danger-hover:#ef4444;--success:#34d399;--warning:#fbbf24;
 --color-airflow:#22d3ee;--color-pressure:#fb923c;--color-leak:#c084fc;
 --color-spo2:#60a5fa;--color-pulse:#f87171;
+--color-flowlim:#f472b6;--color-snore:#34d399;
 --accent-wifi:#0d9488;--accent-smb:#fb923c;--accent-shq:#60a5fa;--accent-ble:#34d399;
 }
 [data-theme="day"]{
@@ -45,6 +46,7 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 --danger:#dc2626;--danger-hover:#b91c1c;--success:#10b981;--warning:#f59e0b;
 --color-airflow:#0891b2;--color-pressure:#ea580c;--color-leak:#7c3aed;
 --color-spo2:#2563eb;--color-pulse:#dc2626;
+--color-flowlim:#db2777;--color-snore:#059669;
 --accent-wifi:#0f766e;--accent-smb:#ea580c;--accent-shq:#2563eb;--accent-ble:#10b981;
 }
 
@@ -67,10 +69,10 @@ header{background:var(--card-bg);border-bottom:1px solid var(--card-border);padd
 .theme-btn.active{background:var(--primary);color:#fff}
 
 /* ── Main Layout ───────────────────────────────────────────────── */
-main{flex:1;padding:16px;max-width:960px;width:100%;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+main{flex:1;padding:16px;max-width:1440px;width:100%;margin:0 auto;display:flex;flex-direction:column;gap:16px}
 .tab-content{display:none;flex-direction:column;gap:16px;animation:fadeIn .15s ease-out}
 .tab-content.active{display:flex}
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
 
 /* ── Cards ─────────────────────────────────────────────────────── */
 .card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:20px;border-left:3px solid transparent}
@@ -164,6 +166,17 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .date-picker-hidden{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .stat-card{display:flex;flex-direction:column;gap:4px}
+.dash-signal-row{margin-top:10px}
+.dash-signal-label{font-size:.72rem;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.02em;margin-bottom:2px}
+/* Zoom drag-select highlight — override uPlot's near-invisible default so the
+ * selection reads clearly on both light and dark themes (used by mouse drag
+ * and touch drag zoom). Higher specificity than uPlot.min.css's .u-select. */
+.uplot .u-select{background:rgba(56,189,248,0.28);border:1px solid rgba(56,189,248,0.85);box-shadow:0 0 0 1px rgba(56,189,248,0.25)}
+/* Chart zoom/pan toolbar. Desktop: sticky just under the sticky 56px header so
+ * it stays in view while scrolling the tall panel stack. Mobile: fixed
+ * bottom-right for thumb reach (won't scroll away). */
+.chart-controls{position:sticky;top:64px;z-index:40;display:flex;gap:6px;align-items:center;width:fit-content;margin:0 0 8px auto;padding:6px 8px;border-radius:24px;background:rgba(15,23,42,0.72);border:1px solid rgba(148,163,184,0.28);backdrop-filter:blur(6px);box-shadow:0 4px 16px rgba(0,0,0,0.28)}
+@media(max-width:600px){.chart-controls{position:fixed;top:auto;bottom:20px;right:20px;margin:0}}
 .stat-val{font-size:1.8rem;font-weight:700}
 .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600;text-transform:uppercase;margin-top:4px;width:fit-content}
 .badge-green{background:rgba(16,185,129,.15);color:var(--success)}
@@ -544,13 +557,13 @@ Save &amp; Reboot
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange">--</span></div>
 </div>
 <div class="card dashboard-charts-panel" style="position:relative;padding:16px">
-<div class="chart-controls" style="position:absolute;top:8px;right:8px;z-index:2;display:flex;gap:6px;align-items:center;padding:4px 6px;border-radius:20px;background:rgba(15,23,42,0.35);border:1px solid rgba(148,163,184,0.15);backdrop-filter:blur(2px)">
+<div class="chart-controls">
 <button class="btn btn-icon" onclick="dashboardZoomOut()" title="Zoom out">−</button>
 <button class="btn btn-icon" onclick="dashboardZoomIn()" title="Zoom in">+</button>
 <button class="btn btn-icon" id="dash-scroll-btn" onclick="toggleDashScroll()" title="Pan mode">⇄</button>
 <button class="btn btn-icon" onclick="dashboardZoomReset()" title="Reset">⟲</button>
 </div>
-<div id="chart-breath" style="min-height:290px;position:relative;touch-action:none"></div>
+<div id="dash-chart-stack"></div>
 <div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:6px"></div>
 </div>
 </section>
@@ -719,8 +732,8 @@ function setTheme(theme) {
   var btn = document.getElementById('theme-' + theme + '-btn');
   if (btn) btn.classList.add('active');
   localStorage.setItem('somnotrace_theme', theme);
-  /* Re-render dashboard chart so axis/grid colors pick up new theme vars. */
-  if (typeof breathChart !== 'undefined' && breathChart) renderDashboardCharts();
+  /* Re-render dashboard charts so axis/grid/stroke colors pick up new theme vars. */
+  if (typeof dashCharts !== 'undefined' && dashCharts.length) renderDashboardCharts();
 }
 function getSystemTheme() { var h = new Date().getHours(); return (h >= 8 && h < 20) ? 'day' : 'night'; }
 
@@ -1679,9 +1692,9 @@ function loadSessionData() { loadDashboardData(); }
  * Invalid marker: v1 dig == -1 -> gap, v2 dig == INT16_MIN -> gap
  */
 var dashCache = new Map();
-var breathChart = null;
+var dashCharts = [];        /* one uPlot per DASH_SIGNALS entry (parallel arrays) */
 var dashSessions = [];      /* sorted manifest from /api/sessions */
-var dashSessionData = [];   /* per-session {t: Float64Array, flow: Float64Array, ready: bool} */
+var dashSessionData = [];   /* per-session { brp: {...}|null, pld: {...}|null } */
 var dashXRange = null;
 var dashNoonDay = '';
 var dashScrollMode = false;
@@ -1689,12 +1702,53 @@ var dashIsPanning = false;
 var dashLoadId = 0;         /* increment to cancel in-flight loads */
 var dashIsLoading = false;   /* true while SNT files are being downloaded */
 var dashProgrammaticScale = false;  /* guard setScale hook during programmatic updates */
-var FLOW_Y_MIN = -150;
-var FLOW_Y_MAX = 150;
 var SNT_HDR_SIZE = 28;
 var DASH_MAX_DISPLAY = 3000;
 var SNT_MISSING_V1 = -1;
 var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
+
+/* Signal descriptor table — drives parsing, per-panel layout, scaling and
+ * y-ranges.  All panels share one x time-range (dashXRange/dashFullRange) and
+ * a synced cursor (cursor.sync key 'dash').  Order here is top→bottom on screen.
+ *
+ * src      — which parsed source sub-object the channel lives in ('brp'|'pld').
+ * ch       — value key inside that sub-object (e.g. 'flow', 'press', 'leak').
+ * minKey/maxKey — optional precomputed envelope arrays (only BRP L1 has them).
+ * y        — fixed {min,max} axis range, or null for auto-scale (pressure).
+ * height   — panel pixel height.
+ */
+var DASH_SIGNALS = [
+  { key:'flow',    label:'Breathing',  unit:'L/min', src:'brp', ch:'flow',
+    minKey:'flowMin',  maxKey:'flowMax',  color:'#3b82f6',          y:{min:-150,max:150}, height:200, decimals:1 },
+  { key:'press',   label:'Pressure',   unit:'cmH\u2082O', src:'brp', ch:'press',
+    minKey:'pressMin', maxKey:'pressMax', color:'--color-pressure', y:null,               height:200, decimals:1 },
+  { key:'leak',    label:'Leak Rate',  unit:'L/min', src:'pld', ch:'leak',
+    minKey:null, maxKey:null,            color:'--color-leak',      y:{min:0,max:null},   height:200, decimals:1 },
+  { key:'flowlim', label:'Flow Limit', unit:'',      src:'pld', ch:'flowlim',
+    minKey:null, maxKey:null,            color:'--color-flowlim',   y:{min:0,max:1},      height:200, decimals:2 },
+  { key:'snore',   label:'Snore',      unit:'',      src:'pld', ch:'snore',
+    minKey:null, maxKey:null,            color:'--color-snore',     y:{min:0,max:null},   height:200, decimals:2 }
+];
+
+/* Resolve a signal's stroke color: literal hex passes through, a leading '--'
+ * is looked up as a theme CSS variable so panels follow day/night switching. */
+function sigColor(sig) {
+  return (sig.color && sig.color.charAt(0) === '-') ? cssVar(sig.color) : sig.color;
+}
+
+function dashHasData() {
+  for (var i = 0; i < dashSessionData.length; i++) {
+    var d = dashSessionData[i];
+    if (d && ((d.brp && d.brp.ready) || (d.pld && d.pld.ready))) return true;
+  }
+  return false;
+}
+
+function fmtSignalVal(sig, v) {
+  if (v == null || isNaN(v)) return '--';
+  var s = v.toFixed(sig.decimals);
+  return sig.unit ? (s + ' ' + sig.unit) : s;
+}
 
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#94a3b8';
@@ -1733,16 +1787,13 @@ function dashFullRange() {
   return {min: lo, max: hi};
 }
 
-/* Parse a .snt binary file (ArrayBuffer) into {t: Float64Array, flow: Float64Array}.
- * For L1 MinMax: uses midpoint (min+max)/2 to show average flow per second.
- * For L0 raw: direct flow value (actual instantaneous flow at 25 Hz).
- * Missing-data sentinel: v1 uses -1, v2 uses INT16_MIN → null (gap).
- * Conversion: dig * 0.6 = L/min (matches LCD therapy graph scaling). */
-function parseSntFlow(buf) {
+/* Read and validate the 32/28-byte .snt header from an ArrayBuffer.
+ * Returns {dv, version, tier, nCh, startMs, sampleCount, msPerRec, recBytes,
+ *          missing, dataOff, n} or null on failure. */
+function readSntHeader(buf) {
   if (!buf || buf.byteLength < 32) return null;
   var dv = new DataView(buf);
-  var magic = dv.getUint32(0, true);
-  if (magic !== 0x534E5442) return null;
+  if (dv.getUint32(0, true) !== 0x534E5442) return null;
   var version = dv.getUint8(4);
   var tier = dv.getUint8(5);
   var nCh = dv.getUint8(6);
@@ -1763,18 +1814,36 @@ function parseSntFlow(buf) {
   }
   var n = Math.min(sampleCount, Math.floor((buf.byteLength - dataOff) / recBytes));
   if (n <= 0) return null;
+  return { dv: dv, version: version, tier: tier, nCh: nCh, startMs: startMs,
+           sampleCount: sampleCount, msPerRec: msPerRec, recBytes: recBytes,
+           missing: missing, dataOff: dataOff, n: n };
+}
 
+/* Parse a BRP .snt file (flow + mask pressure) into per-channel arrays.
+ * L1 MinMax (tier=1, n_ch=4): [flow_min, flow_max, press_min, press_max] — the
+ *   overview waveform envelope; value = midpoint, min/max preserved for
+ *   the envelope renderer.
+ * L0 raw (tier=0, n_ch=2): [flow, pressure] — instantaneous 25 Hz samples.
+ * Missing-data sentinel (v1 -1, v2 INT16_MIN) → NaN (gap).
+ * Scaling: flow dig*0.6 = L/min, pressure dig*0.01 = cmH2O (matches
+ * brp_press_phys()/LCD therapy graph). */
+function parseSntBrp(buf) {
+  var h = readSntHeader(buf);
+  if (!h) return null;
+  var dv = h.dv, n = h.n, missing = h.missing;
+  var isL1 = (h.tier === 1 && h.nCh === 4);
   var t = new Float64Array(n);
-  var flow = new Float64Array(n);
-  var flowMin = null, flowMax = null;
-  var isL1 = (tier === 1 && nCh === 4);
-  if (isL1) { flowMin = new Float64Array(n); flowMax = new Float64Array(n); }
-
+  var flow = new Float64Array(n), press = new Float64Array(n);
+  var flowMin = null, flowMax = null, pressMin = null, pressMax = null;
+  if (isL1) {
+    flowMin = new Float64Array(n); flowMax = new Float64Array(n);
+    pressMin = new Float64Array(n); pressMax = new Float64Array(n);
+  }
   for (var i = 0; i < n; i++) {
-    var off = dataOff + i * recBytes;
+    var off = h.dataOff + i * h.recBytes;
     if (isL1) {
-      var fmn = dv.getInt16(off, true);
-      var fmx = dv.getInt16(off + 2, true);
+      var fmn = dv.getInt16(off, true), fmx = dv.getInt16(off + 2, true);
+      var pmn = dv.getInt16(off + 4, true), pmx = dv.getInt16(off + 6, true);
       if (fmn === missing && fmx === missing) {
         flow[i] = NaN; flowMin[i] = NaN; flowMax[i] = NaN;
       } else {
@@ -1782,122 +1851,161 @@ function parseSntFlow(buf) {
         flowMax[i] = (fmx === missing) ? 0 : fmx * 0.6;
         flow[i] = (flowMin[i] + flowMax[i]) / 2;
       }
+      if (pmn === missing && pmx === missing) {
+        press[i] = NaN; pressMin[i] = NaN; pressMax[i] = NaN;
+      } else {
+        pressMin[i] = (pmn === missing) ? 0 : pmn * 0.01;
+        pressMax[i] = (pmx === missing) ? 0 : pmx * 0.01;
+        press[i] = (pressMin[i] + pressMax[i]) / 2;
+      }
     } else {
       var f = dv.getInt16(off, true);
-      flow[i] = (f === missing) ? NaN : f * 0.6;
+      var p = dv.getInt16(off + 2, true);
+      flow[i]  = (f === missing) ? NaN : f * 0.6;
+      press[i] = (p === missing) ? NaN : p * 0.01;
     }
-    t[i] = startMs + i * msPerRec;
+    t[i] = h.startMs + i * h.msPerRec;
   }
-  return {t: t, flow: flow, flowMin: flowMin, flowMax: flowMax, isL1: isL1};
+  return { t: t, flow: flow, flowMin: flowMin, flowMax: flowMax,
+           press: press, pressMin: pressMin, pressMax: pressMax,
+           isL1: isL1, ready: true };
 }
 
-/* Build display data from per-session arrays with viewport slicing, gap insertion,
- * overlap precedence (later session wins), and min/max bucket aggregation.
- * Returns {t: Array, flow: Array} with null separators between sessions.
- * Each bucket emits two points (min then max) to preserve the waveform envelope
- * at any zoom level, eliminating aliasing from strided subsampling. */
-function buildDisplayData(range, maxPts) {
+/* Parse a PLD .snt file (tier=0, 0.5 Hz, 12 ch/record) into the channels the
+ * dashboard graphs: ch3=Leak, ch9=Snore, ch10=FlowLim.
+ * Scaling (raw int16 = physical * 100):
+ *   Leak  dig*0.6  = L/min  (dig/100 L/s * 60, matches pld_leak_phys())
+ *   Snore dig*0.01           (phys 0..5, dimensionless index)
+ *   FlowLim dig*0.01         (phys 0..1, dimensionless index) */
+function parseSntPld(buf) {
+  var h = readSntHeader(buf);
+  if (!h || h.nCh < 11) return null;
+  var dv = h.dv, n = h.n, missing = h.missing, rb = h.recBytes;
+  var t = new Float64Array(n);
+  var leak = new Float64Array(n), snore = new Float64Array(n), flowlim = new Float64Array(n);
+  for (var i = 0; i < n; i++) {
+    var off = h.dataOff + i * rb;
+    var lk = dv.getInt16(off + 3 * 2, true);
+    var sn = dv.getInt16(off + 9 * 2, true);
+    var fl = dv.getInt16(off + 10 * 2, true);
+    leak[i]    = (lk === missing) ? NaN : lk * 0.6;
+    snore[i]   = (sn === missing) ? NaN : sn * 0.01;
+    flowlim[i] = (fl === missing) ? NaN : fl * 0.01;
+    t[i] = h.startMs + i * h.msPerRec;
+  }
+  return { t: t, leak: leak, snore: snore, flowlim: flowlim, ready: true };
+}
+
+/* Lower-bound binary search: first index i in t[] with t[i] >= target. */
+function dashLowerBound(t, target) {
+  var lo = 0, hi = t.length;
+  while (lo < hi) {
+    var mid = (lo + hi) >>> 1;
+    if (t[mid] < target) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/* Build display data for one signal as a min/max envelope decimated onto a
+ * UNIFORM time grid of W columns (~one column per screen pixel). Emitting the
+ * envelope on evenly spaced timestamps — rather than at per-bucket data
+ * midpoints — makes the segment x-positions map 1:1 to pixel columns, which
+ * removes the beat/moiré that appears when non-uniform bucket centres interfere
+ * with the pixel grid.  Returns {t, v} with two points (min, max) per populated
+ * column and single null separators across empty columns (gaps / between
+ * sessions).  Later sessions take precedence on any overlapping column.
+ *
+ * sig — a DASH_SIGNALS entry.  Per-session data lives in
+ * dashSessionData[i][sig.src]; value array is sub[sig.ch], with optional
+ * precomputed envelope arrays sub[sig.minKey]/[sig.maxKey] (BRP L1). */
+function buildSignalData(sig, range, cols) {
   if (!dashSessionData || !dashSessionData.length) return null;
   var full = dashFullRange();
   if (!full) return null;
   var vMin = range ? range.min : full.min;
   var vMax = range ? range.max : full.max;
+  if (!(vMax > vMin)) return null;
 
-  /* Collect per-session slices within viewport */
+  /* One column per plot pixel. `cols` is the panel's actual plotting-area width
+   * in CSS pixels; matching it exactly is what prevents the beat/moiré. */
+  var W = Math.max(2, Math.min(DASH_MAX_DISPLAY, Math.floor(cols)));
+  var dt = (vMax - vMin) / W;
+
+  /* Sessions holding this signal's source that overlap the viewport, sorted by
+   * start (ascending) so later sessions overwrite earlier ones per column. */
   var slices = [];
   for (var i = 0; i < dashSessionData.length; i++) {
-    var sd = dashSessionData[i];
-    if (!sd || !sd.ready || !sd.t || !sd.t.length) continue;
-    var sStart = sd.t[0];
-    var sEnd = sd.t[sd.t.length - 1];
-    if (sEnd < vMin || sStart > vMax) continue;
-    var lo = 0, hi = sd.t.length - 1;
-    while (lo < sd.t.length && sd.t[lo] < vMin) lo++;
-    while (hi >= 0 && sd.t[hi] > vMax) hi--;
-    if (lo > hi) continue;
-    slices.push({idx: i, lo: lo, hi: hi, start: sStart});
+    var rec = dashSessionData[i];
+    var sd = rec ? rec[sig.src] : null;
+    if (!sd || !sd.ready || !sd.t || !sd.t.length || !sd[sig.ch]) continue;
+    if (sd.t[sd.t.length - 1] < vMin || sd.t[0] > vMax) continue;
+    slices.push(sd);
   }
   if (!slices.length) return null;
+  slices.sort(function(a, b) { return a.t[0] - b.t[0]; });
 
-  /* Sort by start time; later session takes precedence on overlap */
-  slices.sort(function(a, b) { return a.start - b.start; });
-
-  /* Allocate buckets per session proportional to TIME SPAN (not sample count).
-   * This ensures L0 and L1 sessions covering the same duration get the same
-   * number of buckets. Without this, an L0 session (25x more samples than L1)
-   * would hog all buckets during progressive loading, making still-L1 sessions
-   * appear decimated with large gaps. */
-  var totalSpan = 0;
-  for (var si = 0; si < slices.length; si++) {
-    var sd0 = dashSessionData[slices[si].idx];
-    totalSpan += sd0.t[slices[si].hi] - sd0.t[slices[si].lo];
+  /* Native sample interval of the source (min across visible sessions). Used to
+   * tell a real data gap from mere oversampling when the pixel grid is finer
+   * than the samples (zoomed in). */
+  var nativeDt = Infinity;
+  for (var ns = 0; ns < slices.length; ns++) {
+    var st = slices[ns].t;
+    if (st.length >= 2) { var d = st[1] - st[0]; if (d > 0 && d < nativeDt) nativeDt = d; }
   }
-  var halfPts = Math.floor(maxPts / 2);
-  var outT = [], outF = [];
-  var prevEnd = -Infinity;
+  if (!isFinite(nativeDt)) nativeDt = dt;
+
+  var gridMin = new Float64Array(W), gridMax = new Float64Array(W);
+  var owner = new Int32Array(W);
+  for (var c = 0; c < W; c++) { gridMin[c] = NaN; gridMax[c] = NaN; owner[c] = -1; }
 
   for (var si = 0; si < slices.length; si++) {
-    var sl = slices[si];
-    var sd = dashSessionData[sl.idx];
-    var sliceLen = sl.hi - sl.lo + 1;
-    var span = sd.t[sl.hi] - sd.t[sl.lo];
-    if (span <= 0) span = 1;
-
-    /* Insert null separator between sessions (gap) */
-    if (outT.length > 0) { outT.push(null); outF.push(null); }
-
-    /* Buckets for this session, proportional to its share of total time span */
-    var sessionBuckets = Math.max(2, Math.floor(halfPts * span / totalSpan));
-    var bucketSize = sliceLen / sessionBuckets;
-    if (bucketSize < 1) bucketSize = 1;
-
-    var overlapStart = prevEnd;
-
-    for (var b = 0; b < sessionBuckets; b++) {
-      var bLo = sl.lo + Math.floor(b * bucketSize);
-      var bHi = Math.min(sl.hi, sl.lo + Math.floor((b + 1) * bucketSize) - 1);
-      if (bLo > bHi) continue;
-
-      /* Scan bucket for min/max */
-      var bMin = Infinity, bMax = -Infinity;
-      var bMid = Math.floor((bLo + bHi) / 2);
-      var hasData = false;
-
-      if (sd.isL1 && sd.flowMin && sd.flowMax) {
-        /* L1: use pre-computed min/max per record */
-        for (var j = bLo; j <= bHi; j++) {
-          if (sd.t[j] <= overlapStart) continue;
-          var mn = sd.flowMin[j], mx = sd.flowMax[j];
-          if (isNaN(mn) || isNaN(mx)) continue;
-          if (mn < bMin) { bMin = mn; hasData = true; }
-          if (mx > bMax) { bMax = mx; hasData = true; }
-        }
+    var sd = slices[si];
+    var t = sd.t;
+    var vals = sd[sig.ch];
+    var mins = sig.minKey ? sd[sig.minKey] : null;
+    var maxs = sig.maxKey ? sd[sig.maxKey] : null;
+    var hasEnv = !!(mins && maxs);
+    var j = dashLowerBound(t, vMin);
+    var end = t.length;
+    for (; j < end; j++) {
+      var tv = t[j];
+      if (tv > vMax) break;
+      var col = Math.floor((tv - vMin) / dt);
+      if (col < 0) col = 0; else if (col >= W) col = W - 1;
+      /* Precedence: a later session claims (and resets) any column it touches. */
+      if (owner[col] !== si) { gridMin[col] = NaN; gridMax[col] = NaN; owner[col] = si; }
+      var mn, mx;
+      if (hasEnv) {
+        mn = mins[j]; mx = maxs[j];
+        if (isNaN(mn) || isNaN(mx)) continue;
       } else {
-        /* L0: compute min/max from raw flow values */
-        for (var j = bLo; j <= bHi; j++) {
-          if (sd.t[j] <= overlapStart) continue;
-          var v = sd.flow[j];
-          if (isNaN(v)) continue;
-          if (v < bMin) { bMin = v; hasData = true; }
-          if (v > bMax) { bMax = v; hasData = true; }
-        }
+        var v = vals[j];
+        if (isNaN(v)) continue;
+        mn = v; mx = v;
       }
-
-      if (hasData) {
-        var tMid = sd.t[bMid];
-        if (tMid <= overlapStart) tMid = sd.t[bLo];
-        /* Emit min then max at the same timestamp to form a vertical envelope.
-         * uPlot will draw a line from min to max, preserving the waveform shape. */
-        outT.push(tMid); outF.push(bMin);
-        outT.push(tMid); outF.push(bMax);
-      } else if (bLo <= bHi) {
-        /* All-NaN bucket — emit a gap marker */
-        outT.push(sd.t[bMid]); outF.push(NaN);
-      }
+      if (isNaN(gridMin[col]) || mn < gridMin[col]) gridMin[col] = mn;
+      if (isNaN(gridMax[col]) || mx > gridMax[col]) gridMax[col] = mx;
     }
-    prevEnd = sd.t[sl.hi];
   }
-  return {t: outT, flow: outF};
+
+  /* Emit the populated columns, connecting them with lines. Insert a null break
+   * only when the time between consecutive populated columns exceeds a real-gap
+   * threshold — a genuine data gap or a session boundary — rather than at every
+   * empty column. Without this, zooming in (pixel grid finer than the samples)
+   * would isolate each sample between nulls and shatter the line into dots. */
+  var gapThresh = Math.max(nativeDt, dt) * 2.5;
+  var outT = [], outV = [];
+  var prevTc = null;
+  for (var k = 0; k < W; k++) {
+    if (isNaN(gridMin[k])) continue;
+    var tc = vMin + (k + 0.5) * dt;
+    if (prevTc !== null && (tc - prevTc) > gapThresh) { outT.push(null); outV.push(null); }
+    outT.push(tc); outV.push(gridMin[k]);
+    outT.push(tc); outV.push(gridMax[k]);
+    prevTc = tc;
+  }
+  if (!outT.length) return null;
+  return {t: outT, v: outV};
 }
 
 /* Fetch a binary .snt file via a single sequential GET.
@@ -1953,20 +2061,21 @@ function loadDashboardData() {
       return;
     }
 
-    /* Initialize per-session data slots */
-    dashSessionData = dashSessions.map(function() { return {t: null, flow: null, ready: false}; });
+    /* Initialize per-session data slots. Each holds two independent sources:
+     * brp (flow + pressure, 25 Hz) and pld (leak/snore/flowlim, 0.5 Hz). */
+    dashSessionData = dashSessions.map(function() { return {brp: null, pld: null}; });
 
     /* Full range is derived from the manifest, not from data */
     var full = dashFullRange();
     dashXRange = null;  /* initial view = full range */
 
-    /* Step 1: Fetch L1 MinMax sequentially per session, display progressively.
-     * Each session appears in its final fixed horizontal location as soon
-     * as its L1 data is validated. The time axis is set once from the
-     * manifest and never moves. */
+    /* Render the empty panel stack with the correct axis range up front, so
+     * each panel appears in its final position and fills in as data arrives. */
     dashSetStatus('Loading overview...');
-    renderDashboardCharts();  /* render empty chart with correct axis range */
+    renderDashboardCharts();
 
+    /* Step 1: BRP L1 MinMax overview (flow + pressure) sequentially per
+     * session. The time axis is set once from the manifest and never moves. */
     var l1Chain = Promise.resolve();
     dashSessions.forEach(function(s, idx) {
       l1Chain = l1Chain.then(function() {
@@ -1975,9 +2084,9 @@ function loadDashboardData() {
       }).then(function(buf) {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
         if (buf) {
-          var parsed = parseSntFlow(buf);
+          var parsed = parseSntBrp(buf);
           if (parsed && parsed.t.length) {
-            dashSessionData[idx] = {t: parsed.t, flow: parsed.flow, flowMin: parsed.flowMin, flowMax: parsed.flowMax, isL1: parsed.isL1, ready: true};
+            dashSessionData[idx].brp = parsed;
             updateDashView();
           }
         }
@@ -1986,14 +2095,39 @@ function loadDashboardData() {
 
     return l1Chain.then(function() {
       if (myLoadId !== dashLoadId) return;  /* cancelled */
-      /* Cache the L1 overview */
+      dashSetStatus('Loading leak/snore...');
+
+      /* Step 2: PLD (leak, flow limit, snore) — one small 0.5 Hz file per
+       * session, no MinMax tier needed. Fetched after the breathing overview
+       * so those panels light up early. */
+      var pldChain = Promise.resolve();
+      dashSessions.forEach(function(s, idx) {
+        pldChain = pldChain.then(function() {
+          if (myLoadId !== dashLoadId) return;  /* cancelled */
+          return fetchSntFile(s.id, noonDay, 'pld');
+        }).then(function(buf) {
+          if (myLoadId !== dashLoadId) return;  /* cancelled */
+          if (buf) {
+            var parsed = parseSntPld(buf);
+            if (parsed && parsed.t.length) {
+              dashSessionData[idx].pld = parsed;
+              updateDashView();
+            }
+          }
+        });
+      });
+      return pldChain;
+    }).then(function() {
+      if (myLoadId !== dashLoadId) return;  /* cancelled */
+      /* Cache the overview (L1 + PLD) */
       if (!isToday(dateStr)) {
         dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
       }
       dashSetStatus('Loading detail...');
 
-      /* Step 2: Fetch L0 raw sequentially per session (background).
-       * L0 requests do not begin until all L1 sessions are ready or failed. */
+      /* Step 3: BRP L0 raw (background) — replaces the flow/pressure overview
+       * with full-resolution 25 Hz samples for zoom detail. Requests do not
+       * begin until all overview data is ready or failed. */
       var l0Chain = Promise.resolve();
       dashSessions.forEach(function(s, idx) {
         l0Chain = l0Chain.then(function() {
@@ -2002,11 +2136,9 @@ function loadDashboardData() {
         }).then(function(buf) {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
           if (buf) {
-            var parsed = parseSntFlow(buf);
+            var parsed = parseSntBrp(buf);
             if (parsed && parsed.t.length) {
-              /* Replace L1 with L0 for this session */
-              dashSessionData[idx] = {t: parsed.t, flow: parsed.flow, flowMin: parsed.flowMin, flowMax: parsed.flowMax, isL1: parsed.isL1, ready: true};
-              /* Seamless update: preserve current zoom */
+              dashSessionData[idx].brp = parsed;  /* replace L1 with L0 */
               updateDashView();
             }
           }
@@ -2045,58 +2177,74 @@ function dashApplyXRange(min, max) {
   updateDashView();
 }
 
+/* Choose a time formatter based on the current x span (seconds shown when
+ * zoomed under 3 minutes). */
+function dashTimeFmt(u) {
+  var range = (u && u.scales && u.scales.x) ? (u.scales.x.max - u.scales.x.min) : Infinity;
+  return (range < 180000) ? fmtTimeSec : fmtTime;
+}
+
+/* Number of envelope columns for a chart = its actual plotting-area width in
+ * CSS pixels (uPlot's .u-over), NOT the container width. Using the real plot
+ * width (container minus y-axis label strip + padding) makes each column land
+ * on exactly one pixel, which is what eliminates the repeating moiré. Falls
+ * back to an estimate before the overlay is laid out. */
+function dashChartCols(chart, el) {
+  var w = 0;
+  if (chart && chart.over && chart.over.clientWidth) w = chart.over.clientWidth;
+  else if (el && el.clientWidth) w = el.clientWidth - 42;   /* ~y-axis(34)+pad */
+  else w = 560;
+  return Math.max(2, Math.round(w));
+}
+
+/* Push current-range data into every panel without recreating them. */
 function updateDashView() {
-  if (!breathChart) { renderDashboardCharts(); return; }
+  if (!dashCharts.length) { renderDashboardCharts(); return; }
   var full = dashFullRange(); if (!full) return;
   var cur = dashXRange || full;
-  var src = buildDisplayData(cur, DASH_MAX_DISPLAY);
-  if (!src || !src.t.length) return;
-  /* setData with false = do not auto-scale axes.
-   * Then setScale to move viewport to cur, with programmatic guard
-   * to prevent the setScale hook from re-entering. */
   dashProgrammaticScale = true;
-  breathChart.setData([src.t, src.flow], false);
-  breathChart.setScale('x', {min: cur.min, max: cur.max});
+  for (var i = 0; i < dashCharts.length; i++) {
+    var chart = dashCharts[i];
+    if (!chart) continue;
+    var src = buildSignalData(DASH_SIGNALS[i], cur, dashChartCols(chart));
+    chart.setData(src ? [src.t, src.v] : [[], []], false);
+    chart.setScale('x', {min: cur.min, max: cur.max});
+  }
   dashProgrammaticScale = false;
 }
 
-function renderDashboardCharts() {
-  if (typeof uPlot === 'undefined') { dashSetStatus('uPlot not loaded'); return; }
-  var el = document.getElementById('chart-breath');
-  if (!el) return;
-  if (breathChart) { breathChart.destroy(); breathChart = null; }
-  el.textContent = ''; el.style.display = '';
-  var full = dashFullRange();
-  var cur = dashXRange || full;
-  var src = buildDisplayData(cur, DASH_MAX_DISPLAY);
-  if (!src || !src.t || src.t.length === 0) {
-    el.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:280px;color:var(--text-muted)">No breathing data</div>';
-    return;
+/* Build a single uPlot panel for one signal into container `el`. */
+function makeDashPanel(sig, el, cur) {
+  var src = buildSignalData(sig, cur, dashChartCols(null, el));
+  var data = src ? [src.t, src.v] : [[], []];
+  /* Y scale: no sig.y -> fully auto; both bounds -> fixed; only min (max null)
+   * -> hard floor with a dynamic top (used by Snore, floored at 0). */
+  var yScaleOpts;
+  if (!sig.y) {
+    yScaleOpts = { auto: true };
+  } else if (sig.y.max == null) {
+    var floor = sig.y.min;
+    yScaleOpts = { auto: true, range: function(u, dataMin, dataMax) {
+      var top = (dataMax == null || !isFinite(dataMax) || dataMax <= floor) ? floor + 1 : dataMax * 1.05;
+      return [floor, top];
+    } };
+  } else {
+    yScaleOpts = { auto: false, min: sig.y.min, max: sig.y.max };
   }
-  var data = [src.t, src.flow];
-  var xs = cur || (full || {});
-  function currentTimeFmt(u) {
-    var range = (u && u.scales && u.scales.x) ? (u.scales.x.max - u.scales.x.min) : Infinity;
-    return (range < 180000) ? fmtTimeSec : fmtTime;
-  }
-
   var opts = {
     width: dashChartWidth(el),
-    height: 280,
+    height: sig.height,
     padding: [6, 8, 0, 0],
     series: [
-      { label: 'Time', value: function(u, v) { return v == null ? '' : currentTimeFmt(u)(v); } },
-      { label: 'Flow', stroke: '#3b82f6',
-        scale: 'flow', width: 1.2, points: { show: false },
-        spanGaps: false }
+      { label: 'Time', value: function(u, v) { return v == null ? '' : dashTimeFmt(u)(v); } },
+      { label: sig.label, stroke: sigColor(sig),
+        scale: sig.key, width: 0.5, points: { show: false }, spanGaps: false }
     ],
-    scales: {
-      x: xs,
-      flow: { auto: false, min: FLOW_Y_MIN, max: FLOW_Y_MAX }
-    },
+    scales: (function(){ var sc = { x: cur || {} }; sc[sig.key] = yScaleOpts; return sc; })(),
     axes: [
-      { values: function(u, vals) { var tf = currentTimeFmt(u); return vals.map(function(v){return v==null?'':tf(v);}); }, grid: { stroke: cssVar('--card-border'), width: 0.5, dash: [2,2] }, stroke: cssVar('--text-muted'), font: '10px sans-serif' },
-      { scale: 'flow', size: 28, grid: { stroke: cssVar('--card-border'), width: 0.5, dash: [2,2] }, stroke: cssVar('--text-muted'), font: '9px sans-serif' }
+      { values: function(u, vals) { var tf = dashTimeFmt(u); return vals.map(function(v){return v==null?'':tf(v);}); },
+        grid: { stroke: cssVar('--card-border'), width: 0.5, dash: [2,2] }, stroke: cssVar('--text-muted'), font: '10px sans-serif' },
+      { scale: sig.key, size: 34, grid: { stroke: cssVar('--card-border'), width: 0.5, dash: [2,2] }, stroke: cssVar('--text-muted'), font: '9px sans-serif' }
     ],
     cursor: {
       drag: { x: !dashScrollMode, y: false },
@@ -2104,7 +2252,7 @@ function renderDashboardCharts() {
     },
     legend: { show: false },
     hooks: {
-      ready: [function(u) { attachDashInteractions(u, el); }],
+      ready: [function(u) { attachDashInteractions(u, el, sig); attachDashTooltip(u, el, sig); }],
       setScale: [function(u, key) {
         if (key !== 'x' || dashIsPanning || dashProgrammaticScale) return;
         var newRange = {min: u.scales.x.min, max: u.scales.x.max};
@@ -2114,24 +2262,97 @@ function renderDashboardCharts() {
          * pixel mapping, causing data to fill only the selected sub-area. */
         requestAnimationFrame(function() {
           if (dashProgrammaticScale) return;
-          var src = buildDisplayData(newRange, DASH_MAX_DISPLAY);
-          if (src && src.t.length) {
-            dashProgrammaticScale = true;
-            breathChart.setData([src.t, src.flow], false);
-            breathChart.setScale('x', newRange);
-            dashProgrammaticScale = false;
-          }
+          updateDashView();
         });
       }]
     }
   };
   try {
-    breathChart = new uPlot(opts, data, el);
-  } catch(e) { console.error('Breath chart error', e); }
+    return new uPlot(opts, data, el);
+  } catch(e) { console.error('Dash panel error (' + sig.key + ')', e); return null; }
 }
 
-function attachDashInteractions(chart, el) {
+/* (Re)build the whole stacked panel set — one uPlot per DASH_SIGNALS entry. */
+function renderDashboardCharts() {
+  if (typeof uPlot === 'undefined') { dashSetStatus('uPlot not loaded'); return; }
+  var stack = document.getElementById('dash-chart-stack');
+  if (!stack) return;
+  /* Tear down existing charts */
+  for (var i = 0; i < dashCharts.length; i++) { if (dashCharts[i]) dashCharts[i].destroy(); }
+  dashCharts = [];
+  stack.textContent = '';
+
+  var full = dashFullRange();
+  var cur = dashXRange || full;
+
+  if (!dashHasData()) {
+    stack.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:280px;color:var(--text-muted)">No session data</div>';
+    return;
+  }
+
+  DASH_SIGNALS.forEach(function(sig) {
+    var row = document.createElement('div');
+    row.className = 'dash-signal-row';
+    var lbl = document.createElement('div');
+    lbl.className = 'dash-signal-label';
+    lbl.textContent = sig.unit ? (sig.label + ' (' + sig.unit + ')') : sig.label;
+    lbl.style.color = sigColor(sig);
+    var chartEl = document.createElement('div');
+    chartEl.id = 'chart-' + sig.key;
+    chartEl.style.cssText = 'position:relative;touch-action:pan-y';
+    row.appendChild(lbl);
+    row.appendChild(chartEl);
+    stack.appendChild(row);
+    dashCharts.push(makeDashPanel(sig, chartEl, cur));
+  });
+
+  /* The initial build used an estimated plot width (the .u-over overlay isn't
+   * measurable until layout). Rebuild once on the next frame using each chart's
+   * real plotting width so the envelope columns map 1:1 to pixels. */
+  requestAnimationFrame(function() { if (dashCharts.length) updateDashView(); });
+}
+
+/* Shared floating value tooltip helpers (mouse + touch). The dashed vertical
+ * crosshair is drawn by uPlot's synced cursor across all panels; these add the
+ * value label for the active panel. Hidden over session/data gaps. */
+function dashHideTip() { if (chartTooltip) chartTooltip.style.display = 'none'; }
+function dashShowTip(chart, over, sig, clientX, clientY) {
+  var tip = ensureTooltip();
+  var rect = over.getBoundingClientRect();
+  var cx = clientX - rect.left, cy = clientY - rect.top;
+  var idx = chart.posToIdx(cx, cy);
+  if (idx == null) { tip.style.display = 'none'; return; }
+  var ts = chart.data[0][idx];
+  var val = chart.data[1][idx];
+  if (val == null || isNaN(val) || ts == null) { tip.style.display = 'none'; return; }
+  var swatch = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + sigColor(sig) + ';margin-right:5px"></span>';
+  tip.innerHTML = swatch + sig.label + ': ' + fmtSignalVal(sig, val) +
+    '<div style="opacity:.6;margin-top:2px">' + dashTimeFmt(chart)(ts) + '</div>';
+  tip.style.display = 'block';
+  tip.style.left = (rect.left + window.pageXOffset + cx + 12) + 'px';
+  tip.style.top = (rect.top + window.pageYOffset + cy - 40) + 'px';
+}
+
+/* Mouse-hover value tooltip (desktop). Touch tooltip is driven by the gesture
+ * recognizer in attachDashInteractions. */
+function attachDashTooltip(chart, el, sig) {
   var over = el.querySelector('.u-over') || el;
+  over.addEventListener('mousemove', function(e) { dashShowTip(chart, over, sig, e.clientX, e.clientY); });
+  over.addEventListener('mouseleave', dashHideTip);
+}
+
+/* Pointer interactions for one panel. All panels share dashXRange, so any panel
+ * drives the whole stack.
+ *   Desktop: wheel = zoom, drag = box-zoom select (uPlot native), pan-mode
+ *            button = drag-pan, hover = value tooltip, dbl-click = reset.
+ *   Touch:   tap = value tooltip + crosshair, horizontal drag = zoom to range,
+ *            vertical drag = normal page scroll (touch-action: pan-y),
+ *            double-tap = reset.  uPlot binds no touch events itself, so the
+ *            whole touch model is implemented here. */
+function attachDashInteractions(chart, el, sig) {
+  var over = el.querySelector('.u-over') || el;
+  /* Let the browser handle vertical page scrolling; we claim horizontal drags. */
+  over.style.touchAction = 'pan-y';
 
   over.addEventListener('dblclick', function(e) {
     e.preventDefault();
@@ -2140,7 +2361,7 @@ function attachDashInteractions(chart, el) {
 
   over.addEventListener('wheel', function(e) {
     e.preventDefault();
-    if (!breathChart) return;
+    if (!dashCharts.length) return;
     var full = dashFullRange(); if (!full) return;
     var rect = over.getBoundingClientRect();
     var frac = (e.clientX - rect.left) / rect.width;
@@ -2157,6 +2378,7 @@ function attachDashInteractions(chart, el) {
     dashApplyXRange(newMin, newMax);
   }, { passive: false });
 
+  /* ── Desktop drag-pan (only when pan mode is toggled on) ── */
   var isDown = false, startX = 0, startRange = null;
   function startDrag(clientX) {
     if (!dashScrollMode) return;
@@ -2164,7 +2386,7 @@ function attachDashInteractions(chart, el) {
     dashIsPanning = true;
   }
   function moveDrag(clientX) {
-    if (!isDown || !dashScrollMode || !breathChart || !startRange) return;
+    if (!isDown || !dashScrollMode || !dashCharts.length || !startRange) return;
     var rect = over.getBoundingClientRect();
     var px = rect.width;
     if (!px) return;
@@ -2178,9 +2400,6 @@ function attachDashInteractions(chart, el) {
     if (newMax > full.max) { newMin -= newMax - full.max; newMax = full.max; }
     if (newMin < full.min) newMin = full.min;
     dashXRange = {min: newMin, max: newMax};
-    /* Rebuild data for the new panned range — brings in data from
-     * outside the previous viewport. updateDashView handles both
-     * setData and setScale with programmatic guard. */
     updateDashView();
   }
   function endDrag() { isDown = false; startRange = null; setTimeout(function(){ dashIsPanning = false; }, 50); }
@@ -2188,9 +2407,61 @@ function attachDashInteractions(chart, el) {
   over.addEventListener('mousedown', function(e) { startDrag(e.clientX); });
   window.addEventListener('mousemove', function(e) { moveDrag(e.clientX); });
   window.addEventListener('mouseup', endDrag);
-  over.addEventListener('touchstart', function(e) { if (e.touches && e.touches[0]) startDrag(e.touches[0].clientX); }, { passive: true });
-  window.addEventListener('touchmove', function(e) { if (e.touches && e.touches[0]) moveDrag(e.touches[0].clientX); }, { passive: true });
-  window.addEventListener('touchend', endDrag);
+
+  /* ── Touch gestures ── */
+  var tStartX = 0, tStartY = 0, tMode = null, tRect = null, lastTapTime = 0;
+
+  function clearSelect() { try { chart.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false); } catch (e) {} }
+
+  over.addEventListener('touchstart', function(e) {
+    /* Ignore multi-touch (e.g. pinch) — let the browser handle it. */
+    if (!e.touches || e.touches.length !== 1) { tMode = 'multi'; return; }
+    var t = e.touches[0];
+    tRect = over.getBoundingClientRect();
+    tStartX = t.clientX; tStartY = t.clientY; tMode = null;
+    /* Immediate value + crosshair feedback for a tap. */
+    dashShowTip(chart, over, sig, tStartX, tStartY);
+    try { chart.setCursor({ left: tStartX - tRect.left, top: tStartY - tRect.top }); } catch (e2) {}
+  }, { passive: true });
+
+  over.addEventListener('touchmove', function(e) {
+    if (tMode === 'multi' || !e.touches || e.touches.length !== 1 || !tRect) return;
+    var t = e.touches[0];
+    var dx = t.clientX - tStartX, dy = t.clientY - tStartY;
+    if (tMode === null) {
+      /* Decide the gesture once movement exceeds a small threshold. */
+      if (Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy)) tMode = 'zoom';
+      else if (Math.abs(dy) > 8) { tMode = 'scroll'; dashHideTip(); return; }
+      else return;
+    }
+    if (tMode === 'scroll') return;                 /* browser scrolls the page */
+    if (tMode === 'zoom') {
+      e.preventDefault();                            /* claim the horizontal gesture */
+      dashHideTip();
+      var x0 = Math.max(0, Math.min(tStartX, t.clientX) - tRect.left);
+      var x1 = Math.min(tRect.width, Math.max(tStartX, t.clientX) - tRect.left);
+      try { chart.setSelect({ left: x0, top: 0, width: x1 - x0, height: tRect.height }, false); } catch (e3) {}
+    }
+  }, { passive: false });
+
+  over.addEventListener('touchend', function(e) {
+    if (tMode === 'zoom' && tRect) {
+      var endX = (e.changedTouches && e.changedTouches[0]) ? e.changedTouches[0].clientX : tStartX;
+      var a = chart.posToVal(Math.min(tStartX, endX) - tRect.left, 'x');
+      var b = chart.posToVal(Math.max(tStartX, endX) - tRect.left, 'x');
+      clearSelect();
+      if (b - a > 1000) dashApplyXRange(a, b);
+    } else if (tMode === null) {
+      /* A tap: two quick taps reset the zoom; a single tap leaves the value
+       * shown briefly. */
+      var now = Date.now();
+      if (now - lastTapTime < 300) { dashboardZoomReset(); dashHideTip(); lastTapTime = 0; }
+      else { lastTapTime = now; setTimeout(dashHideTip, 1500); }
+    }
+    tMode = null;
+  }, { passive: true });
+
+  over.addEventListener('touchcancel', function() { clearSelect(); dashHideTip(); tMode = null; }, { passive: true });
 }
 
 function reloadDashCharts() {
@@ -2213,7 +2484,7 @@ function dashboardZoomReset() {
 }
 
 function dashboardZoomIn() {
-  if (!breathChart) return;
+  if (!dashCharts.length) return;
   var full = dashFullRange(); if (!full) return;
   var cur = dashXRange || full;
   var span = cur.max - cur.min;
@@ -2223,7 +2494,7 @@ function dashboardZoomIn() {
 }
 
 function dashboardZoomOut() {
-  if (!breathChart) return;
+  if (!dashCharts.length) return;
   var full = dashFullRange(); if (!full) return;
   var cur = dashXRange || full;
   var span = cur.max - cur.min;
@@ -2364,7 +2635,16 @@ function resizeStatsCharts() {
   if (psramChart) { var p = document.getElementById('chart-psram'); if (p) psramChart.setSize({ width: chartWidth(p), height: 120 }); }
 }
 function resizeDashboardChart() {
-  if (breathChart) { var b = document.getElementById('chart-breath'); if (b) breathChart.setSize({ width: dashChartWidth(b), height: 280 }); }
+  if (!dashCharts.length) return;
+  for (var i = 0; i < dashCharts.length; i++) {
+    var chart = dashCharts[i];
+    if (!chart) continue;
+    var el = document.getElementById('chart-' + DASH_SIGNALS[i].key);
+    if (el) chart.setSize({ width: dashChartWidth(el), height: DASH_SIGNALS[i].height });
+  }
+  /* Point budget scales with width — rebuild data so the envelope stays at
+   * ~1 pair per pixel column after a resize. */
+  updateDashView();
 }
 window.addEventListener('resize', function() { resizeStatsCharts(); resizeDashboardChart(); });
 

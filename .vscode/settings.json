@@ -8,5 +8,8 @@
     "build/**": true,
     "managed_components/**": true,
     "dist/**": true
-  }
+  },
+  "kiroAgent.enableCodebaseIndexing": true,
+  "kiroAgent.notifications.agent.actionRequired": false,
+  "workbench.colorTheme": "Monokai Dimmed"
 }
