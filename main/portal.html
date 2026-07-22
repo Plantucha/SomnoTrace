@@ -654,7 +654,7 @@ Maintenance Actions
 <div style="font-weight:600;font-size:.9rem">Delete All EDF Files</div>
 <div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Removes all EDF and related files from SDCARD/ (session data preserved)</div>
 </div>
-<button class="btn btn-primary" onclick="execAction('delete-edfs','Delete all EDF files? This will remove all EDF files and related data (SETTINGS, STR.edf, Identification.json) from the SDCARD folder. Session data in .sessions/ is preserved. Continue?')">Delete All EDFs</button>
+<button class="btn btn-primary" onclick="execAction('delete-edfs','Delete all EDF files? This will remove all EDF files and related data (SETTINGS, STR.edf, Identification.json) from the SDCARD folder. Session data in .somnotrace/sessions/ is preserved. Continue?')">Delete All EDFs</button>
 </div>
 
 <div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px">
@@ -668,7 +668,7 @@ Maintenance Actions
 <div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--danger);border-radius:8px;background:rgba(248,113,113,.05)">
 <div>
 <div style="font-weight:600;font-size:.9rem;color:var(--danger)">Reset ALL (Destructive)</div>
-<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes everything under /somnotrace/ (SDCARD + .sessions) and clears upload state</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes everything under /somnotrace/ (SDCARD + .somnotrace) and clears upload state</div>
 </div>
 <button class="btn btn-danger" onclick="execAction('reset-all','RESET EVERYTHING? This will permanently delete ALL data on the SD card: EDF files, session data, upload state — everything under /somnotrace/. This cannot be undone. Continue?')">Reset ALL</button>
 </div>

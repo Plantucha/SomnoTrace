@@ -53,7 +53,7 @@ static const char *TAG = "log_stream";
 
 /* ── SD Persistent Logging ───────────────────────────────────────── */
 
-#define LOG_DIR             SD_MOUNT_POINT "/.logs"
+#define LOG_DIR             SD_LOG_DIR
 #define LOG_FILE_PREFIX     "somnotrace.log."
 #define LOG_MAX_FILES       4
 #define LOG_FILE_MAX_SIZE   (128 * 1024)  /* 128 KB per file */
@@ -144,7 +144,8 @@ static int log_vprintf_hook(const char *fmt, va_list args)
 static void ensure_log_dir(void)
 {
     if (!sd_storage_is_ready()) return;
-    mkdir(LOG_DIR, 0777);  /* ignore EEXIST */
+    mkdir(SD_APP_DIR, 0777);  /* parent .somnotrace/ (non-recursive mkdir) */
+    mkdir(LOG_DIR, 0777);     /* ignore EEXIST */
     s_sd_ready = true;
 }
 

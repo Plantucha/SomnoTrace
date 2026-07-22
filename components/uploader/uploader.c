@@ -41,7 +41,7 @@
 #include "esp_heap_caps.h"
 
 /* LittleFS */
-#include "esp_littlefs.h"
+/* LittleFS removed: uploader state now lives on the SD card. */
 
 static const char *TAG = "uploader";
 
@@ -58,7 +58,6 @@ static const int retry_delays_ms[] = {30000, 60000, 120000, 300000, 600000};
 #define N_RETRY_DELAYS (int)(sizeof(retry_delays_ms) / sizeof(retry_delays_ms[0]))
 
 #define NVS_NAMESPACE  "uploader"
-#define LITTLEFS_LABEL "storage"
 
 /* ── Internal state ─────────────────────────────────────────────────── */
 
@@ -89,29 +88,6 @@ void uploader_register_backend(const upload_backend_t *backend)
 /* External backend declarations */
 extern const upload_backend_t smb_backend;
 extern const upload_backend_t sleephq_backend;
-
-/* ── LittleFS init ──────────────────────────────────────────────────── */
-
-static esp_err_t init_littlefs(void)
-{
-    esp_vfs_littlefs_conf_t conf = {
-        .base_path = "/littlefs",
-        .partition_label = LITTLEFS_LABEL,
-        .format_if_mount_failed = true,
-        .dont_mount = false,
-    };
-
-    esp_err_t ret = esp_vfs_littlefs_register(&conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "LittleFS mount failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    size_t total = 0, used = 0;
-    esp_littlefs_info(LITTLEFS_LABEL, &total, &used);
-    ESP_LOGI(TAG, "LittleFS mounted: total=%u used=%u", (unsigned)total, (unsigned)used);
-    return ESP_OK;
-}
 
 /* ── Config load / save (NVS) ───────────────────────────────────────── */
 
@@ -165,10 +141,20 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
     return ESP_OK;
 }
 
-esp_err_t uploader_save_config(const uploader_config_t *cfg)
-{
-    if (!cfg) return ESP_ERR_INVALID_ARG;
+/* Injected NVS-write executor (the app's internal-stack nvs_writer). */
+static uploader_nvs_exec_fn_t s_nvs_exec = NULL;
 
+void uploader_set_nvs_executor(uploader_nvs_exec_fn_t exec)
+{
+    s_nvs_exec = exec;
+}
+
+/* NVS-write portion — runs on the injected executor's task (internal stack)
+ * when one is set, so it is safe even when uploader_save_config() is called
+ * from the PSRAM-stacked httpd worker. */
+static esp_err_t do_uploader_save_config(void *arg)
+{
+    const uploader_config_t *cfg = (const uploader_config_t *)arg;
     nvs_handle_t h;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
@@ -188,11 +174,24 @@ esp_err_t uploader_save_config(const uploader_config_t *cfg)
     nvs_set_str(h, "ftp_pass", cfg->ftp_pass);
     nvs_commit(h);
     nvs_close(h);
-
-    /* Update in-memory copy */
-    memcpy(&s_config, cfg, sizeof(s_config));
-    ESP_LOGI(TAG, "config saved to NVS");
     return ESP_OK;
+}
+
+esp_err_t uploader_save_config(const uploader_config_t *cfg)
+{
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+
+    /* Delegate the flash write to the injected executor (internal-stack
+     * nvs_writer) so a caller on a PSRAM stack (httpd) is safe. Runs inline
+     * if no executor was injected (caller then has an internal stack). */
+    esp_err_t ret = s_nvs_exec ? s_nvs_exec(do_uploader_save_config, (void *)cfg)
+                               : do_uploader_save_config((void *)cfg);
+    if (ret == ESP_OK) {
+        /* Update in-memory copy */
+        memcpy(&s_config, cfg, sizeof(s_config));
+        ESP_LOGI(TAG, "config saved to NVS");
+    }
+    return ret;
 }
 
 bool uploader_is_smb_configured(void)
@@ -547,9 +546,8 @@ esp_err_t uploader_init(void)
 {
     if (s_initialised) return ESP_OK;
 
-    /* 1. Mount LittleFS */
-    esp_err_t ret = init_littlefs();
-    if (ret != ESP_OK) return ret;
+    /* 1. Upload state persists on the SD card (mounted by sd_storage_init at
+     *    boot, before uploader_init). No flash filesystem to mount here. */
 
     /* 2. Allocate upload state in PSRAM to keep internal RAM free for
      *    DMA-critical WiFi/BLE buffers. */
@@ -574,7 +572,7 @@ esp_err_t uploader_init(void)
     /* 4. Load config from NVS */
     uploader_load_config(&s_config);
 
-    /* 5. Load upload state from LittleFS */
+    /* 5. Load upload state from the SD card */
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     uploader_state_load(s_state);
     uploader_state_prune(s_state, 30);
@@ -589,13 +587,29 @@ esp_err_t uploader_init(void)
     if (!s_queue) return ESP_ERR_NO_MEM;
 
     /* 8. Start upload task on core 0 (same as BLE, but low priority).
-     * Internal RAM stack required: uploader_state_save() writes to LittleFS
-     * (SPI flash), and esp_partition_erase_range() → esp_ota_get_running_partition()
-     * → spi_flash_cache2phys() freezes the cache even with AUTO_SUSPEND.
-     * A PSRAM-backed stack triggers esp_task_stack_is_sane_when_cache_frozen(). */
+     * PSRAM-backed stack: upload state now lives on the SD card (SDMMC, not
+     * SPI flash) and the task performs no flash erase/write, so it never runs
+     * during a flash-cache freeze — safe for an external-memory stack under
+     * CONFIG_SPI_FLASH_AUTO_SUSPEND. The TCB must stay in internal RAM
+     * (FreeRTOS requirement). Stack/TCB are allocated once and live for the
+     * lifetime of the task, so they are never freed. Falls back to an internal
+     * dynamic stack if the PSRAM allocation fails. */
+    static StackType_t *upload_stack = NULL;
+    static StaticTask_t *upload_tcb = NULL;
     TaskHandle_t upload_handle = NULL;
-    xTaskCreatePinnedToCore(upload_task, "uploader", UPLOAD_TASK_STACK, NULL,
-                            UPLOAD_TASK_PRIORITY, &upload_handle, 0);
+    upload_stack = heap_caps_malloc(UPLOAD_TASK_STACK, MALLOC_CAP_SPIRAM);
+    upload_tcb   = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (upload_stack && upload_tcb) {
+        upload_handle = xTaskCreateStaticPinnedToCore(
+            upload_task, "uploader", UPLOAD_TASK_STACK, NULL,
+            UPLOAD_TASK_PRIORITY, upload_stack, upload_tcb, 0);
+    } else {
+        ESP_LOGW(TAG, "uploader PSRAM stack alloc failed, using internal stack");
+        free(upload_stack); free(upload_tcb);
+        upload_stack = NULL; upload_tcb = NULL;
+        xTaskCreatePinnedToCore(upload_task, "uploader", UPLOAD_TASK_STACK, NULL,
+                                UPLOAD_TASK_PRIORITY, &upload_handle, 0);
+    }
 
     if (!upload_handle) {
         ESP_LOGE(TAG, "failed to create upload task");

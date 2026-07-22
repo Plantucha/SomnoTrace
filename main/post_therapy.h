@@ -36,16 +36,16 @@
  * This module orchestrates the collection of all post-therapy data:
  *
  *   Summary spool (30-day lookback):
- *     → decoded per-day → .sessions/summaries/YYYYMMDD.spool
+ *     → decoded per-day → .somnotrace/sessions/summaries/YYYYMMDD.spool
  *
  *   TherapyEvents-RespiratoryEvents spool:
- *     → .sessions/streams/YYYYMMDD/<prefix>_resp_events.bin
+ *     → .somnotrace/sessions/streams/YYYYMMDD/<prefix>_resp_events.bin
  *
  *   Device identification (Get RPC):
- *     → .sessions/streams/YYYYMMDD/<prefix>_ident.json
+ *     → .somnotrace/sessions/streams/YYYYMMDD/<prefix>_ident.json
  *
  *   Current settings (Get RPC):
- *     → .sessions/streams/YYYYMMDD/<prefix>_settings.json
+ *     → .somnotrace/sessions/streams/YYYYMMDD/<prefix>_settings.json
  *
  * post_therapy_collect() is blocking and should be called from a task
  * with adequate stack (8KB+).  It is invoked by stop_task after
@@ -57,7 +57,7 @@
  * from a separate low-priority task before generating STR.edf.
  *
  * Parameters:
- *   session_dir    - path to the noon-day folder (e.g. ".sessions/streams/20260627")
+ *   session_dir    - path to the noon-day folder (e.g. ".somnotrace/sessions/streams/20260627")
  *   file_prefix    - session file prefix (e.g. "20260627_023000")
  *   start_epoch_ms - session start time in epoch ms (unused for lookback;
  *                    30-day fixed window is used instead)

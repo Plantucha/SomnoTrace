@@ -36,6 +36,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "session_graph";
 
@@ -716,72 +717,33 @@ typedef struct {
     long send_size;
 } session_file_async_t;
 
-/* Binary semaphore: allows exactly one large-file transfer at a time.
- * Using a semaphore instead of a counter+503 means a second request simply
- * waits for the first to finish rather than failing with a 503 error.
- * The dashboard downloads files sequentially in JS anyway, so in normal
- * use there is only ever one transfer in-flight; the semaphore is just
- * defence against race conditions and browser retries.
- *
- * Initialised by session_graph_init(), called before httpd starts. */
-#define SNT_TRANSFER_TIMEOUT_MS  30000   /* 30 s — 2 MB at 100 KB/s worst case */
-#define SNT_CHUNK_SIZE           8192    /* 8 KB chunks — smaller than the 32 KB TCP
-                                          * send buffer so lwIP can fit several
-                                          * in-flight segments between BLE coex slots */
-static SemaphoreHandle_t s_transfer_sem = NULL;
+/* Large-file downloads are handled by a single persistent worker task fed by
+ * a queue. A single worker inherently serialises transfers (the dashboard
+ * downloads files sequentially in JS anyway), and — crucially — its stack is
+ * allocated once from PSRAM, so downloads no longer consume ~6 KB of internal
+ * RAM per request. The httpd worker enqueues a request and returns
+ * immediately; ownership of each `session_file_async_t*` passes to the worker,
+ * which frees it and completes the async handler. */
+#define SNT_CHUNK_SIZE   8192    /* 8 KB chunks — smaller than the 32 KB TCP
+                                  * send buffer so lwIP can fit several
+                                  * in-flight segments between BLE coex slots */
+#define SNT_QUEUE_DEPTH  6       /* pending requests before we reject with 503 */
+#define SNT_WORKER_STACK 6144
+static QueueHandle_t s_download_queue = NULL;
 
-void session_graph_init(void)
+/* Stream one file to its (async) request using the caller-provided chunk
+ * buffer. Does not free/complete the transfer — the worker owns that. */
+static void snt_send_file(session_file_async_t *transfer, char *buf)
 {
-    if (!s_transfer_sem) {
-        s_transfer_sem = xSemaphoreCreateBinary();
-        if (s_transfer_sem) {
-            xSemaphoreGive(s_transfer_sem);   /* start in "available" state */
-            ESP_LOGI(TAG, "transfer semaphore created");
-        } else {
-            ESP_LOGE(TAG, "failed to create transfer semaphore");
-        }
-    }
-}
-
-static void session_file_async_task(void *arg)
-{
-    session_file_async_t *transfer = arg;
-    FILE *f = NULL;
-    char *buf = NULL;
-
-    /* Serialise: wait for any in-progress transfer to finish before starting
-     * our own.  A 30-second timeout is generous (2 MB at ~100 KB/s worst
-     * case takes ~20 s); if we somehow time out, log an error and send 503. */
-    if (!s_transfer_sem ||
-        xSemaphoreTake(s_transfer_sem,
-                       pdMS_TO_TICKS(SNT_TRANSFER_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGE(TAG, "snt_download: timed out waiting for transfer slot");
-        httpd_resp_set_status(transfer->req, "503 Service Unavailable");
-        httpd_resp_sendstr(transfer->req, "download slot timeout");
-        goto done;
-    }
-
-    f = fopen(transfer->file_path, "rb");
-    if (!f) {
-        httpd_resp_send_500(transfer->req);
-        xSemaphoreGive(s_transfer_sem);
-        goto done;
-    }
-
-    buf = heap_caps_malloc(SNT_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        httpd_resp_send_500(transfer->req);
-        xSemaphoreGive(s_transfer_sem);
-        goto done;
-    }
+    FILE *f = fopen(transfer->file_path, "rb");
+    if (!f) { httpd_resp_send_500(transfer->req); return; }
 
     fseek(f, transfer->range_start, SEEK_SET);
     long remaining = transfer->send_size;
     size_t n;
     /* Instrumentation: separate SD-read time from TCP-send time so we can
      * pinpoint whether download stalls originate from FATFS/SD I/O or from
-     * lwIP/Wi-Fi send backpressure. Aggregates are logged at completion;
-     * individual slow operations (>150 ms) are logged immediately. */
+     * lwIP/Wi-Fi send backpressure. */
     int64_t t_read_us = 0, t_send_us = 0;
     int64_t worst_read_us = 0, worst_send_us = 0;
     uint32_t n_chunks = 0;
@@ -802,10 +764,7 @@ static void session_file_async_task(void *arg)
         int64_t s0 = esp_timer_get_time();
         esp_err_t serr = httpd_resp_send_chunk(transfer->req, buf, (ssize_t)n);
         int64_t s1 = esp_timer_get_time();
-        if (serr != ESP_OK) {
-            xSemaphoreGive(s_transfer_sem);
-            goto done;
-        }
+        if (serr != ESP_OK) { fclose(f); return; }
         int64_t send_us = s1 - s0;
         t_send_us += send_us;
         if (send_us > worst_send_us) worst_send_us = send_us;
@@ -827,14 +786,57 @@ static void session_file_async_task(void *arg)
              (long long)(t_send_us / 1000), (long long)(worst_send_us / 1000),
              (unsigned)n_chunks);
     httpd_resp_send_chunk(transfer->req, NULL, 0);
-    xSemaphoreGive(s_transfer_sem);
+    fclose(f);
+}
 
-done:
-    if (buf) free(buf);
-    if (f) fclose(f);
-    httpd_req_async_handler_complete(transfer->req);
-    free(transfer);
-    vTaskDelete(NULL);
+static void snt_download_worker(void *arg)
+{
+    (void)arg;
+    /* One reusable chunk buffer in PSRAM for the worker's lifetime. */
+    char *buf = heap_caps_malloc(SNT_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
+    for (;;) {
+        session_file_async_t *transfer = NULL;
+        if (xQueueReceive(s_download_queue, &transfer, portMAX_DELAY) != pdTRUE || !transfer)
+            continue;
+        if (!buf) buf = heap_caps_malloc(SNT_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            httpd_resp_send_500(transfer->req);
+        } else {
+            snt_send_file(transfer, buf);
+        }
+        httpd_req_async_handler_complete(transfer->req);
+        free(transfer);
+    }
+}
+
+/* Called before httpd starts. Creates the download queue and the single
+ * persistent worker task on a PSRAM stack (the worker only reads SD and writes
+ * to sockets — no flash writes — so an external-memory stack is safe under
+ * CONFIG_SPI_FLASH_AUTO_SUSPEND). Falls back to an internal stack. */
+void session_graph_init(void)
+{
+    if (s_download_queue) return;
+    s_download_queue = xQueueCreate(SNT_QUEUE_DEPTH, sizeof(session_file_async_t *));
+    if (!s_download_queue) {
+        ESP_LOGE(TAG, "failed to create download queue");
+        return;
+    }
+    static StackType_t *stack = NULL;
+    static StaticTask_t *tcb = NULL;
+    stack = heap_caps_malloc(SNT_WORKER_STACK, MALLOC_CAP_SPIRAM);
+    tcb   = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    TaskHandle_t h = NULL;
+    if (stack && tcb) {
+        h = xTaskCreateStaticPinnedToCore(snt_download_worker, "snt_download",
+                                          SNT_WORKER_STACK, NULL, 4, stack, tcb,
+                                          tskNO_AFFINITY);
+    } else {
+        ESP_LOGW(TAG, "snt worker PSRAM stack alloc failed, using internal stack");
+        free(stack); free(tcb); stack = NULL; tcb = NULL;
+        xTaskCreate(snt_download_worker, "snt_download", SNT_WORKER_STACK, NULL, 4, &h);
+    }
+    if (!h) ESP_LOGE(TAG, "failed to create snt_download worker");
+    else ESP_LOGI(TAG, "snt_download worker started (PSRAM stack=%s)", stack ? "yes" : "no");
 }
 
 /* GET /api/session/file?session=ID&date=YYYYMMDD&type=brp|brp_mm|pld|sa2
@@ -959,7 +961,12 @@ esp_err_t session_file_handler(httpd_req_t *req)
     transfer->send_size = send_size;
     fclose(f);
 
-    if (xTaskCreate(session_file_async_task, "snt_download", 6144, transfer, 4, NULL) != pdPASS) {
+    /* Hand off to the persistent download worker. Ownership of `transfer` and
+     * completion of the async handler pass to the worker. If the queue is full
+     * (too many pending downloads), reject and clean up here. */
+    if (!s_download_queue ||
+        xQueueSend(s_download_queue, &transfer, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "snt_download: queue unavailable/full, rejecting request");
         httpd_req_async_handler_complete(async_req);
         free(transfer);
         return ESP_FAIL;

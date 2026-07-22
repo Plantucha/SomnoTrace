@@ -23,6 +23,7 @@
 
 #include "device_settings.h"
 #include "bsp_display.h"
+#include "nvs_writer.h"
 
 #include <string.h>
 #include "nvs_flash.h"
@@ -74,10 +75,9 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     return ESP_OK;
 }
 
-esp_err_t device_settings_save(const device_settings_t *cfg)
+static esp_err_t do_device_settings_save(void *arg)
 {
-    if (!cfg) return ESP_ERR_INVALID_ARG;
-
+    const device_settings_t *cfg = (const device_settings_t *)arg;
     nvs_handle_t h;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
@@ -86,7 +86,15 @@ esp_err_t device_settings_save(const device_settings_t *cfg)
     nvs_set_u8(h, NVS_KEY_LCD_THERAPY, (uint8_t)cfg->lcd_therapy_mode);
     ret = nvs_commit(h);
     nvs_close(h);
+    return ret;
+}
 
+esp_err_t device_settings_save(const device_settings_t *cfg)
+{
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+
+    /* Delegate the flash write so callers on a PSRAM stack (httpd) are safe. */
+    esp_err_t ret = nvs_writer_run(do_device_settings_save, (void *)cfg);
     if (ret == ESP_OK) {
         memcpy(&s_settings, cfg, sizeof(s_settings));
         ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u",

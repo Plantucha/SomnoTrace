@@ -105,6 +105,18 @@ void uploader_register_backend(const upload_backend_t *backend);
 esp_err_t uploader_load_config(uploader_config_t *cfg);
 esp_err_t uploader_save_config(const uploader_config_t *cfg);
 
+/* Optional NVS-write executor injection.
+ *
+ * uploader_save_config() is reached from the httpd worker, which runs on a
+ * PSRAM stack — a task with a PSRAM stack cannot itself perform a flash write.
+ * The app injects an executor (its internal-stack nvs_writer) here; when set,
+ * uploader_save_config() runs its NVS write on that task instead of inline.
+ * If never set, the write runs inline (safe when the caller has an internal
+ * stack). The uploader component does not depend on the app, hence injection. */
+typedef esp_err_t (*uploader_nvs_task_fn_t)(void *arg);
+typedef esp_err_t (*uploader_nvs_exec_fn_t)(uploader_nvs_task_fn_t fn, void *arg);
+void uploader_set_nvs_executor(uploader_nvs_exec_fn_t exec);
+
 /* Check if specific backends are configured and enabled. */
 bool uploader_is_smb_configured(void);
 bool uploader_is_sleephq_configured(void);

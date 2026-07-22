@@ -203,7 +203,7 @@ static void epoch_ms_to_iso_utc(int64_t epoch_ms, char *out, size_t out_len)
 /* ── Summary spool decode & per-day storage ─────────────────────────── */
 
 /* Pull Summary spool with 30-day lookback, decode into per-day files.
- * Each day record is written to .sessions/summaries/YYYYMMDD.spool
+ * Each day record is written to .somnotrace/sessions/summaries/YYYYMMDD.spool
  * (atomic write — latest pull wins). */
 static esp_err_t collect_summary_spool(int64_t clock_drift_ms)
 {
@@ -436,7 +436,7 @@ static bool summary_spool_is_current(int64_t end_epoch_ms, int64_t clock_drift_m
 }
 
 /* Pull only the current noon-day's Summary spool record and write it to
- * .sessions/summaries/YYYYMMDD.spool (atomic — latest pull wins).
+ * .somnotrace/sessions/summaries/YYYYMMDD.spool (atomic — latest pull wins).
  *
  * Uses a fromDateTime starting at noon today (AS11 time) so only the
  * current day's record is returned, making each retry fast.

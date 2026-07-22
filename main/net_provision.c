@@ -29,6 +29,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_http_server.h"
+#include "nvs_writer.h"
 #include "esp_app_desc.h"
 #include "cJSON.h"
 #include "lwip/sockets.h"
@@ -93,8 +94,10 @@ bool netprov_load_config(struct netprov_config *cfg)
     return any;
 }
 
-esp_err_t netprov_save_config(const struct netprov_config *cfg)
+/* Actual NVS write — runs on the internal-stack nvs_writer task. */
+static esp_err_t do_netprov_save(void *arg)
 {
+    const struct netprov_config *cfg = (const struct netprov_config *)arg;
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
@@ -110,6 +113,12 @@ esp_err_t netprov_save_config(const struct netprov_config *cfg)
     err = nvs_commit(h);
     nvs_close(h);
     return err;
+}
+
+esp_err_t netprov_save_config(const struct netprov_config *cfg)
+{
+    /* Delegate the flash write so callers on a PSRAM stack (httpd) are safe. */
+    return nvs_writer_run(do_netprov_save, (void *)cfg);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1306,7 +1315,7 @@ static void recreate_edfs_task(void *arg)
     recursive_delete(SD_SDCARD_DIR);
     ESP_LOGI(TAG, "recreate_edfs_task: SDCARD/ deleted");
 
-    /* 2. Scan .sessions/streams/ for day folders, collect sessions.
+    /* 2. Scan .somnotrace/sessions/streams/ for day folders, collect sessions.
      * Allocate the sessions array on the heap (PSRAM) — 64 * ~312 bytes
      * = ~20KB, which would overflow the 10KB task stack. */
     recreate_session_t *sessions = calloc(64, sizeof(recreate_session_t));
@@ -1478,7 +1487,7 @@ static esp_err_t actions_handler(httpd_req_t *req)
         ESP_LOGI(TAG, "action: delete all EDF files");
         recursive_delete(SD_SDCARD_DIR);
     } else if (strcmp(action, "reset-all") == 0) {
-        ESP_LOGI(TAG, "action: reset all (state + SDCARD + .sessions)");
+        ESP_LOGI(TAG, "action: reset all (state + SDCARD + .somnotrace)");
         uploader_reset_state();
         recursive_delete(SD_SDCARD_DIR);
         recursive_delete(SD_SESSIONS_DIR);
@@ -1513,13 +1522,24 @@ static esp_err_t start_webserver(void)
         s_httpd = NULL;
     }
 
+    /* The httpd worker runs on a PSRAM stack (task_caps below). Its handlers
+     * must therefore never call flash-write directly — all NVS writes are
+     * routed through the internal-stack nvs_writer task, which MUST exist
+     * before the server can accept a request. Init it (and wire the uploader's
+     * NVS executor to it) here, before httpd_start. Both are idempotent. */
+    nvs_writer_init();
+    uploader_set_nvs_executor((uploader_nvs_exec_fn_t)nvs_writer_run);
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
     config.max_uri_handlers = 36;
     config.stack_size = 8192;
     config.max_open_sockets = 10;
+    /* Allocate the httpd worker task's stack from PSRAM to free internal RAM.
+     * Safe because no handler performs a flash write on this task (see above). */
+    config.task_caps = MALLOC_CAP_SPIRAM;
 
-    ESP_LOGI(TAG, "starting httpd: stack=%d, handlers=%d, internal free=%u",
+    ESP_LOGI(TAG, "starting httpd: stack=%d (PSRAM), handlers=%d, internal free=%u",
              config.stack_size, config.max_uri_handlers,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 

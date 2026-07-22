@@ -83,11 +83,14 @@ esp_err_t sd_storage_init(void)
 
     sdmmc_card_print_info(stdout, card);
 
-    /* Create ESP-native directory tree */
+    /* Create the SomnoTrace app-root and its subtrees. The parent .somnotrace/
+     * must be created before its children (FATFS mkdir is non-recursive). */
+    mkdir(SD_APP_DIR, 0775);
     mkdir(SD_SESSIONS_DIR, 0775);
     mkdir(SD_STREAMS_DIR, 0775);
     mkdir(SD_SUMMARIES_DIR, 0775);
-    mkdir(SD_MOUNT_POINT "/.logs", 0775);
+    mkdir(SD_LOG_DIR, 0775);
+    mkdir(SD_UPLOAD_STATE_DIR, 0775);
 
     /* Create ResMed-compatible export directory tree */
     mkdir(SD_SDCARD_DIR, 0775);

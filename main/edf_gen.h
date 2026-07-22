@@ -30,21 +30,21 @@
  * This module generates EDF (European Data Format) files from session
  * data, producing output compatible with OSCAR and SleepHQ.
  *
- * Input data lives in .sessions/ (ESP-native):
- *   /somnotrace/.sessions/streams/YYYYMMDD/
+ * Input data lives under the SomnoTrace app-root (ESP-native):
+ *   /somnotrace/.somnotrace/sessions/streams/YYYYMMDD/
  *     <prefix>_brp.snt, _sa2.snt, _pld.snt, _brp_mm.snt  ← stream data
  *     <prefix>_events.snt                                 ← live events
  *     <prefix>_resp_events.bin                             ← TherapyEvents spool
  *     <prefix>_ident.json                                  ← device identity
  *     <prefix>_settings.json                               ← current settings
  *     <prefix>_session.json                                ← session metadata
- *   /somnotrace/.sessions/summaries/
+ *   /somnotrace/.somnotrace/sessions/summaries/
  *     YYYYMMDD.spool                                       ← per-day Summary spool
  *
  * Output goes to SDCARD/ (ResMed-compatible SD card image, OSCAR-ready):
  *   /somnotrace/SDCARD/
  *     STR.edf                ← Multi-record daily summary (one record per day
- *                              from .sessions/summaries/ spool files, sorted chronologically)
+ *                              from .somnotrace/sessions/summaries/ spool files, sorted chronologically)
  *     Identification.json    ← Device identity (nested AS11 format)
  *     Identification.crc     ← CRC-32 of Identification.json
  *     SETTINGS/
@@ -58,7 +58,7 @@
  *         <prefix>_EVE.edf   ← Respiratory event annotations
  *         <prefix>_CSL.edf   ← CSR event annotations
  *
- * SDCARD/ is fully derived from .sessions/ and can be deleted and regenerated
+ * SDCARD/ is fully derived from .somnotrace/sessions/ and can be deleted and regenerated
  * at any time without BLE access.
  *
  * This function is blocking and should be called from a task with adequate
@@ -66,7 +66,7 @@
  * so that all spool and RPC data is available.
  *
  * Parameters:
- *   session_dir    - path to the noon-day stream folder (.sessions/streams/YYYYMMDD/)
+ *   session_dir    - path to the noon-day stream folder (.somnotrace/sessions/streams/YYYYMMDD/)
  *   session_id     - session prefix (e.g. "20260627_224219" or "20260627_224219_2")
  *   start_epoch_ms - session start time in epoch ms (NTP-corrected)
  *   end_epoch_ms   - session end time in epoch ms (0 if unknown)

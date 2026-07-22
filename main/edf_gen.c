@@ -1769,7 +1769,7 @@ typedef struct {
 } session_drift_entry_t;
 
 /* Build an in-memory index of all session drift entries by scanning
- * .sessions/streams/ once.  Returns a malloc'd array (caller frees) or
+ * .somnotrace/sessions/streams/ once.  Returns a malloc'd array (caller frees) or
  * NULL on failure.  *out_count receives the number of entries. */
 static session_drift_entry_t *build_session_drift_index(int *out_count)
 {
@@ -1858,7 +1858,7 @@ static int64_t lookup_drift(const session_drift_entry_t *entries, int n_entries,
 }
 
 /* Generate multi-record STR.edf from per-day summary spool files.
- * Scans .sessions/summaries/ for *.spool files, parses each into a
+ * Scans .somnotrace/sessions/summaries/ for *.spool files, parses each into a
  * daily STR record, and writes them all into a single STR.edf at
  * <sdcard_dir>/STR.edf with one EDF data record per day.
  * If the current day is not covered by any spool, synthesizes a record
@@ -1873,7 +1873,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                                   int64_t clock_drift_ms)
 {
     (void)start_date;  /* computed internally from oldest record */
-    /* ── Scan .sessions/summaries/ for per-day .spool files ── */
+    /* ── Scan .somnotrace/sessions/summaries/ for per-day .spool files ── */
     DIR *dir = opendir(SD_SUMMARIES_DIR);
     if (!dir) {
         ESP_LOGE(TAG, "STR.edf: cannot open %s: %s", SD_SUMMARIES_DIR, strerror(errno));
@@ -2877,7 +2877,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * EDF files go to /somnotrace/SDCARD/DATALOG/YYYYMMDD/
      * STR.edf goes to /somnotrace/SDCARD/STR.edf (root level)
      * Identification.json goes to /somnotrace/SDCARD/
-     * This is the ResMed-compatible SD card image, fully derived from .sessions/ */
+     * This is the ResMed-compatible SD card image, fully derived from .somnotrace/sessions/ */
     mkdir(SD_SDCARD_DIR, 0775);
     mkdir(SD_SDCARD_DATALOG, 0775);
     mkdir(SD_SDCARD_SETTINGS, 0775);
@@ -2899,7 +2899,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     char ts_prefix[32];
     session_timestamp(start_epoch_ms, ts_prefix, sizeof(ts_prefix));
 
-    /* ── Load post-therapy data from .sessions/streams/YYYYMMDD/ ──
+    /* ── Load post-therapy data from .somnotrace/sessions/streams/YYYYMMDD/ ──
      * Files use prefix-based naming: <session_id>_ident.json, etc. */
 
     /* Read identification.json for EDF header fields */

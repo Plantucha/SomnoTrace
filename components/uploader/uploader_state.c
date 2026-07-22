@@ -1,5 +1,5 @@
 /*
- * SomnoTrace - Upload state tracking on LittleFS
+ * SomnoTrace - Upload state tracking on the SD card
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  *
  * This file is part of SomnoTrace.
@@ -167,6 +167,10 @@ esp_err_t uploader_state_save(const upload_state_t *state)
         ESP_LOGE(TAG, "failed to serialize state");
         return ESP_ERR_NO_MEM;
     }
+
+    /* Ensure the state directory exists (sd_storage_init creates it at boot;
+     * this is a defensive no-op EEXIST otherwise). */
+    mkdir(UPLOAD_STATE_DIR, 0775);
 
     FILE *f = fopen(UPLOAD_STATE_TMP, "w");
     if (!f) {

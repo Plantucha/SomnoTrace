@@ -60,6 +60,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "psram_task.h"
+#include "nvs_writer.h"
 
 #include "mbedtls/sha256.h"
 #include "mbedtls/bignum.h"
@@ -2268,14 +2269,23 @@ cJSON *as11_ble_get_paired_info(void)
     return o;
 }
 
-esp_err_t as11_ble_forget(void)
+static esp_err_t do_forget_nvs(void *arg)
 {
+    (void)arg;
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
     nvs_erase_all(h);
     e = nvs_commit(h);
     nvs_close(h);
+    return e;
+}
+
+esp_err_t as11_ble_forget(void)
+{
+    /* Delegate the NVS erase so callers on a PSRAM stack (httpd forget handler)
+     * are safe; the BLE teardown below stays on the caller (no flash). */
+    esp_err_t e = nvs_writer_run(do_forget_nvs, NULL);
     if (e == ESP_OK) {
         memset(&s_pair_cache, 0, sizeof(s_pair_cache));
     }

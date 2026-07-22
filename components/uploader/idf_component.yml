@@ -1,4 +1,3 @@
 dependencies:
-  joltwallet/littlefs: "^1.22.1"
   idf:
     version: ">=5.0"

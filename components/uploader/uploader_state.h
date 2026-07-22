@@ -29,17 +29,20 @@
 
 /* ── Upload state tracking ─────────────────────────────────────────────
  *
- * Persistent state is stored as a single JSON file on LittleFS
- * (/littlefs/upload_state.json). The file is rewritten atomically
- * (write to .tmp, rename) on each state change.
+ * Persistent state is stored as a single JSON file on the SD card under the
+ * SomnoTrace app-root (/somnotrace/.somnotrace/upload_state/). The file is
+ * rewritten atomically (write to .tmp, rename) on each state change.
+ * NOTE: this path must mirror SD_APP_DIR/SD_UPLOAD_STATE_DIR in
+ * main/sd_storage.h (the uploader component does not depend on main).
  *
  * Day-level tracking: each noon-day (DATALOG/YYYYMMDD) has per-backend
  * status. When a new session is added to an already-uploaded day, the
  * day is "dirtied" (reset to pending) so the whole day is re-uploaded.
  * This is simpler and more correct than per-file fingerprinting. */
 
-#define UPLOAD_STATE_PATH    "/littlefs/upload_state.json"
-#define UPLOAD_STATE_TMP     "/littlefs/upload_state.json.tmp"
+#define UPLOAD_STATE_DIR     "/somnotrace/.somnotrace/upload_state"
+#define UPLOAD_STATE_PATH    UPLOAD_STATE_DIR "/upload_state.json"
+#define UPLOAD_STATE_TMP     UPLOAD_STATE_DIR "/upload_state.json.tmp"
 #define UPLOAD_MAX_DAYS      30
 #define UPLOAD_MAX_BACKENDS  4
 #define UPLOAD_BACKEND_NAME_LEN 16

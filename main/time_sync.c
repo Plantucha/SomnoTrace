@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
+#include "nvs_writer.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -74,20 +75,35 @@ static void apply_timezone(const char *tz_str)
     ESP_LOGI(TAG, "timezone set to %s", tz_str);
 }
 
+/* Args for the NVS write, passed by pointer to the nvs_writer task. */
+typedef struct {
+    const char *tz_str;
+    const char *tz_name;
+} tz_save_args_t;
+
+static esp_err_t do_set_timezone(void *arg)
+{
+    const tz_save_args_t *a = (const tz_save_args_t *)arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(h, NVS_KEY_TZ_STR, a->tz_str);
+    if (err == ESP_OK && a->tz_name && a->tz_name[0]) {
+        nvs_set_str(h, NVS_KEY_TZ_NAME, a->tz_name);
+    }
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 esp_err_t time_sync_set_timezone(const char *tz_str, const char *tz_name)
 {
     if (!tz_str || tz_str[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
-    if (err != ESP_OK) return err;
-    err = nvs_set_str(h, NVS_KEY_TZ_STR, tz_str);
-    if (err == ESP_OK && tz_name && tz_name[0]) {
-        nvs_set_str(h, NVS_KEY_TZ_NAME, tz_name);
-    }
-    if (err == ESP_OK) err = nvs_commit(h);
-    nvs_close(h);
+    /* Delegate the flash write so callers on a PSRAM stack (httpd) are safe. */
+    tz_save_args_t args = { .tz_str = tz_str, .tz_name = tz_name };
+    esp_err_t err = nvs_writer_run(do_set_timezone, &args);
     if (err == ESP_OK) {
         apply_timezone(tz_str);
     }
@@ -116,8 +132,9 @@ void time_sync_get_tz_name(char *tz_name, size_t tz_name_len)
     }
 }
 
-esp_err_t time_sync_set_ntp_server(const char *server)
+static esp_err_t do_set_ntp_server(void *arg)
 {
+    const char *server = (const char *)arg;
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
@@ -130,7 +147,13 @@ esp_err_t time_sync_set_ntp_server(const char *server)
     }
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
+    return err;
+}
 
+esp_err_t time_sync_set_ntp_server(const char *server)
+{
+    /* Delegate the flash write so callers on a PSRAM stack (httpd) are safe. */
+    esp_err_t err = nvs_writer_run(do_set_ntp_server, (void *)server);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "NTP server set to: %s",
                  (server && server[0]) ? server : "(auto)");

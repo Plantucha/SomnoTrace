@@ -455,7 +455,7 @@ session_writer_t *session_writer_start(void)
     char noon_day[16];
     noon_day_folder_local(time(NULL), noon_day, sizeof(noon_day));
 
-    /* Create the noon-day folder under .sessions/streams/ */
+    /* Create the noon-day folder under .somnotrace/sessions/streams/ */
     snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_STREAMS_DIR, noon_day);
     if (mkdir(s->dir, 0775) != 0 && errno != EEXIST) {
         ESP_LOGE(TAG, "failed to create noon-day dir %s: %s", s->dir, strerror(errno));
@@ -1578,7 +1578,7 @@ void session_writer_recover(void)
     struct dirent *ent;
     int recovered = 0;
 
-    /* Scan noon-day folders under .sessions/streams/ */
+    /* Scan noon-day folders under .somnotrace/sessions/streams/ */
     while ((ent = readdir(dir)) != NULL) {
         if (ent->d_name[0] == '.') continue;
         if (strlen(ent->d_name) != 8) continue;  /* YYYYMMDD */
