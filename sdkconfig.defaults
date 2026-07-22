@@ -52,6 +52,16 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 # Use the native USB Serial/JTAG for console/logging (USB-C).
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
+# Push Wi-Fi and lwIP heap allocations to PSRAM. By default every Wi-Fi
+# dynamic RX/TX buffer and every lwIP pbuf/TCP segment is allocated from
+# internal RAM; under concurrency (SleepHQ TLS upload + dashboard snt_download)
+# that exhausted internal SRAM and made the hardware-AES DMA bounce buffer
+# allocation fail ("esp-aes: Failed to allocate memory"). Allowing these to
+# come from PSRAM frees tens of KB of internal RAM. DMA-critical Wi-Fi buffers
+# still stay internal automatically; the driver copies PSRAM pbufs into a DMA
+# TX buffer at the boundary.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
 # Wi-Fi defaults — reduced buffer counts to save internal RAM while remaining
 # stable for SoftAP portal + STA uploads.
 CONFIG_ESP_WIFI_ENABLED=y
