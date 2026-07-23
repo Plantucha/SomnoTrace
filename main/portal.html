@@ -593,7 +593,7 @@ Save &amp; Reboot
 </div>
 <div>
 <div style="font-size:.85rem;font-weight:600;margin-bottom:8px">Statistics</div>
-<table class="dash-stats-tbl"><thead><tr><th></th><th>Median</th><th>95%</th><th>Max</th></tr></thead>
+<table class="dash-stats-tbl"><thead><tr><th></th><th>Median</th><th>95%</th><th>99.5%</th></tr></thead>
 <tbody id="dash-stats-body"></tbody></table>
 </div>
 </div>
@@ -2011,28 +2011,40 @@ function parseSntBrp(buf) {
 }
 
 /* Parse a PLD .snt file (tier=0, 0.5 Hz, 12 ch/record) into the channels the
- * dashboard graphs: ch3=Leak, ch9=Snore, ch10=FlowLim.
+ * dashboard graphs (ch3=Leak, ch9=Snore, ch10=FlowLim) plus the channels the
+ * summary reads (ch1=Press, ch2=EprPress, ch4=RespRate) — OSCAR/SleepHQ take
+ * pressure/EPAP/resp from these PLD channels directly, matching exactly.
  * Scaling (raw int16 = physical * 100):
- *   Leak  dig*0.6  = L/min  (dig/100 L/s * 60, matches pld_leak_phys())
- *   Snore dig*0.01           (phys 0..5, dimensionless index)
- *   FlowLim dig*0.01         (phys 0..1, dimensionless index) */
+ *   Press/EprPress dig*0.01  = cmH2O   (therapy pressure / EPR-relieved pressure)
+ *   RespRate       dig*0.01  = breaths/min
+ *   Leak           dig*0.6   = L/min  (dig/100 L/s * 60, matches pld_leak_phys())
+ *   Snore          dig*0.01            (phys 0..5, dimensionless index)
+ *   FlowLim        dig*0.01            (phys 0..1, dimensionless index) */
 function parseSntPld(buf) {
   var h = readSntHeader(buf);
   if (!h || h.nCh < 11) return null;
   var dv = h.dv, n = h.n, missing = h.missing, rb = h.recBytes;
   var t = new Float64Array(n);
+  var press = new Float64Array(n), eprPress = new Float64Array(n), respRate = new Float64Array(n);
   var leak = new Float64Array(n), snore = new Float64Array(n), flowlim = new Float64Array(n);
   for (var i = 0; i < n; i++) {
     var off = h.dataOff + i * rb;
+    var pr = dv.getInt16(off + 1 * 2, true);
+    var ep = dv.getInt16(off + 2 * 2, true);
+    var rr = dv.getInt16(off + 4 * 2, true);
     var lk = dv.getInt16(off + 3 * 2, true);
     var sn = dv.getInt16(off + 9 * 2, true);
     var fl = dv.getInt16(off + 10 * 2, true);
-    leak[i]    = (lk === missing) ? NaN : lk * 0.6;
-    snore[i]   = (sn === missing) ? NaN : sn * 0.01;
-    flowlim[i] = (fl === missing) ? NaN : fl * 0.01;
+    press[i]    = (pr === missing) ? NaN : pr * 0.01;
+    eprPress[i] = (ep === missing) ? NaN : ep * 0.01;
+    respRate[i] = (rr === missing) ? NaN : rr * 0.01;
+    leak[i]     = (lk === missing) ? NaN : lk * 0.6;
+    snore[i]    = (sn === missing) ? NaN : sn * 0.01;
+    flowlim[i]  = (fl === missing) ? NaN : fl * 0.01;
     t[i] = h.startMs + i * h.msPerRec;
   }
-  return { t: t, leak: leak, snore: snore, flowlim: flowlim, ready: true };
+  return { t: t, press: press, eprPress: eprPress, respRate: respRate,
+           leak: leak, snore: snore, flowlim: flowlim, ready: true };
 }
 
 /* Lower-bound binary search: first index i in t[] with t[i] >= target. */
@@ -2178,14 +2190,17 @@ function clearSummary() {
   });
   var s = document.getElementById('dash-summary'); if (s) s.style.display = 'none';
 }
+var dashSummary = null;   /* last /api/summary response for the current day */
 function loadSummary(noonDay, loadId) {
+  dashSummary = null;
   fetch('/api/summary?date=' + noonDay).then(function(r){
     return r.ok ? r.json() : null;
   }).then(function(sum){
     if (loadId !== dashLoadId) return;         /* superseded by a newer load */
-    if (!sum || sum.error) { clearSummary(); return; }
-    renderSummary(sum);
-  }).catch(function(){ if (loadId === dashLoadId) clearSummary(); });
+    if (!sum || sum.error) { dashSummary = null; clearSummary(); return; }
+    dashSummary = sum;
+    renderSummary();
+  }).catch(function(){ if (loadId === dashLoadId) { dashSummary = null; clearSummary(); } });
 }
 function setStat(id, txt) { var e = document.getElementById(id); if (e) e.textContent = txt; }
 function setBadge(id, cls, txt) {
@@ -2193,21 +2208,111 @@ function setBadge(id, cls, txt) {
   e.className = 'badge ' + cls; e.textContent = txt;
 }
 function num(v, dec) { return (v == null || isNaN(v)) ? '--' : v.toFixed(dec == null ? 1 : dec); }
-function renderSummary(sum) {
-  setStat('stat-ahi', num(sum.ahi, 2));
-  var ab = ahiBadge(sum.ahi); setBadge('stat-ahi-badge', ab.cls, ab.txt);
-  setStat('stat-usage', fmtUsage(sum.usage_min));
-  setStat('stat-leak', sum.leak && sum.leak.p95 != null ? num(sum.leak.p95, 1) + ' L/min' : '--');
-  setStat('stat-press', sum.pressure && sum.pressure.median != null ? num(sum.pressure.median, 1) + ' cmH\u2082O' : '--');
 
-  /* Event breakdown */
+/* AHI and per-type indices computed the way OSCAR/SleepHQ do — from actual
+ * event COUNTS ÷ usage hours (calcs.cpp: ahi = cnt / hours) — not from the
+ * AS11 summary-spool indices, which are only stored at 0.1/hr resolution.
+ * Returns null (→ spool fallback) until events + usage are available. */
+function computeEventIndices() {
+  if (!dashEventsLoaded || !dashSummary || !dashSummary.usage_min) return null;
+  var h = dashSummary.usage_min / 60;
+  if (h <= 0) return null;
+  var oa=0, ca=0, hh=0, a=0, rera=0;
+  for (var i = 0; i < dashEvents.length; i++) {
+    switch (dashEvents[i].code) {
+      case 'OA': oa++; break; case 'CA': ca++; break;
+      case 'H': hh++; break;  case 'A': a++; break;
+      case 'RERA': rera++; break;
+    }
+  }
+  return { ahi:(oa+ca+a+hh)/h, oai:oa/h, cai:ca/h, hi:hh/h, rera:rera/h };
+}
+/* Weighted percentile matching OSCAR's Day::percentile() (SleepLib/day.cpp):
+ * build a value→count histogram sorted by value, locate the bucket holding the
+ * nth-ranked sample, and linearly interpolate between the (cumulative − w/2)
+ * rank midpoints of adjacent buckets. Samples here carry uniform weight, but
+ * this reproduces the exact values OSCAR/SleepHQ display — notably the 99.5%
+ * upper stat, which rejects the brief spikes a true max would show. */
+function weightedPercentile(vals, p) {
+  var SN = vals.length;
+  if (!SN) return NaN;
+  var m = new Map();
+  for (var i = 0; i < SN; i++) { var v = vals[i]; m.set(v, (m.get(v) || 0) + 1); }
+  var hist = [];
+  m.forEach(function(cnt, val){ hist.push([val, cnt]); });
+  hist.sort(function(a, b){ return a[0] - b[0]; });
+  var N = hist.length;
+  var P = 100.0 * p;
+  var nthi = Math.floor(SN * p);
+  var sum1 = 0, v1 = 0, w1 = 0, k = 0;
+  for (k = 0; k < N; k++) {
+    v1 = hist[k][0]; w1 = hist[k][1]; sum1 += w1;
+    if (sum1 > nthi) return v1;
+    if (sum1 === nthi) break;
+  }
+  if (k >= N) return v1;
+  if (N === 1) return hist[0][0];
+  if (k + 1 >= N) return v1;
+  var v2 = hist[k + 1][0], w2 = hist[k + 1][1], sum2 = sum1 + w2;
+  var px = 100.0 / SN;
+  var p1 = px * (sum1 - w1 / 2.0);
+  var p2 = px * (sum2 - w2 / 2.0);
+  return v1 + ((P - p1) / (p2 - p1)) * (v2 - v1);
+}
+
+/* median/95%/99.5% for a PLD channel (key = 'press'|'eprPress'|'respRate'|
+ * 'leak' ...) pooled across all loaded sessions, computed the way OSCAR/SleepHQ
+ * read these channels directly. The top stat is the 99.5th percentile (OSCAR's
+ * default "Max" = percentile(0.995)), not the true max, so transient spikes
+ * don't inflate it. Returns null (→ spool fallback) until PLD data is loaded. */
+function computePldStats(key) {
+  if (!dashSessionData) return null;
+  var vals = [];
+  for (var i = 0; i < dashSessionData.length; i++) {
+    var pld = dashSessionData[i] && dashSessionData[i].pld;
+    var arr = pld && pld[key];
+    if (!arr) continue;
+    for (var k = 0; k < arr.length; k++) { var v = arr[k]; if (!isNaN(v)) vals.push(v); }
+  }
+  if (vals.length < 5) return null;
+  return {
+    median: weightedPercentile(vals, 0.5),
+    p95:    weightedPercentile(vals, 0.95),
+    max:    weightedPercentile(vals, 0.995)
+  };
+}
+/* Leak stats — thin wrapper kept for existing call sites. */
+function computeLeakStats() { return computePldStats('leak'); }
+
+/* Renders from the module globals (dashSummary + dashEvents + PLD data). Safe
+ * to call repeatedly as data arrives; each call upgrades spool values to
+ * event/channel-computed ones once available. */
+function renderSummary() {
+  var sum = dashSummary;
+  if (!sum) { clearSummary(); return; }
+  var idx = computeEventIndices();
+  /* Pressure/EPAP/resp/leak: prefer PLD-channel values (match OSCAR/SleepHQ),
+   * fall back to the summary spool until the PLD stream is loaded. */
+  var press = computePldStats('press')    || sum.pressure;
+  var epap  = computePldStats('eprPress') || sum.epap;
+  var resp  = computePldStats('respRate') || sum.resp_rate;
+  var leak  = computePldStats('leak')     || sum.leak;
+
+  var ahi = idx ? idx.ahi : sum.ahi;
+  setStat('stat-ahi', num(ahi, 2));
+  var ab = ahiBadge(ahi); setBadge('stat-ahi-badge', ab.cls, ab.txt);
+  setStat('stat-usage', fmtUsage(sum.usage_min));
+  setStat('stat-leak', leak && leak.p95 != null ? num(leak.p95, 1) + ' L/min' : '--');
+  setStat('stat-press', press && press.median != null ? num(press.median, 1) + ' cmH\u2082O' : '--');
+
+  /* Event breakdown (computed indices preferred over spool) */
   var brk = document.getElementById('dash-breakdown');
   if (brk) {
     var rows = [
-      { lbl: 'Obstructive (OA)', v: sum.oai, c: '#10b981' },
-      { lbl: 'Central (CA)',     v: sum.cai, c: '#22d3ee' },
-      { lbl: 'Hypopnea (H)',     v: sum.hi,  c: '#8b5cf6' },
-      { lbl: 'RERA',             v: sum.rera,c: '#ec4899' }
+      { lbl: 'Obstructive (OA)', v: idx ? idx.oai : sum.oai, c: '#10b981' },
+      { lbl: 'Central (CA)',     v: idx ? idx.cai : sum.cai, c: '#22d3ee' },
+      { lbl: 'Hypopnea (H)',     v: idx ? idx.hi  : sum.hi,  c: '#8b5cf6' },
+      { lbl: 'RERA',             v: idx ? idx.rera: sum.rera,c: '#ec4899' }
     ];
     brk.innerHTML = rows.map(function(r){
       return '<div class="dash-brk-row"><span class="sw" style="background:' + r.c + '"></span>' +
@@ -2220,16 +2325,16 @@ function renderSummary(sum) {
   /* Stats table */
   var tb = document.getElementById('dash-stats-body');
   if (tb) {
-    function statRow(label, g, unit) {
+    function statRow(label, g) {
       if (!g) return '';
       return '<tr><td>' + label + '</td><td>' + num(g.median) + '</td><td>' + num(g.p95) +
              '</td><td>' + num(g.max) + '</td></tr>';
     }
     tb.innerHTML =
-      statRow('Pressure (cmH\u2082O)', sum.pressure) +
-      statRow('EPAP (cmH\u2082O)', sum.epap) +
-      statRow('Leak (L/min)', sum.leak) +
-      statRow('Resp rate (bpm)', sum.resp_rate);
+      statRow('Pressure (cmH\u2082O)', press) +
+      statRow('EPAP (cmH\u2082O)', epap) +
+      statRow('Leak (L/min)', leak) +
+      statRow('Resp rate (bpm)', resp);
   }
   var panel = document.getElementById('dash-summary'); if (panel) panel.style.display = '';
 }
@@ -2321,6 +2426,7 @@ function sigColorByKey(key) {
  * reportTime as the event END with durationSeconds giving the span. They are
  * drawn as translucent bands + short-code labels on the Breathing panel. */
 var dashEvents = [];
+var dashEventsLoaded = false;   /* true once events.snt parsed for the day */
 var EVENT_DEFS = {
   ObstructiveApneaEnd: { code: 'OA',   color: '#10b981' },
   CentralApneaEnd:     { code: 'CA',   color: '#22d3ee' },
@@ -2362,6 +2468,7 @@ function parseSessionEvents(text, driftMs, out) {
  * from the main data load (like loadSummary); events are tiny. */
 function loadEvents(noonDay, loadId) {
   dashEvents = [];
+  dashEventsLoaded = false;
   if (!dashSessions || !dashSessions.length) return;
   var chain = Promise.resolve();
   dashSessions.forEach(function(s) {
@@ -2377,7 +2484,9 @@ function loadEvents(noonDay, loadId) {
   chain.then(function() {
     if (loadId !== dashLoadId) return;
     dashEvents.sort(function(a, b){ return a.t0 - b.t0; });
+    dashEventsLoaded = true;
     updateDashView();
+    renderSummary();   /* AHI/indices now computable from event counts */
   });
 }
 /* uPlot draw hook for the Breathing panel: translucent band + rotated label
@@ -2552,6 +2661,7 @@ function loadDashboardData() {
       return pldChain;
     }).then(function() {
       if (myLoadId !== dashLoadId) return;  /* cancelled */
+      renderSummary();   /* leak percentiles now computable from PLD samples */
       /* Cache the overview (L1 + PLD) */
       if (!isToday(dateStr)) {
         dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
