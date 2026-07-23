@@ -582,7 +582,7 @@ Save &amp; Reboot
 <div class="stats-grid">
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">AHI</div><div class="stat-val" id="stat-ahi">--</div><span class="badge badge-green" id="stat-ahi-badge">--</span></div>
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Usage Time</div><div class="stat-val" id="stat-usage">--</div><span class="badge badge-green" id="stat-usage-badge">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">95th% Leak</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green" id="stat-leak-badge">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Leak Rate</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green" id="stat-leak-badge">--</span></div>
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Median Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange" id="stat-press-badge">--</span></div>
 </div>
 <div class="card" id="dash-summary" style="display:none;padding:16px">
@@ -2275,7 +2275,10 @@ function computePldStats(key) {
     for (var k = 0; k < arr.length; k++) { var v = arr[k]; if (!isNaN(v)) vals.push(v); }
   }
   if (vals.length < 5) return null;
+  var sum = 0;
+  for (var j = 0; j < vals.length; j++) sum += vals[j];
   return {
+    mean:   sum / vals.length,
     median: weightedPercentile(vals, 0.5),
     p95:    weightedPercentile(vals, 0.95),
     max:    weightedPercentile(vals, 0.995)
@@ -2302,7 +2305,7 @@ function renderSummary() {
   setStat('stat-ahi', num(ahi, 2));
   var ab = ahiBadge(ahi); setBadge('stat-ahi-badge', ab.cls, ab.txt);
   setStat('stat-usage', fmtUsage(sum.usage_min));
-  setStat('stat-leak', leak && leak.p95 != null ? num(leak.p95, 1) + ' L/min' : '--');
+  setStat('stat-leak', leak && leak.mean != null ? num(leak.mean, 1) + ' L/min' : '--');
   setStat('stat-press', press && press.median != null ? num(press.median, 1) + ' cmH\u2082O' : '--');
 
   /* Event breakdown (computed indices preferred over spool) */
