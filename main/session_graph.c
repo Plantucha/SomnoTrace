@@ -27,6 +27,7 @@
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "sd_storage.h"
+#include "edf_gen.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -372,6 +373,192 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
     httpd_resp_send(req, json, pos);
     free(json);
     free(sessions);
+    return ESP_OK;
+}
+
+static void resolve_day_dir(httpd_req_t *req, const char *session_id,
+                            char *day_dir, size_t day_dir_len);
+
+/* GET /api/days — list noon-days that have session data, with a session count.
+ * Cheap: reads the streams/ directory and counts *_session.json per day. */
+static int cmp_str(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+esp_err_t days_list_handler(httpd_req_t *req)
+{
+    DIR *dd = opendir(SD_STREAMS_DIR);
+    if (!dd) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "[]", 2);
+        return ESP_OK;
+    }
+
+    /* Collect day-folder names (exactly 8 digits) first, then close before
+     * re-opening each for counting (keep one dir handle open at a time). */
+    int cap = 64, n = 0;
+    char **days = calloc(cap, sizeof(char *));
+    if (!days) { closedir(dd); httpd_resp_send_500(req); return ESP_FAIL; }
+    struct dirent *ent;
+    while ((ent = readdir(dd)) != NULL) {
+        if (strlen(ent->d_name) != 8) continue;
+        bool alldig = true;
+        for (int i = 0; i < 8; i++) if (ent->d_name[i] < '0' || ent->d_name[i] > '9') { alldig = false; break; }
+        if (!alldig) continue;
+        if (n >= cap) {
+            cap *= 2;
+            char **tmp = realloc(days, cap * sizeof(char *));
+            if (!tmp) break;
+            days = tmp;
+        }
+        days[n] = strdup(ent->d_name);
+        if (days[n]) n++;
+    }
+    closedir(dd);
+
+    qsort(days, n, sizeof(char *), cmp_str);
+
+    int json_cap = n * 48 + 64;
+    char *json = heap_caps_malloc(json_cap, MALLOC_CAP_SPIRAM);
+    if (!json) { for (int i = 0; i < n; i++) free(days[i]); free(days); httpd_resp_send_500(req); return ESP_FAIL; }
+    int pos = 0;
+    pos += snprintf(json + pos, json_cap - pos, "[");
+    for (int i = 0; i < n; i++) {
+        /* Count *_session.json entries in this day folder. */
+        char day_path[300];
+        snprintf(day_path, sizeof(day_path), "%s/%s", SD_STREAMS_DIR, days[i]);
+        int sessions = 0;
+        DIR *d2 = opendir(day_path);
+        if (d2) {
+            struct dirent *e2;
+            const char *suffix = "_session.json";
+            int slen = strlen(suffix);
+            while ((e2 = readdir(d2)) != NULL) {
+                int fl = strlen(e2->d_name);
+                if (fl > slen && strcmp(e2->d_name + fl - slen, suffix) == 0) sessions++;
+            }
+            closedir(d2);
+        }
+        if (sessions == 0) continue;   /* skip empty/partial day folders */
+        pos += snprintf(json + pos, json_cap - pos, "%s{\"day\":\"%s\",\"sessions\":%d}",
+                        (pos > 1 ? "," : ""), days[i], sessions);
+        free(days[i]);
+        days[i] = NULL;
+    }
+    pos += snprintf(json + pos, json_cap - pos, "]");
+    for (int i = 0; i < n; i++) free(days[i]);
+    free(days);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, pos);
+    free(json);
+    return ESP_OK;
+}
+
+/* GET /api/summary?date=YYYYMMDD — per-day summary metrics from the spool. */
+esp_err_t summary_handler(httpd_req_t *req)
+{
+    char date[16];
+    if (!get_qparam(req, "date", date, sizeof(date)) || strlen(date) != 8) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing/invalid date");
+        return ESP_FAIL;
+    }
+    char *json = NULL;
+    esp_err_t e = edf_gen_summary_json(date, &json);
+    if (e != ESP_OK || !json) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_sendstr(req, "{\"error\":\"no summary\"}");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free(json);
+    return ESP_OK;
+}
+
+/* GET /api/session/settings?session=ID&date=YYYYMMDD — therapy mode + pressure
+ * settings for the pressure panel (CPAP flat lines). Parses the session's
+ * settings.json (SettingProfiles). */
+esp_err_t session_settings_handler(httpd_req_t *req)
+{
+    char session_id[32];
+    if (!get_qparam(req, "session", session_id, sizeof(session_id))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing session");
+        return ESP_FAIL;
+    }
+    char day_dir[300];
+    resolve_day_dir(req, session_id, day_dir, sizeof(day_dir));
+
+    char path[400];
+    snprintf(path, sizeof(path), "%s/%s_settings.json", day_dir, session_id);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_sendstr(req, "{\"error\":\"no settings\"}");
+        return ESP_OK;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsz <= 0 || fsz > 32 * 1024) { fclose(f); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "bad settings"); return ESP_FAIL; }
+    char *buf = heap_caps_malloc(fsz + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) { fclose(f); httpd_resp_send_500(req); return ESP_FAIL; }
+    size_t rd = fread(buf, 1, fsz, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "parse error"); return ESP_FAIL; }
+
+    cJSON *sp = cJSON_GetObjectItem(root, "SettingProfiles");
+    cJSON *ap = sp ? cJSON_GetObjectItem(sp, "ActiveProfiles") : NULL;
+    cJSON *tp = sp ? cJSON_GetObjectItem(sp, "TherapyProfiles") : NULL;
+    cJSON *fp = sp ? cJSON_GetObjectItem(sp, "FeatureProfiles") : NULL;
+
+    cJSON *out = cJSON_CreateObject();
+
+    cJSON *tpn = ap ? cJSON_GetObjectItem(ap, "TherapyProfile") : NULL;
+    if (tpn && cJSON_IsString(tpn)) cJSON_AddStringToObject(out, "mode", tpn->valuestring);
+    else cJSON_AddNullToObject(out, "mode");
+
+    cJSON *v;
+    if (tp) {
+        cJSON *cpap = cJSON_GetObjectItem(tp, "CpapProfile");
+        if (cpap) {
+            if ((v = cJSON_GetObjectItem(cpap, "SetPressure")) && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(out, "cpap_set", v->valuedouble);
+        }
+        cJSON *autoset = cJSON_GetObjectItem(tp, "AutoSetProfile");
+        if (autoset) {
+            if ((v = cJSON_GetObjectItem(autoset, "MinPressure")) && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(out, "auto_min", v->valuedouble);
+            if ((v = cJSON_GetObjectItem(autoset, "MaxPressure")) && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(out, "auto_max", v->valuedouble);
+        }
+    }
+    if (fp) {
+        cJSON *epr = cJSON_GetObjectItem(fp, "EprFeature");
+        if (epr) {
+            if ((v = cJSON_GetObjectItem(epr, "EprEnable")) && cJSON_IsString(v))
+                cJSON_AddBoolToObject(out, "epr_enable", strcmp(v->valuestring, "On") == 0);
+            if ((v = cJSON_GetObjectItem(epr, "EprPressure")) && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(out, "epr_level", v->valuedouble);
+            if ((v = cJSON_GetObjectItem(epr, "EprType")) && cJSON_IsString(v))
+                cJSON_AddStringToObject(out, "epr_type", v->valuestring);
+        }
+    }
+    cJSON_Delete(root);
+
+    char *js = cJSON_PrintUnformatted(out);
+    cJSON_Delete(out);
+    if (!js) { httpd_resp_send_500(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, js, strlen(js));
+    free(js);
     return ESP_OK;
 }
 
@@ -839,7 +1026,7 @@ void session_graph_init(void)
     else ESP_LOGI(TAG, "snt_download worker started (PSRAM stack=%s)", stack ? "yes" : "no");
 }
 
-/* GET /api/session/file?session=ID&date=YYYYMMDD&type=brp|brp_mm|pld|sa2
+/* GET /api/session/file?session=ID&date=YYYYMMDD&type=brp|brp_mm|pld|sa2|events
  * Streams the raw .snt file as application/octet-stream so the dashboard
  * can pull the whole file once and cache/decimate it in the browser.
  * Supports HTTP Range requests for parallel chunked downloads. */
@@ -855,9 +1042,12 @@ esp_err_t session_file_handler(httpd_req_t *req)
     char day_dir[300];
     resolve_day_dir(req, session_id, day_dir, sizeof(day_dir));
 
-    /* Only expose the .snt files we actually generate. */
+    /* Only expose the .snt files we actually generate. "events" is the
+     * live-captured JSONL event stream (respiratory events, therapy
+     * start/stop), fetched by the dashboard for the event overlay. */
     if (strcmp(type, "brp") != 0 && strcmp(type, "brp_mm") != 0 &&
-        strcmp(type, "pld") != 0 && strcmp(type, "sa2") != 0) {
+        strcmp(type, "pld") != 0 && strcmp(type, "sa2") != 0 &&
+        strcmp(type, "events") != 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid type");
         return ESP_FAIL;
     }

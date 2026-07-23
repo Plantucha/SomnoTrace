@@ -172,6 +172,32 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
  * selection reads clearly on both light and dark themes (used by mouse drag
  * and touch drag zoom). Higher specificity than uPlot.min.css's .u-select. */
 .uplot .u-select{background:rgba(56,189,248,0.28);border:1px solid rgba(56,189,248,0.85);box-shadow:0 0 0 1px rgba(56,189,248,0.25)}
+/* Custom calendar popover (data-day markers) */
+.dash-cal{position:absolute;top:48px;left:50%;transform:translateX(-50%);z-index:60;width:300px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,0.35);padding:12px}
+.dash-cal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.dash-cal-title{font-weight:600;font-size:.95rem}
+.dash-cal-nav{background:none;border:none;color:var(--text);cursor:pointer;font-size:1.1rem;padding:4px 10px;border-radius:6px}
+.dash-cal-nav:hover{background:rgba(148,163,184,0.15)}
+.dash-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.dash-cal-dow{font-size:.68rem;color:var(--text-muted);text-align:center;padding:2px 0;font-weight:600}
+.dash-cal-day{position:relative;text-align:center;padding:7px 0 11px;font-size:.82rem;border-radius:8px;color:var(--text-muted);cursor:default}
+.dash-cal-day.has-data{color:var(--text);cursor:pointer;font-weight:600}
+.dash-cal-day.has-data:hover{background:rgba(59,130,246,0.15)}
+.dash-cal-day.today{outline:1px solid var(--primary);outline-offset:-1px}
+.dash-cal-day.selected{background:var(--primary);color:#fff}
+.dash-cal-day .dot{position:absolute;left:50%;bottom:4px;transform:translateX(-50%);width:5px;height:5px;border-radius:50%;background:var(--primary)}
+.dash-cal-day.selected .dot{background:#fff}
+/* Summary breakdown + stats */
+.dash-summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:600px){.dash-summary-grid{grid-template-columns:1fr}}
+.dash-brk-row{display:flex;align-items:center;gap:8px;font-size:.85rem;margin:3px 0}
+.dash-brk-row .sw{width:10px;height:10px;border-radius:2px;flex:none}
+.dash-brk-row .lbl{flex:1;color:var(--text-muted)}
+.dash-brk-row .val{font-weight:600}
+.dash-stats-tbl{width:100%;border-collapse:collapse;font-size:.82rem}
+.dash-stats-tbl th,.dash-stats-tbl td{text-align:right;padding:3px 6px}
+.dash-stats-tbl th:first-child,.dash-stats-tbl td:first-child{text-align:left;color:var(--text-muted)}
+.dash-stats-tbl thead th{color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--card-border)}
 /* Chart zoom/pan toolbar. Desktop: sticky just under the sticky 56px header so
  * it stays in view while scrolling the tall panel stack. Mobile: fixed
  * bottom-right for thumb reach (won't scroll away). */
@@ -539,22 +565,38 @@ Save &amp; Reboot
 <!-- ═══════════════ DASHBOARD TAB ═══════════════ -->
 <section id="dashboard" class="tab-content sta-only">
 <div class="dashboard-header">
+<div class="date-nav-wrap" style="position:relative">
 <div class="date-navigator">
-<button class="date-btn" onclick="stepDate(-1)">&larr;</button>
-<div class="date-display" id="date-display-label" onclick="triggerDatePicker()">Select date</div>
-<button class="date-btn" onclick="triggerDatePicker()" style="border-right:1px solid var(--card-border)">
+<button class="date-btn" onclick="stepDate(-1)" title="Previous night with data">&larr;</button>
+<div class="date-display" id="date-display-label" onclick="toggleCalendar()">Select date</div>
+<button class="date-btn" onclick="toggleCalendar()" style="border-right:1px solid var(--card-border)" title="Calendar">
 <svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:currentColor"><path d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V9h14v11zM5 7V6h14v1zm7 5h5v5h-5z"/></svg>
 </button>
-<input type="date" class="date-picker-hidden" id="session-date" onchange="handleDateChange(this.value)">
-<button class="date-btn" onclick="stepDate(1)">&rarr;</button>
+<input type="hidden" id="session-date">
+<button class="date-btn" onclick="stepDate(1)" title="Next night with data">&rarr;</button>
+</div>
+<div id="dash-calendar" class="dash-cal" style="display:none"></div>
 </div>
 <div style="font-size:.85rem;color:var(--text-muted)">Noon-to-Noon window</div>
 </div>
 <div class="stats-grid">
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">AHI</div><div class="stat-val" id="stat-ahi">--</div><span class="badge badge-green" id="stat-ahi-badge">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Usage Time</div><div class="stat-val" id="stat-usage">--</div><span class="badge badge-green">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">95th% Leak</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Usage Time</div><div class="stat-val" id="stat-usage">--</div><span class="badge badge-green" id="stat-usage-badge">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">95th% Leak</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green" id="stat-leak-badge">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Median Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange" id="stat-press-badge">--</span></div>
+</div>
+<div class="card" id="dash-summary" style="display:none;padding:16px">
+<div class="dash-summary-grid">
+<div>
+<div style="font-size:.85rem;font-weight:600;margin-bottom:8px">Event breakdown <span id="dash-summary-sessions" style="color:var(--text-muted);font-weight:400"></span></div>
+<div id="dash-breakdown"></div>
+</div>
+<div>
+<div style="font-size:.85rem;font-weight:600;margin-bottom:8px">Statistics</div>
+<table class="dash-stats-tbl"><thead><tr><th></th><th>Median</th><th>95%</th><th>Max</th></tr></thead>
+<tbody id="dash-stats-body"></tbody></table>
+</div>
+</div>
 </div>
 <div class="card dashboard-charts-panel" style="position:relative;padding:16px">
 <div class="chart-controls">
@@ -1660,20 +1702,117 @@ function updateDateDisplayLabel(dateIsoStr) {
   var el = document.getElementById('date-display-label');
   if (el) el.textContent = formatted;
 }
-function triggerDatePicker() {
-  var picker = document.getElementById('session-date');
-  if (picker && typeof picker.showPicker === 'function') picker.showPicker();
+/* ── Calendar / day selection ────────────────────────────────────
+ * dashDays: [{day:"YYYYMMDD", sessions:N}] sorted ascending (from /api/days).
+ * The hidden #session-date input holds the selected noon-day as ISO
+ * (YYYY-MM-DD); its digits-only form is the streams folder name. */
+var dashDays = [];
+var dashDaySet = {};       /* "YYYYMMDD" -> true, for O(1) marker lookup */
+var dashCalYear = 0, dashCalMonth = 0;  /* month shown in the popover (0-based month) */
+
+function isoToDay(iso) { return iso ? iso.replace(/-/g, '') : ''; }
+function dayToIso(d) { return d && d.length === 8 ? d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8) : ''; }
+
+function fetchDays() {
+  return fetch('/api/days').then(function(r){ return r.ok ? r.json() : []; })
+    .then(function(arr){
+      dashDays = Array.isArray(arr) ? arr : [];
+      dashDaySet = {};
+      dashDays.forEach(function(d){ dashDaySet[d.day] = true; });
+      return dashDays;
+    }).catch(function(){ dashDays = []; dashDaySet = {}; return []; });
 }
+
 function handleDateChange(val) { updateDateDisplayLabel(val); loadSessionData(); }
-function stepDate(days) {
-  var picker = document.getElementById('session-date');
-  var parts = picker.value.split('-');
-  var date = new Date(parts[0], parts[1] - 1, parts[2]);
-  date.setDate(date.getDate() + days);
-  var newval = date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
-  picker.value = newval;
-  handleDateChange(newval);
+
+/* Step to the previous/next noon-day that actually has data. */
+function stepDate(dir) {
+  if (!dashDays.length) return;
+  var cur = isoToDay(document.getElementById('session-date').value);
+  var idx = -1;
+  for (var i = 0; i < dashDays.length; i++) { if (dashDays[i].day === cur) { idx = i; break; } }
+  var next;
+  if (idx === -1) {
+    /* current day not in list — jump to nearest in the requested direction */
+    next = dir < 0 ? dashDays[dashDays.length-1].day : dashDays[0].day;
+  } else {
+    var ni = idx + (dir < 0 ? -1 : 1);
+    if (ni < 0 || ni >= dashDays.length) return;   /* at an end */
+    next = dashDays[ni].day;
+  }
+  selectDay(dayToIso(next));
 }
+
+function selectDay(iso) {
+  document.getElementById('session-date').value = iso;
+  closeCalendar();
+  handleDateChange(iso);
+}
+
+function toggleCalendar() {
+  var el = document.getElementById('dash-calendar');
+  if (!el) return;
+  if (el.style.display === 'none' || !el.style.display) {
+    var iso = document.getElementById('session-date').value;
+    var d = iso ? new Date(iso.slice(0,4), iso.slice(5,7)-1, iso.slice(8,10)) : new Date();
+    dashCalYear = d.getFullYear(); dashCalMonth = d.getMonth();
+    renderCalendar();
+    el.style.display = 'block';
+  } else {
+    el.style.display = 'none';
+  }
+}
+function closeCalendar() { var el = document.getElementById('dash-calendar'); if (el) el.style.display = 'none'; }
+function calStepMonth(delta) {
+  dashCalMonth += delta;
+  if (dashCalMonth < 0) { dashCalMonth = 11; dashCalYear--; }
+  else if (dashCalMonth > 11) { dashCalMonth = 0; dashCalYear++; }
+  renderCalendar();
+}
+
+function renderCalendar() {
+  var el = document.getElementById('dash-calendar');
+  if (!el) return;
+  var y = dashCalYear, m = dashCalMonth;
+  var monthName = new Date(y, m, 1).toLocaleDateString(navigator.language, { month: 'long', year: 'numeric' });
+  var selIso = document.getElementById('session-date').value;
+  var todayD = new Date();
+  var pad = function(n){ return String(n).padStart(2,'0'); };
+  var html = '<div class="dash-cal-head">' +
+    '<button class="dash-cal-nav" onclick="calStepMonth(-1)">&lsaquo;</button>' +
+    '<div class="dash-cal-title">' + monthName + '</div>' +
+    '<button class="dash-cal-nav" onclick="calStepMonth(1)">&rsaquo;</button></div>';
+  html += '<div class="dash-cal-grid">';
+  var dows = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  for (var i = 0; i < 7; i++) html += '<div class="dash-cal-dow">' + dows[i] + '</div>';
+  var first = new Date(y, m, 1);
+  /* Monday-based leading blanks */
+  var lead = (first.getDay() + 6) % 7;
+  for (var b = 0; b < lead; b++) html += '<div></div>';
+  var daysInMonth = new Date(y, m + 1, 0).getDate();
+  for (var day = 1; day <= daysInMonth; day++) {
+    var iso = y + '-' + pad(m+1) + '-' + pad(day);
+    var d8 = isoToDay(iso);
+    var cls = 'dash-cal-day';
+    var hasData = !!dashDaySet[d8];
+    if (hasData) cls += ' has-data';
+    if (iso === selIso) cls += ' selected';
+    if (y === todayD.getFullYear() && m === todayD.getMonth() && day === todayD.getDate()) cls += ' today';
+    var click = hasData ? (' onclick="selectDay(\'' + iso + '\')"') : '';
+    html += '<div class="' + cls + '"' + click + '>' + day + (hasData ? '<span class="dot"></span>' : '') + '</div>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+/* Close the calendar when clicking outside the date navigator. */
+document.addEventListener('click', function(e) {
+  var cal = document.getElementById('dash-calendar');
+  if (!cal || cal.style.display === 'none') return;
+  var nav = e.target.closest ? e.target.closest('.date-nav-wrap') : null;
+  if (!nav) closeCalendar();
+});
+
 function loadSessionData() { loadDashboardData(); }
 
 /* ── Dashboard charts ────────────────────────────────────────────
@@ -2019,12 +2158,284 @@ function fetchSntFile(sessionId, noonDay, type) {
   }).catch(function() { return null; });
 }
 
+/* ── Summary (AHI / usage / leak / pressure) ─────────────────────── */
+function fmtUsage(min) {
+  if (min == null || isNaN(min)) return '--';
+  var h = Math.floor(min / 60), m = Math.round(min % 60);
+  return h > 0 ? (h + 'h ' + m + 'm') : (m + 'm');
+}
+/* AHI severity → badge class (matches the app's badge palette). */
+function ahiBadge(ahi) {
+  if (ahi == null || isNaN(ahi)) return { cls: 'badge-green', txt: '--' };
+  if (ahi < 5)  return { cls: 'badge-green',  txt: 'Normal' };
+  if (ahi < 15) return { cls: 'badge-orange', txt: 'Mild' };
+  if (ahi < 30) return { cls: 'badge-orange', txt: 'Moderate' };
+  return { cls: 'badge-red', txt: 'Severe' };
+}
+function clearSummary() {
+  ['stat-ahi','stat-usage','stat-leak','stat-press'].forEach(function(id){
+    var e = document.getElementById(id); if (e) e.textContent = '--';
+  });
+  var s = document.getElementById('dash-summary'); if (s) s.style.display = 'none';
+}
+function loadSummary(noonDay, loadId) {
+  fetch('/api/summary?date=' + noonDay).then(function(r){
+    return r.ok ? r.json() : null;
+  }).then(function(sum){
+    if (loadId !== dashLoadId) return;         /* superseded by a newer load */
+    if (!sum || sum.error) { clearSummary(); return; }
+    renderSummary(sum);
+  }).catch(function(){ if (loadId === dashLoadId) clearSummary(); });
+}
+function setStat(id, txt) { var e = document.getElementById(id); if (e) e.textContent = txt; }
+function setBadge(id, cls, txt) {
+  var e = document.getElementById(id); if (!e) return;
+  e.className = 'badge ' + cls; e.textContent = txt;
+}
+function num(v, dec) { return (v == null || isNaN(v)) ? '--' : v.toFixed(dec == null ? 1 : dec); }
+function renderSummary(sum) {
+  setStat('stat-ahi', num(sum.ahi, 2));
+  var ab = ahiBadge(sum.ahi); setBadge('stat-ahi-badge', ab.cls, ab.txt);
+  setStat('stat-usage', fmtUsage(sum.usage_min));
+  setStat('stat-leak', sum.leak && sum.leak.p95 != null ? num(sum.leak.p95, 1) + ' L/min' : '--');
+  setStat('stat-press', sum.pressure && sum.pressure.median != null ? num(sum.pressure.median, 1) + ' cmH\u2082O' : '--');
+
+  /* Event breakdown */
+  var brk = document.getElementById('dash-breakdown');
+  if (brk) {
+    var rows = [
+      { lbl: 'Obstructive (OA)', v: sum.oai, c: '#10b981' },
+      { lbl: 'Central (CA)',     v: sum.cai, c: '#22d3ee' },
+      { lbl: 'Hypopnea (H)',     v: sum.hi,  c: '#8b5cf6' },
+      { lbl: 'RERA',             v: sum.rera,c: '#ec4899' }
+    ];
+    brk.innerHTML = rows.map(function(r){
+      return '<div class="dash-brk-row"><span class="sw" style="background:' + r.c + '"></span>' +
+             '<span class="lbl">' + r.lbl + '</span><span class="val">' + num(r.v, 2) + '</span></div>';
+    }).join('');
+  }
+  var sc = document.getElementById('dash-summary-sessions');
+  if (sc) sc.textContent = sum.sessions ? '(' + sum.sessions + ' session' + (sum.sessions > 1 ? 's' : '') + ')' : '';
+
+  /* Stats table */
+  var tb = document.getElementById('dash-stats-body');
+  if (tb) {
+    function statRow(label, g, unit) {
+      if (!g) return '';
+      return '<tr><td>' + label + '</td><td>' + num(g.median) + '</td><td>' + num(g.p95) +
+             '</td><td>' + num(g.max) + '</td></tr>';
+    }
+    tb.innerHTML =
+      statRow('Pressure (cmH\u2082O)', sum.pressure) +
+      statRow('EPAP (cmH\u2082O)', sum.epap) +
+      statRow('Leak (L/min)', sum.leak) +
+      statRow('Resp rate (bpm)', sum.resp_rate);
+  }
+  var panel = document.getElementById('dash-summary'); if (panel) panel.style.display = '';
+}
+
+/* ── CPAP fixed-pressure flat lines (Feature 3) ──────────────────────
+ * When a session's therapy mode is CPAP (fixed), the pressure panel shows two
+ * flat lines — IPAP (set pressure) and EPAP (set − EPR when FullTime) — rather
+ * than the fluctuating 25 Hz mask-pressure waveform. Non-CPAP sessions keep
+ * the 25 Hz waveform. */
+function dashCpapInfo() {
+  var info = { any: false, minEpap: Infinity, maxIpap: -Infinity, spans: [] };
+  if (!dashSessions || !dashSessionData) return info;
+  for (var i = 0; i < dashSessions.length; i++) {
+    var st = dashSessionData[i] && dashSessionData[i].settings;
+    if (!st || st.mode !== 'CpapProfile' || typeof st.cpap_set !== 'number') continue;
+    var ipap = st.cpap_set;
+    var relief = (st.epr_enable && st.epr_type === 'FullTime' && typeof st.epr_level === 'number') ? st.epr_level : 0;
+    var epap = ipap - relief;
+    var s = dashSessions[i];
+    info.spans.push({ startMs: s.start_epoch_ms, endMs: s.end_epoch_ms || s.start_epoch_ms, ipap: ipap, epap: epap });
+    info.any = true;
+    if (epap < info.minEpap) info.minEpap = epap;
+    if (ipap > info.maxIpap) info.maxIpap = ipap;
+  }
+  return info;
+}
+/* Blank the pressure waveform inside CPAP spans so only the flat lines show. */
+function blankPressCpap(src) {
+  var ci = dashCpapInfo();
+  if (!ci.any || !src) return src;
+  for (var k = 0; k < src.t.length; k++) {
+    var t = src.t[k];
+    if (t == null) continue;
+    for (var s = 0; s < ci.spans.length; s++) {
+      if (t >= ci.spans[s].startMs && t <= ci.spans[s].endMs) { src.v[k] = NaN; break; }
+    }
+  }
+  return src;
+}
+/* uPlot y-range for the pressure panel: framed around the CPAP set/relief
+ * pressures when CPAP is present, else a padded auto-fit. */
+function pressYRange(u, dmin, dmax) {
+  var ci = dashCpapInfo();
+  if (ci.any && isFinite(ci.minEpap) && isFinite(ci.maxIpap)) {
+    return [ci.minEpap - 1.5, ci.maxIpap + 1.5];
+  }
+  if (dmin == null || !isFinite(dmin)) return [0, 20];
+  var pad = Math.max(0.5, (dmax - dmin) * 0.1);
+  return [dmin - pad, dmax + pad];
+}
+/* uPlot draw hook: paint flat IPAP/EPAP lines over each visible CPAP span. */
+function pressDrawHook(u) {
+  var ci = dashCpapInfo();
+  if (!ci.any) return;
+  var ctx = u.ctx;
+  var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
+  var col = sigColorByKey('press');
+  for (var i = 0; i < ci.spans.length; i++) {
+    var sp = ci.spans[i];
+    var x0 = u.valToPos(sp.startMs, 'x', true);
+    var x1 = u.valToPos(sp.endMs, 'x', true);
+    if (x1 < left || x0 > left + wid) continue;
+    x0 = Math.max(x0, left); x1 = Math.min(x1, left + wid);
+    /* IPAP (solid) */
+    var yI = u.valToPos(sp.ipap, 'press', true);
+    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(x0, yI); ctx.lineTo(x1, yI); ctx.stroke();
+    /* EPAP (dashed) — only if EPR relief lowers it */
+    if (Math.abs(sp.epap - sp.ipap) > 0.05) {
+      var yE = u.valToPos(sp.epap, 'press', true);
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(x0, yE); ctx.lineTo(x1, yE); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  ctx.restore();
+}
+function sigColorByKey(key) {
+  for (var i = 0; i < DASH_SIGNALS.length; i++) if (DASH_SIGNALS[i].key === key) return sigColor(DASH_SIGNALS[i]);
+  return '#fb923c';
+}
+
+/* ── Respiratory events overlay (Feature 4) ──────────────────────────
+ * Events come from each session's events.snt (JSONL). We keep only the
+ * TherapyEvents-RespiratoryEvents notifications, NTP-correct their timestamps
+ * (reportTime is AS11-clock UTC; NTP = reportTime + clock_drift_ms), and treat
+ * reportTime as the event END with durationSeconds giving the span. They are
+ * drawn as translucent bands + short-code labels on the Breathing panel. */
+var dashEvents = [];
+var EVENT_DEFS = {
+  ObstructiveApneaEnd: { code: 'OA',   color: '#10b981' },
+  CentralApneaEnd:     { code: 'CA',   color: '#22d3ee' },
+  HypopneaEnd:         { code: 'H',    color: '#8b5cf6' },
+  ApneaEnd:            { code: 'A',    color: '#f59e0b' },
+  ReraEnd:             { code: 'RERA', color: '#ec4899' }
+};
+function hexA(hex, a) {
+  var h = (hex || '#888').replace('#', '');
+  if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  var r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+}
+/* Parse one session's events.snt (JSONL) into `out`, applying its NTP drift. */
+function parseSessionEvents(text, driftMs, out) {
+  if (!text) return;
+  var lines = text.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i].trim();
+    if (!ln) continue;
+    var msg; try { msg = JSON.parse(ln); } catch (e) { continue; }
+    var params = msg && msg.params;
+    if (!params || params.dataId !== 'TherapyEvents-RespiratoryEvents') continue;
+    var evs = params.events;
+    if (!Array.isArray(evs)) continue;
+    for (var j = 0; j < evs.length; j++) {
+      var ev = evs[j];
+      var def = ev && ev.event && EVENT_DEFS[ev.event];
+      if (!def) continue;
+      var endMs = Date.parse(ev.reportTime);
+      if (isNaN(endMs)) continue;
+      endMs += (driftMs || 0);
+      var dur = (typeof ev.durationSeconds === 'number' && ev.durationSeconds > 0) ? ev.durationSeconds : 0;
+      out.push({ t0: endMs - dur * 1000, t1: endMs, code: def.code, color: def.color });
+    }
+  }
+}
+/* Fetch + parse events for all sessions of the day, then redraw. Decoupled
+ * from the main data load (like loadSummary); events are tiny. */
+function loadEvents(noonDay, loadId) {
+  dashEvents = [];
+  if (!dashSessions || !dashSessions.length) return;
+  var chain = Promise.resolve();
+  dashSessions.forEach(function(s) {
+    chain = chain.then(function() {
+      if (loadId !== dashLoadId) return;
+      return fetch('/api/session/file?session=' + s.id + '&date=' + noonDay + '&type=events')
+        .then(function(r){ return r.ok ? r.text() : null; }).catch(function(){ return null; });
+    }).then(function(txt) {
+      if (loadId !== dashLoadId) return;
+      parseSessionEvents(txt, s.clock_drift_ms || 0, dashEvents);
+    });
+  });
+  chain.then(function() {
+    if (loadId !== dashLoadId) return;
+    dashEvents.sort(function(a, b){ return a.t0 - b.t0; });
+    updateDashView();
+  });
+}
+/* uPlot draw hook for the Breathing panel: translucent band + rotated label
+ * per event visible in the current viewport (min 2px wide so brief events
+ * stay visible when zoomed out). */
+function breathEventsHook(u) {
+  if (!dashEvents || !dashEvents.length) return;
+  var ctx = u.ctx;
+  var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
+  var xmin = u.scales.x.min, xmax = u.scales.x.max;
+  var pr = u.pxRatio || 1;
+  var minW = 3 * pr;                 /* keep brief events visible when zoomed out */
+  var halo = cssVar('--card-bg');    /* background-coloured outline so labels pop */
+  ctx.save();
+  ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
+  ctx.font = '700 ' + Math.round(12 * pr) + 'px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.lineJoin = 'round';
+  for (var i = 0; i < dashEvents.length; i++) {
+    var ev = dashEvents[i];
+    if (ev.t1 < xmin || ev.t0 > xmax) continue;
+    var x0 = u.valToPos(ev.t0, 'x', true);
+    var x1 = u.valToPos(ev.t1, 'x', true);
+    if (x1 - x0 < minW) { var c = (x0 + x1) / 2; x0 = c - minW / 2; x1 = c + minW / 2; }
+    if (x0 < left) x0 = left;
+    if (x1 > left + wid) x1 = left + wid;
+    /* Translucent fill + crisp edge lines for definition. */
+    ctx.fillStyle = hexA(ev.color, 0.30);
+    ctx.fillRect(x0, top, x1 - x0, hgt);
+    ctx.strokeStyle = hexA(ev.color, 0.9);
+    ctx.lineWidth = Math.max(1, pr);
+    ctx.beginPath();
+    ctx.moveTo(x0 + 0.5, top); ctx.lineTo(x0 + 0.5, top + hgt);
+    ctx.moveTo(x1 - 0.5, top); ctx.lineTo(x1 - 0.5, top + hgt);
+    ctx.stroke();
+    /* Vertical label near the top, with a background-coloured halo. */
+    ctx.save();
+    ctx.translate((x0 + x1) / 2 + 4.5 * pr, top + 5 * pr);
+    ctx.rotate(Math.PI / 2);
+    ctx.lineWidth = 3 * pr;
+    ctx.strokeStyle = halo;
+    ctx.strokeText(ev.code, 0, 0);
+    ctx.fillStyle = ev.color;
+    ctx.fillText(ev.code, 0, 0);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
 function loadDashboardData() {
   var picker = document.getElementById('session-date');
   var dateStr = picker ? picker.value : '';
   if (!dateStr) return;
   var noonDay = noonDayStr(dateStr);
   dashNoonDay = noonDay;
+  clearSummary();
+  loadSummary(noonDay, dashLoadId + 1);   /* loadId matches the increment below */
 
   /* Cancel any in-flight load */
   var myLoadId = ++dashLoadId;
@@ -2036,6 +2447,7 @@ function loadDashboardData() {
     dashSessionData = c.sessionData;
     dashXRange = null;
     renderDashboardCharts();
+    loadEvents(noonDay, myLoadId);
     dashIsLoading = false;
     return;
   }
@@ -2055,11 +2467,15 @@ function loadDashboardData() {
     });
     if (!dashSessions.length) {
       dashSessionData = [];
+      dashEvents = [];
       dashSetStatus('No sessions');
       renderDashboardCharts();
       dashIsLoading = false;
       return;
     }
+
+    /* Events overlay (decoupled, tiny): fetch + parse in the background. */
+    loadEvents(noonDay, myLoadId);
 
     /* Initialize per-session data slots. Each holds two independent sources:
      * brp (flow + pressure, 25 Hz) and pld (leak/snore/flowlim, 0.5 Hz). */
@@ -2074,9 +2490,26 @@ function loadDashboardData() {
     dashSetStatus('Loading overview...');
     renderDashboardCharts();
 
+    /* Step 0: per-session therapy settings (mode / set pressure / EPR) for the
+     * pressure panel's CPAP flat lines. Tiny JSON; fetched first so the flat
+     * lines and pressure y-range are correct from the first waveform paint. */
+    var setChain = Promise.resolve();
+    dashSessions.forEach(function(s, idx) {
+      setChain = setChain.then(function() {
+        if (myLoadId !== dashLoadId) return;  /* cancelled */
+        return fetch('/api/session/settings?session=' + s.id + '&date=' + noonDay)
+          .then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; });
+      }).then(function(st) {
+        if (myLoadId !== dashLoadId) return;
+        if (st && !st.error) dashSessionData[idx].settings = st;
+      });
+    });
+    /* Rebuild panels once settings are in so pressure flat-lines/range apply. */
+    setChain = setChain.then(function(){ if (myLoadId === dashLoadId) renderDashboardCharts(); });
+
     /* Step 1: BRP L1 MinMax overview (flow + pressure) sequentially per
      * session. The time axis is set once from the manifest and never moves. */
-    var l1Chain = Promise.resolve();
+    var l1Chain = setChain;
     dashSessions.forEach(function(s, idx) {
       l1Chain = l1Chain.then(function() {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
@@ -2207,6 +2640,7 @@ function updateDashView() {
     var chart = dashCharts[i];
     if (!chart) continue;
     var src = buildSignalData(DASH_SIGNALS[i], cur, dashChartCols(chart));
+    if (DASH_SIGNALS[i].key === 'press') src = blankPressCpap(src);
     chart.setData(src ? [src.t, src.v] : [[], []], false);
     chart.setScale('x', {min: cur.min, max: cur.max});
   }
@@ -2216,11 +2650,15 @@ function updateDashView() {
 /* Build a single uPlot panel for one signal into container `el`. */
 function makeDashPanel(sig, el, cur) {
   var src = buildSignalData(sig, cur, dashChartCols(null, el));
+  if (sig.key === 'press') src = blankPressCpap(src);
   var data = src ? [src.t, src.v] : [[], []];
   /* Y scale: no sig.y -> fully auto; both bounds -> fixed; only min (max null)
-   * -> hard floor with a dynamic top (used by Snore, floored at 0). */
+   * -> hard floor with a dynamic top (used by Snore, floored at 0).
+   * Pressure is special: framed around CPAP set/relief lines when present. */
   var yScaleOpts;
-  if (!sig.y) {
+  if (sig.key === 'press') {
+    yScaleOpts = { auto: true, range: pressYRange };
+  } else if (!sig.y) {
     yScaleOpts = { auto: true };
   } else if (sig.y.max == null) {
     var floor = sig.y.min;
@@ -2252,6 +2690,7 @@ function makeDashPanel(sig, el, cur) {
     },
     legend: { show: false },
     hooks: {
+      draw: (sig.key === 'press') ? [pressDrawHook] : (sig.key === 'flow' ? [breathEventsHook] : []),
       ready: [function(u) { attachDashInteractions(u, el, sig); attachDashTooltip(u, el, sig); }],
       setScale: [function(u, key) {
         if (key !== 'x' || dashIsPanning || dashProgrammaticScale) return;
@@ -2704,12 +3143,28 @@ window.onload = function() {
     initStatsCharts();
     statusTimer = setInterval(pollStatus, 3000);
   }
-  // Set today's date for dashboard
-  var today = new Date();
+  // Dashboard: open it by default (STA mode) and load the latest day with data.
   var picker = document.getElementById('session-date');
-  if (picker) {
-    picker.value = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
-    updateDateDisplayLabel(picker.value);
+  var today = new Date();
+  var todayIso = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
+  if (!PORTAL_MODE) {
+    switchTab('dashboard');
+    fetchDays().then(function(days) {
+      if (days.length) {
+        var latestIso = dayToIso(days[days.length - 1].day);
+        if (picker) picker.value = latestIso;
+        updateDateDisplayLabel(latestIso);
+        loadSessionData();
+      } else {
+        /* No data yet — show today with an empty state. */
+        if (picker) picker.value = todayIso;
+        updateDateDisplayLabel(todayIso);
+        dashSetStatus('No sessions recorded yet');
+      }
+    });
+  } else if (picker) {
+    picker.value = todayIso;
+    updateDateDisplayLabel(todayIso);
   }
   /* Defer service worker registration to avoid competing for HTTP sockets during boot. */
   if ('serviceWorker' in navigator) setTimeout(function() { navigator.serviceWorker.register('/sw.js'); }, 3000);

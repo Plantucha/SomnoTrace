@@ -1857,6 +1857,93 @@ static int64_t lookup_drift(const session_drift_entry_t *entries, int n_entries,
     return resolved_drift_ms;
 }
 
+/* Build a JSON summary for one noon-day from its Summary spool, for the
+ * dashboard. Reuses the same protobuf parser and physical-unit scaling as the
+ * STR.edf export, so values match OSCAR/SleepHQ. Returns:
+ *   - ESP_OK and *out_json (caller frees) on success
+ *   - ESP_ERR_NOT_FOUND if the day has no spool yet
+ *
+ * Physical conversion (raw spool int = physical × 100 for these fields):
+ *   indices/pressure/resp-rate  → raw × 0.01
+ *   leak (stored L/s × 100)     → raw × 0.6  (= L/min)
+ * Metric percentile sub-indices: pressure/resp median=2 p95=3 max=4;
+ *   leak median=2 p70=3 p95=4 max=5. */
+esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
+{
+    if (!noon_day || !out_json) return ESP_ERR_INVALID_ARG;
+    *out_json = NULL;
+
+    char spool_path[300];
+    snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, noon_day);
+    size_t spool_len = 0;
+    uint8_t *spool_data = read_bin_file(spool_path, &spool_len);
+    if (!spool_data || spool_len == 0) {
+        free(spool_data);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
+    if (!ctx) { free(spool_data); return ESP_ERR_NO_MEM; }
+    pb_iter(spool_data, spool_len, summary_field_cb, ctx);
+    free(spool_data);
+
+    /* Total usage (mask-on) minutes and session count from SessionModeEntries. */
+    int64_t usage_min = 0;
+    for (int i = 0; i < ctx->n_session_entries; i++) {
+        usage_min += ctx->session_entries[i].duration_min;
+    }
+    if (usage_min == 0 && ctx->has_scalar[SUM_F_DURATION_MIN]) {
+        usage_min = ctx->scalars[SUM_F_DURATION_MIN];
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) { free(ctx); return ESP_ERR_NO_MEM; }
+
+    cJSON_AddStringToObject(root, "day", noon_day);
+    cJSON_AddNumberToObject(root, "sessions", ctx->n_session_entries);
+    cJSON_AddNumberToObject(root, "usage_min", (double)usage_min);
+
+    /* Indices (events/hr): raw × 0.01. -1 sentinel → null. */
+    #define ADD_INDEX(key, field) do { \
+        int16_t r = get_scalar(ctx, field, -1); \
+        if (r < 0) cJSON_AddNullToObject(root, key); \
+        else cJSON_AddNumberToObject(root, key, r * 0.01); \
+    } while (0)
+    ADD_INDEX("ahi",  SUM_F_AHI);
+    ADD_INDEX("ai",   SUM_F_AI);
+    ADD_INDEX("hi",   SUM_F_HI);
+    ADD_INDEX("oai",  SUM_F_OAI);
+    ADD_INDEX("cai",  SUM_F_CAI);
+    ADD_INDEX("uai",  SUM_F_UAI);
+    ADD_INDEX("rera", SUM_F_RIN);
+    #undef ADD_INDEX
+
+    /* Percentile groups. factor: pressure/resp = 0.01 cmH2O/bpm; leak = 0.6 L/min. */
+    #define ADD_STAT3(key, field, s_med, s_p95, s_max, factor) do { \
+        cJSON *o = cJSON_CreateObject(); \
+        int16_t m = get_metric(ctx, field, s_med, -1); \
+        int16_t p = get_metric(ctx, field, s_p95, -1); \
+        int16_t x = get_metric(ctx, field, s_max, -1); \
+        if (m < 0) cJSON_AddNullToObject(o, "median"); else cJSON_AddNumberToObject(o, "median", m * (factor)); \
+        if (p < 0) cJSON_AddNullToObject(o, "p95");    else cJSON_AddNumberToObject(o, "p95",    p * (factor)); \
+        if (x < 0) cJSON_AddNullToObject(o, "max");    else cJSON_AddNumberToObject(o, "max",    x * (factor)); \
+        cJSON_AddItemToObject(root, key, o); \
+    } while (0)
+    ADD_STAT3("pressure",  SUM_F_MEAN_MASK_PRESS, 2, 3, 4, 0.01);
+    ADD_STAT3("epap",      SUM_F_EXP_PRESS,       2, 3, 4, 0.01);
+    ADD_STAT3("resp_rate", SUM_F_RESP_RATE,       2, 3, 4, 0.01);
+    /* Leak percentiles: median=2, p95=4, max=5. */
+    ADD_STAT3("leak",      SUM_F_LEAK,            2, 4, 5, 0.6);
+    #undef ADD_STAT3
+
+    char *js = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    free(ctx);
+    if (!js) return ESP_ERR_NO_MEM;
+    *out_json = js;
+    return ESP_OK;
+}
+
 /* Generate multi-record STR.edf from per-day summary spool files.
  * Scans .somnotrace/sessions/summaries/ for *.spool files, parses each into a
  * daily STR record, and writes them all into a single STR.edf at

@@ -37,6 +37,21 @@ esp_err_t sessions_list_handler(httpd_req_t *req);
  *   &start_ms=X&end_ms=Y  (zoom — raw L0 for time range) */
 esp_err_t session_graph_handler(httpd_req_t *req);
 
-/* GET /api/session/file?session=ID&date=YYYYMMDD&type=brp|brp_mm|pld|sa2
+/* GET /api/session/file?session=ID&date=YYYYMMDD&type=brp|brp_mm|pld|sa2|events
  * Streams the raw .snt file as application/octet-stream. */
 esp_err_t session_file_handler(httpd_req_t *req);
+
+/* GET /api/days
+ * Returns JSON array of noon-days that have session data, e.g.
+ * [{"day":"20260719","sessions":2}, ...] sorted ascending. */
+esp_err_t days_list_handler(httpd_req_t *req);
+
+/* GET /api/summary?date=YYYYMMDD
+ * Returns the day's summary metrics (AHI/indices, usage, leak/pressure/EPAP/
+ * resp-rate percentiles) parsed from the AS11 Summary spool. 404 if none. */
+esp_err_t summary_handler(httpd_req_t *req);
+
+/* GET /api/session/settings?session=ID&date=YYYYMMDD
+ * Returns therapy mode + pressure/EPR settings parsed from the session's
+ * settings.json, for the pressure-panel rendering (CPAP flat lines). */
+esp_err_t session_settings_handler(httpd_req_t *req);

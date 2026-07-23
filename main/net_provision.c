@@ -1532,7 +1532,7 @@ static esp_err_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 36;
+    config.max_uri_handlers = 42;
     config.stack_size = 8192;
     config.max_open_sockets = 10;
     /* Allocate the httpd worker task's stack from PSRAM to free internal RAM.
@@ -1626,10 +1626,16 @@ static esp_err_t start_webserver(void)
     httpd_uri_t session_graph = { .uri = "/api/session/graph", .method = HTTP_GET, .handler = session_graph_handler };
     httpd_uri_t session_file  = { .uri = "/api/session/file", .method = HTTP_GET, .handler = session_file_handler };
     httpd_uri_t session_file_head = { .uri = "/api/session/file", .method = HTTP_HEAD, .handler = session_file_handler };
+    httpd_uri_t days_list     = { .uri = "/api/days", .method = HTTP_GET, .handler = days_list_handler };
+    httpd_uri_t summary_uri   = { .uri = "/api/summary", .method = HTTP_GET, .handler = summary_handler };
+    httpd_uri_t sess_settings = { .uri = "/api/session/settings", .method = HTTP_GET, .handler = session_settings_handler };
     httpd_register_uri_handler(s_httpd, &sessions_list);
     httpd_register_uri_handler(s_httpd, &session_graph);
     httpd_register_uri_handler(s_httpd, &session_file);
     httpd_register_uri_handler(s_httpd, &session_file_head);
+    httpd_register_uri_handler(s_httpd, &days_list);
+    httpd_register_uri_handler(s_httpd, &summary_uri);
+    httpd_register_uri_handler(s_httpd, &sess_settings);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */

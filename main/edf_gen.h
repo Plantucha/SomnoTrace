@@ -75,6 +75,13 @@
  *                    to correct for AS11 clock skew.  Stream .snt data is
  *                    already NTP-timestamped and needs no adjustment.
  */
+/* Build a per-noon-day JSON summary (AHI/indices, usage, leak/pressure/EPAP/
+ * resp-rate percentiles, session count) from that day's Summary spool, in
+ * physical units matching STR.edf/OSCAR. On success returns ESP_OK and sets
+ * *out_json to a malloc'd string (caller frees). Returns ESP_ERR_NOT_FOUND if
+ * the day has no spool. noon_day is "YYYYMMDD". */
+esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json);
+
 esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                            int64_t start_epoch_ms, int64_t end_epoch_ms,
                            int64_t clock_drift_ms);
