@@ -2520,8 +2520,8 @@ function breathEventsHook(u) {
   var halo = cssVar('--card-bg');    /* background-coloured outline so labels pop */
   ctx.save();
   ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
-  /* Labels are ~1.5x larger on phones — 13px was unreadable on a small screen. */
-  var fpx = (window.innerWidth <= 600) ? 20 : 13;
+  /* Labels are larger on phones — 13px was unreadable on a small screen. */
+  var fpx = (window.innerWidth <= 600) ? 24 : 13;
   ctx.font = '700 ' + Math.round(fpx * pr) + 'px sans-serif';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
@@ -2573,6 +2573,12 @@ function loadDashboardData() {
   var noonDay = noonDayStr(dateStr);
   dashNoonDay = noonDay;
   clearSummary();
+  /* Reset per-day state before any async fetches complete to prevent
+   * stale data from a previous day being used by renderSummary() when
+   * the spool fetch resolves before the sessions fetch. */
+  dashSessionData = [];
+  dashEvents = [];
+  dashEventsLoaded = false;
   loadSummary(noonDay, dashLoadId + 1);   /* loadId matches the increment below */
 
   /* Cancel any in-flight load */
