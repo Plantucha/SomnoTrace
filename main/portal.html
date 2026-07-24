@@ -226,7 +226,7 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .info-value{font-weight:600;font-size:.85rem}
 
 /* ── Logs Tab ──────────────────────────────────────────────────── */
-.logs-container{display:flex;flex-direction:column;flex:1;min-height:380px;height:calc(100vh - 120px)}
+.logs-container{display:flex;flex-direction:column;flex:1;min-height:380px;height:calc(100vh - 120px);height:calc(100dvh - 120px)}
 .logs-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap}
 .logs-search{background:var(--input-bg);border:1px solid var(--border-color);color:var(--text);padding:8px 12px;border-radius:6px;outline:none;font-size:.85rem;width:220px}
 .logs-search:focus{border-color:var(--input-focus)}
@@ -261,7 +261,8 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 }
 @media(max-width:600px){
 header{flex-direction:column;height:auto;padding:10px 12px;gap:6px}
-.nav-tabs{width:100%;justify-content:space-between;padding:0 2px}
+.nav-tabs{width:100%;gap:2px;padding:0}
+.nav-tabs .tab-btn{flex:1;justify-content:center;padding:8px 2px;font-size:.82rem}
 .theme-selector{align-self:flex-end}
 main{padding:8px}
 .card{padding:14px}
@@ -269,10 +270,11 @@ main{padding:8px}
  * plotting area (every pixel counts on a narrow screen). */
 .dashboard-charts-panel{padding:10px 4px}
 .save-footer{flex-direction:column;align-items:stretch;padding:12px;bottom:8px}
-.logs-container{height:calc(100vh - 145px);min-height:340px}
+.logs-container{height:calc(100vh - 145px);height:calc(100dvh - 145px);min-height:340px}
 }
 body.fixed-height {
-  height: 100vh;
+  height: 100vh;    /* fallback for browsers without dvh */
+  height: 100dvh;   /* dynamic viewport height — excludes the mobile address/nav bars */
   overflow: hidden;
 }
 body.fixed-height main {
@@ -299,8 +301,8 @@ SomnoTrace
 <span class="setup-badge" id="setup-badge">Setup Mode</span>
 </a>
 <div class="nav-tabs" id="nav-tabs">
-<button class="tab-btn" onclick="switchTab('dashboard')">Dashboard</button>
-<button class="tab-btn active" onclick="switchTab('tab-status')">Status</button>
+<button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+<button class="tab-btn" onclick="switchTab('tab-status')">Status</button>
 <button class="tab-btn" onclick="switchTab('logs')">Logs</button>
 <button class="tab-btn" onclick="switchTab('actions')">Actions</button>
 <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
@@ -574,7 +576,7 @@ Save &amp; Reboot
 </section>
 
 <!-- ═══════════════ DASHBOARD TAB ═══════════════ -->
-<section id="dashboard" class="tab-content sta-only">
+<section id="dashboard" class="tab-content active sta-only">
 <div class="dashboard-header">
 <div class="date-nav-wrap" style="position:relative">
 <div class="date-navigator">
@@ -615,7 +617,7 @@ Save &amp; Reboot
 </section>
 
 <!-- ═══════════════ STATUS TAB ═══════════════ -->
-<section id="tab-status" class="tab-content active sta-only">
+<section id="tab-status" class="tab-content sta-only">
 <div class="status-grid">
 <div class="card info-list">
 <div class="card-title">System Status</div>
@@ -2303,14 +2305,17 @@ function renderSummary() {
   var sum = dashSummary;
   if (!sum) { clearSummary(); return; }
   var idx = computeEventIndices();
-  /* Pressure/EPAP/resp/leak: prefer PLD-channel values (match OSCAR/SleepHQ),
-   * fall back to the summary spool until the PLD stream is loaded. */
-  var press = computePldStats('press')    || sum.pressure;
-  var epap  = computePldStats('eprPress') || sum.epap;
-  var resp  = computePldStats('respRate') || sum.resp_rate;
-  var leak  = computePldStats('leak')     || sum.leak;
+  /* Client-side PLD/event values only — no spool fallback. This avoids showing
+   * a misleading intermediate value (e.g. spool AHI / mean-mask pressure) that
+   * then changes once the PLD stream and events finish loading. Everything
+   * reads '--' until it can be computed; usage comes from the summary spool and
+   * is accurate immediately. */
+  var press = computePldStats('press');
+  var epap  = computePldStats('eprPress');
+  var resp  = computePldStats('respRate');
+  var leak  = computePldStats('leak');
 
-  var ahi = idx ? idx.ahi : sum.ahi;
+  var ahi = idx ? idx.ahi : null;
   setStat('stat-ahi', num(ahi, 2));
   var ab = ahiBadge(ahi); setBadge('stat-ahi-badge', ab.cls, ab.txt);
   setStat('stat-usage', fmtUsage(sum.usage_min));
@@ -2321,10 +2326,10 @@ function renderSummary() {
   var brk = document.getElementById('dash-breakdown');
   if (brk) {
     var rows = [
-      { lbl: 'Obstructive (OA)', v: idx ? idx.oai : sum.oai, c: '#10b981' },
-      { lbl: 'Central (CA)',     v: idx ? idx.cai : sum.cai, c: '#22d3ee' },
-      { lbl: 'Hypopnea (H)',     v: idx ? idx.hi  : sum.hi,  c: '#8b5cf6' },
-      { lbl: 'RERA',             v: idx ? idx.rera: sum.rera,c: '#ec4899' }
+      { lbl: 'Obstructive (OA)', v: idx ? idx.oai : null, c: '#10b981' },
+      { lbl: 'Central (CA)',     v: idx ? idx.cai : null, c: '#22d3ee' },
+      { lbl: 'Hypopnea (H)',     v: idx ? idx.hi  : null, c: '#8b5cf6' },
+      { lbl: 'RERA',             v: idx ? idx.rera: null, c: '#ec4899' }
     ];
     brk.innerHTML = rows.map(function(r){
       return '<div class="dash-brk-row"><span class="sw" style="background:' + r.c + '"></span>' +
@@ -2337,10 +2342,11 @@ function renderSummary() {
   /* Stats table */
   var tb = document.getElementById('dash-stats-body');
   if (tb) {
+    /* Always render all rows so the table layout is stable; cells read '--'
+     * until the PLD stream is loaded. */
     function statRow(label, g) {
-      if (!g) return '';
-      return '<tr><td>' + label + '</td><td>' + num(g.median) + '</td><td>' + num(g.p95) +
-             '</td><td>' + num(g.max) + '</td></tr>';
+      return '<tr><td>' + label + '</td><td>' + num(g && g.median) + '</td><td>' + num(g && g.p95) +
+             '</td><td>' + num(g && g.max) + '</td></tr>';
     }
     tb.innerHTML =
       statRow('Pressure (cmH\u2082O)', press) +
@@ -2514,7 +2520,9 @@ function breathEventsHook(u) {
   var halo = cssVar('--card-bg');    /* background-coloured outline so labels pop */
   ctx.save();
   ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
-  ctx.font = '700 ' + Math.round(13 * pr) + 'px sans-serif';
+  /* Labels are ~1.5x larger on phones — 13px was unreadable on a small screen. */
+  var fpx = (window.innerWidth <= 600) ? 20 : 13;
+  ctx.font = '700 ' + Math.round(fpx * pr) + 'px sans-serif';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
   ctx.lineJoin = 'round';
@@ -2523,7 +2531,7 @@ function breathEventsHook(u) {
    * top/mid/bottom spreading SleepHQ uses. Isolated events reset to the top. */
   var lanes = [top + 6 * pr, top + hgt * 0.34, top + hgt * 0.64];
   var lastCx = -1e9, lastLane = -1;
-  var proximity = 22 * pr;
+  var proximity = (fpx + 10) * pr;
   for (var i = 0; i < dashEvents.length; i++) {
     var ev = dashEvents[i];
     if (ev.t1 < xmin || ev.t0 > xmax) continue;
