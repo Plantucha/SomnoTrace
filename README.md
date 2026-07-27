@@ -50,14 +50,18 @@ Flash and install from https://github.com/ilyakruchinin/SomnoTrace/releases
 These are "pre-releases" distributed as binary firmware images.
 Source code will be made available soon.
 
+## Implemented features
+- **Browser-based data visualisation (basic)** — built-in web interface for viewing
+  therapy graphs and reports directly from the device. No need for third-party
+  tools like OSCAR; basic charts available through a browser, which covers
+  the needs of 90+% of users. For advanced charts - uploading to SMB/SleepHQ
+  is fully automated.
+
 ## Planned features
 
 - **Viatom O2 Ring S support** — BLE oximetry data collection from the
   Viatom/O2 Ring S pulse oximeter, with NTP-corrected timestamps for perfect
   alignment with CPAP therapy data.
-- **Browser-based data visualisation** — built-in web interface for viewing
-  therapy graphs and reports directly from the device. No need for third-party
-  tools like OSCAR; all charts available through a browser.
 - **Therapy interruption alarm** — configurable sound alert if therapy stops
   during the night (e.g. mask removed and not put back on), so you don't lose
   half a night of treatment without knowing.
