@@ -42,6 +42,14 @@ and uploads them to SMB and/or SleepHQ — no SD card required.
 3. On therapy stop, collects summary spools and generates standard EDF files.
 4. Uploads files to a configured SMB share and/or SleepHQ automatically.
 
+## Web UI
+<img width="1346" height="1100" alt="image" src="https://github.com/user-attachments/assets/953748c4-4f96-4d44-a925-9ef701b63558" />
+
+## Did you know - binary pre-releases are already available! Flash it and try it.
+Flash and install from https://github.com/ilyakruchinin/SomnoTrace/releases
+These are "pre-releases" distributed as binary firmware images.
+Source code will be made available soon.
+
 ## Planned features
 
 - **Viatom O2 Ring S support** — BLE oximetry data collection from the
