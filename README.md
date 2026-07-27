@@ -1,5 +1,7 @@
 # SomnoTrace
 
+A successor to https://github.com/ilyakruchinin/CPAP-AutoSync.
+
 An open-source ESP32-S3 bridge that pulls sleep-therapy data from a ResMed
 AirSense 11 CPAP machine over Bluetooth Low Energy, writes standard EDF files,
 and uploads them to SMB and/or SleepHQ — no SD card required in your AirSense.
