@@ -2325,9 +2325,37 @@ function num(v, dec) { return (v == null || isNaN(v)) ? '--' : v.toFixed(dec == 
  * event COUNTS ÷ usage hours (calcs.cpp: ahi = cnt / hours) — not from the
  * AS11 summary-spool indices, which are only stored at 0.1/hr resolution.
  * Returns null (→ spool fallback) until events + usage are available. */
+/* Usage minutes, matching OSCAR's Day::total_time() / Day::hours():
+ * the sum of each session's *data* span, with zero-length sessions excluded —
+ * not the summary spool's Duration field, which counts the machine's mask-on
+ * time and can read 1-2 min higher (it also includes sessions that produced no
+ * data at all).  Session data is stored in whole 60 s records, so each gated
+ * session contributes (samples / samples-per-record) minutes.
+ * Returns null until the PLD streams are loaded. */
+function computeUsageMin() {
+  if (!dashSessionData || !dashSessionData.length) return null;
+  var total = 0, any = false;
+  for (var i = 0; i < dashSessionData.length; i++) {
+    var rec = dashSessionData[i];
+    if (!rec || rec.noTherapy) continue;
+    var pld = rec.pld;
+    if (!pld || !pld.t || pld.t.length < 2) continue;
+    var msPerRec = pld.t[1] - pld.t[0];
+    if (!(msPerRec > 0)) continue;
+    var spr = Math.max(1, Math.round(60000 / msPerRec));
+    var mins = Math.floor(pld.t.length / spr);
+    if (mins <= 0) continue;          /* zero-length session — OSCAR skips it */
+    total += mins;
+    any = true;
+  }
+  return any ? total : null;
+}
+
 function computeEventIndices() {
-  if (!dashEventsLoaded || !dashSummary || !dashSummary.usage_min) return null;
-  var h = dashSummary.usage_min / 60;
+  if (!dashEventsLoaded) return null;
+  var usage = computeUsageMin();
+  if (!usage) return null;
+  var h = usage / 60;
   if (h <= 0) return null;
   var oa=0, ca=0, hh=0, a=0, rera=0;
   for (var i = 0; i < dashEvents.length; i++) {
@@ -2420,8 +2448,12 @@ function renderSummary() {
   var ahi = idx ? idx.ahi : null;
   setStat('stat-ahi', num(ahi, 2));
   var ab = ahiBadge(ahi); setBadge('stat-ahi-badge', ab.cls, ab.txt);
-  setStat('stat-usage', fmtUsage(sum.usage_min));
-  setStat('stat-leak', leak && leak.mean != null ? num(leak.mean, 1) + ' L/min' : '--');
+  /* Usage from the session data spans (OSCAR's definition), not the spool. */
+  var usageMin = computeUsageMin();
+  setStat('stat-usage', usageMin != null ? fmtUsage(usageMin) : '--');
+  /* 2 decimals: leak averages are often well under 1 L/min, where 1 decimal
+   * hides real differences (0.6248 shows as "0.6" instead of "0.62"). */
+  setStat('stat-leak', leak && leak.mean != null ? num(leak.mean, 2) + ' L/min' : '--');
   setStat('stat-press', press && press.median != null ? num(press.median, 1) + ' cmH\u2082O' : '--');
 
   /* Event breakdown (computed indices preferred over spool) */
