@@ -1880,6 +1880,97 @@ var DASH_SIGNALS = [
     minKey:null, maxKey:null,            color:'--color-snore',     y:{min:0,max:null},   height:200, decimals:2 }
 ];
 
+/* ── AS11 data-gating window ────────────────────────────────────────────
+ * The AS11's own BRP/PLD/SA2 files span its internal data-gating window, not
+ * the whole therapy session: they start at the _ZLE (Zero Leak Estimate)
+ * rising edge and stop at the falling edge.  Our .snt capture spans the wider
+ * TherapyStart→TherapyStop interval, so it includes ~50 s of pre-therapy
+ * pressure ramp whose high leak values skew averages and percentiles.
+ * Trimming to the same window is what makes the dashboard agree with what
+ * OSCAR/SleepHQ compute from the AS11's EDF files.
+ *
+ * IMPORTANT: this mirrors the boundary logic in main/edf_gen.c
+ * (find_zle_edge_time() + the skip/max block in the session EDF generator).
+ * If the gating rule changes there, update it here too — the two are
+ * deliberately independent so the web UI never depends on export-time output.
+ *
+ * Parse one session's events.snt (JSONL) into a gating window.
+ * Start = first _ZLE rising edge (value=1), falling back to MaskOn.
+ * End   = last _ZLE falling edge (value=0), falling back to the last MaskOff.
+ * Timestamps use the ms-precision reportTime plus the session's NTP drift
+ * (the injected ntpTimeMs is only second-granular). */
+function parseSessionGate(text, driftMs) {
+  var g = { start: null, end: null, gated: false };
+  if (!text) return g;
+  var d = driftMs || 0;
+  var rise = null, fall = null, maskOn = null, maskOff = null;
+  var lines = text.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i].trim();
+    if (!ln) continue;
+    var msg; try { msg = JSON.parse(ln); } catch (e) { continue; }
+    var p = msg && msg.params;
+    if (!p || !Array.isArray(p.events)) continue;
+    for (var j = 0; j < p.events.length; j++) {
+      var ev = p.events[j];
+      if (!ev) continue;
+      var t = Date.parse(ev.reportTime);
+      if (isNaN(t)) continue;
+      t += d;
+      if (p.dataId === '_ZLE' && typeof ev.value === 'number') {
+        if (ev.value === 1) { if (rise === null) rise = t; }   /* first rising */
+        else if (ev.value === 0) { fall = t; }                  /* last falling */
+      }
+      if (ev.event === 'MaskOn' && maskOn === null) maskOn = t;
+      if (ev.event === 'MaskOff') maskOff = t;
+    }
+  }
+  g.start = (rise !== null) ? rise : maskOn;
+  g.end   = (fall !== null) ? fall : maskOff;
+  g.gated = (g.start !== null);
+  return g;
+}
+
+/* Trim a parsed .snt object to the gating window, in sample-index space so it
+ * matches convert_snt_to_edf() exactly:
+ *   skip    = round((gateStart - startMs) / msPerRec)
+ *   maxN    = round((gateEnd - gateStart) / msPerRec)   (no end trim if absent)
+ *   total   = min(available, maxN)     <- availability can bind when BLE
+ *                                         packets were lost / capture cut short
+ *   records = floor(total / spr)       <- partial trailing record dropped,
+ *                                         as AS11 does not zero-pad
+ * Returns a view-sliced copy, the original object when nothing to trim, or
+ * null when not even one complete 60 s record survives. */
+function gateTrim(parsed, gate) {
+  if (!parsed || !parsed.t || !gate || gate.start == null) return parsed;
+  var t = parsed.t, n = t.length;
+  if (n < 2) return parsed;
+  var msPerRec = t[1] - t[0];
+  if (!(msPerRec > 0)) return parsed;
+  var spr = Math.max(1, Math.round(60000 / msPerRec));
+  var skip = Math.round((gate.start - t[0]) / msPerRec);
+  if (skip < 0) skip = 0;
+  if (skip > n) skip = n;
+  var avail = n - skip;
+  var total = avail;
+  if (gate.end != null) {
+    var maxN = Math.round((gate.end - gate.start) / msPerRec);
+    if (maxN < total) total = maxN;
+  }
+  var keep = Math.floor(total / spr) * spr;
+  if (keep <= 0) return null;
+  if (skip === 0 && keep === n) return parsed;
+  var out = {};
+  for (var k in parsed) {
+    var v = parsed[k];
+    if (v && v.length === n && typeof v.subarray === 'function')
+      out[k] = v.subarray(skip, skip + keep);
+    else
+      out[k] = v;
+  }
+  return out;
+}
+
 /* Resolve a signal's stroke color: literal hex passes through, a leading '--'
  * is looked up as a theme CSS variable so panels follow day/night switching. */
 function sigColor(sig) {
@@ -1923,15 +2014,24 @@ function dashSetStatus(m) { var e = document.getElementById('dash-status'); if (
 
 /* Compute the full time range from the session manifest (not from data arrays).
  * This is stable and does not change as data arrives. */
+/* Full x-axis range for the day. Uses each session's AS11 gating window when
+ * known so the axis matches the trimmed data (and OSCAR's view); falls back to
+ * the manifest's TherapyStart/Stop before the gates have loaded. Sessions with
+ * no therapy are excluded. */
 function dashFullRange() {
   if (!dashSessions.length) return null;
   var lo = Infinity, hi = -Infinity;
   for (var i = 0; i < dashSessions.length; i++) {
     var s = dashSessions[i];
     if (!s.start_epoch_ms) continue;
-    if (s.start_epoch_ms < lo) lo = s.start_epoch_ms;
-    var end = s.end_epoch_ms || s.start_epoch_ms;
-    if (end > hi) hi = end;
+    var d = dashSessionData && dashSessionData[i];
+    if (d && d.noTherapy) continue;
+    var gate = d && d.gate;
+    var st = (gate && gate.start != null) ? gate.start : s.start_epoch_ms;
+    var en = (gate && gate.end != null) ? gate.end
+                                       : (s.end_epoch_ms || s.start_epoch_ms);
+    if (st < lo) lo = st;
+    if (en > hi) hi = en;
   }
   if (hi === -Infinity) return null;
   return {min: lo, max: hi};
@@ -2098,6 +2198,7 @@ function buildSignalData(sig, range, cols) {
   var slices = [];
   for (var i = 0; i < dashSessionData.length; i++) {
     var rec = dashSessionData[i];
+    if (rec && rec.noTherapy) continue;
     var sd = rec ? rec[sig.src] : null;
     if (!sd || !sd.ready || !sd.t || !sd.t.length || !sd[sig.ch]) continue;
     if (sd.t[sd.t.length - 1] < vMin || sd.t[0] > vMax) continue;
@@ -2280,6 +2381,7 @@ function computePldStats(key) {
   if (!dashSessionData) return null;
   var vals = [];
   for (var i = 0; i < dashSessionData.length; i++) {
+    if (dashSessionData[i] && dashSessionData[i].noTherapy) continue;
     var pld = dashSessionData[i] && dashSessionData[i].pld;
     var arr = pld && pld[key];
     if (!arr) continue;
@@ -2482,24 +2584,38 @@ function parseSessionEvents(text, driftMs, out) {
     }
   }
 }
-/* Fetch + parse events for all sessions of the day, then redraw. Decoupled
- * from the main data load (like loadSummary); events are tiny. */
+/* Fetch each session's events.snt once and derive both the respiratory-event
+ * overlay and the AS11 data-gating window from it.  Returns a promise so the
+ * caller can await the gates before fetching waveform data — the gates must be
+ * known before the first paint so graphs and statistics are never shown
+ * ungated (and never visibly change once gating arrives). Events are tiny. */
 function loadEvents(noonDay, loadId) {
   dashEvents = [];
   dashEventsLoaded = false;
-  if (!dashSessions || !dashSessions.length) return;
+  if (!dashSessions || !dashSessions.length) return Promise.resolve();
   var chain = Promise.resolve();
-  dashSessions.forEach(function(s) {
+  dashSessions.forEach(function(s, idx) {
     chain = chain.then(function() {
       if (loadId !== dashLoadId) return;
       return fetch('/api/session/file?session=' + s.id + '&date=' + noonDay + '&type=events')
         .then(function(r){ return r.ok ? r.text() : null; }).catch(function(){ return null; });
     }).then(function(txt) {
       if (loadId !== dashLoadId) return;
-      parseSessionEvents(txt, s.clock_drift_ms || 0, dashEvents);
+      var drift = s.clock_drift_ms || 0;
+      parseSessionEvents(txt, drift, dashEvents);
+      var gate = parseSessionGate(txt, drift);
+      if (dashSessionData && dashSessionData[idx]) {
+        dashSessionData[idx].gate = gate;
+        /* No gating signal at all and less than one full 60 s record of
+         * breathing data means the AS11 never delivered therapy (e.g. therapy
+         * started then SmartStop fired seconds later).  It writes no files for
+         * such sessions, so exclude them here too. */
+        dashSessionData[idx].noTherapy =
+          (!gate.gated && (s.brp_samples || 0) < 1500);
+      }
     });
   });
-  chain.then(function() {
+  return chain.then(function() {
     if (loadId !== dashLoadId) return;
     dashEvents.sort(function(a, b){ return a.t0 - b.t0; });
     dashEventsLoaded = true;
@@ -2618,12 +2734,13 @@ function loadDashboardData() {
       return;
     }
 
-    /* Events overlay (decoupled, tiny): fetch + parse in the background. */
-    loadEvents(noonDay, myLoadId);
-
     /* Initialize per-session data slots. Each holds two independent sources:
      * brp (flow + pressure, 25 Hz) and pld (leak/snore/flowlim, 0.5 Hz). */
     dashSessionData = dashSessions.map(function() { return {brp: null, pld: null}; });
+
+    /* Events overlay + per-session gating windows (tiny files). Awaited before
+     * any waveform fetch so every sample is gated from the first paint. */
+    var gateChain = loadEvents(noonDay, myLoadId);
 
     /* Full range is derived from the manifest, not from data */
     var full = dashFullRange();
@@ -2637,7 +2754,7 @@ function loadDashboardData() {
     /* Step 0: per-session therapy settings (mode / set pressure / EPR) for the
      * pressure panel's CPAP flat lines. Tiny JSON; fetched first so the flat
      * lines and pressure y-range are correct from the first waveform paint. */
-    var setChain = Promise.resolve();
+    var setChain = gateChain;
     dashSessions.forEach(function(s, idx) {
       setChain = setChain.then(function() {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
@@ -2657,11 +2774,12 @@ function loadDashboardData() {
     dashSessions.forEach(function(s, idx) {
       l1Chain = l1Chain.then(function() {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
+        if (dashSessionData[idx].noTherapy) return;
         return fetchSntFile(s.id, noonDay, 'brp_mm');
       }).then(function(buf) {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
         if (buf) {
-          var parsed = parseSntBrp(buf);
+          var parsed = gateTrim(parseSntBrp(buf), dashSessionData[idx].gate);
           if (parsed && parsed.t.length) {
             dashSessionData[idx].brp = parsed;
             updateDashView();
@@ -2681,11 +2799,12 @@ function loadDashboardData() {
       dashSessions.forEach(function(s, idx) {
         pldChain = pldChain.then(function() {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
+          if (dashSessionData[idx].noTherapy) return;
           return fetchSntFile(s.id, noonDay, 'pld');
         }).then(function(buf) {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
           if (buf) {
-            var parsed = parseSntPld(buf);
+            var parsed = gateTrim(parseSntPld(buf), dashSessionData[idx].gate);
             if (parsed && parsed.t.length) {
               dashSessionData[idx].pld = parsed;
               updateDashView();
@@ -2710,11 +2829,12 @@ function loadDashboardData() {
       dashSessions.forEach(function(s, idx) {
         l0Chain = l0Chain.then(function() {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
+          if (dashSessionData[idx].noTherapy) return;
           return fetchSntFile(s.id, noonDay, 'brp');
         }).then(function(buf) {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
           if (buf) {
-            var parsed = parseSntBrp(buf);
+            var parsed = gateTrim(parseSntBrp(buf), dashSessionData[idx].gate);
             if (parsed && parsed.t.length) {
               dashSessionData[idx].brp = parsed;  /* replace L1 with L0 */
               updateDashView();
