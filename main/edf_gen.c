@@ -630,18 +630,26 @@ static int64_t find_mask_off_time(const char *events_snt_path)
     return mask_off_ms;
 }
 
-/* Find the first _ZLE ValueChange rising-edge timestamp in events.snt.
+/* Find a _ZLE ValueChange edge timestamp in events.snt.
  * _ZLE is boolean: value=1 (rising edge) means the AS11 starts accepting
- * valid flow data; value=0 (falling edge) means it stops.  We only match
- * the rising edge (value=1) for EDF start alignment.
+ * valid flow data; value=0 (falling edge) means it stops.  The AS11's own
+ * BRP/PLD/SA2 files span exactly this gating window, so the rising edge marks
+ * the EDF start and the falling edge marks the EDF end.
  *
- * Returns NTP epoch ms (from the injected "ntpTimeMs" field), or -1 if
- * no rising-edge _ZLE is found.  Unlike find_mask_on_time() which returns
- * AS11-clock time and requires clock_drift_ms compensation, this returns
- * NTP time directly because the timestamp is captured at notification receipt.
+ * want_value selects the edge: 1 returns the *first* rising edge, 0 returns
+ * the *last* falling edge (a session may gate on and off more than once).
+ *
+ * Returns NTP epoch ms, or -1 if no matching edge is found.
+ *
+ * Timestamp source: the drift-corrected "reportTime" is preferred because it
+ * carries millisecond precision, whereas the injected "ntpTimeMs" is only
+ * second-granular (it always ends in 000) and throws away up to a second of
+ * start/end alignment.  "ntpTimeMs" is used as a fallback when reportTime is
+ * missing or unparseable.
  *
  * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
-static int64_t find_zle_time(const char *events_snt_path)
+static int64_t find_zle_edge_time(const char *events_snt_path, int want_value,
+                                  int64_t clock_drift_ms)
 {
     FILE *f = fopen(events_snt_path, "r");
     if (!f) return -1;
@@ -660,16 +668,32 @@ static int64_t find_zle_time(const char *events_snt_path)
                 if (events && cJSON_IsArray(events)) {
                     cJSON *ev = cJSON_GetArrayItem(events, 0);
                     if (ev) {
-                        /* Only match rising edge: value == 1 */
                         cJSON *val = cJSON_GetObjectItem(ev, "value");
                         if (val && cJSON_IsNumber(val) &&
-                            (int)val->valuedouble == 1) {
-                            cJSON *ntp = cJSON_GetObjectItem(ev, "ntpTimeMs");
-                            if (ntp && cJSON_IsNumber(ntp)) {
-                                zle_ms = (int64_t)ntp->valuedouble;
-                                cJSON_Delete(msg);
-                                fclose(f);
-                                return zle_ms;
+                            (int)val->valuedouble == want_value) {
+                            int64_t cand = -1;
+                            /* Prefer ms-precision reportTime (AS11 clock). */
+                            cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
+                            if (rt && cJSON_IsString(rt)) {
+                                int64_t as11_ms =
+                                    parse_iso8601_utc_ms(rt->valuestring);
+                                if (as11_ms > 0)
+                                    cand = as11_ms + clock_drift_ms;
+                            }
+                            if (cand < 0) {
+                                cJSON *ntp = cJSON_GetObjectItem(ev, "ntpTimeMs");
+                                if (ntp && cJSON_IsNumber(ntp))
+                                    cand = (int64_t)ntp->valuedouble;
+                            }
+                            if (cand > 0) {
+                                zle_ms = cand;
+                                /* Rising edge: first match wins. */
+                                if (want_value == 1) {
+                                    cJSON_Delete(msg);
+                                    fclose(f);
+                                    return zle_ms;
+                                }
+                                /* Falling edge: keep scanning for the last. */
                             }
                         }
                     }
@@ -680,6 +704,25 @@ static int64_t find_zle_time(const char *events_snt_path)
     }
     fclose(f);
     return zle_ms;
+}
+
+/* Duration (ms) → sample count, rounded to the NEAREST sample.
+ *
+ * These were previously floor-truncated, which discarded up to a full sample
+ * at each boundary.  At 0.5 Hz that is a whole 2 s PLD sample, which shifted
+ * the leak/pressure series by one sample and moved derived statistics
+ * (average leak, large-leak time) relative to the AS11's own export. */
+static inline uint32_t ms_to_samples_25hz(int64_t ms)
+{
+    return (ms <= 0) ? 0 : (uint32_t)((ms * 25 + 500) / 1000);
+}
+static inline uint32_t ms_to_samples_1hz(int64_t ms)
+{
+    return (ms <= 0) ? 0 : (uint32_t)((ms + 500) / 1000);
+}
+static inline uint32_t ms_to_samples_pld(int64_t ms)   /* 0.5 Hz = one per 2 s */
+{
+    return (ms <= 0) ? 0 : (uint32_t)((ms + 1000) / 2000);
 }
 
 /* Convert one .snt file to an EDF file.
@@ -1520,22 +1563,40 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
                                  int16_t *mask_on_extra, int16_t *mask_off_extra,
                                  int64_t period_start_ms, int64_t clock_drift_ms)
 {
-    /* Summary timestamps are in AS11 time.  STR.edf is deliberately exported
-     * in NTP time so its session intervals match the NTP-based EDF headers,
-     * filenames, and event annotations. */
-    int64_t ntp_period_start_ms = period_start_ms + clock_drift_ms;
+    /* Summary timestamps are in AS11 time.  The MaskOn/MaskOff *values* are
+     * deliberately exported in NTP time so their session intervals match the
+     * NTP-based EDF headers, filenames, and event annotations (OSCAR matches
+     * sessions to STR mask events within a ~1 minute window).
+     *
+     * The noon-day *bucket*, however, must be decided from the RAW AS11 clock.
+     * The AS11 sets PeriodStart to exactly noon in its own clock; applying the
+     * NTP drift first (typically -8 min) lands it at 11:5x, which tripped the
+     * "before noon" test below and rolled every record back a full day —
+     * producing Date-1 and MaskOn/MaskOff +1440.  Values above 1440 exceed the
+     * signal's declared physical maximum, and OSCAR discards any mask on/off
+     * pair over 24*60 as card corruption, losing all STR session times.
+     * Rationale: same as str_day_record_t.period_start_as11 below. */
+    time_t day_t = (time_t)(period_start_ms / 1000);
+    struct tm day_tm;
+    localtime_r(&day_t, &day_tm);
+    if (day_tm.tm_hour < 12) day_t -= 86400;
+    localtime_r(&day_t, &day_tm);
 
-    /* [0] Date: days from Unix epoch (noon-based NTP day of PeriodStart) */
-    time_t t = (time_t)(ntp_period_start_ms / 1000);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    if (tm.tm_hour < 12) t -= 86400;
+    /* [0] Date: days from Unix epoch (noon-based day of PeriodStart).
+     * Snap to exactly local noon so MaskOn/MaskOff are true minutes from noon
+     * rather than minutes from a drift-shifted instant. */
+    day_tm.tm_hour = 12;
+    day_tm.tm_min = 0;
+    day_tm.tm_sec = 0;
+    day_tm.tm_isdst = -1;
+    time_t noon_t = mktime(&day_tm);
+
     struct tm epoch_tm = { .tm_year = 70, .tm_mon = 0, .tm_mday = 1,
                            .tm_hour = 0, .tm_min = 0, .tm_sec = 0 };
     time_t epoch_t = mktime(&epoch_tm);
-    str_values[0] = (int16_t)((t - epoch_t) / 86400);
+    str_values[0] = (int16_t)((noon_t - epoch_t) / 86400);
 
-    int64_t noon_epoch_ms = (int64_t)t * 1000;
+    int64_t noon_epoch_ms = (int64_t)noon_t * 1000;
 
     /* [1-3] MaskOn/MaskOff/MaskEvents from session entries.
      * Each session entry has: ts = MaskOn timestamp, duration_min = session
@@ -3032,14 +3093,18 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     int64_t maskon_start_ms = start_epoch_ms;
     uint32_t brp_skip = 0, sa2_skip = 0, pld_skip = 0;
     uint32_t brp_max = 0, sa2_max = 0, pld_max = 0;
+    /* True once a real data-gating signal (_ZLE rising or MaskOn) was found.
+     * When false the AS11 never began delivering gated flow data. */
+    bool therapy_gated = false;
     {
-        int64_t zle_ntp = find_zle_time(events_snt_path);
+        int64_t zle_ntp = find_zle_edge_time(events_snt_path, 1, clock_drift_ms);
         if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms) {
             maskon_start_ms = zle_ntp;
+            therapy_gated = true;
             int64_t skip_ms = zle_ntp - start_epoch_ms;
-            brp_skip = (uint32_t)(skip_ms * 25 / 1000);   /* 25 Hz */
-            sa2_skip = (uint32_t)(skip_ms * 1 / 1000);     /* 1 Hz */
-            pld_skip = (uint32_t)(skip_ms / 2000);         /* 0.5 Hz */
+            brp_skip = ms_to_samples_25hz(skip_ms);
+            sa2_skip = ms_to_samples_1hz(skip_ms);
+            pld_skip = ms_to_samples_pld(skip_ms);
             ESP_LOGI(TAG, "_ZLE: ntp=%lld skip_ms=%lld "
                          "brp_skip=%u sa2_skip=%u pld_skip=%u",
                      (long long)zle_ntp, (long long)skip_ms,
@@ -3061,10 +3126,11 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                 int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
                 if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
                     maskon_start_ms = maskon_ntp;
+                    therapy_gated = true;
                     int64_t skip_ms = maskon_ntp - start_epoch_ms;
-                    brp_skip = (uint32_t)(skip_ms * 25 / 1000);   /* 25 Hz */
-                    sa2_skip = (uint32_t)(skip_ms * 1 / 1000);     /* 1 Hz */
-                    pld_skip = (uint32_t)(skip_ms / 2000);         /* 0.5 Hz */
+                    brp_skip = ms_to_samples_25hz(skip_ms);
+                    sa2_skip = ms_to_samples_1hz(skip_ms);
+                    pld_skip = ms_to_samples_pld(skip_ms);
                     ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
                                  "brp_skip=%u sa2_skip=%u pld_skip=%u",
                              (long long)maskon_as11, (long long)maskon_ntp,
@@ -3084,34 +3150,83 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
             }
         }
 
-        /* MaskOff timestamp (for BRP/PLD/SA2 end truncation).
-         * AS11 EDF data spans MaskOn→MaskOff, but .snt captures TherapyStart→
-         * TherapyStop.  We need to truncate the tail to match MaskOff. */
-        int64_t maskoff_as11 = find_mask_off_time(events_snt_path);
-        if (maskoff_as11 > 0) {
-            int64_t maskoff_ntp = maskoff_as11 + clock_drift_ms;
-            if (maskoff_ntp > maskon_start_ms && maskoff_ntp < end_epoch_ms) {
-                int64_t dur_ms = maskoff_ntp - maskon_start_ms;
-                brp_max = (uint32_t)(dur_ms * 25 / 1000);   /* 25 Hz */
-                sa2_max = (uint32_t)(dur_ms * 1 / 1000);     /* 1 Hz */
-                pld_max = (uint32_t)(dur_ms / 2000);         /* 0.5 Hz */
-                ESP_LOGI(TAG, "MaskOff: as11=%lld ntp=%lld dur_ms=%lld "
+        /* BRP/PLD/SA2 end timestamp (for end truncation).
+         * AS11 EDF data spans exactly the _ZLE gating window, but .snt
+         * captures TherapyStart→TherapyStop, so the tail must be truncated.
+         *
+         * Prefer the _ZLE falling edge — the symmetric counterpart of the
+         * rising edge used for the start, in the same clock domain.  Fall back
+         * to the last MaskOff only when no falling edge is present.  MaskOff
+         * alone is unreliable: many sessions emit no MaskOff event at all
+         * (e.g. SmartStop), in which case end truncation silently never ran
+         * and the file simply ended wherever the .snt capture stopped. */
+        int64_t end_ntp = find_zle_edge_time(events_snt_path, 0, clock_drift_ms);
+        const char *end_src = "_ZLE-falling";
+        if (end_ntp <= 0) {
+            int64_t maskoff_as11 = find_mask_off_time(events_snt_path);
+            if (maskoff_as11 > 0) {
+                end_ntp = maskoff_as11 + clock_drift_ms;
+                end_src = "MaskOff";
+            }
+        }
+        if (end_ntp > 0) {
+            if (end_ntp > maskon_start_ms && end_ntp <= end_epoch_ms) {
+                int64_t dur_ms = end_ntp - maskon_start_ms;
+                brp_max = ms_to_samples_25hz(dur_ms);
+                sa2_max = ms_to_samples_1hz(dur_ms);
+                pld_max = ms_to_samples_pld(dur_ms);
+                ESP_LOGI(TAG, "end (%s): ntp=%lld dur_ms=%lld "
                              "brp_max=%u sa2_max=%u pld_max=%u",
-                         (long long)maskoff_as11, (long long)maskoff_ntp,
-                         (long long)dur_ms,
+                         end_src, (long long)end_ntp, (long long)dur_ms,
                          (unsigned)brp_max, (unsigned)sa2_max,
                          (unsigned)pld_max);
             } else {
-                ESP_LOGW(TAG, "MaskOff NTP time %lld out of range "
-                             "[%lld, %lld], no end truncation",
-                         (long long)maskoff_ntp,
+                ESP_LOGW(TAG, "end (%s) NTP time %lld out of range "
+                             "(%lld, %lld], no end truncation",
+                         end_src, (long long)end_ntp,
                          (long long)maskon_start_ms,
                          (long long)end_epoch_ms);
             }
         } else {
-            ESP_LOGI(TAG, "MaskOff not found in events.snt, no end truncation");
+            ESP_LOGI(TAG, "no _ZLE falling edge or MaskOff in events.snt, "
+                          "no end truncation");
         }
     }
+    /* ── Aborted session with no therapy: emit no per-session files ──
+     * The AS11 writes no DATALOG files at all for a session where the mask was
+     * never detected as on and no gated flow data was produced (e.g. therapy
+     * started then SmartStop fired seconds later).  Previously we still emitted
+     * header-only 0-record BRP/PLD/SA2 files while skipping EVE/CSL — breaking
+     * an invariant the AS11 holds without exception (all 31 zero-record
+     * sessions in a reference export carry a matching EVE+CSL pair) and adding
+     * a spurious session to the day.
+     *
+     * Both conditions are required.  A session with no gating signal but a
+     * meaningful amount of data (e.g. an older recording, or one where the
+     * _ZLE/MaskOn subscription was not accepted) is still exported, since the
+     * AS11 would have written files for it and discarding it would lose real
+     * data.  "Meaningful" = at least one full 60 s data record of BRP samples. */
+    bool no_therapy = false;
+    if (!therapy_gated) {
+        char brp_snt[300];
+        snprintf(brp_snt, sizeof(brp_snt), "%s/%s_brp.snt", session_dir, session_id);
+        FILE *bf = fopen(brp_snt, "rb");
+        uint32_t brp_samples = 0;
+        if (bf) {
+            snt_header_t bhdr;
+            if (snt_read_header(bf, &bhdr) == ESP_OK)
+                brp_samples = bhdr.sample_count;
+            fclose(bf);
+        }
+        if (brp_samples < 1500) {       /* < one 60 s record at 25 Hz */
+            no_therapy = true;
+            ESP_LOGI(TAG, "session %s: no _ZLE/MaskOn and only %u BRP samples "
+                          "(<1500) — no therapy delivered, skipping all "
+                          "per-session EDF files", session_id,
+                     (unsigned)brp_samples);
+        }
+    }
+
     char maskon_date[16], maskon_time[16];
     format_edf_datetime(maskon_start_ms, maskon_date, sizeof(maskon_date),
                         maskon_time, sizeof(maskon_time));
@@ -3161,7 +3276,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     int errors = 0;
 
     /* ── Generate BRP.edf (25 Hz breath waveform) ── */
-    {
+    if (!no_therapy) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, maskon_ts_prefix);
@@ -3184,7 +3299,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     }
 
     /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
-    {
+    if (!no_therapy) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
@@ -3226,7 +3341,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
      * limitation and cannot be fixed by firmware changes.
      * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
-    {
+    if (!no_therapy) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
@@ -3298,29 +3413,18 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * one data record (60 seconds).  Match this behaviour by checking
      * the BRP .snt sample count — if it's less than one record's worth
      * (1500 samples at 25 Hz), skip EVE/CSL generation. */
-    bool session_too_short = false;
-    {
-        char brp_snt[300];
-        snprintf(brp_snt, sizeof(brp_snt), "%s/%s_brp.snt", session_dir, session_id);
-        FILE *bf = fopen(brp_snt, "rb");
-        if (bf) {
-            snt_header_t bhdr;
-            if (snt_read_header(bf, &bhdr) == ESP_OK) {
-                int brp_spr = 1500;  /* BRP samples per 60s record */
-                if (bhdr.sample_count < (uint32_t)brp_spr) {
-                    session_too_short = true;
-                    ESP_LOGI(TAG, "session %s too short (%u BRP samples < %d), "
-                             "skipping EVE/CSL", session_id,
-                             (unsigned)bhdr.sample_count, brp_spr);
-                }
-            }
-            fclose(bf);
-        }
-    }
-
     /* ── Generate EVE.edf from events.snt ──
-     * Both event onsets and the EDF header use NTP-corrected time. */
-    if (!session_too_short) {
+     * Both event onsets and the EDF header use NTP-corrected time.
+     *
+     * These are written for every exported session, including very short ones.
+     * EVE/CSL are EDF+D annotation files whose records are event-driven rather
+     * than fixed-duration, so a sub-60 s session still gets its "Recording
+     * starts" record — which is exactly what the AS11 does (verified: all 31
+     * zero-record sessions in a reference export have EVE+CSL, none omit them).
+     * The previous "session too short" skip was based on the opposite, and
+     * incorrect, assumption.  Sessions with no therapy at all are excluded
+     * earlier via no_therapy, which drops the whole session. */
+    if (!no_therapy) {
         char eve_path[350];
         snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
         if (generate_eve_edf(eve_path, events_snt_path,
