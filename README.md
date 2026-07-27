@@ -53,6 +53,7 @@ These are "pre-releases" distributed as binary firmware images.
 Source code will be made available soon.
 
 ## Implemented features
+- **Uploads to SMB and/or SleepHQ (automatic)** - starts immediately after therapy ends.
 - **Browser-based data visualisation (basic)** — built-in web interface for viewing
   therapy graphs and reports directly from the device. No need for third-party
   tools like OSCAR; basic charts available through a browser, which covers
