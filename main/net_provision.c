@@ -1560,7 +1560,7 @@ static esp_err_t start_webserver(void)
     config.lru_purge_enable = true;
     config.max_uri_handlers = 42;
     config.stack_size = 8192;
-    config.max_open_sockets = 13;
+    config.max_open_sockets = 24;
     config.recv_wait_timeout = 2;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
     config.keep_alive_enable = true;    /* detect dead connections via TCP probes */
