@@ -37,6 +37,7 @@
 static const char *TAG = "sd_storage";
 
 static bool s_mounted = false;
+static sdmmc_card_t *s_card = NULL;
 
 esp_err_t sd_storage_init(void)
 {
@@ -80,6 +81,7 @@ esp_err_t sd_storage_init(void)
     }
 
     s_mounted = true;
+    s_card = card;
 
     sdmmc_card_print_info(stdout, card);
 
@@ -105,4 +107,37 @@ esp_err_t sd_storage_init(void)
 bool sd_storage_is_ready(void)
 {
     return s_mounted;
+}
+
+esp_err_t sd_storage_format(void)
+{
+    if (!s_mounted || !s_card) {
+        ESP_LOGE(TAG, "format: SD card not mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGW(TAG, "format: formatting SD card — ALL DATA WILL BE LOST");
+
+    /* esp_vfs_fat_sdcard_format() unmounts, formats (f_mkfs), and remounts
+     * the filesystem at the same mount point.  The card handle remains valid. */
+    esp_err_t ret = esp_vfs_fat_sdcard_format(SD_MOUNT_POINT, s_card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "format: esp_vfs_fat_sdcard_format failed: %s", esp_err_to_name(ret));
+        s_mounted = false;
+        return ret;
+    }
+
+    /* Recreate the SomnoTrace directory tree (format wipes everything). */
+    mkdir(SD_APP_DIR, 0775);
+    mkdir(SD_SESSIONS_DIR, 0775);
+    mkdir(SD_STREAMS_DIR, 0775);
+    mkdir(SD_SUMMARIES_DIR, 0775);
+    mkdir(SD_LOG_DIR, 0775);
+    mkdir(SD_UPLOAD_STATE_DIR, 0775);
+    mkdir(SD_SDCARD_DIR, 0775);
+    mkdir(SD_SDCARD_DATALOG, 0775);
+    mkdir(SD_SDCARD_SETTINGS, 0775);
+
+    ESP_LOGI(TAG, "format: SD card formatted and directory tree recreated");
+    return ESP_OK;
 }

@@ -196,6 +196,17 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .dash-cal-day.selected{background:var(--primary);color:#fff}
 .dash-cal-day .dot{position:absolute;left:50%;bottom:4px;transform:translateX(-50%);width:5px;height:5px;border-radius:50%;background:var(--primary)}
 .dash-cal-day.selected .dot{background:#fff}
+/* Loading progress bar */
+.dash-progress-wrap{margin:12px 0;display:none}
+.dash-progress-track{height:6px;background:var(--input-bg);border-radius:3px;overflow:hidden;position:relative}
+.dash-progress-fill{height:100%;background:var(--primary);border-radius:3px;transition:width .3s ease;width:0%}
+.dash-progress-fill.shimmer{background:linear-gradient(90deg,var(--primary) 25%,var(--primary-glow) 50%,var(--primary) 75%);background-size:200% 100%;animation:progShimmer 1.4s linear infinite;width:100%}
+@keyframes progShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.dash-progress-label{font-size:.78rem;color:var(--text-muted);margin-top:5px;display:flex;justify-content:space-between;align-items:center}
+.dash-progress-label .pct{font-weight:600;color:var(--text)}
+.dash-progress-wrap.error .dash-progress-fill{background:var(--danger)}
+.dash-progress-wrap.error .dash-progress-label{color:var(--danger)}
+@media(max-width:600px){.dash-progress-wrap.sticky{position:sticky;top:56px;z-index:90;background:var(--card-bg);padding:8px 12px;margin:0 -12px 10px;border-bottom:1px solid var(--card-border);border-radius:0}}
 /* Summary breakdown + stats */
 .dash-summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:600px){.dash-summary-grid{grid-template-columns:1fr}}
@@ -597,6 +608,10 @@ Save &amp; Reboot
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Leak Rate</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green" id="stat-leak-badge">--</span></div>
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Median Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange" id="stat-press-badge">--</span></div>
 </div>
+<div id="dash-progress" class="dash-progress-wrap">
+<div class="dash-progress-track"><div class="dash-progress-fill" id="dash-progress-fill"></div></div>
+<div class="dash-progress-label"><span id="dash-progress-text"></span><span class="pct" id="dash-progress-pct"></span></div>
+</div>
 <div class="card" id="dash-summary" style="display:none;padding:16px">
 <div class="dash-summary-grid">
 <div>
@@ -719,6 +734,14 @@ Maintenance Actions
 <div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes everything under /somnotrace/ (SDCARD + .somnotrace) and clears upload state</div>
 </div>
 <button class="btn btn-danger" onclick="execAction('reset-all','RESET EVERYTHING? This will permanently delete ALL data on the SD card: EDF files, session data, upload state — everything under /somnotrace/. This cannot be undone. Continue?')">Reset ALL</button>
+</div>
+
+<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--danger);border-radius:8px;background:rgba(248,113,113,.05)">
+<div>
+<div style="font-weight:600;font-size:.9rem;color:var(--danger)">Format SD Card (Destructive)</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Formats the SD card to FAT32. ALL data is permanently erased — no recovery possible</div>
+</div>
+<button class="btn btn-danger" onclick="execAction('format-sd','FORMAT SD CARD? This will erase EVERYTHING on the card by reformatting it to FAT32. All session data, EDF files, logs, and upload state will be permanently lost — not even data recovery tools can restore a formatted card. The device will need to record new data from scratch. This action cannot be undone.\\n\\nAre you absolutely sure you want to continue?')">Format SD</button>
 </div>
 
 </div>
@@ -2012,6 +2035,71 @@ function noonDayStr(s) { return s ? s.replace(/-/g, '') : ''; }
 function dashChartWidth(el) { var w = el.clientWidth; return (w && w > 0) ? w : 320; }
 function dashSetStatus(m) { var e = document.getElementById('dash-status'); if (e) e.textContent = m; }
 
+/* ── Loading progress bar ────────────────────────────────────────
+ * Visible between the stat cards and the summary card.  Shows a
+ * shimmer during indeterminate phases (events/settings), then a
+ * determinate percentage as waveform files download.  On mobile
+ * (<=600px) the bar sticks below the header so it stays visible
+ * even when the user has scrolled into the chart area. */
+function dashProgShow(label, pct, sticky) {
+  var wrap = document.getElementById('dash-progress');
+  if (!wrap) return;
+  wrap.style.display = 'block';
+  wrap.classList.remove('error');
+  if (sticky) wrap.classList.add('sticky'); else wrap.classList.remove('sticky');
+  var fill = document.getElementById('dash-progress-fill');
+  var txt  = document.getElementById('dash-progress-text');
+  var pc   = document.getElementById('dash-progress-pct');
+  if (fill) { fill.classList.remove('shimmer'); fill.style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+  if (txt) txt.textContent = label;
+  if (pc)  pc.textContent  = Math.round(pct) + '%';
+}
+function dashProgShimmer(label) {
+  var wrap = document.getElementById('dash-progress');
+  if (!wrap) return;
+  wrap.style.display = 'block';
+  wrap.classList.remove('error');
+  wrap.classList.add('sticky');
+  var fill = document.getElementById('dash-progress-fill');
+  var txt  = document.getElementById('dash-progress-text');
+  var pc   = document.getElementById('dash-progress-pct');
+  if (fill) { fill.classList.add('shimmer'); }
+  if (txt) txt.textContent = label;
+  if (pc)  pc.textContent  = '';
+}
+function dashProgError(msg) {
+  var wrap = document.getElementById('dash-progress');
+  if (!wrap) return;
+  wrap.style.display = 'block';
+  wrap.classList.add('error');
+  var fill = document.getElementById('dash-progress-fill');
+  var txt  = document.getElementById('dash-progress-text');
+  var pc   = document.getElementById('dash-progress-pct');
+  if (fill) { fill.classList.remove('shimmer'); fill.style.width = '100%'; }
+  if (txt) txt.textContent = msg;
+  if (pc)  pc.textContent  = '';
+}
+function dashProgDone(label) {
+  var wrap = document.getElementById('dash-progress');
+  if (!wrap) return;
+  wrap.style.display = 'block';
+  wrap.classList.remove('sticky', 'error');
+  var fill = document.getElementById('dash-progress-fill');
+  var txt  = document.getElementById('dash-progress-text');
+  var pc   = document.getElementById('dash-progress-pct');
+  if (fill) { fill.classList.remove('shimmer'); fill.style.width = '100%'; }
+  if (txt) txt.textContent = '';
+  if (pc)  pc.textContent  = '';
+}
+function dashProgHide() {
+  var wrap = document.getElementById('dash-progress');
+  if (!wrap) return;
+  wrap.style.display = 'none';
+  wrap.classList.remove('sticky', 'error');
+  var fill = document.getElementById('dash-progress-fill');
+  if (fill) fill.classList.remove('shimmer');
+}
+
 /* Compute the full time range from the session manifest (not from data arrays).
  * This is stable and does not change as data arrives. */
 /* Full x-axis range for the day. Uses each session's AS11 gating window when
@@ -2741,9 +2829,11 @@ function loadDashboardData() {
     renderDashboardCharts();
     loadEvents(noonDay, myLoadId);
     dashIsLoading = false;
+    dashProgDone();
     return;
   }
 
+  dashProgShimmer('Loading...');
   dashSetStatus('Loading...');
   fetch('/api/sessions?date=' + noonDay).then(function(r){
     if (!r.ok) return r.text().then(function(t){ throw new Error('sessions '+r.status+': '+t); });
@@ -2761,10 +2851,22 @@ function loadDashboardData() {
       dashSessionData = [];
       dashEvents = [];
       dashSetStatus('No sessions');
+      dashProgHide();
       renderDashboardCharts();
       dashIsLoading = false;
       return;
     }
+
+    /* Count sessions that will fetch waveform data (exclude noTherapy).
+     * Used for weighted progress bar across the 3 file-fetch phases. */
+    var nFetch = 0;
+    dashSessions.forEach(function(s, idx) {
+      if (!(dashSessionData[idx] && dashSessionData[idx].noTherapy)) nFetch++;
+    });
+    if (nFetch === 0) nFetch = 1;  /* avoid div-by-zero */
+    /* Phase weights: overview 20%, pld 5%, detail 70% (brp L0 is the bulk).
+     * Events+settings share the first 5% (shimmer phase). */
+    var W_EVENTS = 5, W_BRP_MM = 20, W_PLD = 5, W_BRP = 70;
 
     /* Initialize per-session data slots. Each holds two independent sources:
      * brp (flow + pressure, 25 Hz) and pld (leak/snore/flowlim, 0.5 Hz). */
@@ -2781,6 +2883,7 @@ function loadDashboardData() {
     /* Render the empty panel stack with the correct axis range up front, so
      * each panel appears in its final position and fills in as data arrives. */
     dashSetStatus('Loading overview...');
+    dashProgShimmer('Preparing...');
     renderDashboardCharts();
 
     /* Step 0: per-session therapy settings (mode / set pressure / EPR) for the
@@ -2798,7 +2901,8 @@ function loadDashboardData() {
       });
     });
     /* Rebuild panels once settings are in so pressure flat-lines/range apply. */
-    setChain = setChain.then(function(){ if (myLoadId === dashLoadId) renderDashboardCharts(); });
+    var l1Done = 0;
+    setChain = setChain.then(function(){ if (myLoadId === dashLoadId) { renderDashboardCharts(); dashProgShow('Loading overview...', W_EVENTS, true); } });
 
     /* Step 1: BRP L1 MinMax overview (flow + pressure) sequentially per
      * session. The time axis is set once from the manifest and never moves. */
@@ -2817,16 +2921,22 @@ function loadDashboardData() {
             updateDashView();
           }
         }
+        l1Done++;
+        if (myLoadId === dashLoadId)
+          dashProgShow('Loading overview...', W_EVENTS + W_BRP_MM * l1Done / nFetch, true);
       });
     });
 
     return l1Chain.then(function() {
       if (myLoadId !== dashLoadId) return;  /* cancelled */
       dashSetStatus('Loading leak/snore...');
+      if (myLoadId === dashLoadId)
+        dashProgShow('Loading leak/snore...', W_EVENTS + W_BRP_MM, true);
 
       /* Step 2: PLD (leak, flow limit, snore) — one small 0.5 Hz file per
        * session, no MinMax tier needed. Fetched after the breathing overview
        * so those panels light up early. */
+      var pldDone = 0;
       var pldChain = Promise.resolve();
       dashSessions.forEach(function(s, idx) {
         pldChain = pldChain.then(function() {
@@ -2842,6 +2952,9 @@ function loadDashboardData() {
               updateDashView();
             }
           }
+          pldDone++;
+          if (myLoadId === dashLoadId)
+            dashProgShow('Loading leak/snore...', W_EVENTS + W_BRP_MM + W_PLD * pldDone / nFetch, true);
         });
       });
       return pldChain;
@@ -2853,10 +2966,13 @@ function loadDashboardData() {
         dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
       }
       dashSetStatus('Loading detail...');
+      if (myLoadId === dashLoadId)
+        dashProgShow('Loading detail...', W_EVENTS + W_BRP_MM + W_PLD, true);
 
       /* Step 3: BRP L0 raw (background) — replaces the flow/pressure overview
        * with full-resolution 25 Hz samples for zoom detail. Requests do not
        * begin until all overview data is ready or failed. */
+      var l0Done = 0;
       var l0Chain = Promise.resolve();
       dashSessions.forEach(function(s, idx) {
         l0Chain = l0Chain.then(function() {
@@ -2872,6 +2988,9 @@ function loadDashboardData() {
               updateDashView();
             }
           }
+          l0Done++;
+          if (myLoadId === dashLoadId)
+            dashProgShow('Loading detail...', W_EVENTS + W_BRP_MM + W_PLD + W_BRP * l0Done / nFetch, true);
         });
       });
 
@@ -2882,11 +3001,13 @@ function loadDashboardData() {
         }
         dashSetStatus('');
         dashIsLoading = false;
+        dashProgDone();
       });
     });
   }).catch(function(e){
     if (myLoadId !== dashLoadId) return;
     dashSetStatus('Error: '+e.message);
+    dashProgError('Error: ' + e.message);
     dashIsLoading = false;
     console.error(e);
   });
@@ -3068,17 +3189,40 @@ function dashShowTip(chart, over, sig, clientX, clientY) {
   var tip = ensureTooltip();
   var rect = over.getBoundingClientRect();
   var cx = clientX - rect.left, cy = clientY - rect.top;
-  var idx = chart.posToIdx(cx, cy);
-  if (idx == null) { tip.style.display = 'none'; return; }
-  var ts = chart.data[0][idx];
-  var val = chart.data[1][idx];
+  /* Use posToVal to get the exact timestamp at the cursor's pixel position.
+   * This is a pure scale transform (independent of data distribution), so it
+   * stays accurate even though buildSignalData emits non-uniformly-spaced
+   * arrays with null breaks and duplicate timestamps.  posToIdx's binary
+   * search breaks on that structure, causing progressive drift toward the
+   * right edge.  We then linear-scan for the nearest non-null data point. */
+  var targetTs = chart.posToVal(cx, 'x');
+  if (targetTs == null || isNaN(targetTs)) { tip.style.display = 'none'; return; }
+  var data = chart.data;
+  var bestIdx = -1, bestDist = Infinity;
+  for (var i = 0; i < data[0].length; i++) {
+    var t = data[0][i];
+    if (t == null) continue;
+    var d = Math.abs(t - targetTs);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  if (bestIdx < 0) { tip.style.display = 'none'; return; }
+  var ts = data[0][bestIdx];
+  var val = data[1][bestIdx];
   if (val == null || isNaN(val) || ts == null) { tip.style.display = 'none'; return; }
   var swatch = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + sigColor(sig) + ';margin-right:5px"></span>';
   tip.innerHTML = swatch + sig.label + ': ' + fmtSignalVal(sig, val) +
     '<div style="opacity:.6;margin-top:2px">' + dashTimeFmt(chart)(ts) + '</div>';
   tip.style.display = 'block';
-  tip.style.left = (rect.left + window.pageXOffset + cx + 12) + 'px';
-  tip.style.top = (rect.top + window.pageYOffset + cy - 40) + 'px';
+  /* Position tooltip: default right+12 / above-40.  Flip left if it would
+   * overflow the viewport's right edge; flip below if it would go above 0. */
+  var tipW = tip.offsetWidth, tipH = tip.offsetHeight;
+  var leftPx = rect.left + cx + 12;
+  if (leftPx + tipW > window.innerWidth) leftPx = rect.left + cx - 12 - tipW;
+  if (leftPx < 0) leftPx = 0;
+  var topPx = rect.top + cy - 40;
+  if (topPx < 0) topPx = rect.top + cy + 12;
+  tip.style.left = (window.pageXOffset + leftPx) + 'px';
+  tip.style.top = (window.pageYOffset + topPx) + 'px';
 }
 
 /* Mouse-hover value tooltip (desktop). Touch tooltip is driven by the gesture
@@ -3241,7 +3385,7 @@ function attachDashInteractions(chart, el, sig) {
       /* A tap: two quick taps reset the zoom; a single tap leaves the value
        * shown briefly. */
       var now = Date.now();
-      if (now - lastTapTime < 300) { dashboardZoomReset(); dashHideTip(); lastTapTime = 0; }
+      if (now - lastTapTime < 200) { dashboardZoomReset(); dashHideTip(); lastTapTime = 0; }
       else { lastTapTime = now; setTimeout(dashHideTip, 1500); }
     }
     tMode = null;

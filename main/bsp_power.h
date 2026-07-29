@@ -48,6 +48,14 @@ void bsp_power_start_button_monitor(int hold_ms);
  * lifetime of the task. */
 void bsp_power_start_boot_monitor(volatile bool *softap_flag, int hold_ms);
 
+/* Read battery charge level as a percentage (0-100).
+ * Uses the ADC on GPIO1 (BAT_ADC) with a 2:1 voltage divider (200k/100k).
+ * Returns -1 if the ADC read fails. */
+int bsp_power_battery_percent(void);
+
+/* Returns true if the battery is currently charging (CHG_STAT pin low). */
+bool bsp_power_is_charging(void);
+
 /* Start a background task that monitors the PLUS button (IO4) for
  * double-clicks. On a double-click, sends EnterStandby RPC to stop
  * AS11 therapy (only if therapy is currently active). */

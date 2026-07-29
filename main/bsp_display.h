@@ -13,6 +13,7 @@ void bsp_display_show_number(uint32_t value);
 void bsp_display_show_lines(const char *title, const char *const *lines, int n_lines);
 void bsp_display_set_wifi_connected(bool connected);
 void bsp_display_set_as11_paired(bool paired);
+void bsp_display_set_battery(int percent, bool charging);
 
 /* Therapy graph mode */
 void bsp_display_set_therapy_active(bool active);

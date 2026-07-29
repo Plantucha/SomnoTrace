@@ -123,6 +123,10 @@ static char s_status_title[STATUS_TITLE_LEN];
 static char s_status_lines[MAX_STATUS_LINES][STATUS_LINE_LEN];
 static int  s_status_nlines = 0;
 
+/* Battery indicator state */
+static int s_batt_percent = -1;   /* -1 = unknown/not set */
+static bool s_batt_charging = false;
+
 /* Live flow ring buffer for the therapy graph */
 static float s_flow_buf[FLOW_BUF_SIZE];
 static int   s_flow_head = 0;
@@ -555,6 +559,17 @@ void bsp_display_set_as11_paired(bool paired)
     if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
+void bsp_display_set_battery(int percent, bool charging)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_batt_percent = percent;
+    s_batt_charging = charging;
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
 /* ── Backlight control ─────────────────────────────────────────────── */
 
 void bsp_display_set_brightness(uint8_t percent)
@@ -843,6 +858,48 @@ static void render_graph(void)
     lcd_flush();
 }
 
+/* Draw battery percentage with a small outline icon and optional charging bolt.
+ * Layout: [12×9px battery outline] [N% text]
+ * x,y is the top-left of the battery outline. */
+static void fb_draw_battery_indicator(int x, int y, int percent, bool charging)
+{
+    uint16_t frame_col = rgb565(180, 180, 180);
+    uint16_t bolt_col = rgb565(255, 200, 0);
+
+    /* Text color based on charge level */
+    uint16_t text_col;
+    if (percent < 0) {
+        text_col = rgb565(100, 100, 100);   /* unknown */
+    } else if (percent <= 15) {
+        text_col = rgb565(255, 60, 60);      /* red */
+    } else if (percent <= 30) {
+        text_col = rgb565(255, 180, 0);      /* orange */
+    } else {
+        text_col = rgb565(80, 220, 100);     /* green */
+    }
+
+    /* Battery outline: 10px wide × 8px tall body + 2px terminal nub */
+    fb_fill_rect(x, y + 1, 10, 8, frame_col);        /* outer frame */
+    fb_fill_rect(x + 1, y + 2, 8, 6, rgb565(0, 0, 0)); /* inner cavity */
+    fb_fill_rect(x + 10, y + 3, 2, 4, frame_col);    /* terminal nub */
+
+    /* Charging bolt inside the outline */
+    if (charging) {
+        fb_fill_rect(x + 4, y + 2, 2, 3, bolt_col);
+        fb_fill_rect(x + 3, y + 3, 4, 1, bolt_col);
+        fb_fill_rect(x + 2, y + 4, 6, 1, bolt_col);
+        fb_fill_rect(x + 3, y + 5, 4, 1, bolt_col);
+        fb_fill_rect(x + 4, y + 6, 2, 2, bolt_col);
+    }
+
+    /* Percentage text to the right of the outline */
+    if (percent >= 0) {
+        char pct_str[16];
+        snprintf(pct_str, sizeof(pct_str), "%d%%", percent);
+        fb_draw_string_aa(x + 15, y - 3, &roboto_body, pct_str, text_col);
+    }
+}
+
 /* Render the status screen. Snapshots content under the state mutex, then
  * draws without holding it. RSSI is read live each refresh. */
 static void render_status(void)
@@ -860,6 +917,8 @@ static void render_status(void)
     nlines = s_status_nlines;
     wifi = s_wifi_connected;
     bool as11_paired = s_as11_paired;
+    int batt_pct = s_batt_percent;
+    bool batt_chg = s_batt_charging;
     xSemaphoreGive(s_state_mutex);
 
     const uint16_t bg = rgb565(0, 0, 0);
@@ -875,7 +934,7 @@ static void render_status(void)
         localtime_r(&now, &tm_info);
         char time_str[16];
         strftime(time_str, sizeof(time_str), "%H:%M", &tm_info);
-        fb_draw_string_aa(6, 10, &roboto_body, time_str, rgb565(200, 210, 225));
+        fb_draw_string_aa(6, 9, &roboto_body, time_str, rgb565(200, 210, 225));
     }
 
     fb_draw_wifi_indicator(218, 10, wifi);
@@ -891,6 +950,11 @@ static void render_status(void)
         /* Strap line */
         for (int dx = 0; dx < 14; dx += 3)
             fb_fill_rect(bx + dx, by + 14, 2, 2, icon_col);
+    }
+
+    /* Battery indicator — left of AS11 icon, right of clock area */
+    if (batt_pct >= 0) {
+        fb_draw_battery_indicator(130, 12, batt_pct, batt_chg);
     }
 
     int y = 48;

@@ -107,6 +107,14 @@ void app_main(void)
     const char *boot_lines[] = { "Booting..." };
     show_status("SomnoTrace", boot_lines, 1);
 
+    /* Initial battery reading for the status indicator */
+    {
+        int batt_pct = bsp_power_battery_percent();
+        if (batt_pct >= 0) {
+            bsp_display_set_battery(batt_pct, bsp_power_is_charging());
+        }
+    }
+
     /* 4. Initialise networking stack (includes NVS init). */
     ESP_ERROR_CHECK(netprov_init());
 
@@ -125,8 +133,29 @@ void app_main(void)
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 
     /* 4c. Initialise SD card storage and session writer. Non-fatal. */
-    if (sd_storage_init() != ESP_OK) {
+    esp_err_t sd_ret = sd_storage_init();
+    if (sd_ret != ESP_OK) {
         ESP_LOGE(TAG, "SD card init failed; session storage unavailable");
+        /* Distinguish "no card" from "card present but mount/format error".
+         * ESP_ERR_NOT_FOUND = SDMMC host couldn't probe a card (none inserted).
+         * Other errors (e.g. ESP_ERR_INVALID_STATE, FR_NO_FILESYSTEM) mean
+         * the card is physically present but unusable. */
+        const char *sd_title, *sd_lines[2];
+        int sd_nlines;
+        if (sd_ret == ESP_ERR_NOT_FOUND) {
+            sd_title = "Warning";
+            sd_lines[0] = "Insert SD Card";
+            sd_lines[1] = "Power off, insert card,";
+            sd_nlines = 2;
+        } else {
+            sd_title = "SD Card Error";
+            sd_lines[0] = "Card mount failed";
+            sd_lines[1] = "Check or reformat card";
+            sd_nlines = 2;
+        }
+        show_status(sd_title, sd_lines, sd_nlines);
+        /* Hold the warning for 3 seconds before continuing boot */
+        vTaskDelay(pdMS_TO_TICKS(3000));
     } else {
         session_writer_init();
         session_writer_recover();
@@ -246,6 +275,14 @@ void app_main(void)
                 ESP_LOGW(TAG, "SoftAP 10-minute idle timeout: rebooting to retry connection");
                 esp_restart();
             }
+            /* Update battery indicator in SoftAP mode too */
+            if (++refresh_counter >= 3) {
+                refresh_counter = 0;
+                int batt_pct = bsp_power_battery_percent();
+                if (batt_pct >= 0) {
+                    bsp_display_set_battery(batt_pct, bsp_power_is_charging());
+                }
+            }
         } else if (err == ESP_OK) {
             /* Keep the status content current (IP line). The display render task
              * owns the screen and auto-refreshes RSSI on its own cadence, and it
@@ -256,11 +293,26 @@ void app_main(void)
                 char ip_line[32];
                 snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
 
-                const char *lines[] = {
-                    "Wi-Fi Connected",
-                    ip_line,
-                };
-                bsp_display_show_lines("SomnoTrace", lines, 2);
+                if (sd_storage_is_ready()) {
+                    const char *lines[] = {
+                        "Wi-Fi Connected",
+                        ip_line,
+                    };
+                    bsp_display_show_lines("SomnoTrace", lines, 2);
+                } else {
+                    const char *lines[] = {
+                        "Wi-Fi Connected",
+                        ip_line,
+                        "SD Card Error",
+                    };
+                    bsp_display_show_lines("SomnoTrace", lines, 3);
+                }
+
+                /* Update battery indicator (ADC read + charger status) */
+                int batt_pct = bsp_power_battery_percent();
+                if (batt_pct >= 0) {
+                    bsp_display_set_battery(batt_pct, bsp_power_is_charging());
+                }
             }
         }
     }

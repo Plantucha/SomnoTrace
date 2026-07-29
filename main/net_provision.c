@@ -1449,7 +1449,27 @@ static void recreate_edfs_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* HTTP handler for consolidated actions. Body: {"action":"reset-state|delete-edfs|reset-all|recreate-edfs"} */
+/* Background task for SD card format (destructive).  Runs in a PSRAM-backed
+ * task because esp_vfs_fat_sdcard_format() can take several seconds and must
+ * not block the HTTP handler.  Also resets upload state since all data is gone. */
+static void format_sd_task(void *arg)
+{
+    ESP_LOGW(TAG, "format_sd_task: starting destructive format");
+
+    /* Reset upload state first — all tracked data is about to be destroyed. */
+    uploader_reset_state();
+
+    esp_err_t ret = sd_storage_format();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "format_sd_task: failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "format_sd_task: SD card formatted successfully");
+    }
+
+    vTaskDelete(NULL);
+}
+
+/* HTTP handler for consolidated actions. Body: {"action":"reset-state|delete-edfs|reset-all|recreate-edfs|format-sd"} */
 
 static esp_err_t actions_handler(httpd_req_t *req)
 {
@@ -1497,6 +1517,12 @@ static esp_err_t actions_handler(httpd_req_t *req)
         if (!h) {
             err = ESP_ERR_NO_MEM;
         }
+    } else if (strcmp(action, "format-sd") == 0) {
+        ESP_LOGI(TAG, "action: format SD card (destructive)");
+        TaskHandle_t h = psram_task_create(format_sd_task, "format_sd", 16384, NULL, 5, 1, NULL, NULL);
+        if (!h) {
+            err = ESP_ERR_NO_MEM;
+        }
     } else {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown action");
@@ -1534,7 +1560,13 @@ static esp_err_t start_webserver(void)
     config.lru_purge_enable = true;
     config.max_uri_handlers = 42;
     config.stack_size = 8192;
-    config.max_open_sockets = 10;
+    config.max_open_sockets = 13;
+    config.recv_wait_timeout = 2;       /* close idle keep-alive sockets fast */
+    config.send_wait_timeout = 5;
+    config.keep_alive_enable = true;    /* detect dead connections via TCP probes */
+    config.keep_alive_idle = 5;         /* start probing after 5s idle */
+    config.keep_alive_interval = 5;     /* probe every 5s */
+    config.keep_alive_count = 3;        /* 3 failed probes = dead */
     /* Allocate the httpd worker task's stack from PSRAM to free internal RAM.
      * Safe because no handler performs a flash write on this task (see above). */
     config.task_caps = MALLOC_CAP_SPIRAM;

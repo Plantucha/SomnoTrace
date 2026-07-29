@@ -60,3 +60,9 @@ esp_err_t sd_storage_init(void);
 
 /* Returns true if the SD card is mounted and ready. */
 bool sd_storage_is_ready(void);
+
+/* Format the SD card filesystem (FAT32).  All data on the card is lost.
+ * Unmounts, formats, remounts, and recreates the directory tree.
+ * Must NOT be called from the HTTP handler task — run via a background task.
+ * Returns ESP_OK on success. */
+esp_err_t sd_storage_format(void);
