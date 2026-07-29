@@ -98,7 +98,7 @@ static const ble_uuid128_t UUID_RX =
 #define FIG_VCID_TX_ENC     0x0397           /* encrypted TX (RPC requests) */
 #define FIG_VCID_RX_ENC     0x0396           /* encrypted RX (notifications/responses) */
 
-#define RX_BUF_MAX          4096
+#define RX_BUF_MAX          16384
 #define TX_PAYLOAD_MAX      1024
 
 /* ------------------------------------------------------------------ */
@@ -156,7 +156,7 @@ static volatile int s_connect_status;
 static SemaphoreHandle_t s_resp_sem;  /* JSON RPC response arrived */
 static cJSON *s_resp_json;            /* owned; freed by waiter */
 
-static uint8_t s_rx_buf[RX_BUF_MAX];
+static uint8_t *s_rx_buf;          /* PSRAM-allocated, RX_BUF_MAX bytes */
 static int s_rx_len;
 
 /* Notification processing queue — offloads heavy work from NimBLE host task.
@@ -695,11 +695,18 @@ static void handle_notify(const uint8_t *data, int len)
     memcpy(s_rx_buf + s_rx_len, data, len);
     s_rx_len += len;
 
-    static uint8_t payload[RX_BUF_MAX];
-    static uint8_t decrypted[RX_BUF_MAX];
+    static uint8_t *payload = NULL;
+    static uint8_t *decrypted = NULL;
+    if (!payload)   payload   = heap_caps_malloc(RX_BUF_MAX, MALLOC_CAP_SPIRAM);
+    if (!decrypted) decrypted = heap_caps_malloc(RX_BUF_MAX, MALLOC_CAP_SPIRAM);
+    if (!payload || !decrypted) {
+        ESP_LOGE(TAG, "handle_notify: failed to allocate PSRAM decrypt buffers");
+        s_rx_len = 0;
+        return;
+    }
     uint16_t vcid;
     int n;
-    while ((n = fig_take_packet(payload, sizeof(payload) - 1, &vcid)) >= 0) {
+    while ((n = fig_take_packet(payload, RX_BUF_MAX - 1, &vcid)) >= 0) {
         ESP_LOGD(TAG, "FIG packet received: vcid=0x%04x len=%d", vcid, n);
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, payload, n > 64 ? 64 : n, ESP_LOG_DEBUG);
 
@@ -709,7 +716,7 @@ static void handle_notify(const uint8_t *data, int len)
 
         if (vcid == FIG_VCID_RX_ENC && s_session_encrypted) {
             int dlen = aes_cbc_decrypt(s_session_key, payload, n,
-                                       decrypted, sizeof(decrypted) - 1);
+                                       decrypted, RX_BUF_MAX - 1);
             if (dlen < 0) {
                 ESP_LOGW(TAG, "AES decrypt failed for vcid=0x%04x len=%d", vcid, n);
                 continue;
@@ -2117,6 +2124,17 @@ esp_err_t as11_ble_init(void)
     s_resp_sem   = xSemaphoreCreateBinary();
     s_scan_done  = xSemaphoreCreateBinary();
     if (!s_state_mtx || !s_op_sem || !s_connect_sem || !s_resp_sem || !s_scan_done) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Allocate BLE RX accumulation buffer in PSRAM to avoid exhausting
+     * internal RAM.  The SettingProfiles Get RPC response can exceed 4 KB
+     * after AES-CBC encryption and FIG framing; 16 KB gives ample headroom.
+     * The payload and decrypted buffers in handle_notify() are allocated
+     * lazily on first use (also PSRAM). */
+    s_rx_buf = heap_caps_malloc(RX_BUF_MAX, MALLOC_CAP_SPIRAM);
+    if (!s_rx_buf) {
+        ESP_LOGE(TAG, "init: failed to allocate s_rx_buf in PSRAM");
         return ESP_ERR_NO_MEM;
     }
 
