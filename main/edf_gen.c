@@ -1266,13 +1266,14 @@ static int16_t get_scalar(const summary_ctx_t *ctx, int field, int16_t default_v
     return (int16_t)ctx->scalars[field];
 }
 
-/* Map On/Off string from settings.json to AS11 EDF enum value.
- * AS11 EDF uses: Off=1, On=2 for boolean-like settings. */
+/* Map On/Off/Auto string from settings.json to AS11 EDF enum value.
+ * AS11 EDF uses: Off=1, On=2, Auto=3. */
 static int on_off_to_edf(const char *s)
 {
     if (!s) return -1;
     if (strcmp(s, "On") == 0) return 2;
     if (strcmp(s, "Off") == 0) return 1;
+    if (strcmp(s, "Auto") == 0) return 3;
     return -1;
 }
 
@@ -1414,6 +1415,7 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                 if (v && cJSON_IsString(v)) {
                     if (strcmp(v->valuestring, "On") == 0) str_values[14] = 2;
                     else if (strcmp(v->valuestring, "Plus") == 0) str_values[14] = 1;
+                    else if (strcmp(v->valuestring, "Off") == 0) str_values[14] = 0;
                 }
             }
 
@@ -1451,6 +1453,7 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                 v = cJSON_GetObjectItem(patview, "PatientView");
                 if (v && cJSON_IsString(v)) {
                     if (strcmp(v->valuestring, "Advanced") == 0) str_values[22] = 1;
+                    else if (strcmp(v->valuestring, "Full") == 0) str_values[22] = 1;
                     else if (strcmp(v->valuestring, "Basic") == 0) str_values[22] = 2;
                 }
             }
