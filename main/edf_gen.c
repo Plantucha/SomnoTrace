@@ -1643,7 +1643,8 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
         mask_off_count = 1;
     }
 
-    str_values[3] = (int16_t)(mask_on_count > mask_off_count ? mask_on_count : mask_off_count);
+    int n_pairs = mask_on_count > mask_off_count ? mask_on_count : mask_off_count;
+    str_values[3] = (int16_t)(n_pairs * 2);  /* total mask events (on+off), not pair count */
     return str_values[3];
 }
 
@@ -1804,7 +1805,8 @@ static void build_current_day_record(str_day_record_t *rec,
             mask_off_count = 1;
         }
     }
-    rec->values[3] = (int16_t)(mask_on_count > mask_off_count ? mask_on_count : mask_off_count);
+    int n_pairs = mask_on_count > mask_off_count ? mask_on_count : mask_off_count;
+    rec->values[3] = (int16_t)(n_pairs * 2);  /* total mask events (on+off), not pair count */
 
     /* [4] Duration: minutes from start to end */
     if (end_epoch_ms > start_epoch_ms)
