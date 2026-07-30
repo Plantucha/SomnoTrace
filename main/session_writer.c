@@ -129,9 +129,15 @@ struct session_writer {
      * A dropped BLE notification produces a gap of ~400ms+, which we
      * detect by comparing startTime values.
      *
-     * Compensation strategy (per signal type):
-     *   BRP (25Hz waveform): insert SNT_MISSING sentinels — fabricated data
-     *     could mimic apnea/hypopnea, so missing data must be visible.
+     * Compensation strategy (all signal types): hold previous value.
+     *   BRP (25Hz waveform): gaps are typically 200-400ms (1-2 dropped
+     *     notifications = 5-10 samples).  Breath cycle is ~3-5s, so a
+     *     200-400ms hold is <10% of a cycle and visually indistinguishable
+     *     from real data.  Using sentinels (SNT_MISSING) produces visible
+     *     artifacts in OSCAR/SleepHQ (clamped to dig_min → displayed as
+     *     -120 L/min flow spike).  The AS11 native EDF never has missing
+     *     BRP data (direct SD card write, no BLE), so there is no native
+     *     sentinel convention for BRP.
      *   SA2 (1Hz vitals):    hold previous value — HR/SpO2 change over
      *     minutes; a 200ms-1s gap is clinically negligible.
      *   PLD (0.5Hz metrics):  hold previous value — all PLD signals are
@@ -140,6 +146,9 @@ struct session_writer {
      * See: https://github.com/ilyakruchinin/SomnoTrace/issues/20 */
     int64_t  prev_stream_ms;     /* ms-since-midnight from last startTime */
     bool     prev_stream_ms_valid;  /* false until first notification */
+    int16_t  last_flow;          /* last known Flow for hold-on-gap */
+    int16_t  last_press;         /* last known Press for hold-on-gap */
+    bool     last_brp_valid;     /* true after first BRP sample received */
     int16_t  last_hr;            /* last known HR for hold-on-gap */
     int16_t  last_spo2;          /* last known SpO2 for hold-on-gap */
     int16_t  last_pld[12];       /* last known PLD row for hold-on-gap */
@@ -441,6 +450,7 @@ session_writer_t *session_writer_start(void)
     /* Missing-packet compensation: no previous startTime until first
      * notification arrives; no cached values to hold until first sample. */
     s->prev_stream_ms_valid = false;
+    s->last_brp_valid = false;
     s->last_hr_valid = false;
     s->last_spo2_valid = false;
     s->last_pld_valid = false;
@@ -991,7 +1001,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
      * 200ms) and advances the SA2/PLD decimation counters by 1.
      *
      * Compensation per signal type:
-     *   BRP: insert SNT_MISSING sentinels (waveform integrity — no fabrication)
+     *   BRP: hold previous flow/pressure (short gaps, <10% of breath cycle)
      *   SA2: hold previous HR/SpO2 (slow vitals, change over minutes)
      *   PLD: hold previous row (2s summaries, change slowly)
      *
@@ -1012,13 +1022,15 @@ void session_writer_on_stream_data_raw(const char *json, int len)
                 s->gap_events++;
                 s->gap_missing_total += missing;
 
-                /* BRP: insert 5 SNT_MISSING sentinels per missing notification */
+                /* BRP: hold last flow/pressure for 5 samples per missing
+                 * notification.  Gaps are typically 1-2 notifications
+                 * (200-400ms), which is <10% of a breath cycle. */
                 for (int m = 0; m < missing; m++) {
                     uint32_t base = s->brp_buf_count;
-                    if (base + 5 <= 1500) {
+                    if (base + 5 <= 1500 && s->last_brp_valid) {
                         for (int j = 0; j < 5; j++) {
-                            s->brp_flow[base + j] = SNT_MISSING;
-                            s->brp_press[base + j] = SNT_MISSING;
+                            s->brp_flow[base + j] = s->last_flow;
+                            s->brp_press[base + j] = s->last_press;
                         }
                         s->brp_buf_count = base + 5;
                     }
@@ -1086,6 +1098,15 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         uint32_t added = (uint32_t)n_pairs;
         if (base + added > 1500) added = 1500 - base;
         s->brp_buf_count = base + added;
+        /* Cache last known BRP values for gap hold */
+        if (added > 0) {
+            uint32_t last = base + added - 1;
+            if (last < 1500) {
+                s->last_flow = s->brp_flow[last];
+                s->last_press = s->brp_press[last];
+                s->last_brp_valid = true;
+            }
+        }
     }
 
     /* SA2: HeartRate + SpO2 (1 Hz, decimated from 5 Hz notifications).
