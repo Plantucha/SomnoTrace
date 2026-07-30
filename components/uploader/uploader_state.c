@@ -183,6 +183,9 @@ esp_err_t uploader_state_save(const upload_state_t *state)
     fclose(f);
     free(json_str);
 
+    /* FAT32 rename() fails with EEXIST if the destination already exists,
+     * so remove it first (same pattern as write_bin_atomic in post_therapy.c). */
+    remove(UPLOAD_STATE_PATH);
     if (rename(UPLOAD_STATE_TMP, UPLOAD_STATE_PATH) != 0) {
         ESP_LOGE(TAG, "rename failed: %s", strerror(errno));
         return ESP_FAIL;

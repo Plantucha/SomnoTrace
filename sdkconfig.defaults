@@ -79,7 +79,9 @@ CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 
 # HTTP server: enough URI handlers and header space for the portal
 # Mobile browsers send very long headers during captive-portal detection.
-CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+# Cloudflare Access adds ~1051-char cookies + ~1000-char JWT header, so we
+# need at least ~2600 chars for proxy headers alone plus normal browser headers.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=4096
 CONFIG_HTTPD_MAX_URI_LEN=512
 
 # WebSocket support for real-time log streaming (/api/logs/ws). Frames are
