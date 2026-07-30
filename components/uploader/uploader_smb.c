@@ -37,6 +37,9 @@
 #include "esp_timer.h"
 #include "smb2.h"
 #include "libsmb2.h"
+#include "libsmb2-raw.h"
+#include <sys/time.h>
+#include <sys/poll.h>
 
 /* SD card paths — must match sd_storage.h */
 #define SD_MOUNT_POINT      "/somnotrace"
@@ -50,6 +53,80 @@ static const char *TAG = "upload_smb";
 #define SMB_BUF_SIZE  (32 * 1024)
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
+
+/* Sync callback for smb2_cmd_set_info_async */
+struct set_info_sync {
+    int is_finished;
+    int status;
+};
+
+static void set_info_cb(struct smb2_context *smb2, int status,
+                        void *command_data, void *private_data)
+{
+    struct set_info_sync *sync = private_data;
+    sync->is_finished = 1;
+    sync->status = status;
+}
+
+/* Set the last-write and change timestamps on an open SMB file handle
+ * to match the local file's mtime.  Uses SMB2 SET_INFO with
+ * FILE_BASIC_INFORMATION. */
+static int smb_set_mtime(struct smb2_context *smb2, struct smb2fh *fh,
+                         time_t mtime)
+{
+    struct smb2_file_basic_info bi;
+    struct smb2_set_info_request si_req;
+    struct set_info_sync sync = {0, 0};
+    struct smb2_pdu *pdu;
+
+    memset(&bi, 0, sizeof(bi));
+    /* Setting times to 0 means "don't change" in SMB2 */
+    bi.creation_time.tv_sec = 0;
+    bi.creation_time.tv_usec = 0;
+    bi.last_access_time.tv_sec = 0;
+    bi.last_access_time.tv_usec = 0;
+    bi.last_write_time.tv_sec = mtime;
+    bi.last_write_time.tv_usec = 0;
+    bi.change_time.tv_sec = mtime;
+    bi.change_time.tv_usec = 0;
+    bi.file_attributes = 0;  /* 0 = don't change */
+
+    memset(&si_req, 0, sizeof(si_req));
+    si_req.info_type = SMB2_0_INFO_FILE;
+    si_req.file_info_class = SMB2_FILE_BASIC_INFORMATION;
+    si_req.additional_information = 0;
+    smb2_file_id *fid = smb2_get_file_id(fh);
+    memcpy(si_req.file_id, fid, SMB2_FD_SIZE);
+    si_req.input_data = &bi;
+
+    pdu = smb2_cmd_set_info_async(smb2, &si_req, set_info_cb, &sync);
+    if (!pdu) {
+        ESP_LOGW(TAG, "  smb2_cmd_set_info_async failed: %s",
+                 smb2_get_error(smb2));
+        return -1;
+    }
+    smb2_queue_pdu(smb2, pdu);
+
+    /* Poll loop — same pattern as libsmb2's sync.c wait_for_reply() */
+    while (!sync.is_finished) {
+        struct pollfd pfd;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = smb2_get_fd(smb2);
+        pfd.events = smb2_which_events(smb2);
+        if (poll(&pfd, 1, 1000) < 0) {
+            ESP_LOGW(TAG, "  set_info poll failed");
+            return -1;
+        }
+        if (pfd.revents == 0) continue;
+        if (smb2_service(smb2, pfd.revents) < 0) {
+            ESP_LOGW(TAG, "  set_info smb2_service failed: %s",
+                     smb2_get_error(smb2));
+            return -1;
+        }
+    }
+
+    return sync.status;
+}
 
 /* Upload a single local file to an SMB path. */
 static upload_result_t smb_upload_file(struct smb2_context *smb2,
@@ -135,6 +212,16 @@ static upload_result_t smb_upload_file(struct smb2_context *smb2,
     }
 
     free(buf);
+
+    /* Set remote file timestamps to match local file mtime */
+    struct stat local_st;
+    if (stat(local_path, &local_st) == 0) {
+        int rc = smb_set_mtime(smb2, fh, local_st.st_mtime);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "  smb_set_mtime failed: %d (continuing)", rc);
+        }
+    }
+
     smb2_close(smb2, fh);
     fclose(f);
 
