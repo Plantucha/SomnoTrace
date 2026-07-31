@@ -459,9 +459,10 @@ static void battery_monitor_task(void *arg)
                 settle_until = xTaskGetTickCount() +
                                pdMS_TO_TICKS(BAT_UNPLUG_SETTLE_S * 1000);
                 /* Record the charge-termination voltage as the 100% anchor.
-                 * Use the raw filtered terminal voltage (not IR-compensated):
-                 * the battery will never exceed this during discharge, so 100%
-                 * is guaranteed reachable.  Persist to NVS so it survives reboots. */
+                 * filtered_mv is the IR-compensated OCV estimate from during
+                 * charging.  The settled OCV after unplug will be slightly
+                 * higher, so the display reaches 100%.  Persist to NVS so it
+                 * survives reboots. */
                 if (filtered_mv >= BAT_ANCHOR_MIN_MV && filtered_mv <= BAT_ANCHOR_MAX_MV) {
                     if (filtered_mv != s_full_charge_mv) {
                         s_full_charge_mv = filtered_mv;
