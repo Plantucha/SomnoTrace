@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "bsp_display.h"
 #include "bsp_power.h"
 #include "esp_log.h"
@@ -34,6 +35,8 @@
 #include "esp_http_server.h"
 #include "nvs_writer.h"
 #include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -1638,6 +1641,199 @@ static void format_sd_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* ── OTA firmware upload ─────────────────────────────────────────── */
+
+#define OTA_CHUNK_SIZE   4096
+#define OTA_MAX_SIZE     (0x400000)  /* 4 MB — partition size */
+#define OTA_BUF_SIZE     (OTA_CHUNK_SIZE * 2)  /* stream buffer: 8 KB */
+
+/* OTA flash task context — passed from httpd handler to the internal-stack task. */
+typedef struct {
+    StreamBufferHandle_t sbuf;       /* data channel: httpd → flash task */
+    int total_size;                  /* expected image size */
+    esp_err_t result;                /* result from flash task */
+    bool done;                       /* flash task finished */
+} ota_ctx_t;
+
+/* OTA flash task — runs on an INTERNAL RAM stack because esp_ota_* functions
+ * freeze the SPI cache, which asserts the task stack is not in PSRAM. */
+static void ota_flash_task(void *arg)
+{
+    ota_ctx_t *ctx = (ota_ctx_t *)arg;
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) {
+        ESP_LOGE(TAG, "OTA: no update partition");
+        ctx->result = ESP_FAIL;
+        ctx->done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_ota_handle_t ota_hdl = 0;
+    esp_err_t err = esp_ota_begin(part, ctx->total_size, &ota_hdl);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: begin failed: %s", esp_err_to_name(err));
+        ctx->result = err;
+        ctx->done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t *buf = malloc(OTA_CHUNK_SIZE);
+    if (!buf) {
+        esp_ota_abort(ota_hdl);
+        ctx->result = ESP_ERR_NO_MEM;
+        ctx->done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int written = 0;
+    while (written < ctx->total_size) {
+        size_t want = ctx->total_size - written;
+        if (want > OTA_CHUNK_SIZE) want = OTA_CHUNK_SIZE;
+        size_t got = xStreamBufferReceive(ctx->sbuf, buf, want, pdMS_TO_TICKS(10000));
+        if (got == 0) {
+            ESP_LOGE(TAG, "OTA: stream buffer timeout at %d/%d", written, ctx->total_size);
+            esp_ota_abort(ota_hdl);
+            free(buf);
+            ctx->result = ESP_ERR_TIMEOUT;
+            ctx->done = true;
+            vTaskDelete(NULL);
+            return;
+        }
+        err = esp_ota_write(ota_hdl, buf, got);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: write failed: %s", esp_err_to_name(err));
+            esp_ota_abort(ota_hdl);
+            free(buf);
+            ctx->result = err;
+            ctx->done = true;
+            vTaskDelete(NULL);
+            return;
+        }
+        written += got;
+    }
+    free(buf);
+
+    err = esp_ota_end(ota_hdl);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: end failed: %s", esp_err_to_name(err));
+        ctx->result = err;
+        ctx->done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: set_boot_partition failed: %s", esp_err_to_name(err));
+        ctx->result = err;
+        ctx->done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "OTA: flash complete (%d bytes)", written);
+    ctx->result = ESP_OK;
+    ctx->done = true;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t ota_upload_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+        return ESP_FAIL;
+    }
+    if (total > OTA_MAX_SIZE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "image too large");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA: receiving %d bytes", total);
+
+    /* Set up stream buffer and context for the flash task. */
+    ota_ctx_t ctx = {
+        .sbuf = xStreamBufferCreate(OTA_BUF_SIZE, 1),
+        .total_size = total,
+        .result = ESP_FAIL,
+        .done = false,
+    };
+    if (!ctx.sbuf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom (stream buffer)");
+        return ESP_FAIL;
+    }
+
+    /* Launch flash task on an INTERNAL RAM stack (not PSRAM) — required for
+     * cache-freeze safety during esp_ota_write. */
+    TaskHandle_t flash_task = NULL;
+    BaseType_t tr = xTaskCreate(ota_flash_task, "ota_flash", 8192, &ctx, 5, &flash_task);
+    if (tr != pdPASS) {
+        vStreamBufferDelete(ctx.sbuf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom (flash task)");
+        return ESP_FAIL;
+    }
+
+    /* Feed data from the HTTP socket to the stream buffer. */
+    uint8_t *recv_buf = heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
+    if (!recv_buf) {
+        xStreamBufferSend(ctx.sbuf, NULL, 0, 0);  /* signal EOF */
+        vStreamBufferDelete(ctx.sbuf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < total) {
+        int want = total - received;
+        if (want > OTA_CHUNK_SIZE) want = OTA_CHUNK_SIZE;
+        int r = httpd_req_recv(req, (char *)recv_buf, want);
+        if (r <= 0) {
+            ESP_LOGE(TAG, "OTA: recv error at %d/%d", received, total);
+            break;
+        }
+        /* Wait for space in the stream buffer (flash task may be slow). */
+        size_t sent = xStreamBufferSend(ctx.sbuf, recv_buf, r, pdMS_TO_TICKS(10000));
+        if (sent != (size_t)r) {
+            ESP_LOGE(TAG, "OTA: stream buffer full at %d/%d", received, total);
+            break;
+        }
+        received += r;
+    }
+    free(recv_buf);
+
+    /* Wait for the flash task to finish. */
+    int wait_ms = 0;
+    while (!ctx.done && wait_ms < 30000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait_ms += 100;
+    }
+
+    if (!ctx.done) {
+        ESP_LOGE(TAG, "OTA: flash task timed out");
+        vStreamBufferDelete(ctx.sbuf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "flash task timeout");
+        return ESP_FAIL;
+    }
+
+    vStreamBufferDelete(ctx.sbuf);
+
+    if (ctx.result != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(ctx.result));
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA: upload complete (%d bytes), rebooting", received);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+
+    /* Reboot after a short delay so the response is sent. */
+    psram_task_create(reboot_task, "ota_reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    return ESP_OK;
+}
+
 /* HTTP handler for consolidated actions. Body: {"action":"reset-state|delete-edfs|reset-all|recreate-edfs|format-sd"} */
 
 static esp_err_t actions_handler(httpd_req_t *req)
@@ -1818,6 +2014,10 @@ static esp_err_t start_webserver(void)
     /* Consolidated actions endpoint */
     httpd_uri_t actions = { .uri = "/api/actions", .method = HTTP_POST, .handler = actions_handler };
     httpd_register_uri_handler(s_httpd, &actions);
+
+    /* OTA firmware upload endpoint */
+    httpd_uri_t ota_upload = { .uri = "/api/ota", .method = HTTP_POST, .handler = ota_upload_handler };
+    httpd_register_uri_handler(s_httpd, &ota_upload);
 
     /* Log stream endpoints (SSE, download, level control) */
     log_stream_register_handlers(s_httpd);

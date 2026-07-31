@@ -749,6 +749,28 @@ Maintenance Actions
 </div>
 <div id="action-status" class="status-msg" style="margin-top:14px"></div>
 </div>
+
+<div class="card" style="border-left-color:var(--primary);margin-top:16px">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
+Firmware Update (OTA)
+</div>
+<p style="color:var(--text-muted);font-size:.85rem;margin-bottom:16px">Upload a new firmware image (.bin) to update the device. The device will reboot automatically after a successful upload.</p>
+
+<div style="display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<input type="file" id="ota-file-input" accept=".bin" style="font-size:.85rem;flex:1;min-width:200px">
+<button class="btn btn-primary" id="ota-upload-btn" onclick="otaUpload()" disabled>Upload &amp; Flash</button>
+</div>
+<div id="ota-progress-wrap" style="display:none">
+<div style="background:var(--input-bg);border-radius:6px;height:24px;overflow:hidden;border:1px solid var(--border-color)">
+<div id="ota-progress-bar" style="height:100%;width:0%;background:var(--primary);transition:width .15s ease-out;border-radius:6px"></div>
+</div>
+<div id="ota-progress-text" style="font-size:.8rem;color:var(--text-muted);margin-top:4px;text-align:center">0%</div>
+</div>
+<div id="ota-status" class="status-msg" style="margin-top:4px"></div>
+</div>
+</div>
 </section>
 
 </main>
@@ -1618,6 +1640,69 @@ function execAction(action, confirmMsg) {
     .catch(function() {
       if (statusEl) { statusEl.textContent = 'Action failed — network error.'; statusEl.className = 'status-msg error'; }
     });
+}
+
+/* ── OTA Firmware Upload ───────────────────────────────────────── */
+document.getElementById('ota-file-input').addEventListener('change', function() {
+  var btn = document.getElementById('ota-upload-btn');
+  btn.disabled = !this.files || !this.files.length;
+});
+
+function otaUpload() {
+  var input = document.getElementById('ota-file-input');
+  if (!input.files || !input.files.length) return;
+  var file = input.files[0];
+  if (file.size > 4 * 1024 * 1024) {
+    alert('Image too large (max 4 MB).');
+    return;
+  }
+  if (!confirm('Upload and flash "' + file.name + '" (' + (file.size / 1024).toFixed(0) + ' KB)?\nThe device will reboot automatically after the update completes.')) return;
+
+  var btn = document.getElementById('ota-upload-btn');
+  var statusEl = document.getElementById('ota-status');
+  var progWrap = document.getElementById('ota-progress-wrap');
+  var progBar = document.getElementById('ota-progress-bar');
+  var progText = document.getElementById('ota-progress-text');
+
+  btn.disabled = true;
+  input.disabled = true;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  progText.textContent = '0%';
+  statusEl.textContent = 'Uploading…';
+  statusEl.className = 'status-msg';
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota', true);
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      var pct = Math.round(e.loaded / e.total * 100);
+      progBar.style.width = pct + '%';
+      progText.textContent = pct + '% (' + (e.loaded / 1024).toFixed(0) + ' / ' + (e.total / 1024).toFixed(0) + ' KB)';
+    }
+  };
+  xhr.onload = function() {
+    if (xhr.status === 200) {
+      progBar.style.width = '100%';
+      progText.textContent = '100%';
+      statusEl.textContent = 'Upload complete. Device is rebooting…';
+      statusEl.className = 'status-msg success';
+    } else {
+      statusEl.textContent = 'Upload failed: ' + (xhr.responseText || 'server error');
+      statusEl.className = 'status-msg error';
+      btn.disabled = false;
+      input.disabled = false;
+      progWrap.style.display = 'none';
+    }
+  };
+  xhr.onerror = function() {
+    statusEl.textContent = 'Upload failed — network error.';
+    statusEl.className = 'status-msg error';
+    btn.disabled = false;
+    input.disabled = false;
+    progWrap.style.display = 'none';
+  };
+  xhr.send(file);
 }
 
 /* ── Logs ──────────────────────────────────────────────────────── */

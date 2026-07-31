@@ -5,7 +5,7 @@ idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provisio
                        INCLUDE_DIRS "."
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json esp_app_format
                                 bt mbedtls esp_rom fatfs sdmmc esp-idf-ftpServer uploader
-                                esp_driver_i2c esp_driver_i2s esp_adc)
+                                esp_driver_i2c esp_driver_i2s esp_adc app_update)
 
 # Download zones.json (IANA-to-POSIX timezone database) if not present.
 # Source: https://github.com/nayarsystems/posix_tz_db (MIT License)
