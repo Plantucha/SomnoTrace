@@ -1267,7 +1267,8 @@ static int16_t get_scalar(const summary_ctx_t *ctx, int field, int16_t default_v
 }
 
 /* Map On/Off/Auto string from settings.json to AS11 EDF enum value.
- * AS11 EDF uses: Off=1, On=2, Auto=3. */
+ * AS11 EDF convention: raw enum + 1, so Off=1, On=2, Auto=3.
+ * See spec/0002-edf-export.md §4.3.4. */
 static int on_off_to_edf(const char *s)
 {
     if (!s) return -1;
@@ -1363,7 +1364,8 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
     /* CPAP/AutoSet settings [6-13] and common comfort/settings [14-30]:
      * from settings.json (Get RPC response captured during post-therapy).
      * Pressures are stored in cmH2O × 50, temperatures in °C × 10.
-     * Enum fields use AS11 EDF enum values (Off=1, On=2, etc.). */
+     * Enum fields use AS11 EDF convention: raw enum + 1 (Off=1, On=2, etc.).
+     * S.Mask is the exception: raw + 2.  See spec/0002-edf-export.md §4.3.4. */
     if (settings_json) {
         cJSON *sp = cJSON_GetObjectItem(settings_json, "SettingProfiles");
         cJSON *tp = sp ? cJSON_GetObjectItem(sp, "TherapyProfiles") : NULL;
@@ -1414,8 +1416,7 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                 v = cJSON_GetObjectItem(comfort, "AutoSetComfort");
                 if (v && cJSON_IsString(v)) {
                     if (strcmp(v->valuestring, "On") == 0) str_values[14] = 2;
-                    else if (strcmp(v->valuestring, "Plus") == 0) str_values[14] = 1;
-                    else if (strcmp(v->valuestring, "Off") == 0) str_values[14] = 0;
+                    else if (strcmp(v->valuestring, "Off") == 0) str_values[14] = 1;
                 }
             }
 
@@ -1466,17 +1467,17 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                 }
                 v = cJSON_GetObjectItem(circuit, "MaskType");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "Nasal") == 0) str_values[24] = 1;
-                    else if (strcmp(v->valuestring, "Pillows") == 0) str_values[24] = 2;
+                    if (strcmp(v->valuestring, "Pillows") == 0) str_values[24] = 2;
                     else if (strcmp(v->valuestring, "FullFace") == 0 ||
                              strcmp(v->valuestring, "Full Face") == 0) str_values[24] = 3;
-                    else if (strcmp(v->valuestring, "Pediatric") == 0) str_values[24] = 4;
+                    else if (strcmp(v->valuestring, "Nasal") == 0) str_values[24] = 4;
+                    else if (strcmp(v->valuestring, "Pediatric") == 0) str_values[24] = 5;
                 }
                 v = cJSON_GetObjectItem(circuit, "TubeType");
                 if (v && cJSON_IsString(v)) {
                     if (strcmp(v->valuestring, "SlimLine") == 0) str_values[25] = 1;
                     else if (strcmp(v->valuestring, "Standard") == 0) str_values[25] = 2;
-                    else if (strcmp(v->valuestring, "3m") == 0) str_values[25] = 3;
+                    else if (strcmp(v->valuestring, "15mmNonHeated") == 0) str_values[25] = 3;
                     else if (strcmp(v->valuestring, "19mmNonHeated") == 0) str_values[25] = 4;
                 }
             }

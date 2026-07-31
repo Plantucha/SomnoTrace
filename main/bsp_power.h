@@ -25,6 +25,8 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
+#include "esp_err.h"
 
 /* Latch the battery power rail on.
  *
@@ -48,12 +50,32 @@ void bsp_power_start_button_monitor(int hold_ms);
  * lifetime of the task. */
 void bsp_power_start_boot_monitor(volatile bool *softap_flag, int hold_ms);
 
-/* Read battery charge level as a percentage (0-100).
- * Uses the ADC on GPIO1 (BAT_ADC) with a 2:1 voltage divider (200k/100k).
- * Returns -1 if the ADC read fails. */
+/* Immutable snapshot of the battery state, published by the monitor task. */
+typedef struct {
+    int      percent;      /* 0-100 (slew-limited for display), -1 if unknown */
+    int      millivolts;   /* filtered VBAT in mV, -1 if unknown */
+    bool     charging;     /* true while CHG_STAT is low */
+    bool     valid;        /* false until the first successful sample burst */
+    uint32_t age_s;        /* seconds since the last successful sample burst */
+} bsp_battery_t;
+
+/* Start the background battery monitor.  Call once at boot, after
+ * bsp_power_hold().  The monitor task is the only owner of the ADC:
+ * it samples on a slow cadence and publishes a snapshot that all
+ * consumers (LCD, /api/status, ...) read for free.  Safe to call twice. */
+esp_err_t bsp_power_battery_monitor_start(void);
+
+/* Read the latest published battery snapshot.  Non-blocking, never touches
+ * the ADC, safe from any task.  Before the first burst completes, *out has
+ * valid=false and percent/millivolts = -1. */
+void bsp_power_battery_get(bsp_battery_t *out);
+
+/* Battery charge level as a percentage (0-100), or -1 if not yet known.
+ * Convenience wrapper over bsp_power_battery_get(). */
 int bsp_power_battery_percent(void);
 
-/* Returns true if the battery is currently charging (CHG_STAT pin low). */
+/* Returns true if the battery is currently charging (CHG_STAT pin low).
+ * Reads the GPIO directly — cheap and always current. */
 bool bsp_power_is_charging(void);
 
 /* Start a background task that monitors the PLUS button (IO4) for

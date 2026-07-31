@@ -124,6 +124,96 @@ all other fields.
 - Spool filenames use raw AS11 PeriodStart for noon-day classification
   (no drift correction) — consistent with `edf_gen.c`'s day matching.
 
+#### 4.3.4 STR enum mapping conventions
+
+Settings fields [14-30] are enum values mapped from the AS11 `settings.json`
+string labels to EDF digital integers.  The mapping follows a consistent
+convention verified against three independent sources: AS11 native EDF
+exports, OSCAR source code (`resmed_loader.cpp`), and airbreak-plus
+(`resmed_config.py` ENUM_OPTIONS, `edf_signals.md`).
+
+**Universal rule: EDF = raw enum + 1**
+
+The AS11 EDF writes `raw_enum + 1` for most enum fields.  OSCAR recovers
+the 0-indexed enum by decrementing by 1 for AS11 devices (`if (AS_eleven)
+field--;`).  The raw enums match airbreak-plus `ENUM_OPTIONS` (0-indexed).
+
+| Idx | EDF label | Short | Raw enum (airbreak-plus)            | JSON string → EDF value        |
+|-----|-----------|-------|--------------------------------------|--------------------------------|
+| 14  | S.AS.Comfort    | AFC | `{0:'Standard', 1:'Soft'}`     | Off→1, On→2                    |
+| 15  | S.RampEnable    | RMA | `{0:'Off', 1:'On', 2:'Auto'}`  | Off→1, On→2, Auto→3            |
+| 17  | S.EPR.ClinEnable| EPA | `{0:'Off', 1:'On'}`            | via `on_off_to_edf()`          |
+| 18  | S.EPR.EPREnable | EPX | `{0:'Off', 1:'On'}`            | via `on_off_to_edf()`          |
+| 20  | S.EPR.EPRType   | EPT | `{0:'Ramp Only', 1:'Full Time'}` | RampOnly→1, FullTime→2       |
+| 21  | S.SmartStart    | SST | `{0:'Off', 1:'On'}`            | via `on_off_to_edf()`          |
+| 22  | S.PtAccess      | —   | *(not in ENUM_OPTIONS)*        | Full/Advanced→1, Basic→2       |
+| 23  | S.ABFilter      | ABF | `{0:'No', 1:'Yes'}`            | No→1, Yes→2                    |
+| 25  | S.Tube          | TBT | `{0:'SlimLine', 1:'Standard', 2:'3m'}` | SlimLine→1, Standard→2, 15mmNonHeated→3, 19mmNonHeated→4 |
+| 26  | S.ClimateControl| CCO | `{0:'Auto', 1:'Manual'}`       | Auto→1, Manual→2               |
+| 27  | S.HumEnable     | HMX | `{0:'Off', 1:'On'}`            | via `on_off_to_edf()`          |
+| 29  | S.TempEnable    | HTX | `{0:'Off', 1:'On', 2:'Auto'}`  | via `on_off_to_edf()`          |
+
+**Exception 1: S.Mask [24] uses raw + 2**
+
+OSCAR's AS11 mask handling subtracts 2 (not 1) with the comment
+`// why be consistent?`.  Confirmed by AS11 native EDF data:
+Pillows→2, FullFace→3, Nasal→4, Pediatric→5.
+
+| Raw (airbreak-plus `MSK`) | EDF value | OSCAR (−2) | Label     |
+|---------------------------|-----------|------------|-----------|
+| 0                         | 2         | 0          | Pillows   |
+| 1                         | 3         | 1          | Full Face |
+| 2                         | 4         | 2          | Nasal     |
+| 3                         | 5         | 3          | Pediatric (OSCAR maps to Unknown) |
+
+**Exception 2: Mode [5] uses a custom remap table**
+
+`MODE_MAP[] = {3,1,2,4,10,16,8,6,7,5,9}` — maps the MOP (ActiveTherapyProfile)
+enum index to the EDF Mode value.  See `edf_signals.md` "STR enum export maps".
+AutoSetForHer (MOP=11) is passed through as-is (not in the 11-entry table).
+
+**Exception 3: S.EPR.EPRType [20] — OSCAR applies a net-zero transform for AS11**
+
+OSCAR does `epr += 1; if (AS_eleven) epr--;`, so for AS11 the EDF value is
+used as-is.  The `+1` is for AS10 devices where EDF values are 0-indexed.
+Our raw+1 values happen to match OSCAR's option index directly.
+
+**Exception 4: S.Tube [25] — OSCAR does NOT decrement for AS11**
+
+OSCAR reads `S.Tube` without any `AS_eleven` adjustment.  Our raw+1 values
+match the AS11 native EDF.  OSCAR's `RMS9_TubeType` channel is declared but
+never assigned display options, so tube type is not shown in OSCAR's UI.
+
+**Exception 5: HeatedTube [31] / Humidifier [32] — spool-derived remap**
+
+These come from the Summary spool (not settings.json) and use custom remap
+tables documented in `edf_signals.md`: `ZHT: [3,4,1,5,2]`, `HUC: [1,2,3]`.
+In practice the spool values are copied directly and match AS11 native output.
+
+**Scalar fields (no enum mapping):**
+
+| Idx | EDF label       | Conversion        |
+|-----|-----------------|-------------------|
+| 6-13| Pressure fields | cmH2O × 50        |
+| 16  | S.RampTime      | direct minutes    |
+| 19  | S.EPR.Level     | cmH2O × 50        |
+| 28  | S.HumLevel      | direct            |
+| 30  | S.Temp          | °C × 10           |
+
+**AS10 differences (for future EDF→session conversion support):**
+
+The AS10 (AirSense 10) EDF uses **0-indexed** enum values (no +1 offset).
+OSCAR detects the device generation and applies the decrement only for AS11.
+If we ever need to parse AS10 EDF files:
+
+- Most enum fields: use the value directly (0=Off, 1=On, etc.)
+- S.Mask: use the value directly (0=Pillows, 1=Full Face, 2=Nasal)
+- S.EPR.EPRType: OSCAR adds 1 to the EDF value (undoing the 0-index)
+- Mode: AS10 uses the same MODE_MAP remap table
+- S.Tube: AS10 EDF values are 0-indexed (0=SlimLine, 1=Standard, 2=3m)
+- JSON labels differ: AS10 uses `Essentials` (Plus/On) instead of
+  `PatientView` (Full/Basic), and tube types may use different strings
+
 ## 5. Acceptance criteria
 
 - [x] STR.edf stats fields match AS11 firmware output (verified via
@@ -132,6 +222,9 @@ all other fields.
       via FTP fetch + Python protobuf parse, 2026-06-29).
 - [x] Spool filename uses raw AS11 PeriodStart (no drift correction)
       — fixed in `post_therapy.c`.
+- [x] STR.edf settings enum fields match AS11 firmware output (verified
+      via AS11 native EDF comparison, OSCAR source, and airbreak-plus,
+      2026-07-31).  See §4.3.4.
 - [ ] Multi-day STR.edf opens correctly in OSCAR.
 - [ ] BRP/PLD/SA2/EVE EDF files match AS11 SD card output.
 

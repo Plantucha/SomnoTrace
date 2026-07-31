@@ -28,6 +28,24 @@ struct netprov_config {
 /* Initialise NVS, netif, event loop and Wi-Fi driver. Call once at boot. */
 esp_err_t netprov_init(void);
 
+/* Live station link state, maintained from Wi-Fi/IP events.
+ *
+ * This is observed state, not a boot-time assumption: `up` goes false the
+ * moment the AP disappears, so callers must never cache "connected". */
+typedef struct {
+    bool up;                              /* associated AND holding an IP */
+    char ssid[NETPROV_SSID_MAXLEN + 1];   /* AP actually in use ("" if down) */
+    char ip[16];                          /* current IP ("0.0.0.0" if down) */
+    int  rssi;                            /* dBm; only valid if rssi_valid */
+    bool rssi_valid;                      /* false when down or query failed */
+} netprov_link_t;
+
+/* Snapshot the current station link state. Non-blocking, safe from any task. */
+void netprov_get_link(netprov_link_t *out);
+
+/* True while the station is associated and holds an IP. */
+bool netprov_is_link_up(void);
+
 /* Load the full config from NVS. Returns true if at least one SSID is stored. */
 bool netprov_load_config(struct netprov_config *cfg);
 

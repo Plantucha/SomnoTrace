@@ -20,6 +20,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "bsp_display.h"
+#include "bsp_power.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -47,6 +50,11 @@ static const char *TAG = "netprov";
 #define WIFI_FAIL_BIT       BIT1
 #define MAX_STA_RETRY       3
 
+/* Failed reconnects to the current SSID before falling back to a full
+ * scan across every configured network.  Without this the driver retries
+ * one dead SSID forever and never fails over. */
+#define RECONNECT_TRIES_BEFORE_RESCAN  5
+
 static EventGroupHandle_t s_wifi_events;
 static int s_retry_num = 0;
 static volatile bool s_connecting = false;
@@ -57,6 +65,15 @@ static bool s_portal_mode = false;
 static char s_connected_ip[16] = "0.0.0.0";
 static char s_ap_ssid[NETPROV_HOSTNAME_MAXLEN + 8];
 static uint32_t s_ap_ip = 0;
+
+/* Link state published to the LCD and /api/status. */
+static char s_link_ssid[NETPROV_SSID_MAXLEN + 1] = "";
+static SemaphoreHandle_t s_link_mutex = NULL;
+static volatile int  s_reconnect_tries = 0;
+static volatile bool s_rescan_requested = false;
+/* Copy of the credentials kept for autonomous failover rescans. */
+static struct netprov_config s_link_cfg;
+static bool s_link_cfg_valid = false;
 
 static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap = NULL;
@@ -124,6 +141,33 @@ esp_err_t netprov_save_config(const struct netprov_config *cfg)
 /* ------------------------------------------------------------------ */
 /*  WiFi events                                                       */
 /* ------------------------------------------------------------------ */
+/* Publish the "link is down" state.  Called on association loss: the IP we
+ * were handed is no longer ours, so it must not be reported any more. */
+static void link_mark_down(void)
+{
+    if (s_link_mutex) xSemaphoreTake(s_link_mutex, portMAX_DELAY);
+    s_connected = false;
+    s_link_ssid[0] = '\0';
+    strlcpy(s_connected_ip, "0.0.0.0", sizeof(s_connected_ip));
+    if (s_link_mutex) xSemaphoreGive(s_link_mutex);
+}
+
+/* Publish the "link is up" state, recording which AP we actually landed on
+ * (which is not necessarily slot 1 — candidates are ranked by RSSI). */
+static void link_mark_up(const char *ip)
+{
+    wifi_ap_record_t ap;
+    bool have_ap = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+
+    if (s_link_mutex) xSemaphoreTake(s_link_mutex, portMAX_DELAY);
+    s_connected = true;
+    strlcpy(s_connected_ip, ip, sizeof(s_connected_ip));
+    if (have_ap) {
+        strlcpy(s_link_ssid, (const char *)ap.ssid, sizeof(s_link_ssid));
+    }
+    if (s_link_mutex) xSemaphoreGive(s_link_mutex);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
@@ -134,7 +178,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         if (s_connected) {
-            ESP_LOGI(TAG, "Wi-Fi link lost, retrying connection indefinitely...");
+            /* Link genuinely lost while up.  Publish that immediately — the
+             * old code left s_connected/s_connected_ip stale, so the LCD and
+             * /api/status kept advertising a dead connection. */
+            link_mark_down();
+            bsp_display_set_wifi_connected(false);
+            s_reconnect_tries = 0;
+            ESP_LOGW(TAG, "Wi-Fi link lost, reconnecting...");
             esp_wifi_connect();
         } else if (s_connecting) {
             if (s_retry_num < MAX_STA_RETRY) {
@@ -144,19 +194,116 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             } else if (s_wifi_events) {
                 xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
             }
+        } else if (!s_portal_mode) {
+            /* Reconnect attempt to the *current* SSID failed.  esp_wifi_connect()
+             * only ever retries the single SSID in the driver config, so retrying
+             * forever strands us on a network that has gone away while another
+             * configured network sits available.  Escalate to a full rescan. */
+            if (++s_reconnect_tries < RECONNECT_TRIES_BEFORE_RESCAN) {
+                ESP_LOGI(TAG, "reconnect failed (%d/%d), retrying same SSID",
+                         s_reconnect_tries, RECONNECT_TRIES_BEFORE_RESCAN);
+                esp_wifi_connect();
+            } else {
+                ESP_LOGW(TAG, "reconnect to '%s' failed %d times, "
+                              "rescanning all configured networks",
+                         s_link_ssid[0] ? s_link_ssid : "(unknown)",
+                         s_reconnect_tries);
+                s_rescan_requested = true;
+            }
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         snprintf(s_got_ip, sizeof(s_got_ip), IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        s_reconnect_tries = 0;
         if (s_connecting && s_wifi_events) {
             xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        } else if (!s_portal_mode) {
+            /* Reconnect succeeded outside the boot-time connect path. */
+            link_mark_up(s_got_ip);
+            bsp_display_set_wifi_connected(true);
+            ESP_LOGI(TAG, "Wi-Fi reconnected to '%s', ip=%s",
+                     s_link_ssid[0] ? s_link_ssid : "?", s_got_ip);
+        }
+    }
+}
+
+void netprov_get_link(netprov_link_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    strlcpy(out->ip, "0.0.0.0", sizeof(out->ip));
+
+    if (s_link_mutex) xSemaphoreTake(s_link_mutex, portMAX_DELAY);
+    out->up = s_connected;
+    if (s_connected) {
+        strlcpy(out->ssid, s_link_ssid, sizeof(out->ssid));
+        strlcpy(out->ip, s_connected_ip, sizeof(out->ip));
+    }
+    if (s_link_mutex) xSemaphoreGive(s_link_mutex);
+
+    /* RSSI is only meaningful while associated, and the query can still
+     * fail — report validity rather than a misleading default. */
+    if (out->up) {
+        int rssi = 0;
+        if (esp_wifi_sta_get_rssi(&rssi) == ESP_OK) {
+            out->rssi = rssi;
+            out->rssi_valid = true;
+        }
+    }
+}
+
+bool netprov_is_link_up(void)
+{
+    return s_connected;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Link supervisor: autonomous failover between configured networks   */
+/* ------------------------------------------------------------------ */
+/* esp_wifi_connect() only ever retries the SSID currently programmed into
+ * the driver, so a network that disappears permanently strands the device
+ * even when another configured network is in range.  The event handler
+ * raises s_rescan_requested after RECONNECT_TRIES_BEFORE_RESCAN failures;
+ * this task performs the (blocking) scan-and-rank off the event loop. */
+static void link_supervisor_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (!s_rescan_requested || s_portal_mode || s_connected) continue;
+        s_rescan_requested = false;
+
+        if (!s_link_cfg_valid) {
+            ESP_LOGW(TAG, "failover rescan requested but no cached config");
+            continue;
+        }
+
+        ESP_LOGW(TAG, "failover: rescanning all configured networks");
+        char ip[16] = "0.0.0.0";
+        if (netprov_try_connect(&s_link_cfg, ip, 15000) == ESP_OK) {
+            link_mark_up(ip);
+            bsp_display_set_wifi_connected(true);
+            strlcpy(s_connected_ip, ip, sizeof(s_connected_ip));
+            ESP_LOGI(TAG, "failover: reconnected to '%s', ip=%s",
+                     s_link_ssid[0] ? s_link_ssid : "?", ip);
+        } else {
+            /* Nothing reachable right now.  Back off and let the next
+             * disconnect cycle raise another rescan. */
+            ESP_LOGW(TAG, "failover: no configured network reachable, "
+                          "retrying in 30s");
+            vTaskDelay(pdMS_TO_TICKS(30000));
+            s_rescan_requested = true;
         }
     }
 }
 
 esp_err_t netprov_init(void)
 {
+    s_link_mutex = xSemaphoreCreateMutex();
+    if (!s_link_mutex) return ESP_ERR_NO_MEM;
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -207,9 +354,14 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
     esp_err_t result;
     if (bits & WIFI_CONNECTED_BIT) {
         strlcpy(ip_out, s_got_ip, 16);
+        /* Publish the link state, including which SSID we actually landed on. */
+        if (s_link_mutex) xSemaphoreTake(s_link_mutex, portMAX_DELAY);
         strlcpy(s_connected_ip, s_got_ip, sizeof(s_connected_ip));
-        ESP_LOGI(TAG, "connected to '%s', ip=%s", ssid, ip_out);
+        strlcpy(s_link_ssid, ssid, sizeof(s_link_ssid));
         s_connected = true;
+        if (s_link_mutex) xSemaphoreGive(s_link_mutex);
+        s_reconnect_tries = 0;
+        ESP_LOGI(TAG, "connected to '%s', ip=%s", ssid, ip_out);
         result = ESP_OK;
     } else {
         ESP_LOGW(TAG, "connect to '%s' failed", ssid);
@@ -226,7 +378,14 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
 esp_err_t netprov_try_connect(const struct netprov_config *cfg,
                                char *ip_out, int timeout_ms)
 {
-    s_connected = false;
+    link_mark_down();
+
+    /* Cache the credentials so the link supervisor can rescan on its own
+     * when the current network disappears. */
+    if (cfg != &s_link_cfg) {
+        memcpy(&s_link_cfg, cfg, sizeof(s_link_cfg));
+        s_link_cfg_valid = true;
+    }
 
     /* 1. Scan with retries */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -585,9 +744,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         status_cache_refresh_nvs();
     }
 
-    bool has_cfg = s_status_cache.cfg_valid;
-    struct netprov_config *cfg = &s_status_cache.cfg;
-
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "mode", s_portal_mode ? "setup" : "connected");
 
@@ -595,20 +751,26 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(resp, "fw_ver", app_desc ? app_desc->version : "unknown");
 
     if (!s_portal_mode) {
-        cJSON_AddStringToObject(resp, "ip", s_connected_ip);
-    }
-
-    /* Wi-Fi SSIDs (from cached NVS config) */
-    cJSON *ssids_arr = cJSON_AddArrayToObject(resp, "ssids");
-    cJSON *has_pass_arr = cJSON_AddArrayToObject(resp, "has_pass");
-    if (has_cfg) {
-        for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
-            if (cfg->wifi[i].ssid[0] != '\0') {
-                cJSON_AddItemToArray(ssids_arr, cJSON_CreateString(cfg->wifi[i].ssid));
-                cJSON_AddItemToArray(has_pass_arr, cJSON_CreateBool(cfg->wifi[i].pass[0] != '\0'));
-            }
+        /* Live link state: SSID, IP, RSSI — all derived from the event-driven
+         * link state, not boot-time assumptions. */
+        netprov_link_t link;
+        netprov_get_link(&link);
+        cJSON *wifi = cJSON_AddObjectToObject(resp, "wifi");
+        cJSON_AddBoolToObject(wifi, "up", link.up);
+        cJSON_AddStringToObject(wifi, "ssid", link.ssid);
+        cJSON_AddStringToObject(wifi, "ip", link.ip);
+        if (link.rssi_valid) {
+            cJSON_AddNumberToObject(wifi, "rssi", link.rssi);
+        } else {
+            cJSON_AddNullToObject(wifi, "rssi");
         }
     }
+
+    /* Wi-Fi radio (channel is always available in STA mode) */
+    uint8_t primary_chan = 0;
+    wifi_second_chan_t second_chan;
+    esp_wifi_get_channel(&primary_chan, &second_chan);
+    cJSON_AddNumberToObject(resp, "channel", primary_chan);
 
     /* Time / timezone / NTP (from cache) */
     cJSON_AddStringToObject(resp, "tz_name", s_status_cache.tz_name);
@@ -625,14 +787,21 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         cJSON_AddNullToObject(resp, "time");
     }
 
-    /* Wi-Fi radio */
-    int rssi = -128;
-    uint8_t primary_chan = 0;
-    wifi_second_chan_t second_chan;
-    esp_wifi_sta_get_rssi(&rssi);
-    esp_wifi_get_channel(&primary_chan, &second_chan);
-    cJSON_AddNumberToObject(resp, "rssi", rssi);
-    cJSON_AddNumberToObject(resp, "channel", primary_chan);
+    /* Battery (from the background monitor — never blocks on the ADC) */
+    {
+        bsp_battery_t batt;
+        bsp_power_battery_get(&batt);
+        cJSON *batt_obj = cJSON_AddObjectToObject(resp, "battery");
+        if (batt.valid) {
+            cJSON_AddNumberToObject(batt_obj, "percent", batt.percent);
+            cJSON_AddNumberToObject(batt_obj, "millivolts", batt.millivolts);
+        } else {
+            cJSON_AddNullToObject(batt_obj, "percent");
+            cJSON_AddNullToObject(batt_obj, "millivolts");
+        }
+        cJSON_AddBoolToObject(batt_obj, "charging", batt.charging);
+        cJSON_AddBoolToObject(batt_obj, "valid", batt.valid);
+    }
 
     /* Uptime */
     uint32_t uptime_s = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
@@ -1778,8 +1947,8 @@ void netprov_dns_task(void *arg)
 esp_err_t netprov_start_portal(const struct netprov_config *cfg, char *ap_ip_out)
 {
     s_portal_mode = true;
-    s_connected = false;
     s_connecting = false;
+    link_mark_down();
     esp_wifi_disconnect();
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "%s-setup", cfg->hostname);
 
@@ -1815,5 +1984,16 @@ esp_err_t netprov_start_connected_server(const char *ip)
 {
     s_portal_mode = false;
     strlcpy(s_connected_ip, ip, sizeof(s_connected_ip));
+
+    /* Start the link supervisor for autonomous failover.  The task checks
+     * s_rescan_requested which is raised by the event handler after repeated
+     * failed reconnects to the current SSID. */
+    static bool supervisor_started = false;
+    if (!supervisor_started) {
+        psram_task_create(link_supervisor_task, "link_sup", 4096,
+                          NULL, 3, tskNO_AFFINITY, NULL, NULL);
+        supervisor_started = true;
+    }
+
     return start_webserver();
 }

@@ -639,6 +639,8 @@ Save &amp; Reboot
 <div class="info-row"><span class="info-label">Firmware</span><span class="info-value" id="status-fw">--</span></div>
 <div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="status-uptime">--</span></div>
 <div class="info-row"><span class="info-label">Local IP</span><span class="info-value" id="status-ip">--</span></div>
+<div class="info-row"><span class="info-label">Wi-Fi SSID</span><span class="info-value" id="status-ssid">--</span></div>
+<div class="info-row"><span class="info-label">Battery</span><span class="info-value" id="status-battery">--</span></div>
 <div class="info-row"><span class="info-label">Timezone</span><span class="info-value" id="status-tz">--</span></div>
 <div class="info-row"><span class="info-label">NTP Sync</span><span class="info-value" id="status-ntp">--</span></div>
 <div class="info-row"><span class="info-label">SD Card Free</span><span class="info-value" id="status-sd">--</span></div>
@@ -1216,14 +1218,30 @@ function formatSdSpace(total, free) {
 function loadStatusTab(d) {
   function setEl(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
   setEl('status-fw', d.fw_ver || '--');
-  setEl('status-ip', d.ip || '--');
+
+  /* Wi-Fi link state from the new nested object, with fallback to the
+   * old flat fields for backward compatibility. */
+  var wifi = d.wifi || {};
+  setEl('status-ip', wifi.up ? (wifi.ip || '--') : 'Disconnected');
+  setEl('status-ssid', wifi.up ? (wifi.ssid || '--') : '--');
+  setEl('status-rssi', (wifi.rssi != null && wifi.rssi > -128) ? (wifi.rssi + ' dBm') : '--');
+
+  /* Battery */
+  var batt = d.battery || {};
+  if (batt.valid) {
+    var battStr = batt.percent + '%';
+    if (batt.millivolts != null) battStr += ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)';
+    if (batt.charging) battStr += ' \u26A1';
+    setEl('status-battery', battStr);
+  } else {
+    setEl('status-battery', '--');
+  }
   setEl('status-tz', d.tz_name || 'UTC');
   var ntpEl = document.getElementById('status-ntp');
   if (ntpEl) {
     ntpEl.textContent = d.ntp_synced ? 'Synchronized' : 'Not synced';
     ntpEl.style.color = d.ntp_synced ? 'var(--success)' : 'var(--warning)';
   }
-  setEl('status-rssi', (d.rssi && d.rssi > -128) ? (d.rssi + ' dBm') : '--');
   setEl('status-uptime', formatUptime(d.uptime));
 
   var bleEl = document.getElementById('status-ble');

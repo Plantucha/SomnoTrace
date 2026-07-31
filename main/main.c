@@ -108,12 +108,7 @@ void app_main(void)
     show_status("SomnoTrace", boot_lines, 1);
 
     /* Initial battery reading for the status indicator */
-    {
-        int batt_pct = bsp_power_battery_percent();
-        if (batt_pct >= 0) {
-            bsp_display_set_battery(batt_pct, bsp_power_is_charging());
-        }
-    }
+    bsp_power_battery_monitor_start();
 
     /* 4. Initialise networking stack (includes NVS init). */
     ESP_ERROR_CHECK(netprov_init());
@@ -270,48 +265,62 @@ void app_main(void)
             softap_start_ticks = xTaskGetTickCount();
         }
         if (in_softap) {
-            uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - softap_start_ticks);
-            if (elapsed_ms >= 10 * 60 * 1000) { // 10 minutes idle timeout
+            /* SoftAP idle timeout */
+            if ((xTaskGetTickCount() - softap_start_ticks) * portTICK_PERIOD_MS
+                 > 10 * 60 * 1000) {
                 ESP_LOGW(TAG, "SoftAP 10-minute idle timeout: rebooting to retry connection");
                 esp_restart();
             }
             /* Update battery indicator in SoftAP mode too */
             if (++refresh_counter >= 3) {
                 refresh_counter = 0;
-                int batt_pct = bsp_power_battery_percent();
-                if (batt_pct >= 0) {
-                    bsp_display_set_battery(batt_pct, bsp_power_is_charging());
+                bsp_battery_t batt;
+                bsp_power_battery_get(&batt);
+                if (batt.valid) {
+                    bsp_display_set_battery(batt.percent, batt.charging);
                 }
             }
-        } else if (err == ESP_OK) {
-            /* Keep the status content current (IP line). The display render task
-             * owns the screen and auto-refreshes RSSI on its own cadence, and it
-             * automatically restores the status screen when therapy ends.
+        } else {
+            /* Connected mode: refresh status display every 3 s.
              * Skipped during therapy (graph mode owns the display). */
             if (++refresh_counter >= 3 && !bsp_display_is_therapy_active()) {
                 refresh_counter = 0;
-                char ip_line[32];
-                snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
 
-                if (sd_storage_is_ready()) {
+                /* Use live link state instead of boot-time assumption. */
+                netprov_link_t link;
+                netprov_get_link(&link);
+
+                if (!link.up) {
                     const char *lines[] = {
-                        "Wi-Fi Connected",
-                        ip_line,
+                        "Wi-Fi Disconnected",
+                        "Reconnecting...",
                     };
                     bsp_display_show_lines("SomnoTrace", lines, 2);
                 } else {
-                    const char *lines[] = {
-                        "Wi-Fi Connected",
-                        ip_line,
-                        "SD Card Error",
-                    };
-                    bsp_display_show_lines("SomnoTrace", lines, 3);
+                    char ip_line[32];
+                    snprintf(ip_line, sizeof(ip_line), "IP: %s", link.ip);
+
+                    if (sd_storage_is_ready()) {
+                        const char *lines[] = {
+                            "Wi-Fi Connected",
+                            ip_line,
+                        };
+                        bsp_display_show_lines("SomnoTrace", lines, 2);
+                    } else {
+                        const char *lines[] = {
+                            "Wi-Fi Connected",
+                            ip_line,
+                            "SD Card Error",
+                        };
+                        bsp_display_show_lines("SomnoTrace", lines, 3);
+                    }
                 }
 
-                /* Update battery indicator (ADC read + charger status) */
-                int batt_pct = bsp_power_battery_percent();
-                if (batt_pct >= 0) {
-                    bsp_display_set_battery(batt_pct, bsp_power_is_charging());
+                /* Update battery indicator */
+                bsp_battery_t batt;
+                bsp_power_battery_get(&batt);
+                if (batt.valid) {
+                    bsp_display_set_battery(batt.percent, batt.charging);
                 }
             }
         }
