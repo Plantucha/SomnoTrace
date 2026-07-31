@@ -243,8 +243,10 @@ void app_main(void)
         char ip_line[32];
         snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
 
+        netprov_link_t link;
+        netprov_get_link(&link);
         const char *lines[] = {
-            "Wi-Fi Connected",
+            link.ssid[0] ? link.ssid : "Wi-Fi Connected",
             ip_line,
         };
         show_status("SomnoTrace", lines, 2);
@@ -300,15 +302,16 @@ void app_main(void)
                     char ip_line[32];
                     snprintf(ip_line, sizeof(ip_line), "IP: %s", link.ip);
 
+                    const char *ssid_str = link.ssid[0] ? link.ssid : "Wi-Fi Connected";
                     if (sd_storage_is_ready()) {
                         const char *lines[] = {
-                            "Wi-Fi Connected",
+                            ssid_str,
                             ip_line,
                         };
                         bsp_display_show_lines("SomnoTrace", lines, 2);
                     } else {
                         const char *lines[] = {
-                            "Wi-Fi Connected",
+                            ssid_str,
                             ip_line,
                             "SD Card Error",
                         };

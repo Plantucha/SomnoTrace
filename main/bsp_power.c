@@ -238,6 +238,11 @@ static const adc_channel_t s_bat_adc_channel = ADC_CHANNEL_0;  /* GPIO1 = ADC1_C
 /* Terminal voltage sits above OCV by roughly this much while charging. */
 #define BAT_CHARGE_IR_OFFSET_MV 120
 
+/* Above this voltage the reading cannot be a real Li-ion cell (max ~4.2 V).
+ * USB power with no battery installed pegs the ADC at ~5 V through the
+ * divider.  Use this to detect battery absence and hide the indicator. */
+#define BAT_NO_BATTERY_MV      4250
+
 /* Published snapshot, guarded by a mutex. */
 static SemaphoreHandle_t s_bat_mutex = NULL;
 static bsp_battery_t s_bat_state = {
@@ -371,6 +376,10 @@ static void bat_publish(int mv, int pct, bool charging, bool ok)
         s_bat_state.percent = pct;
         s_bat_state.valid = true;
         s_bat_last_ok_tick = xTaskGetTickCount();
+    } else {
+        s_bat_state.millivolts = mv;
+        s_bat_state.percent = pct;
+        s_bat_state.valid = false;
     }
     s_bat_state.charging = charging;
     xSemaphoreGive(s_bat_mutex);
@@ -411,35 +420,46 @@ static void battery_monitor_task(void *arg)
 
         int mv = bat_sample_burst();
         if (mv > 0) {
-            /* Compensate the charging IR rise so the charge and discharge
-             * curves roughly agree. */
-            int ocv_mv = charging ? mv - BAT_CHARGE_IR_OFFSET_MV : mv;
-
-            /* IIR low-pass across bursts.  Anything faster than this is
-             * noise by definition at a 20-60 s cadence. */
-            if (filtered_mv < 0) filtered_mv = ocv_mv;
-            else filtered_mv += (ocv_mv - filtered_mv) / 4;
-
-            int target_pct = bat_mv_to_percent(filtered_mv);
-
-            if (shown_pct < 0) {
-                shown_pct = target_pct;      /* first reading: adopt directly */
-            } else if (settling && xTaskGetTickCount() < settle_until) {
-                /* Hold the displayed value while the cell relaxes. */
+            /* No battery installed: USB rail drives the divider to ~5 V,
+             * well above any real Li-ion cell.  Publish invalid state so
+             * the LCD and /api/status hide the battery indicator. */
+            if (mv > BAT_NO_BATTERY_MV) {
+                filtered_mv = -1;
+                shown_pct = -1;
+                bat_publish(mv, -1, false, false);
+                ESP_LOGD(TAG, "battery: no battery detected (%dmV > %dmV)",
+                         mv, BAT_NO_BATTERY_MV);
             } else {
-                settling = false;
-                /* Slew limit: at most 1 percentage point per update.  This is
-                 * what removes the visible "jump" on plug-in. */
-                if (target_pct > shown_pct) shown_pct++;
-                else if (target_pct < shown_pct) shown_pct--;
+                /* Compensate the charging IR rise so the charge and discharge
+                 * curves roughly agree. */
+                int ocv_mv = charging ? mv - BAT_CHARGE_IR_OFFSET_MV : mv;
 
-                /* While charging the bar must never walk backwards. */
-                if (charging && target_pct < shown_pct) shown_pct++;
+                /* IIR low-pass across bursts.  Anything faster than this is
+                 * noise by definition at a 20-60 s cadence. */
+                if (filtered_mv < 0) filtered_mv = ocv_mv;
+                else filtered_mv += (ocv_mv - filtered_mv) / 4;
+
+                int target_pct = bat_mv_to_percent(filtered_mv);
+
+                if (shown_pct < 0) {
+                    shown_pct = target_pct;      /* first reading: adopt directly */
+                } else if (settling && xTaskGetTickCount() < settle_until) {
+                    /* Hold the displayed value while the cell relaxes. */
+                } else {
+                    settling = false;
+                    /* Slew limit: at most 1 percentage point per update.  This is
+                     * what removes the visible "jump" on plug-in. */
+                    if (target_pct > shown_pct) shown_pct++;
+                    else if (target_pct < shown_pct) shown_pct--;
+
+                    /* While charging the bar must never walk backwards. */
+                    if (charging && target_pct < shown_pct) shown_pct++;
+                }
+
+                bat_publish(filtered_mv, shown_pct, charging, true);
+                ESP_LOGD(TAG, "battery: vbat=%dmV filt=%dmV target=%d%% shown=%d%% chg=%d",
+                         mv, filtered_mv, target_pct, shown_pct, charging);
             }
-
-            bat_publish(filtered_mv, shown_pct, charging, true);
-            ESP_LOGD(TAG, "battery: vbat=%dmV filt=%dmV target=%d%% shown=%d%% chg=%d",
-                     mv, filtered_mv, target_pct, shown_pct, charging);
         } else {
             ESP_LOGW(TAG, "battery: sample burst failed");
             bat_publish(0, 0, charging, false);
