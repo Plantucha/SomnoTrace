@@ -19,6 +19,9 @@
 #include "as11_ble.h"
 #include "esp_sleep.h"
 #include "psram_task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "nvs_writer.h"
 
 #define BSP_PIN_BAT_EN   2
 #define BSP_PIN_KEY_PWR  5
@@ -251,7 +254,9 @@ static bsp_battery_t s_bat_state = {
 static TickType_t s_bat_last_ok_tick = 0;
 
 /* Li-ion open-circuit voltage → percent.  Descending by mV; linear
- * interpolation between rows. */
+ * interpolation between rows.  The 100% anchor is adaptive: it learns the
+ * cell's charge-termination voltage so the display reaches 100% when the
+ * charger IC stops, rather than requiring an unrealistic 4200 mV. */
 static const struct { int mv; int pct; } s_ocv_curve[] = {
     { 4200, 100 },
     { 4100,  90 },
@@ -264,15 +269,54 @@ static const struct { int mv; int pct; } s_ocv_curve[] = {
     { 3300,   0 },
 };
 
+/* Adaptive 100% anchor: updated to the observed charge-termination voltage.
+ * Defaults to the OCV curve's 4200 mV; replaced with the real value once the
+ * charger IC stops for the first time.  Persisted in NVS so it survives reboots. */
+#define BAT_NVS_NS         "bat"
+#define BAT_NVS_KEY_FULL   "full_mv"
+#define BAT_ANCHOR_MIN_MV  4000
+#define BAT_ANCHOR_MAX_MV  4200
+static int s_full_charge_mv = 4200;
+
+/* NVS write callback — runs on the internal-stack nvs_writer task. */
+static esp_err_t do_save_bat_anchor(void *arg)
+{
+    int mv = *(const int *)arg;
+    nvs_handle_t h;
+    if (nvs_open(BAT_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return ESP_FAIL;
+    esp_err_t err = nvs_set_i32(h, BAT_NVS_KEY_FULL, mv);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+/* Load the persisted anchor at boot.  Called before the monitor task starts
+ * (internal stack at that point), so a direct nvs_open is safe. */
+static void bat_load_anchor(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(BAT_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    int32_t mv = 4200;
+    if (nvs_get_i32(h, BAT_NVS_KEY_FULL, &mv) == ESP_OK &&
+        mv >= BAT_ANCHOR_MIN_MV && mv <= BAT_ANCHOR_MAX_MV) {
+        s_full_charge_mv = mv;
+        ESP_LOGI(TAG, "battery: loaded full-charge anchor = %dmV from NVS", mv);
+    }
+    nvs_close(h);
+}
+
 static int bat_mv_to_percent(int mv)
 {
     const int n = sizeof(s_ocv_curve) / sizeof(s_ocv_curve[0]);
-    if (mv >= s_ocv_curve[0].mv) return 100;
+    if (mv >= s_full_charge_mv) return 100;
     if (mv <= s_ocv_curve[n - 1].mv) return 0;
     for (int i = 0; i < n - 1; i++) {
         int hi_mv = s_ocv_curve[i].mv, lo_mv = s_ocv_curve[i + 1].mv;
+        int hi_pct = s_ocv_curve[i].pct, lo_pct = s_ocv_curve[i + 1].pct;
+        /* Stretch the top segment so its upper bound is the adaptive 100%
+         * anchor rather than the hardcoded 4200 mV. */
+        if (i == 0) hi_mv = s_full_charge_mv;
         if (mv <= hi_mv && mv > lo_mv) {
-            int hi_pct = s_ocv_curve[i].pct, lo_pct = s_ocv_curve[i + 1].pct;
             return lo_pct + (mv - lo_mv) * (hi_pct - lo_pct) / (hi_mv - lo_mv);
         }
     }
@@ -414,7 +458,25 @@ static void battery_monitor_task(void *arg)
                 settling = true;
                 settle_until = xTaskGetTickCount() +
                                pdMS_TO_TICKS(BAT_UNPLUG_SETTLE_S * 1000);
+                /* Record the charge-termination voltage as the 100% anchor.
+                 * Use the raw filtered terminal voltage (not IR-compensated):
+                 * the battery will never exceed this during discharge, so 100%
+                 * is guaranteed reachable.  Persist to NVS so it survives reboots. */
+                if (filtered_mv >= BAT_ANCHOR_MIN_MV && filtered_mv <= BAT_ANCHOR_MAX_MV) {
+                    if (filtered_mv != s_full_charge_mv) {
+                        s_full_charge_mv = filtered_mv;
+                        ESP_LOGI(TAG, "battery: full-charge anchor = %dmV",
+                                 s_full_charge_mv);
+                        nvs_writer_run(do_save_bat_anchor, &s_full_charge_mv);
+                    }
+                }
             }
+            /* Reset the IIR filter and displayed percentage on any charger
+             * transition so they adopt the next sample directly.  Without
+             * this the filter lags ~4 cycles (IR offset change) and the
+             * slew-limited percentage takes minutes to reach the new target. */
+            filtered_mv = -1;
+            shown_pct = -1;
             prev_charging = charging;
         }
 
@@ -479,6 +541,9 @@ static void battery_monitor_task(void *arg)
 esp_err_t bsp_power_battery_monitor_start(void)
 {
     if (s_bat_mutex) return ESP_OK;   /* already running */
+
+    bat_load_anchor();
+    nvs_writer_init();
 
     s_bat_mutex = xSemaphoreCreateMutex();
     if (!s_bat_mutex) return ESP_ERR_NO_MEM;
