@@ -136,7 +136,11 @@ static int   s_flow_count = 0;
 
 void bsp_display_set_therapy_active(bool active)
 {
-    if (!s_state_mutex) return;
+    if (!s_state_mutex) {
+        ESP_LOGW(TAG, "set_therapy_active(%s) called before init — ignored",
+                 active ? "true" : "false");
+        return;
+    }
 
     /* Check LCD therapy mode setting */
     const device_settings_t *dev = device_settings_get();
@@ -149,11 +153,16 @@ void bsp_display_set_therapy_active(bool active)
         if (active) {
             s_flow_head = 0;
             s_flow_count = 0;
-            ESP_LOGI(TAG, "therapy graph mode enabled");
+            ESP_LOGI(TAG, "therapy graph mode enabled (display_task=%s)",
+                     s_display_task ? "alive" : "NULL");
         } else {
             s_status_dirty = true;  /* force immediate status redraw */
             ESP_LOGI(TAG, "therapy graph mode disabled");
         }
+    } else {
+        ESP_LOGD(TAG, "set_therapy_active(%s) — mode already %s, no-op",
+                 active ? "true" : "false",
+                 s_mode == DISP_MODE_GRAPH ? "GRAPH" : "STATUS");
     }
     xSemaphoreGive(s_state_mutex);
 

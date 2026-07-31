@@ -45,6 +45,7 @@
 #include "log_stream.h"
 #include "device_settings.h"
 #include "bsp_audio.h"
+#include "crash_diag.h"
 
 
 static const char *TAG = "somnotrace";
@@ -93,6 +94,10 @@ void app_main(void)
 
     /* 1b. Start log capture early so the ring buffer catches boot messages. */
     log_stream_init();
+
+    /* 1c. Log reset reason and check for crash core dump from previous boot.
+     * Must be after log_stream_init() so output is captured. */
+    crash_diag_check();
 
     /* 2. Start button monitors. */
     bsp_power_start_button_monitor(5000);   /* PWR 5 s = power off */

@@ -976,13 +976,11 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     /* Edge case: auto-start session if flow and pressure indicate active therapy */
     if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped && has_active_flow && has_therapy_pressure) {
         ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
+        bsp_display_set_therapy_active(true);
         s = session_writer_start();
-        if (s) {
-            bsp_display_set_therapy_active(true);
-        } else {
-            /* SD not ready — show warning instead of therapy graph */
-            const char *sd_lines[] = { "SD Card Error", "Cannot record session" };
-            bsp_display_show_lines("Warning", sd_lines, 2);
+        if (!s) {
+            ESP_LOGW(TAG, "session_writer_start() failed — "
+                     "graph active but NOT recording to SD");
         }
     }
 
@@ -1491,16 +1489,18 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         if (start) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
             s_therapy_stopped = false;
+            /* Always activate the live graph — the display should show the
+             * waveform regardless of whether SD recording succeeds.  Flow
+             * data from push_flow() is discarded when s_mode != GRAPH. */
+            bsp_display_set_therapy_active(true);
             if (!s || !s->active) {
                 s = session_writer_start();
             }
             if (s) {
-                bsp_display_set_therapy_active(true);
                 write_event(s, msg);
             } else {
-                /* SD not ready — show warning instead of therapy graph */
-                const char *sd_lines[] = { "SD Card Error", "Cannot record session" };
-                bsp_display_show_lines("Warning", sd_lines, 2);
+                ESP_LOGW(TAG, "session_writer_start() failed — "
+                         "graph active but NOT recording to SD");
             }
         }
         if (start || stop) return;
