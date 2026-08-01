@@ -27,3 +27,9 @@ bool bsp_display_is_therapy_active(void);
 void bsp_display_set_brightness(uint8_t percent);
 void bsp_display_set_backlight(bool on);
 uint8_t bsp_display_get_brightness(void);
+
+/* Apply the current backlight policy based on lcd_therapy_mode and therapy
+ * state.  Called after boot completes, when entering/leaving SoftAP, or
+ * when the mode is changed at runtime.
+ *   force_on: if true, always turn backlight on (used for SoftAP mode). */
+void bsp_display_apply_backlight_policy(bool force_on);

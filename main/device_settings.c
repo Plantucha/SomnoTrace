@@ -160,7 +160,11 @@ esp_err_t device_settings_save_json(const char *json_str)
     }
     if ((v = cJSON_GetObjectItem(root, "lcd_therapy_mode")) && cJSON_IsNumber(v)) {
         int val = v->valueint;
-        cfg.lcd_therapy_mode = (val == LCD_THERAPY_OFF) ? LCD_THERAPY_OFF : LCD_THERAPY_GRAPH;
+        if (val == LCD_THERAPY_OFF || val == LCD_THERAPY_ALWAYS_OFF) {
+            cfg.lcd_therapy_mode = (lcd_therapy_mode_t)val;
+        } else {
+            cfg.lcd_therapy_mode = LCD_THERAPY_GRAPH;
+        }
     }
 
     cJSON_Delete(root);
@@ -168,11 +172,9 @@ esp_err_t device_settings_save_json(const char *json_str)
     /* Apply brightness immediately */
     bsp_display_set_brightness(cfg.brightness);
 
-    /* If therapy is active, re-evaluate backlight based on the new mode */
-    if (bsp_display_is_therapy_active()) {
-        bool lcd_off = (cfg.lcd_therapy_mode == LCD_THERAPY_OFF);
-        bsp_display_set_backlight(!lcd_off);
-    }
+    /* Re-evaluate backlight based on the new mode.
+     * If in SoftAP (force_on), backlight stays on regardless. */
+    bsp_display_apply_backlight_policy(false);
 
     return device_settings_save(&cfg);
 }

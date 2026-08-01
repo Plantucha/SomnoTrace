@@ -29,8 +29,10 @@
 
 /* LCD behaviour during therapy */
 typedef enum {
-    LCD_THERAPY_GRAPH = 0,   /* Live flow graph (default) */
-    LCD_THERAPY_OFF   = 1,   /* Backlight completely off */
+    LCD_THERAPY_GRAPH      = 0,  /* Live flow graph (default) */
+    LCD_THERAPY_OFF        = 1,  /* Backlight off during therapy, on otherwise */
+    LCD_THERAPY_ALWAYS_OFF = 2,  /* Backlight always off (battery-friendly) —
+                                 * except during boot and SoftAP mode */
 } lcd_therapy_mode_t;
 
 typedef struct {

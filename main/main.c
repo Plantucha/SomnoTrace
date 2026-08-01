@@ -63,6 +63,7 @@ static void enter_softap(const struct netprov_config *cfg)
 {
     as11_ble_disconnect();
     bsp_display_set_wifi_connected(false);
+    bsp_display_apply_backlight_policy(true);  /* always show display in AP mode */
     char ap_ip[16] = "0.0.0.0";
     esp_err_t err = netprov_start_portal(cfg, ap_ip);
     if (err != ESP_OK) {
@@ -255,6 +256,10 @@ void app_main(void)
             ip_line,
         };
         show_status("SomnoTrace", lines, 2);
+
+        /* Boot complete: apply backlight policy (turns off LCD if
+         * LCD_THERAPY_ALWAYS_OFF mode is selected for battery saving). */
+        bsp_display_apply_backlight_policy(false);
     } else {
         ESP_LOGW(TAG, "Wi-Fi connect failed, entering SoftAP");
         enter_softap(&cfg);

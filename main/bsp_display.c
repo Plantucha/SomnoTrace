@@ -51,6 +51,7 @@
 
 static uint8_t s_brightness = 100;  /* current brightness (tenth-percent: 1=0.1%, 200=20%) */
 static bool s_backlight_on = true;  /* backlight hardware state */
+static bool s_backlight_force_on = false;  /* SoftAP/portal: keep backlight on */
 
 static const char *TAG = "bsp_display";
 
@@ -144,7 +145,7 @@ void bsp_display_set_therapy_active(bool active)
 
     /* Check LCD therapy mode setting */
     const device_settings_t *dev = device_settings_get();
-    bool lcd_off_mode = (dev->lcd_therapy_mode == LCD_THERAPY_OFF);
+    bool lcd_off_mode = (dev->lcd_therapy_mode != LCD_THERAPY_GRAPH);
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     disp_mode_t new_mode = active ? DISP_MODE_GRAPH : DISP_MODE_STATUS;
@@ -166,9 +167,17 @@ void bsp_display_set_therapy_active(bool active)
     }
     xSemaphoreGive(s_state_mutex);
 
-    /* In LCD-off mode, turn backlight off during therapy, restore on stop */
+    /* Backlight policy:
+     *   LCD_THERAPY_GRAPH:      always on
+     *   LCD_THERAPY_OFF:        off during therapy, on when therapy stops
+     *   LCD_THERAPY_ALWAYS_OFF: off during therapy, stays off when therapy stops */
     if (lcd_off_mode) {
-        bsp_display_set_backlight(!active);
+        if (active) {
+            bsp_display_set_backlight(false);
+        } else if (dev->lcd_therapy_mode == LCD_THERAPY_OFF) {
+            bsp_display_set_backlight(true);
+        }
+        /* ALWAYS_OFF: backlight stays off when therapy stops */
     }
 
     /* Wake the render task so the mode change is reflected immediately. */
@@ -611,6 +620,39 @@ void bsp_display_set_backlight(bool on)
 uint8_t bsp_display_get_brightness(void)
 {
     return s_brightness;
+}
+
+void bsp_display_apply_backlight_policy(bool force_on)
+{
+    if (force_on) {
+        s_backlight_force_on = true;
+        bsp_display_set_backlight(true);
+        return;
+    }
+
+    /* If force-on is active (SoftAP), keep backlight on regardless of mode */
+    if (s_backlight_force_on) {
+        bsp_display_set_backlight(true);
+        return;
+    }
+
+    const device_settings_t *dev = device_settings_get();
+    bool therapy_active = bsp_display_is_therapy_active();
+
+    switch (dev->lcd_therapy_mode) {
+    case LCD_THERAPY_GRAPH:
+        bsp_display_set_backlight(true);
+        break;
+    case LCD_THERAPY_OFF:
+        bsp_display_set_backlight(!therapy_active);
+        break;
+    case LCD_THERAPY_ALWAYS_OFF:
+        bsp_display_set_backlight(false);
+        break;
+    default:
+        bsp_display_set_backlight(true);
+        break;
+    }
 }
 
 static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
