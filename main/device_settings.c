@@ -172,9 +172,11 @@ esp_err_t device_settings_save_json(const char *json_str)
     /* Apply brightness immediately */
     bsp_display_set_brightness(cfg.brightness);
 
-    /* Re-evaluate backlight based on the new mode.
+    /* Persist first so device_settings_get() returns the new mode,
+     * then re-evaluate backlight based on the new mode.
      * If in SoftAP (force_on), backlight stays on regardless. */
+    esp_err_t ret = device_settings_save(&cfg);
     bsp_display_apply_backlight_policy(false);
 
-    return device_settings_save(&cfg);
+    return ret;
 }
