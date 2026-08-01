@@ -769,6 +769,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         }
     }
 
+    /* Configured SSIDs and password presence (from cache — no passwords sent) */
+    if (s_status_cache.cfg_valid) {
+        cJSON *ssids_arr = cJSON_AddArrayToObject(resp, "ssids");
+        cJSON *has_pass_arr = cJSON_AddArrayToObject(resp, "has_pass");
+        for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
+            if (s_status_cache.cfg.wifi[i].ssid[0] != '\0') {
+                cJSON_AddItemToArray(ssids_arr, cJSON_CreateString(s_status_cache.cfg.wifi[i].ssid));
+                cJSON_AddItemToArray(has_pass_arr, cJSON_CreateBool(s_status_cache.cfg.wifi[i].pass[0] != '\0'));
+            }
+        }
+    }
+
     /* Wi-Fi radio (channel is always available in STA mode) */
     uint8_t primary_chan = 0;
     wifi_second_chan_t second_chan;
@@ -1128,6 +1140,8 @@ static esp_err_t save_post_handler(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs save failed");
             return ESP_FAIL;
         }
+        /* Invalidate cached config so /api/status returns the new SSID list */
+        s_status_cache.cfg_valid = false;
         ESP_LOGI(TAG, "saved %d credentials", saved_count);
     }
 

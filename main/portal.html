@@ -1173,10 +1173,13 @@ function loadStatus() {
      * The dropdown already shows the current TZ from /api/status. */
     setTimeout(function() { loadTimezoneList(d.tz_name || ''); }, 2000);
 
-    // WiFi profiles: default to dropdown mode
+    // WiFi profiles: use manual (text input) mode for pre-populated networks
+    // so the SSID is visible even before a scan is done.
     if (d.ssids && d.ssids.length > 0) {
       activeBlocks = d.ssids.length;
-      // Don't set manualSSID — leave as dropdown by default
+      for (var i = 1; i <= d.ssids.length; i++) {
+        manualSSID[i] = true;
+      }
     }
     renderWifiBlocks();
 
