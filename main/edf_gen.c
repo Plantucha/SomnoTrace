@@ -1113,12 +1113,12 @@ static void noon_day_folder(int64_t epoch_ms, char *out, size_t out_len);
  * Sub-field 2 = 50th percentile, 3 = 95th (or 70th for Leak), 4 = 100th (or 95th).
  * The exact mapping depends on the field — see _SUMMARY_SUBFIELDS in as11_spool.py. */
 
-/* STR.edf signal count for VID=3 (AutoSet):
- * 77 data signals + 1 Crc16 = 78 total.
- * Non-AutoSet variants would have additional signals (VAuto/Spont/ST/ASV settings,
- * SpontTrig/Cyc, TgtVent/IERatio/Ti stats) — see edf_signals.md variant provenance. */
-#define STR_DATA_COUNT    77
-#define STR_SIGNAL_COUNT  78   /* includes Crc16 */
+/* STR.edf signal count — full 134-signal superset:
+ * 133 data signals + 1 Crc16 = 134 total.
+ * Includes VAuto/Spont/ST/Timed/ASV/ASVAuto settings and
+ * SpontTrig/Cyc, TgtVent/IERatio/Ti stats — see edf_signals.md. */
+#define STR_DATA_COUNT    133
+#define STR_SIGNAL_COUNT  134   /* includes Crc16 */
 
 /* STR enum export maps — some fields are remapped before writing to EDF.
  * From edf_signals.md "STR enum export maps" section. */
@@ -1278,6 +1278,37 @@ static int on_off_to_edf(const char *s)
     return -1;
 }
 
+/* Map trigger/cycle sensitivity to EDF value.
+ * Export map [1,2,3,4,5,6,7] = raw_index + 1.
+ * The AS11 Get RPC returns these as numbers (raw CONF indices 0-6).
+ * See edf_signals.md "STR enum export maps". */
+static int trigger_cycle_to_edf(int raw)
+{
+    if (raw < 0 || raw > 6) return -1;
+    return raw + 1;
+}
+
+/* Map EasyBreathe enable to EDF value.
+ * Export map [1,2] = Off=1, On=2. */
+static int easy_breathe_to_edf(const char *s)
+{
+    if (!s) return -1;
+    if (strcmp(s, "Off") == 0) return 1;
+    if (strcmp(s, "On") == 0) return 2;
+    return -1;
+}
+
+/* Map RespiratoryRateEnable to EDF value.
+ * Export map [1,3]: raw 0→1 (Off), raw 1→3 (On).
+ * See edf_signals.md "STR enum export maps". */
+static int resp_rate_en_to_edf(const char *s)
+{
+    if (!s) return -1;
+    if (strcmp(s, "Off") == 0) return 1;
+    if (strcmp(s, "On") == 0) return 3;
+    return -1;
+}
+
 /* Map ActiveTherapyProfile name from settings.json to the MOP enum index
  * used by MODE_MAP.  The AS11 STR.edf Mode field is sourced from the
  * ActiveTherapyProfile (MOP setting), not from SessionModeEntries in the
@@ -1288,13 +1319,15 @@ static int profile_name_to_mop(const char *name)
     if (!name) return -1;
     if (strcmp(name, "CpapProfile") == 0)       return 0;  /* CPAP      */
     if (strcmp(name, "AutoSetProfile") == 0)    return 1;  /* AutoSet   */
+    if (strcmp(name, "AutoSetForHerProfile") == 0) return 2;  /* APAP (Her) */
     if (strcmp(name, "SpontProfile") == 0)      return 3;  /* S         */
     if (strcmp(name, "STProfile") == 0)         return 4;  /* ST        */
     if (strcmp(name, "TimedProfile") == 0)      return 5;  /* T         */
     if (strcmp(name, "VAutoProfile") == 0)      return 6;  /* VAuto     */
     if (strcmp(name, "ASVProfile") == 0)        return 7;  /* ASV       */
     if (strcmp(name, "ASVAutoProfile") == 0)    return 8;  /* ASVAuto   */
-    if (strcmp(name, "AutoSetForHerProfile") == 0) return 11; /* AutoSet Her */
+    if (strcmp(name, "iVAPSProfile") == 0)      return 9;  /* iVAPS     */
+    if (strcmp(name, "PACProfile") == 0)        return 10; /* PAC       */
     return -1;
 }
 
@@ -1325,13 +1358,13 @@ static int16_t spool_to_edf(int16_t raw, int num, int den)
     return (int16_t)((int32_t)raw * num / den);
 }
 
-/* Build STR data values [4-76] from a summary context and settings JSON.
+/* Build STR data values [4-132] from a summary context and settings JSON.
  * str_values must be pre-filled with 0xFF (sentinel for "no data").
  *
- * Spool-derived stat fields [33-76] are raw fixed-point integers from the
+ * Spool-derived stat fields [78-132] are raw fixed-point integers from the
  * protobuf Summary record.  Each is divided by its logical_scale (via
  * spool_to_edf) to produce the EDF digital value that the AS11 firmware
- * would write.  Settings fields [6-30] come from the Get RPC response
+ * would write.  Settings fields [6-77] come from the Get RPC response
  * (settings.json) and are already in EDF digital units (e.g. cmH2O × 50). */
 static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                                   const cJSON *settings_json)
@@ -1353,17 +1386,15 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
     }
     if (mode_raw >= 0 && mode_raw < (int)(sizeof(MODE_MAP) / sizeof(MODE_MAP[0]))) {
         str_values[5] = MODE_MAP[mode_raw];
-    } else if (mode_raw == 11) {
-        /* AutoSet Her: not in standard MODE_MAP (which has 11 entries for
-         * indices 0-10).  Use the MOP enum value directly as the EDF value. */
-        str_values[5] = 11;
     } else {
         str_values[5] = -1;  /* unknown — leave sentinel */
     }
 
-    /* CPAP/AutoSet settings [6-13] and common comfort/settings [14-30]:
-     * from settings.json (Get RPC response captured during post-therapy).
+    /* CPAP/AutoSet settings [6-13], bi-level settings [14-58], and
+     * common comfort/settings [59-77]: from settings.json (Get RPC response
+     * captured during post-therapy).
      * Pressures are stored in cmH2O × 50, temperatures in °C × 10.
+     * Ti fields use seconds × 50 (logical_scale=20, edf_output_scale=50).
      * Enum fields use AS11 EDF convention: raw enum + 1 (Off=1, On=2, etc.).
      * S.Mask is the exception: raw + 2.  See spec/0002-edf-export.md §4.3.4. */
     if (settings_json) {
@@ -1399,9 +1430,134 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                 if ((v = cJSON_GetObjectItem(her, "MinPressure")) && cJSON_IsNumber(v))
                     str_values[13] = (int16_t)(v->valuedouble * 50);
             }
+
+            /* VAuto settings [14-21]: pressures cmH2O × 50, Ti × 50,
+             * trigger/cycle via trigger_cycle_to_edf (raw + 1). */
+            cJSON *vauto = cJSON_GetObjectItem(tp, "VAutoProfile");
+            if (vauto) {
+                if ((v = cJSON_GetObjectItem(vauto, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[14] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(vauto, "MaxInspiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[15] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(vauto, "MinExpiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[16] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(vauto, "SetPressureSupport")) && cJSON_IsNumber(v))
+                    str_values[17] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(vauto, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
+                    str_values[18] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(vauto, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
+                    str_values[19] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(vauto, "TriggerSensitivity")) && cJSON_IsNumber(v))
+                    str_values[20] = (int16_t)trigger_cycle_to_edf(v->valueint);
+                if ((v = cJSON_GetObjectItem(vauto, "CycleSensitivity")) && cJSON_IsNumber(v))
+                    str_values[21] = (int16_t)trigger_cycle_to_edf(v->valueint);
+            }
+
+            /* Spont settings [22-32]: pressures cmH2O × 50, Ti × 50,
+             * EasyBreathe/RespRateEn via helpers, RiseEnable via on_off,
+             * RiseTime in msec, trigger/cycle via helper. */
+            cJSON *spont = cJSON_GetObjectItem(tp, "SpontProfile");
+            if (spont) {
+                if ((v = cJSON_GetObjectItem(spont, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[22] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(spont, "TargetInspiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[23] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(spont, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[24] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(spont, "EasyBreatheEnable")) && cJSON_IsString(v))
+                    str_values[25] = (int16_t)easy_breathe_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(spont, "RespiratoryRateEnable")) && cJSON_IsString(v))
+                    str_values[26] = (int16_t)resp_rate_en_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(spont, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
+                    str_values[27] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(spont, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
+                    str_values[28] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(spont, "RiseTimeEnable")) && cJSON_IsString(v))
+                    str_values[29] = (int16_t)on_off_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(spont, "RiseTime")) && cJSON_IsNumber(v))
+                    str_values[30] = (int16_t)v->valuedouble;
+                if ((v = cJSON_GetObjectItem(spont, "TriggerSensitivity")) && cJSON_IsNumber(v))
+                    str_values[31] = (int16_t)trigger_cycle_to_edf(v->valueint);
+                if ((v = cJSON_GetObjectItem(spont, "CycleSensitivity")) && cJSON_IsNumber(v))
+                    str_values[32] = (int16_t)trigger_cycle_to_edf(v->valueint);
+            }
+
+            /* ST settings [33-42]: pressures cmH2O × 50, RespRate × 5,
+             * Ti × 50, RiseEnable/RiseTime, trigger via helper, cycle raw+1. */
+            cJSON *st = cJSON_GetObjectItem(tp, "STProfile");
+            if (st) {
+                if ((v = cJSON_GetObjectItem(st, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[33] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(st, "TargetInspiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[34] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(st, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[35] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(st, "SetRespiratoryRate")) && cJSON_IsNumber(v))
+                    str_values[36] = (int16_t)(v->valuedouble * 5);
+                if ((v = cJSON_GetObjectItem(st, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
+                    str_values[37] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(st, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
+                    str_values[38] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(st, "RiseTimeEnable")) && cJSON_IsString(v))
+                    str_values[39] = (int16_t)on_off_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(st, "RiseTime")) && cJSON_IsNumber(v))
+                    str_values[40] = (int16_t)v->valuedouble;
+                if ((v = cJSON_GetObjectItem(st, "TriggerSensitivity")) && cJSON_IsNumber(v))
+                    str_values[41] = (int16_t)trigger_cycle_to_edf(v->valueint);
+                if ((v = cJSON_GetObjectItem(st, "CycleSensitivity")) && cJSON_IsNumber(v))
+                    str_values[42] = (int16_t)(v->valueint + 1);
+            }
+
+            /* Timed settings [43-49]: pressures cmH2O × 50, RespRate × 5,
+             * Ti × 50, RiseEnable/RiseTime. */
+            cJSON *timed = cJSON_GetObjectItem(tp, "TimedProfile");
+            if (timed) {
+                if ((v = cJSON_GetObjectItem(timed, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[43] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(timed, "TargetInspiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[44] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(timed, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[45] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(timed, "SetRespiratoryRate")) && cJSON_IsNumber(v))
+                    str_values[46] = (int16_t)(v->valuedouble * 5);
+                if ((v = cJSON_GetObjectItem(timed, "SetInspiratoryTime")) && cJSON_IsNumber(v))
+                    str_values[47] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(timed, "RiseTimeEnable")) && cJSON_IsString(v))
+                    str_values[48] = (int16_t)on_off_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(timed, "RiseTime")) && cJSON_IsNumber(v))
+                    str_values[49] = (int16_t)v->valuedouble;
+            }
+
+            /* ASV settings [50-53]: pressures cmH2O × 50 */
+            cJSON *asv = cJSON_GetObjectItem(tp, "ASVProfile");
+            if (asv) {
+                if ((v = cJSON_GetObjectItem(asv, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[50] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(asv, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[51] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(asv, "MaxPressureSupport")) && cJSON_IsNumber(v))
+                    str_values[52] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(asv, "MinPressureSupport")) && cJSON_IsNumber(v))
+                    str_values[53] = (int16_t)(v->valuedouble * 50);
+            }
+
+            /* ASVAuto settings [54-58]: pressures cmH2O × 50 */
+            cJSON *asvauto = cJSON_GetObjectItem(tp, "ASVAutoProfile");
+            if (asvauto) {
+                if ((v = cJSON_GetObjectItem(asvauto, "StartPressure")) && cJSON_IsNumber(v))
+                    str_values[54] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(asvauto, "MaxExpiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[55] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(asvauto, "MinExpiratoryPressure")) && cJSON_IsNumber(v))
+                    str_values[56] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(asvauto, "MaxPressureSupport")) && cJSON_IsNumber(v))
+                    str_values[57] = (int16_t)(v->valuedouble * 50);
+                if ((v = cJSON_GetObjectItem(asvauto, "MinPressureSupport")) && cJSON_IsNumber(v))
+                    str_values[58] = (int16_t)(v->valuedouble * 50);
+            }
         }
 
-        /* Comfort/settings [14-30] */
+        /* Comfort/settings [59-77] */
         if (fp) {
             cJSON *comfort = cJSON_GetObjectItem(fp, "ComfortFeature");
             cJSON *epr = cJSON_GetObjectItem(fp, "EprFeature");
@@ -1415,148 +1571,167 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             if (comfort) {
                 v = cJSON_GetObjectItem(comfort, "AutoSetComfort");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "On") == 0) str_values[14] = 2;
-                    else if (strcmp(v->valuestring, "Off") == 0) str_values[14] = 1;
+                    if (strcmp(v->valuestring, "On") == 0) str_values[59] = 2;
+                    else if (strcmp(v->valuestring, "Off") == 0) str_values[59] = 1;
                 }
             }
 
             if (ramp) {
                 v = cJSON_GetObjectItem(ramp, "RampEnable");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "Off") == 0) str_values[15] = 1;
-                    else if (strcmp(v->valuestring, "On") == 0) str_values[15] = 2;
-                    else if (strcmp(v->valuestring, "Auto") == 0) str_values[15] = 3;
+                    if (strcmp(v->valuestring, "Off") == 0) str_values[60] = 1;
+                    else if (strcmp(v->valuestring, "On") == 0) str_values[60] = 2;
+                    else if (strcmp(v->valuestring, "Auto") == 0) str_values[60] = 3;
                 }
                 v = cJSON_GetObjectItem(ramp, "RampTime");
-                if (v && cJSON_IsNumber(v)) str_values[16] = (int16_t)v->valuedouble;
+                if (v && cJSON_IsNumber(v)) str_values[61] = (int16_t)v->valuedouble;
             }
 
             if (epr) {
                 v = cJSON_GetObjectItem(epr, "EprEnablePatientAccess");
-                if (v && cJSON_IsString(v)) str_values[17] = (int16_t)on_off_to_edf(v->valuestring);
+                if (v && cJSON_IsString(v)) str_values[62] = (int16_t)on_off_to_edf(v->valuestring);
                 v = cJSON_GetObjectItem(epr, "EprEnable");
-                if (v && cJSON_IsString(v)) str_values[18] = (int16_t)on_off_to_edf(v->valuestring);
+                if (v && cJSON_IsString(v)) str_values[63] = (int16_t)on_off_to_edf(v->valuestring);
                 v = cJSON_GetObjectItem(epr, "EprPressure");
-                if (v && cJSON_IsNumber(v)) str_values[19] = (int16_t)(v->valuedouble * 50);
+                if (v && cJSON_IsNumber(v)) str_values[64] = (int16_t)(v->valuedouble * 50);
                 v = cJSON_GetObjectItem(epr, "EprType");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "RampOnly") == 0) str_values[20] = 1;
-                    else if (strcmp(v->valuestring, "FullTime") == 0) str_values[20] = 2;
+                    if (strcmp(v->valuestring, "RampOnly") == 0) str_values[65] = 1;
+                    else if (strcmp(v->valuestring, "FullTime") == 0) str_values[65] = 2;
                 }
             }
 
             if (smart) {
                 v = cJSON_GetObjectItem(smart, "SmartStart");
-                if (v && cJSON_IsString(v)) str_values[21] = (int16_t)on_off_to_edf(v->valuestring);
+                if (v && cJSON_IsString(v)) str_values[66] = (int16_t)on_off_to_edf(v->valuestring);
             }
 
             if (patview) {
                 v = cJSON_GetObjectItem(patview, "PatientView");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "Advanced") == 0) str_values[22] = 1;
-                    else if (strcmp(v->valuestring, "Full") == 0) str_values[22] = 1;
-                    else if (strcmp(v->valuestring, "Basic") == 0) str_values[22] = 2;
+                    if (strcmp(v->valuestring, "Advanced") == 0) str_values[67] = 1;
+                    else if (strcmp(v->valuestring, "Full") == 0) str_values[67] = 1;
+                    else if (strcmp(v->valuestring, "Basic") == 0) str_values[67] = 2;
                 }
             }
 
             if (circuit) {
                 v = cJSON_GetObjectItem(circuit, "AntiBacterialFilter");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "No") == 0) str_values[23] = 1;
-                    else if (strcmp(v->valuestring, "Yes") == 0) str_values[23] = 2;
+                    if (strcmp(v->valuestring, "No") == 0) str_values[68] = 1;
+                    else if (strcmp(v->valuestring, "Yes") == 0) str_values[68] = 2;
                 }
                 v = cJSON_GetObjectItem(circuit, "MaskType");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "Pillows") == 0) str_values[24] = 2;
+                    if (strcmp(v->valuestring, "Pillows") == 0) str_values[69] = 2;
                     else if (strcmp(v->valuestring, "FullFace") == 0 ||
-                             strcmp(v->valuestring, "Full Face") == 0) str_values[24] = 3;
-                    else if (strcmp(v->valuestring, "Nasal") == 0) str_values[24] = 4;
-                    else if (strcmp(v->valuestring, "Pediatric") == 0) str_values[24] = 5;
+                             strcmp(v->valuestring, "Full Face") == 0) str_values[69] = 3;
+                    else if (strcmp(v->valuestring, "Nasal") == 0) str_values[69] = 4;
+                    else if (strcmp(v->valuestring, "Pediatric") == 0) str_values[69] = 5;
                 }
                 v = cJSON_GetObjectItem(circuit, "TubeType");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "SlimLine") == 0) str_values[25] = 1;
-                    else if (strcmp(v->valuestring, "Standard") == 0) str_values[25] = 2;
-                    else if (strcmp(v->valuestring, "15mmNonHeated") == 0) str_values[25] = 3;
-                    else if (strcmp(v->valuestring, "19mmNonHeated") == 0) str_values[25] = 4;
+                    if (strcmp(v->valuestring, "SlimLine") == 0) str_values[70] = 1;
+                    else if (strcmp(v->valuestring, "Standard") == 0) str_values[70] = 2;
+                    else if (strcmp(v->valuestring, "15mmNonHeated") == 0) str_values[70] = 3;
+                    else if (strcmp(v->valuestring, "19mmNonHeated") == 0) str_values[70] = 4;
                 }
             }
 
             if (climate) {
                 v = cJSON_GetObjectItem(climate, "ClimateControl");
                 if (v && cJSON_IsString(v)) {
-                    if (strcmp(v->valuestring, "Auto") == 0) str_values[26] = 1;
-                    else if (strcmp(v->valuestring, "Manual") == 0) str_values[26] = 2;
+                    if (strcmp(v->valuestring, "Auto") == 0) str_values[71] = 1;
+                    else if (strcmp(v->valuestring, "Manual") == 0) str_values[71] = 2;
                 }
                 v = cJSON_GetObjectItem(climate, "HumidifierSettingEnable");
-                if (v && cJSON_IsString(v)) str_values[27] = (int16_t)on_off_to_edf(v->valuestring);
+                if (v && cJSON_IsString(v)) str_values[72] = (int16_t)on_off_to_edf(v->valuestring);
                 v = cJSON_GetObjectItem(climate, "HumidifierLevel");
-                if (v && cJSON_IsNumber(v)) str_values[28] = (int16_t)v->valuedouble;
+                if (v && cJSON_IsNumber(v)) str_values[73] = (int16_t)v->valuedouble;
                 v = cJSON_GetObjectItem(climate, "HeatedTubeSettingEnable");
-                if (v && cJSON_IsString(v)) str_values[29] = (int16_t)on_off_to_edf(v->valuestring);
+                if (v && cJSON_IsString(v)) str_values[74] = (int16_t)on_off_to_edf(v->valuestring);
                 v = cJSON_GetObjectItem(climate, "HeatedTubeTemperature");
-                if (v && cJSON_IsNumber(v)) str_values[30] = (int16_t)(v->valuedouble * 10);
+                if (v && cJSON_IsNumber(v)) str_values[75] = (int16_t)(v->valuedouble * 10);
             }
         }
     }
 
-    /* [31] HeatedTube and [32] Humidifier: enum fields from Summary spool.
+    /* [76] HeatedTube and [77] Humidifier: enum fields from Summary spool.
      * logical_scale = 1, no conversion needed. */
-    str_values[31] = get_scalar(ctx, SUM_F_TUBE_CONNECTED, -1);
-    str_values[32] = get_scalar(ctx, SUM_F_HUM_CONNECTED, -1);
+    str_values[76] = get_scalar(ctx, SUM_F_TUBE_CONNECTED, -1);
+    str_values[77] = get_scalar(ctx, SUM_F_HUM_CONNECTED, -1);
 
-    /* Environment and oximetry stats [33-46]
+    /* Environment and oximetry stats [78-91]
      * Spool values are converted to EDF digital via spool_to_edf().
      * Default -1 (sentinel) when no summary data available. */
-    str_values[33] = spool_to_edf(get_metric(ctx, SUM_F_BLOWER_PRESS, 3, -1), 1, 2);   /* BlowPress.95  /2  */
-    str_values[34] = spool_to_edf(get_metric(ctx, SUM_F_BLOWER_PRESS, 1, -1), 1, 2);   /* BlowPress.5   /2  */
-    str_values[35] = spool_to_edf(get_metric(ctx, SUM_F_RESP_FLOW, 3, -1), 5, 1);     /* Flow.95       *5  */
-    str_values[36] = spool_to_edf(get_metric(ctx, SUM_F_RESP_FLOW, 1, -1), 5, 1);     /* Flow.5        *5  */
-    str_values[37] = spool_to_edf(get_metric(ctx, SUM_F_BLOWER_FLOW, 2, -1), 5, 1);   /* BlowFlow.50   *5  */
-    str_values[38] = spool_to_edf(get_metric(ctx, SUM_F_AMB_HUMID, 2, -1), 1, 10);    /* AmbHumidity   /10 */
-    str_values[39] = spool_to_edf(get_metric(ctx, SUM_F_HUM_TEMP, 2, -1), 1, 10);     /* HumTemp       /10 */
-    str_values[40] = spool_to_edf(get_metric(ctx, SUM_F_HTUBE_TEMP, 2, -1), 1, 10);   /* HTubeTemp     /10 */
-    str_values[41] = spool_to_edf(get_metric(ctx, SUM_F_HTUBE_POWER, 2, -1), 1, 10);  /* HTubePow      /10 */
-    str_values[42] = spool_to_edf(get_metric(ctx, SUM_F_HUM_POWER, 2, -1), 1, 10);    /* HumPow        /10 */
-    str_values[43] = spool_to_edf(get_metric(ctx, SUM_F_SPO2, 2, -1), 1, 100);        /* SpO2.50       /100*/
-    str_values[44] = spool_to_edf(get_metric(ctx, SUM_F_SPO2, 3, -1), 1, 100);        /* SpO2.95       /100*/
-    str_values[45] = spool_to_edf(get_metric(ctx, SUM_F_SPO2, 4, -1), 1, 100);        /* SpO2.Max      /100*/
-    str_values[46] = get_scalar(ctx, SUM_F_SAU, -1);                                  /* SpO2Thresh    no scale */
+    str_values[78] = spool_to_edf(get_metric(ctx, SUM_F_BLOWER_PRESS, 3, -1), 1, 2);   /* BlowPress.95  /2  */
+    str_values[79] = spool_to_edf(get_metric(ctx, SUM_F_BLOWER_PRESS, 1, -1), 1, 2);   /* BlowPress.5   /2  */
+    str_values[80] = spool_to_edf(get_metric(ctx, SUM_F_RESP_FLOW, 3, -1), 5, 1);     /* Flow.95       *5  */
+    str_values[81] = spool_to_edf(get_metric(ctx, SUM_F_RESP_FLOW, 1, -1), 5, 1);     /* Flow.5        *5  */
+    str_values[82] = spool_to_edf(get_metric(ctx, SUM_F_BLOWER_FLOW, 2, -1), 5, 1);   /* BlowFlow.50   *5  */
+    str_values[83] = spool_to_edf(get_metric(ctx, SUM_F_AMB_HUMID, 2, -1), 1, 10);    /* AmbHumidity   /10 */
+    str_values[84] = spool_to_edf(get_metric(ctx, SUM_F_HUM_TEMP, 2, -1), 1, 10);     /* HumTemp       /10 */
+    str_values[85] = spool_to_edf(get_metric(ctx, SUM_F_HTUBE_TEMP, 2, -1), 1, 10);   /* HTubeTemp     /10 */
+    str_values[86] = spool_to_edf(get_metric(ctx, SUM_F_HTUBE_POWER, 2, -1), 1, 10);  /* HTubePow      /10 */
+    str_values[87] = spool_to_edf(get_metric(ctx, SUM_F_HUM_POWER, 2, -1), 1, 10);    /* HumPow        /10 */
+    str_values[88] = spool_to_edf(get_metric(ctx, SUM_F_SPO2, 2, -1), 1, 100);        /* SpO2.50       /100*/
+    str_values[89] = spool_to_edf(get_metric(ctx, SUM_F_SPO2, 3, -1), 1, 100);        /* SpO2.95       /100*/
+    str_values[90] = spool_to_edf(get_metric(ctx, SUM_F_SPO2, 4, -1), 1, 100);        /* SpO2.Max      /100*/
+    str_values[91] = get_scalar(ctx, SUM_F_SAU, -1);                                  /* SpO2Thresh    no scale */
 
-    /* Bilevel/ventilation summary stats [47-68] */
-    str_values[47] = spool_to_edf(get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 2, -1), 1, 2);  /* MaskPress.50 /2 */
-    str_values[48] = spool_to_edf(get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 3, -1), 1, 2);  /* MaskPress.95 /2 */
-    str_values[49] = spool_to_edf(get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 4, -1), 1, 2);  /* MaskPress.Max /2 */
-    str_values[50] = spool_to_edf(get_metric(ctx, SUM_F_INSP_PRESS, 2, -1), 1, 2);       /* TgtIPAP.50   /2 */
-    str_values[51] = spool_to_edf(get_metric(ctx, SUM_F_INSP_PRESS, 3, -1), 1, 2);       /* TgtIPAP.95   /2 */
-    str_values[52] = spool_to_edf(get_metric(ctx, SUM_F_INSP_PRESS, 4, -1), 1, 2);       /* TgtIPAP.Max  /2 */
-    str_values[53] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 2, -1), 1, 2);        /* TgtEPAP.50   /2 */
-    str_values[54] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 3, -1), 1, 2);        /* TgtEPAP.95   /2 */
-    str_values[55] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 4, -1), 1, 2);        /* TgtEPAP.Max  /2 */
-    str_values[56] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 2, -1), 1, 2);             /* Leak.50      /2 */
-    str_values[57] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 4, -1), 1, 2);             /* Leak.95      /2 */
-    str_values[58] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 3, -1), 1, 2);             /* Leak.70      /2 */
-    str_values[59] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 5, -1), 1, 2);             /* Leak.Max     /2 */
-    str_values[60] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 2, -1), 2, 25);        /* MinVent.50   /12.5 */
-    str_values[61] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 3, -1), 2, 25);        /* MinVent.95   /12.5 */
-    str_values[62] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 4, -1), 2, 25);        /* MinVent.Max  /12.5 */
-    str_values[63] = spool_to_edf(get_metric(ctx, SUM_F_RESP_RATE, 2, -1), 1, 20);       /* RespRate.50  /20 */
-    str_values[64] = spool_to_edf(get_metric(ctx, SUM_F_RESP_RATE, 3, -1), 1, 20);       /* RespRate.95  /20 */
-    str_values[65] = spool_to_edf(get_metric(ctx, SUM_F_RESP_RATE, 4, -1), 1, 20);       /* RespRate.Max /20 */
-    str_values[66] = spool_to_edf(get_metric(ctx, SUM_F_TIDAL_VOL, 2, -1), 1, 2);        /* TidVol.50    /2 */
-    str_values[67] = spool_to_edf(get_metric(ctx, SUM_F_TIDAL_VOL, 3, -1), 1, 2);        /* TidVol.95    /2 */
-    str_values[68] = spool_to_edf(get_metric(ctx, SUM_F_TIDAL_VOL, 4, -1), 1, 2);        /* TidVol.Max   /2 */
+    /* Spont trigger/cycle percentages [92-93] — scalars, logical_scale = 50. */
+    str_values[92] = spool_to_edf(get_scalar(ctx, SUM_F_SPONT_TRIG, -1), 1, 50);  /* SpontTrig% /50 */
+    str_values[93] = spool_to_edf(get_scalar(ctx, SUM_F_SPONT_CYC, -1), 1, 50);   /* SpontCyc%  /50 */
 
-    /* Indices [69-75] — logical_scale = 10 (events/hr × 10 in spool).
-     * [76] CSR — logical_scale = 1, no conversion. */
-    str_values[69] = spool_to_edf(get_scalar(ctx, SUM_F_AHI, -1), 1, 10);
-    str_values[70] = spool_to_edf(get_scalar(ctx, SUM_F_HI, -1), 1, 10);
-    str_values[71] = spool_to_edf(get_scalar(ctx, SUM_F_AI, -1), 1, 10);
-    str_values[72] = spool_to_edf(get_scalar(ctx, SUM_F_OAI, -1), 1, 10);
-    str_values[73] = spool_to_edf(get_scalar(ctx, SUM_F_CAI, -1), 1, 10);
-    str_values[74] = spool_to_edf(get_scalar(ctx, SUM_F_UAI, -1), 1, 10);
-    str_values[75] = spool_to_edf(get_scalar(ctx, SUM_F_RIN, -1), 1, 10);
-    str_values[76] = get_scalar(ctx, SUM_F_CSR, -1);
+    /* Bilevel/ventilation summary stats [94-115] */
+    str_values[94] = spool_to_edf(get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 2, -1), 1, 2);  /* MaskPress.50 /2 */
+    str_values[95] = spool_to_edf(get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 3, -1), 1, 2);  /* MaskPress.95 /2 */
+    str_values[96] = spool_to_edf(get_metric(ctx, SUM_F_MEAN_MASK_PRESS, 4, -1), 1, 2);  /* MaskPress.Max /2 */
+    str_values[97] = spool_to_edf(get_metric(ctx, SUM_F_INSP_PRESS, 2, -1), 1, 2);       /* TgtIPAP.50   /2 */
+    str_values[98] = spool_to_edf(get_metric(ctx, SUM_F_INSP_PRESS, 3, -1), 1, 2);       /* TgtIPAP.95   /2 */
+    str_values[99] = spool_to_edf(get_metric(ctx, SUM_F_INSP_PRESS, 4, -1), 1, 2);       /* TgtIPAP.Max  /2 */
+    str_values[100] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 2, -1), 1, 2);       /* TgtEPAP.50   /2 */
+    str_values[101] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 3, -1), 1, 2);       /* TgtEPAP.95   /2 */
+    str_values[102] = spool_to_edf(get_metric(ctx, SUM_F_EXP_PRESS, 4, -1), 1, 2);       /* TgtEPAP.Max  /2 */
+    str_values[103] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 2, -1), 1, 2);            /* Leak.50      /2 */
+    str_values[104] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 4, -1), 1, 2);            /* Leak.95      /2 */
+    str_values[105] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 3, -1), 1, 2);            /* Leak.70      /2 */
+    str_values[106] = spool_to_edf(get_metric(ctx, SUM_F_LEAK, 5, -1), 1, 2);            /* Leak.Max     /2 */
+    str_values[107] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 2, -1), 2, 25);       /* MinVent.50   /12.5 */
+    str_values[108] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 3, -1), 2, 25);       /* MinVent.95   /12.5 */
+    str_values[109] = spool_to_edf(get_metric(ctx, SUM_F_MIN_VENT, 4, -1), 2, 25);       /* MinVent.Max  /12.5 */
+    str_values[110] = spool_to_edf(get_metric(ctx, SUM_F_RESP_RATE, 2, -1), 1, 20);      /* RespRate.50  /20 */
+    str_values[111] = spool_to_edf(get_metric(ctx, SUM_F_RESP_RATE, 3, -1), 1, 20);      /* RespRate.95  /20 */
+    str_values[112] = spool_to_edf(get_metric(ctx, SUM_F_RESP_RATE, 4, -1), 1, 20);      /* RespRate.Max /20 */
+    str_values[113] = spool_to_edf(get_metric(ctx, SUM_F_TIDAL_VOL, 2, -1), 1, 2);       /* TidVol.50    /2 */
+    str_values[114] = spool_to_edf(get_metric(ctx, SUM_F_TIDAL_VOL, 3, -1), 1, 2);       /* TidVol.95    /2 */
+    str_values[115] = spool_to_edf(get_metric(ctx, SUM_F_TIDAL_VOL, 4, -1), 1, 2);       /* TidVol.Max   /2 */
+
+    /* Target minute ventilation [116-118] — logical_scale = 12.5. */
+    str_values[116] = spool_to_edf(get_metric(ctx, SUM_F_TGT_VENT, 2, -1), 2, 25);  /* TgtVent.50  /12.5 */
+    str_values[117] = spool_to_edf(get_metric(ctx, SUM_F_TGT_VENT, 3, -1), 2, 25);  /* TgtVent.95  /12.5 */
+    str_values[118] = spool_to_edf(get_metric(ctx, SUM_F_TGT_VENT, 4, -1), 2, 25);  /* TgtVent.Max /12.5 */
+
+    /* I:E ratio [119-121] — logical_scale = 100. */
+    str_values[119] = spool_to_edf(get_metric(ctx, SUM_F_IE_RATIO, 2, -1), 1, 100);  /* IERatio.50  /100 */
+    str_values[120] = spool_to_edf(get_metric(ctx, SUM_F_IE_RATIO, 3, -1), 1, 100);  /* IERatio.95  /100 */
+    str_values[121] = spool_to_edf(get_metric(ctx, SUM_F_IE_RATIO, 4, -1), 1, 100);  /* IERatio.Max /100 */
+
+    /* Inspiratory duration [122-124] — logical_scale = 20. */
+    str_values[122] = spool_to_edf(get_metric(ctx, SUM_F_INSP_DUR, 2, -1), 1, 20);  /* Ti.50  /20 */
+    str_values[123] = spool_to_edf(get_metric(ctx, SUM_F_INSP_DUR, 3, -1), 1, 20);  /* Ti.95  /20 */
+    str_values[124] = spool_to_edf(get_metric(ctx, SUM_F_INSP_DUR, 4, -1), 1, 20);  /* Ti.Max /20 */
+
+    /* Indices [125-131] — logical_scale = 10 (events/hr × 10 in spool).
+     * [132] CSR — logical_scale = 1, no conversion. */
+    str_values[125] = spool_to_edf(get_scalar(ctx, SUM_F_AHI, -1), 1, 10);
+    str_values[126] = spool_to_edf(get_scalar(ctx, SUM_F_HI, -1), 1, 10);
+    str_values[127] = spool_to_edf(get_scalar(ctx, SUM_F_AI, -1), 1, 10);
+    str_values[128] = spool_to_edf(get_scalar(ctx, SUM_F_OAI, -1), 1, 10);
+    str_values[129] = spool_to_edf(get_scalar(ctx, SUM_F_CAI, -1), 1, 10);
+    str_values[130] = spool_to_edf(get_scalar(ctx, SUM_F_UAI, -1), 1, 10);
+    str_values[131] = spool_to_edf(get_scalar(ctx, SUM_F_RIN, -1), 1, 10);
+    str_values[132] = get_scalar(ctx, SUM_F_CSR, -1);
 }
 
 /* Build STR header values [0-3] from summary spool session entries.
@@ -2083,7 +2258,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     /* Keep only the newest 30 (trim from the front) */
     int start_idx = n_spool > 30 ? n_spool - 30 : 0;
 
-    str_day_record_t *records = calloc(30, sizeof(str_day_record_t));
+    str_day_record_t *records = calloc(31, sizeof(str_day_record_t));
     summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
     edf_signal_def_t *str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
     if (!records || !ctx || !str_sigs) {
@@ -2184,7 +2359,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     }
     ESP_LOGI(TAG, "STR.edf: current_day_found=%d n_records=%d",
              current_day_found, n_records);
-    if (!current_day_found && n_records < 30) {
+    if (!current_day_found && n_records < 31) {
         ESP_LOGI(TAG, "STR.edf: synthesizing current day record (day=%s)",
                  current_day_label);
         build_current_day_record(&records[n_records], session_dir,
@@ -2230,7 +2405,58 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         { .label="S.AFH.StartPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
         { .label="S.AFH.MaxPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
         { .label="S.AFH.MinPress", .transducer="", .unit="cmH2O", .phys_min=4.0, .phys_max=20.0, .dig_min=200, .dig_max=1000, .prefilter="", .samples_per_record=1 },
-        /* [14-33] Common comfort/settings */
+        /* [14-21] VAuto settings */
+        { .label="S.VA.StartPress", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.VA.MaxIPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.VA.MinEPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.VA.PS", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=20.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.VA.TiMax", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.VA.TiMin", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.VA.Trigger", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.VA.Cycle", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        /* [22-32] Spont settings */
+        { .label="S.S.StartPress", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.IPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.EPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.EasyBreathe", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.RespRateEn", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.TiMax", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.TiMin", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.RiseEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.RiseTime", .transducer="", .unit="msec", .phys_min=0.0, .phys_max=2000.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.Trigger", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.S.Cycle", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        /* [33-42] ST settings */
+        { .label="S.ST.StartPress", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.IPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.EPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.RespRate", .transducer="", .unit="bpm", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.TiMax", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.TiMin", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.RiseEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.RiseTime", .transducer="", .unit="msec", .phys_min=0.0, .phys_max=2000.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.Trigger", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.ST.Cycle", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        /* [43-49] Timed settings */
+        { .label="S.T.StartPress", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.T.IPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.T.EPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.T.RespRate", .transducer="", .unit="bpm", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.T.Ti", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="S.T.RiseEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
+        { .label="S.T.RiseTime", .transducer="", .unit="msec", .phys_min=0.0, .phys_max=2000.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
+        /* [50-53] ASV settings */
+        { .label="S.AV.StartPress", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.AV.EPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.AV.MaxPS", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=20.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.AV.MinPS", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=20.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        /* [54-58] ASVAuto settings */
+        { .label="S.AA.StartPress", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.AA.MaxEPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.AA.MinEPAP", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=1500, .prefilter="", .samples_per_record=1 },
+        { .label="S.AA.MaxPS", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=20.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        { .label="S.AA.MinPS", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=20.0, .dig_min=0, .dig_max=1000, .prefilter="", .samples_per_record=1 },
+        /* [59-77] Common comfort/settings */
         { .label="S.AS.Comfort", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
         { .label="S.RampEnable", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
         { .label="S.RampTime", .transducer="", .unit="min.", .phys_min=5.0, .phys_max=45.0, .dig_min=5, .dig_max=45, .prefilter="", .samples_per_record=1 },
@@ -2250,7 +2476,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         { .label="S.Temp", .transducer="", .unit="Celsius", .phys_min=15.6, .phys_max=30.0, .dig_min=156, .dig_max=300, .prefilter="", .samples_per_record=1 },
         { .label="HeatedTube", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
         { .label="Humidifier", .transducer="", .unit="", .phys_min=0, .phys_max=16, .dig_min=0, .dig_max=16, .prefilter="", .samples_per_record=1 },
-        /* [33-46] Environment and oximetry stats */
+        /* [78-91] Environment and oximetry stats */
         { .label="BlowPress.95", .transducer="", .unit="cmH2O", .phys_min=-10.0, .phys_max=45.0, .dig_min=-500, .dig_max=2250, .prefilter="", .samples_per_record=1 },
         { .label="BlowPress.5", .transducer="", .unit="cmH2O", .phys_min=-10.0, .phys_max=45.0, .dig_min=-500, .dig_max=2250, .prefilter="", .samples_per_record=1 },
         { .label="Flow.95", .transducer="", .unit="L/s", .phys_min=-2.0, .phys_max=3.0, .dig_min=-1000, .dig_max=1500, .prefilter="", .samples_per_record=1 },
@@ -2265,7 +2491,10 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         { .label="SpO2.95", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
         { .label="SpO2.Max", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
         { .label="SpO2Thresh", .transducer="", .unit="min.", .phys_min=0.0, .phys_max=1440.0, .dig_min=0, .dig_max=1440, .prefilter="", .samples_per_record=1 },
-        /* [47-68] Bilevel/ventilation summary stats */
+        /* [92-93] Spont trigger/cycle percentages */
+        { .label="SpontTrig%", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="SpontCyc%", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        /* [94-115] Bilevel/ventilation summary stats */
         { .label="MaskPress.50", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
         { .label="MaskPress.95", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
         { .label="MaskPress.Max", .transducer="", .unit="cmH2O", .phys_min=0.0, .phys_max=40.0, .dig_min=0, .dig_max=2000, .prefilter="", .samples_per_record=1 },
@@ -2288,7 +2517,19 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         { .label="TidVol.50", .transducer="", .unit="L", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
         { .label="TidVol.95", .transducer="", .unit="L", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
         { .label="TidVol.Max", .transducer="", .unit="L", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
-        /* [69-76] Indices and CSR */
+        /* [116-118] Target minute ventilation */
+        { .label="TgtVent.50", .transducer="", .unit="L/min", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=240, .prefilter="", .samples_per_record=1 },
+        { .label="TgtVent.95", .transducer="", .unit="L/min", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=240, .prefilter="", .samples_per_record=1 },
+        { .label="TgtVent.Max", .transducer="", .unit="L/min", .phys_min=0.0, .phys_max=30.0, .dig_min=0, .dig_max=240, .prefilter="", .samples_per_record=1 },
+        /* [119-121] I:E ratio */
+        { .label="IERatio.50", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="IERatio.95", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        { .label="IERatio.Max", .transducer="", .unit="%", .phys_min=0.0, .phys_max=100.0, .dig_min=0, .dig_max=100, .prefilter="", .samples_per_record=1 },
+        /* [122-124] Inspiratory duration */
+        { .label="Ti.50", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="Ti.95", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        { .label="Ti.Max", .transducer="", .unit="seconds", .phys_min=0.0, .phys_max=4.0, .dig_min=0, .dig_max=200, .prefilter="", .samples_per_record=1 },
+        /* [125-132] Indices and CSR */
         { .label="AHI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
         { .label="HI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
         { .label="AI", .transducer="", .unit="", .phys_min=0.0, .phys_max=240.0, .dig_min=0, .dig_max=2400, .prefilter="", .samples_per_record=1 },
@@ -2380,9 +2621,9 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     }
 
     /* Write one data record per day.
-     * Each record: 115 data int16 + 1 CRC int16 = 232 bytes. */
+     * Each record: 171 data int16 + 1 CRC int16 = 344 bytes. */
     for (int r = 0; r < n_records; r++) {
-        int16_t rec_buf[115];
+        int16_t rec_buf[171];
         int rec_pos = 0;
         for (int i = 0; i < STR_DATA_COUNT; i++) {
             int spr = str_signal_defs[i].samples_per_record;
@@ -2396,15 +2637,15 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                     rec_buf[rec_pos++] = -1;
             }
         }
-        if (rec_pos != 115) {
-            ESP_LOGE(TAG, "STR.edf: internal error: rec_pos=%d != 115", rec_pos);
+        if (rec_pos != 171) {
+            ESP_LOGE(TAG, "STR.edf: internal error: rec_pos=%d != 171", rec_pos);
             discard_atomic_file(edf, tmp_path);
             free(records); free(ctx); free(str_sigs);
             return ESP_FAIL;
         }
 
-        uint16_t crc = crc16_ccitt((uint8_t *)rec_buf, 115 * sizeof(int16_t));
-        if (!write_all(edf, rec_buf, 115 * sizeof(int16_t))) {
+        uint16_t crc = crc16_ccitt((uint8_t *)rec_buf, 171 * sizeof(int16_t));
+        if (!write_all(edf, rec_buf, 171 * sizeof(int16_t))) {
             ESP_LOGE(TAG, "STR.edf: write failed at record %d", r);
             discard_atomic_file(edf, tmp_path);
             free(records); free(ctx); free(str_sigs);
