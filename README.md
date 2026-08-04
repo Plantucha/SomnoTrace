@@ -14,7 +14,7 @@ and uploads them to SMB and/or SleepHQ — no SD card required in your AirSense.
   machines experience when using WiFi-enabled SD cards in the SD slot.
   Based on the BLE protocol work by
   [m-kozlowski/airbreak-plus](https://github.com/m-kozlowski/airbreak-plus),
-  SomnoTrace is the first open-source solution to package this into a
+  SomnoTrace is the first (soon to be open-sourced) solution to package this into a
   standalone device that looks and feels like a finished consumer product.
 - **Correct timestamp drift.** The AirSense 11 has a known issue with
   inaccurate internal timestamps, causing drift in exported EDF files.
