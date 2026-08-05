@@ -1753,15 +1753,26 @@ static void reconnect_task(void *arg)
 
     set_state(AS11_STATUS_CONNECTING);
 
-    /* Retry connect+discover with backoff.  The AS11 may not be immediately
-     * available after a disconnect — it needs a few seconds to restart
-     * advertising.  We try up to 3 times with increasing delays. */
+    /* Two-phase retry:
+     * Phase 1 — fast: 3 attempts with 2-4s backoff for transient disconnect
+     *   (AS11 needs a few seconds to restart advertising).
+     * Phase 2 — slow: retry every 60s indefinitely for when the AS11 is off
+     *   at boot and turned on later.  Without this, a single failed
+     *   reconnect_task at boot means the ST never connects to the AS11
+     *   until manually rebooted. */
     bool connected = false;
     for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
         if (attempt > 1) {
             int delay_s = attempt * 2;
             ESP_LOGI(TAG, "reconnect: retry %d/3 in %ds", attempt, delay_s);
             vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+        }
+        if (!s_pair_cache.valid || s_manual_disconnect) {
+            ESP_LOGI(TAG, "reconnect: aborted (pairing=%d manual=%d)",
+                     s_pair_cache.valid, s_manual_disconnect);
+            set_state(AS11_STATUS_IDLE);
+            vTaskDelete(NULL);
+            return;
         }
         if (do_connect_and_discover() == ESP_OK) {
             connected = true;
@@ -1773,6 +1784,43 @@ static void reconnect_task(void *arg)
             ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         }
+    }
+
+    /* Phase 2: slow retry loop — AS11 may not be powered yet. */
+    int slow_attempt = 0;
+    while (!connected) {
+        if (!s_pair_cache.valid || s_manual_disconnect) {
+            ESP_LOGI(TAG, "reconnect: aborted during slow retry "
+                         "(pairing=%d manual=%d)",
+                     s_pair_cache.valid, s_manual_disconnect);
+            set_state(AS11_STATUS_IDLE);
+            vTaskDelete(NULL);
+            return;
+        }
+        slow_attempt++;
+        ESP_LOGI(TAG, "reconnect: slow retry %d in 60s...", slow_attempt);
+        for (int i = 0; i < 60; i++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (!s_pair_cache.valid || s_manual_disconnect) break;
+        }
+        if (!s_pair_cache.valid || s_manual_disconnect) {
+            ESP_LOGI(TAG, "reconnect: aborted during slow retry wait");
+            set_state(AS11_STATUS_IDLE);
+            vTaskDelete(NULL);
+            return;
+        }
+        set_state(AS11_STATUS_CONNECTING);
+        if (do_connect_and_discover() == ESP_OK) {
+            connected = true;
+            break;
+        }
+        ESP_LOGW(TAG, "reconnect: slow retry %d failed: %s",
+                 slow_attempt, as11_ble_get_error());
+        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        }
+        set_state(AS11_STATUS_IDLE);
     }
     if (!connected) {
         ESP_LOGE(TAG, "reconnect: all connect attempts failed");

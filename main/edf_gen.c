@@ -746,6 +746,11 @@ static inline uint32_t ms_to_samples_pld(int64_t ms)   /* 0.5 Hz = one per 2 s *
  *                 after skipping, used to truncate the end to MaskOff.
  *                 0 = use all remaining samples (no end truncation).
  */
+/* v2 format: flow.snt and press.snt are separate 1-channel files.
+ * When snt_path2 is non-NULL, the function opens it as the second source
+ * channel and interleaves the two 1-ch files into the raw buffer, producing
+ * the same 2-channel interleaved layout as a v1 brp.snt.
+ * v1 (backwards compat): snt_path2 is NULL, snt_path is a single multi-ch file. */
 static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                     const char *patient_id, const char *recording_id,
                                     const char *start_date, const char *start_time,
@@ -753,7 +758,8 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                                     const char *record_dur,
                                     const int *channel_map,
                                     uint32_t skip_samples,
-                                    uint32_t max_samples)
+                                    uint32_t max_samples,
+                                    const char *snt_path2)
 {
     FILE *snt = fopen(snt_path, "rb");
     if (!snt) {
@@ -761,10 +767,40 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         return ESP_FAIL;
     }
 
+    /* v2: open second source file (pressure channel) */
+    FILE *snt2 = NULL;
+    if (snt_path2) {
+        snt2 = fopen(snt_path2, "rb");
+        if (!snt2) {
+            ESP_LOGW(TAG, "cannot open %s: %s", snt_path2, strerror(errno));
+            fclose(snt);
+            return ESP_FAIL;
+        }
+    }
+
     snt_header_t hdr;
     if (snt_read_header(snt, &hdr) != ESP_OK) {
         fclose(snt);
+        if (snt2) fclose(snt2);
         return ESP_FAIL;
+    }
+
+    /* v2: verify second file header and use virtual 2-channel layout */
+    if (snt2) {
+        snt_header_t hdr2;
+        if (snt_read_header(snt2, &hdr2) != ESP_OK) {
+            ESP_LOGW(TAG, "cannot read header from %s", snt_path2);
+            fclose(snt); fclose(snt2);
+            return ESP_FAIL;
+        }
+        if (hdr.n_channels != 1 || hdr2.n_channels != 1) {
+            ESP_LOGE(TAG, "v2 pair mode requires 1-ch files: %s has %d ch, %s has %d ch",
+                     snt_path, hdr.n_channels, snt_path2, hdr2.n_channels);
+            fclose(snt); fclose(snt2);
+            return ESP_FAIL;
+        }
+        /* Treat the two 1-ch files as a virtual 2-ch interleaved stream */
+        hdr.n_channels = 2;
     }
 
     /* Validate channel mapping.
@@ -778,6 +814,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                 ESP_LOGE(TAG, "%s: channel_map[%d]=%d >= snt n_channels=%d",
                          snt_path, i, channel_map[i], snt_channels);
                 fclose(snt);
+                if (snt2) fclose(snt2);
                 return ESP_FAIL;
             }
         }
@@ -785,6 +822,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         ESP_LOGE(TAG, "%s: channel count mismatch: snt=%d edf=%d",
                  snt_path, snt_channels, n_signals);
         fclose(snt);
+        if (snt2) fclose(snt2);
         return ESP_FAIL;
     }
 
@@ -797,6 +835,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         ESP_LOGE(TAG, "malloc spr/sig failed");
         free(spr); free(sig);
         fclose(snt);
+        if (snt2) fclose(snt2);
         return ESP_ERR_NO_MEM;
     }
     for (int i = 0; i < n_signals; i++) {
@@ -851,10 +890,12 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
             ESP_LOGE(TAG, "cannot write %s: %s", edf_path, strerror(errno));
             free(spr); free(sig);
             fclose(snt);
+            if (snt2) fclose(snt2);
             return ESP_FAIL;
         }
         free(spr); free(sig);
         fclose(snt);
+        if (snt2) fclose(snt2);
         return ESP_OK;
     }
 
@@ -864,12 +905,23 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     /* Seek past skipped leading samples.
      * .snt data starts at offset sizeof(snt_header_t) and is interleaved
      * as [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...], so each sample frame is
-     * snt_channels × sizeof(int16_t) bytes. */
+     * snt_channels × sizeof(int16_t) bytes.
+     * v2: each file is 1-ch, so skip_bytes = skip_samples × sizeof(int16_t)
+     *     per file.  snt_channels is already set to 2 (virtual), so the
+     *     math below works for both v1 and v2 when we seek in both files. */
     if (skip_samples > 0) {
         long skip_bytes = (long)skip_samples * snt_channels * sizeof(int16_t);
         if (fseek(snt, sizeof(snt_header_t) + skip_bytes, SEEK_SET) != 0) {
             ESP_LOGW(TAG, "%s: fseek skip failed, starting from beginning", snt_path);
             fseek(snt, sizeof(snt_header_t), SEEK_SET);
+        }
+        if (snt2) {
+            /* v2: skip in the second file too (1-ch, so skip_bytes is halved) */
+            long skip2 = (long)skip_samples * sizeof(int16_t);
+            if (fseek(snt2, sizeof(snt_header_t) + skip2, SEEK_SET) != 0) {
+                ESP_LOGW(TAG, "%s: fseek skip failed, starting from beginning", snt_path2);
+                fseek(snt2, sizeof(snt_header_t), SEEK_SET);
+            }
         }
     }
 
@@ -879,6 +931,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     if (!edf) {
         ESP_LOGE(TAG, "cannot create %s: %s", edf_path, strerror(errno));
         fclose(snt);
+        if (snt2) fclose(snt2);
         return ESP_FAIL;
     }
 
@@ -891,6 +944,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
         free(spr); free(sig);
         discard_atomic_file(edf, tmp_path);
         fclose(snt);
+        if (snt2) fclose(snt2);
         return ESP_FAIL;
     }
 
@@ -932,7 +986,11 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     for (int rec = 0; rec < total_records; rec++) {
         /* Read one record's worth of interleaved samples from .snt.
          * With floor division the last record is always complete, but
-         * the partial-record handling is retained as a safety net. */
+         * the partial-record handling is retained as a safety net.
+         *
+         * v1: single multi-ch file — one fread gets the interleaved data.
+         * v2: two 1-ch files — read flow and press separately, then
+         *   interleave into raw: [flow_s0, press_s0, flow_s1, press_s1, ...] */
         memset(raw, 0, raw_record_bytes);
         size_t avail = raw_record_bytes;
         /* For the last record, only read what's available */
@@ -943,12 +1001,44 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
             }
         }
         if (avail > 0) {
-            if (fread(raw, 1, avail, snt) != avail) {
-                ESP_LOGW(TAG, "short read at record %d", rec);
-                free(raw); free(record_buf); free(spr); free(sig);
-                discard_atomic_file(edf, tmp_path);
-                fclose(snt);
-                return ESP_FAIL;
+            if (snt2) {
+                /* v2: read flow and press from separate 1-ch files,
+                 * interleave into raw buffer */
+                int n_samp = (int)(avail / (snt_channels * sizeof(int16_t)));
+                size_t ch_bytes = (size_t)n_samp * sizeof(int16_t);
+                int16_t *flow_buf = malloc(ch_bytes);
+                int16_t *press_buf = malloc(ch_bytes);
+                if (!flow_buf || !press_buf) {
+                    ESP_LOGW(TAG, "v2 interleave malloc failed at record %d", rec);
+                    free(flow_buf); free(press_buf);
+                    free(raw); free(record_buf); free(spr); free(sig);
+                    discard_atomic_file(edf, tmp_path);
+                    fclose(snt); fclose(snt2);
+                    return ESP_FAIL;
+                }
+                if (fread(flow_buf, 1, ch_bytes, snt) != ch_bytes ||
+                    fread(press_buf, 1, ch_bytes, snt2) != ch_bytes) {
+                    ESP_LOGW(TAG, "v2 short read at record %d", rec);
+                    free(flow_buf); free(press_buf);
+                    free(raw); free(record_buf); free(spr); free(sig);
+                    discard_atomic_file(edf, tmp_path);
+                    fclose(snt); fclose(snt2);
+                    return ESP_FAIL;
+                }
+                for (int s = 0; s < n_samp; s++) {
+                    raw[s * 2]     = flow_buf[s];
+                    raw[s * 2 + 1] = press_buf[s];
+                }
+                free(flow_buf); free(press_buf);
+            } else {
+                /* v1: single interleaved file */
+                if (fread(raw, 1, avail, snt) != avail) {
+                    ESP_LOGW(TAG, "short read at record %d", rec);
+                    free(raw); free(record_buf); free(spr); free(sig);
+                    discard_atomic_file(edf, tmp_path);
+                    fclose(snt);
+                    return ESP_FAIL;
+                }
             }
         }
 
@@ -1017,6 +1107,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
             free(raw); free(record_buf); free(spr); free(sig);
             discard_atomic_file(edf, tmp_path);
             fclose(snt);
+            if (snt2) fclose(snt2);
             return ESP_FAIL;
         }
 
@@ -1027,6 +1118,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
             free(raw); free(record_buf); free(spr); free(sig);
             discard_atomic_file(edf, tmp_path);
             fclose(snt);
+            if (snt2) fclose(snt2);
             return ESP_FAIL;
         }
     }
@@ -1039,9 +1131,11 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
     if (finalize_atomic_file(edf, tmp_path, edf_path) != ESP_OK) {
         ESP_LOGE(TAG, "cannot finalize %s: %s", edf_path, strerror(errno));
         fclose(snt);
+        if (snt2) fclose(snt2);
         return ESP_FAIL;
     }
     fclose(snt);
+    if (snt2) fclose(snt2);
     ESP_LOGI(TAG, "EDF conversion complete: %s", edf_path);
     return ESP_OK;
 }
@@ -3522,10 +3616,14 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
 
     int errors = 0;
 
-    /* ── Generate BRP.edf (25 Hz breath waveform) ── */
+    /* ── Generate BRP.edf (25 Hz breath waveform) ──
+     * v2 format: flow.snt + press.snt (separate 1-ch files).
+     * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
+     * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
     if (!no_therapy) {
-        char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
+        char snt_path[300], edf_path[350], press_path[300];
+        snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
+        snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, maskon_ts_prefix);
 
         edf_signal_def_t brp_sigs[] = {
@@ -3538,9 +3636,18 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
               .dig_min = 0, .dig_max = 2000,
               .prefilter = "", .samples_per_record = 1500 },
         };
+
+        /* Check if v2 flow.snt exists; if not, fall back to v1 brp.snt */
+        struct stat st_test;
+        const char *press_arg = press_path;
+        if (stat(snt_path, &st_test) != 0) {
+            /* v1 fallback: use brp.snt (2-ch interleaved, no second file) */
+            snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
+            press_arg = NULL;
+        }
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
                                maskon_date, maskon_time, brp_sigs, 2, "60.00",
-                               NULL, brp_skip, brp_max) != ESP_OK) {
+                               NULL, brp_skip, brp_max, press_arg) != ESP_OK) {
             errors++;
         }
     }
@@ -3565,7 +3672,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         };
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
                                maskon_date, maskon_time, sa2_sigs, 2, "60.00",
-                               NULL, sa2_skip, sa2_max) != ESP_OK) {
+                               NULL, sa2_skip, sa2_max, NULL) != ESP_OK) {
             errors++;
         }
     }
@@ -3640,7 +3747,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
         static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
         if (convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
                                maskon_date, maskon_time, pld_sigs, 9, "60.00",
-                               pld_ch_map, pld_skip, pld_max) != ESP_OK) {
+                               pld_ch_map, pld_skip, pld_max, NULL) != ESP_OK) {
             errors++;
         }
     }

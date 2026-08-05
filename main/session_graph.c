@@ -209,6 +209,10 @@ typedef struct {
     uint32_t pld_samples;
     long brp_bytes;
     long brp_mm_bytes;
+    int fmt;                    /* session format: 2=flow/press split, 1=legacy brp */
+    uint32_t stream_notifications;  /* BLE notifications received */
+    uint32_t gap_events;            /* gap detections (compensated) */
+    uint32_t gap_missing;           /* total missing notifications compensated */
 } session_manifest_t;
 
 static int compare_session_start(const void *a, const void *b)
@@ -296,6 +300,10 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         cJSON *j_pld = cJSON_GetObjectItem(j, "pld_samples");
         cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
         cJSON *j_drift_valid = cJSON_GetObjectItem(j, "clock_drift_valid");
+        cJSON *j_fmt = cJSON_GetObjectItem(j, "fmt");
+        cJSON *j_notif = cJSON_GetObjectItem(j, "stream_notifications");
+        cJSON *j_gaps = cJSON_GetObjectItem(j, "gap_events");
+        cJSON *j_missing = cJSON_GetObjectItem(j, "gap_missing");
 
         if (!j_st || !cJSON_IsNumber(j_st)) { cJSON_Delete(j); continue; }
         if ((int64_t)j_st->valuedouble < 946684800000LL) { cJSON_Delete(j); continue; }
@@ -321,15 +329,27 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         s->pld_samples = j_pld ? (uint32_t)j_pld->valuedouble : 0;
         s->clock_drift_ms = j_drift ? (int64_t)j_drift->valuedouble : 0;
         s->clock_drift_valid = j_drift_valid ? cJSON_IsTrue(j_drift_valid) : (j_drift != NULL);
+        s->fmt = j_fmt ? (int)j_fmt->valuedouble : 1;  /* default v1 if absent */
+        s->stream_notifications = j_notif ? (uint32_t)j_notif->valuedouble : 0;
+        s->gap_events = j_gaps ? (uint32_t)j_gaps->valuedouble : 0;
+        s->gap_missing = j_missing ? (uint32_t)j_missing->valuedouble : 0;
 
         cJSON_Delete(j);
 
-        /* Stat the .snt files for sizes */
+        /* Stat the .snt files for sizes.
+         * v2: flow.snt + flow_mm.snt; v1 (backwards compat): brp.snt + brp_mm.snt */
         char fpath[600];
-        snprintf(fpath, sizeof(fpath), "%s/%s_brp.snt", day_dir, session_id);
-        s->brp_bytes = file_size_stat(fpath);
-        snprintf(fpath, sizeof(fpath), "%s/%s_brp_mm.snt", day_dir, session_id);
-        s->brp_mm_bytes = file_size_stat(fpath);
+        if (s->fmt >= 2) {
+            snprintf(fpath, sizeof(fpath), "%s/%s_flow.snt", day_dir, session_id);
+            s->brp_bytes = file_size_stat(fpath);
+            snprintf(fpath, sizeof(fpath), "%s/%s_flow_mm.snt", day_dir, session_id);
+            s->brp_mm_bytes = file_size_stat(fpath);
+        } else {
+            snprintf(fpath, sizeof(fpath), "%s/%s_brp.snt", day_dir, session_id);
+            s->brp_bytes = file_size_stat(fpath);
+            snprintf(fpath, sizeof(fpath), "%s/%s_brp_mm.snt", day_dir, session_id);
+            s->brp_mm_bytes = file_size_stat(fpath);
+        }
 
         count++;
     }
@@ -360,12 +380,14 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
             "\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,"
             "\"clock_drift_ms\":%lld,\"clock_drift_valid\":%s,"
             "\"brp_samples\":%u,\"brp_mm_samples\":%u,\"pld_samples\":%u,"
-            "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld}",
+            "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld,"
+            "\"fmt\":%d,\"stream_notifications\":%u,\"gap_events\":%u,\"gap_missing\":%u}",
             s->id,
             (long long)s->start_epoch_ms, (long long)s->end_epoch_ms,
             (long long)s->clock_drift_ms, s->clock_drift_valid ? "true" : "false",
             (unsigned)s->brp_samples, (unsigned)s->brp_mm_samples, (unsigned)s->pld_samples,
-            s->brp_bytes, s->brp_mm_bytes);
+            s->brp_bytes, s->brp_mm_bytes,
+            s->fmt, (unsigned)s->stream_notifications, (unsigned)s->gap_events, (unsigned)s->gap_missing);
     }
 
     pos += snprintf(json + pos, json_cap - pos, "]");
@@ -1044,10 +1066,13 @@ esp_err_t session_file_handler(httpd_req_t *req)
 
     /* Only expose the .snt files we actually generate. "events" is the
      * live-captured JSONL event stream (respiratory events, therapy
-     * start/stop), fetched by the dashboard for the event overlay. */
+     * start/stop), fetched by the dashboard for the event overlay.
+     * v2 format: "flow" and "flow_mm" replace "brp" and "brp_mm".
+     * v1 types are kept for backwards compatibility with old sessions. */
     if (strcmp(type, "brp") != 0 && strcmp(type, "brp_mm") != 0 &&
+        strcmp(type, "flow") != 0 && strcmp(type, "flow_mm") != 0 &&
         strcmp(type, "pld") != 0 && strcmp(type, "sa2") != 0 &&
-        strcmp(type, "events") != 0) {
+        strcmp(type, "events") != 0 && strcmp(type, "press") != 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid type");
         return ESP_FAIL;
     }

@@ -204,18 +204,30 @@ void app_main(void)
             /* Show failure message on screen */
             const char *fail_lines[] = {
                 "NTP Sync Failed",
-                "Rebooting...",
+                "Hold BOOT for Wi-Fi setup",
             };
             show_status("Error", fail_lines, 2);
 
-            /* Sound audible alarm: 5 beeps of 1s on / 1s off, loud */
+            /* Sound audible alarm: 5 beeps of 1s on / 1s off, loud.
+             * Poll s_softap_requested during the silence gaps so the BOOT
+             * button can cancel the alarm and enter SoftAP instead of
+             * rebooting into the same NTP failure. */
             if (bsp_audio_init() == ESP_OK) {
                 for (int i = 0; i < 5; i++) {
                     bsp_audio_beep(880, 1000, 60);
                     vTaskDelay(pdMS_TO_TICKS(1000));
+                    if (s_softap_requested) break;
                 }
             } else {
                 ESP_LOGE(TAG, "audio init failed — silent reboot");
+            }
+
+            if (s_softap_requested) {
+                ESP_LOGW(TAG, "BOOT pressed during NTP alarm: entering SoftAP");
+                enter_softap(&cfg);
+                while (true) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
             }
 
             /* Hard reboot */

@@ -93,11 +93,18 @@ struct session_writer {
     int64_t  end_epoch_ms;        /* NTP epoch ms at session stop */
     bool     active;
 
-    stream_files_t brp;     /* 25 Hz, 2 ch: flow + mask_pressure (40ms natural) */
+    /* v2 format: flow and pressure are stored in separate .snt files.
+     * v1 (backwards compat) stored both interleaved in a single brp.snt.
+     * The web UI only needs flow for the breathing graph — pressure comes
+     * from PLD — so splitting them halves the HTTP transfer for the dashboard.
+     * EDF export reads both files and interleaves them into BRP.edf to match
+     * the AS11 native format. */
+    stream_files_t flow;    /* 25 Hz, 1 ch: flow (40ms natural) */
+    stream_files_t press;   /* 25 Hz, 1 ch: mask_pressure (40ms natural) */
     stream_files_t sa2;     /* 1 Hz, 2 ch: heart_rate + spo2 (decimated from 5 Hz report) */
     stream_files_t pld;     /* 0.5 Hz, 12 ch (0.5 Hz natural, decimated from 5 Hz report) */
     FILE    *f_events;
-    uint32_t brp_mm_count;  /* L1 MinMax records written */
+    uint32_t flow_mm_count; /* L1 MinMax records written (flow only) */
 
     int64_t  clock_drift_ms;   /* NTP time - AS11 device time at session stop */
     bool     clock_drift_valid; /* true when clock_drift_ms was successfully queried */
@@ -238,44 +245,54 @@ static void update_snt_header_sample_count(FILE *f, uint32_t count)
 
 /* ── Flush ────────────────────────────────────────────────────────── */
 
-static void flush_brp(session_writer_t *s)
+/* v2 format: flow and pressure are written to separate .snt files.
+ * v1 (backwards compat) interleaved both into a single brp.snt with a
+ * 4-channel brp_mm.snt sidecar (flowMin/Max + pressMin/Max).
+ * v2 writes flow.snt (1-ch), press.snt (1-ch), and flow_mm.snt (2-ch:
+ * flowMin/Max only — pressure overview is not needed by the web UI since
+ * the pressure graph uses PLD data). */
+static void flush_flow(session_writer_t *s)
 {
-    if (!s->brp.f_l0 || s->brp_buf_count == 0) return;
+    if (!s->flow.f_l0 || s->brp_buf_count == 0) return;
 
-    /* L0: interleave flow + pressure */
+    /* L0: flow only (1 channel per sample) */
     for (uint32_t i = 0; i < s->brp_buf_count; i++) {
-        int16_t pair[2] = { s->brp_flow[i], s->brp_press[i] };
-        fwrite(pair, sizeof(int16_t), 2, s->brp.f_l0);
+        fwrite(&s->brp_flow[i], sizeof(int16_t), 1, s->flow.f_l0);
     }
 
-    /* L1: 1-second MinMax (25 samples per second) */
-    if (s->brp.f_l1) {
+    /* L1: 1-second MinMax for flow only (25 samples per second) */
+    if (s->flow.f_l1) {
         uint32_t n_sec = s->brp_buf_count / 25;
         for (uint32_t sec = 0; sec < n_sec; sec++) {
             uint32_t base = sec * 25;
             int16_t fmn = INT16_MAX, fmx = INT16_MIN;
-            int16_t pmn = INT16_MAX, pmx = INT16_MIN;
             for (int j = 0; j < 25; j++) {
                 int16_t fv = s->brp_flow[base + j];
-                int16_t pv = s->brp_press[base + j];
                 if (fv != SNT_MISSING) {
                     if (fv < fmn) fmn = fv;
                     if (fv > fmx) fmx = fv;
                 }
-                if (pv != SNT_MISSING) {
-                    if (pv < pmn) pmn = pv;
-                    if (pv > pmx) pmx = pv;
-                }
             }
             if (fmn == INT16_MAX) { fmn = fmx = SNT_MISSING; }
-            if (pmn == INT16_MAX) { pmn = pmx = SNT_MISSING; }
-            int16_t mm[4] = { fmn, fmx, pmn, pmx };
-            fwrite(mm, sizeof(int16_t), 4, s->brp.f_l1);
-            s->brp_mm_count++;
+            int16_t mm[2] = { fmn, fmx };
+            fwrite(mm, sizeof(int16_t), 2, s->flow.f_l1);
+            s->flow_mm_count++;
         }
     }
 
-    s->brp.sample_count += s->brp_buf_count;
+    s->flow.sample_count += s->brp_buf_count;
+}
+
+static void flush_press(session_writer_t *s)
+{
+    if (!s->press.f_l0 || s->brp_buf_count == 0) return;
+
+    /* L0: pressure only (1 channel per sample, no L1 sidecar) */
+    for (uint32_t i = 0; i < s->brp_buf_count; i++) {
+        fwrite(&s->brp_press[i], sizeof(int16_t), 1, s->press.f_l0);
+    }
+
+    s->press.sample_count += s->brp_buf_count;
     s->brp_buf_count = 0;
 }
 
@@ -308,19 +325,22 @@ static void flush_all(session_writer_t *s)
 
     xSemaphoreTake(s->mutex, portMAX_DELAY);
 
-    flush_brp(s);
+    flush_flow(s);
+    flush_press(s);
     flush_sa2(s);
     flush_pld(s);
 
     /* sync all files */
-    if (s->brp.f_l0) { fflush(s->brp.f_l0); update_snt_header_sample_count(s->brp.f_l0, s->brp.sample_count); }
-    if (s->brp.f_l1) { fflush(s->brp.f_l1); update_snt_header_sample_count(s->brp.f_l1, s->brp_mm_count); }
+    if (s->flow.f_l0) { fflush(s->flow.f_l0); update_snt_header_sample_count(s->flow.f_l0, s->flow.sample_count); }
+    if (s->flow.f_l1) { fflush(s->flow.f_l1); update_snt_header_sample_count(s->flow.f_l1, s->flow_mm_count); }
+    if (s->press.f_l0) { fflush(s->press.f_l0); update_snt_header_sample_count(s->press.f_l0, s->press.sample_count); }
     if (s->sa2.f_l0) { fflush(s->sa2.f_l0); update_snt_header_sample_count(s->sa2.f_l0, s->sa2.sample_count); }
     if (s->pld.f_l0) { fflush(s->pld.f_l0); update_snt_header_sample_count(s->pld.f_l0, s->pld.sample_count); }
     if (s->f_events) fflush(s->f_events);
 
-    ESP_LOGI(TAG, "flush: brp=%u sa2=%u pld=%u samples",
-             (unsigned)s->brp.sample_count,
+    ESP_LOGI(TAG, "flush: flow=%u press=%u sa2=%u pld=%u samples",
+             (unsigned)s->flow.sample_count,
+             (unsigned)s->press.sample_count,
              (unsigned)s->sa2.sample_count,
              (unsigned)s->pld.sample_count);
 
@@ -373,10 +393,25 @@ static void write_session_json(session_writer_t *s, const char *state)
     }
 
     cJSON_AddStringToObject(root, "state", state);
-    cJSON_AddNumberToObject(root, "brp_samples", (double)s->brp.sample_count);
-    cJSON_AddNumberToObject(root, "brp_mm_samples", (double)s->brp_mm_count);
+
+    /* v2 format marker: flow and pressure are in separate .snt files.
+     * v1 sessions (created before this change) do not have this field;
+     * readers default to fmt=1 and use the legacy brp.snt / brp_mm.snt files. */
+    cJSON_AddNumberToObject(root, "fmt", 2);
+
+    /* Sample counts — field names kept as brp_samples / brp_mm_samples for
+     * backwards compatibility with existing manifest readers; they now
+     * reflect the flow file's sample count. */
+    cJSON_AddNumberToObject(root, "brp_samples", (double)s->flow.sample_count);
+    cJSON_AddNumberToObject(root, "brp_mm_samples", (double)s->flow_mm_count);
+    cJSON_AddNumberToObject(root, "press_samples", (double)s->press.sample_count);
     cJSON_AddNumberToObject(root, "sa2_samples", (double)s->sa2.sample_count);
     cJSON_AddNumberToObject(root, "pld_samples", (double)s->pld.sample_count);
+
+    /* Stream quality: BLE notification reception statistics. */
+    cJSON_AddNumberToObject(root, "stream_notifications", (double)s->stream_notifications);
+    cJSON_AddNumberToObject(root, "gap_events", (double)s->gap_events);
+    cJSON_AddNumberToObject(root, "gap_missing", (double)s->gap_missing_total);
 
     cJSON_AddNumberToObject(root, "clock_drift_ms", (double)s->clock_drift_ms);
     cJSON_AddBoolToObject(root, "clock_drift_valid", s->clock_drift_valid);
@@ -474,14 +509,15 @@ session_writer_t *session_writer_start(void)
     }
 
     /* Check for filename collision (DST fallback — same local timestamp
-     * occurs twice). If any file with this prefix exists, append _2, _3, etc. */
+     * occurs twice). If any file with this prefix exists, append _2, _3, etc.
+     * v2 checks _flow.snt; v1 used _brp.snt (no collision across formats). */
     {
         char check_path[MAX_SESSION_DIR_LEN + 48];
-        snprintf(check_path, sizeof(check_path), "%s/%s_brp.snt", s->dir, s->session_id);
+        snprintf(check_path, sizeof(check_path), "%s/%s_flow.snt", s->dir, s->session_id);
         struct stat st;
         if (stat(check_path, &st) == 0) {
             for (int suffix = 2; suffix < 100; suffix++) {
-                snprintf(check_path, sizeof(check_path), "%s/%s_%d_brp.snt",
+                snprintf(check_path, sizeof(check_path), "%s/%s_%d_flow.snt",
                          s->dir, s->session_id, suffix);
                 if (stat(check_path, &st) != 0) {
                     char sid_with_suffix[40];
@@ -508,13 +544,20 @@ session_writer_t *session_writer_start(void)
     char path[MAX_SESSION_DIR_LEN + 48];
     int64_t start_epoch_ms = s->start_epoch_ms;
 
-    snprintf(path, sizeof(path), "%s/%s_brp.snt", s->dir, s->session_id);
-    s->brp.f_l0 = fopen(path, "wb");
-    if (s->brp.f_l0) write_snt_header(s->brp.f_l0, 0, 250, 2, start_epoch_ms);  /* 25 Hz */
+    /* v2 format: flow.snt (1-ch, 25 Hz) + press.snt (1-ch, 25 Hz) +
+     * flow_mm.snt (2-ch: flowMin/Max, 1 Hz).
+     * v1 (backwards compat) used brp.snt (2-ch, 25 Hz) + brp_mm.snt (4-ch, 1 Hz). */
+    snprintf(path, sizeof(path), "%s/%s_flow.snt", s->dir, s->session_id);
+    s->flow.f_l0 = fopen(path, "wb");
+    if (s->flow.f_l0) write_snt_header(s->flow.f_l0, 0, 250, 1, start_epoch_ms);  /* 25 Hz, 1 ch */
 
-    snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", s->dir, s->session_id);
-    s->brp.f_l1 = fopen(path, "wb");
-    if (s->brp.f_l1) write_snt_header(s->brp.f_l1, 1, 10, 4, start_epoch_ms);  /* 1 Hz */
+    snprintf(path, sizeof(path), "%s/%s_press.snt", s->dir, s->session_id);
+    s->press.f_l0 = fopen(path, "wb");
+    if (s->press.f_l0) write_snt_header(s->press.f_l0, 0, 250, 1, start_epoch_ms);  /* 25 Hz, 1 ch */
+
+    snprintf(path, sizeof(path), "%s/%s_flow_mm.snt", s->dir, s->session_id);
+    s->flow.f_l1 = fopen(path, "wb");
+    if (s->flow.f_l1) write_snt_header(s->flow.f_l1, 1, 10, 2, start_epoch_ms);  /* 1 Hz, 2 ch (flowMin/Max) */
 
     snprintf(path, sizeof(path), "%s/%s_sa2.snt", s->dir, s->session_id);
     s->sa2.f_l0 = fopen(path, "wb");
@@ -530,7 +573,7 @@ session_writer_t *session_writer_start(void)
         ESP_LOGW(TAG, "failed to open events file (non-fatal)");
     }
 
-    if (!s->brp.f_l0 || !s->sa2.f_l0 || !s->pld.f_l0) {
+    if (!s->flow.f_l0 || !s->press.f_l0 || !s->sa2.f_l0 || !s->pld.f_l0) {
         ESP_LOGE(TAG, "failed to open .snt files");
         /* No mutex held — safe to call session_writer_stop directly. */
         session_writer_stop(s);
@@ -632,8 +675,9 @@ esp_err_t session_writer_stop(session_writer_t *s)
     flush_all(s);
 
     /* Close data files first to free file descriptors */
-    if (s->brp.f_l0) { fclose(s->brp.f_l0); s->brp.f_l0 = NULL; }
-    if (s->brp.f_l1) { fclose(s->brp.f_l1); s->brp.f_l1 = NULL; }
+    if (s->flow.f_l0) { fclose(s->flow.f_l0); s->flow.f_l0 = NULL; }
+    if (s->flow.f_l1) { fclose(s->flow.f_l1); s->flow.f_l1 = NULL; }
+    if (s->press.f_l0) { fclose(s->press.f_l0); s->press.f_l0 = NULL; }
     if (s->sa2.f_l0) { fclose(s->sa2.f_l0); s->sa2.f_l0 = NULL; }
     if (s->pld.f_l0) { fclose(s->pld.f_l0); s->pld.f_l0 = NULL; }
     if (s->f_events) { fclose(s->f_events); s->f_events = NULL; }
@@ -642,8 +686,9 @@ esp_err_t session_writer_stop(session_writer_t *s)
     write_session_json(s, "completed");
 
     ESP_LOGI(TAG, "=== SESSION STOPPED: %s ===", s->session_id);
-    ESP_LOGI(TAG, "brp=%u sa2=%u pld=%u total samples",
-             (unsigned)s->brp.sample_count,
+    ESP_LOGI(TAG, "flow=%u press=%u sa2=%u pld=%u total samples",
+             (unsigned)s->flow.sample_count,
+             (unsigned)s->press.sample_count,
              (unsigned)s->sa2.sample_count,
              (unsigned)s->pld.sample_count);
 
@@ -1146,7 +1191,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     }
 
     /* Flush if buffers are getting full */
-    if (s->brp_buf_count >= 1400) flush_brp(s);
+    if (s->brp_buf_count >= 1400) { flush_flow(s); flush_press(s); }
     if (s->sa2_buf_count >= 55) flush_sa2(s);
     if (s->pld_buf_count >= 280) flush_pld(s);
 
@@ -1626,12 +1671,16 @@ void session_writer_recover(void)
         while ((day_ent = readdir(day_dir)) != NULL) {
             if (day_ent->d_name[0] == '.') continue;
 
-            /* Look for *_brp.snt files — each indicates a session */
-            const char *brp_suffix = strstr(day_ent->d_name, "_brp.snt");
-            if (!brp_suffix) continue;
+            /* Detect sessions: v2 uses _flow.snt, v1 (backwards compat) uses
+             * _brp.snt.  Check v2 first, then fall back to v1. */
+            const char *flow_suffix = strstr(day_ent->d_name, "_flow.snt");
+            const char *brp_suffix  = strstr(day_ent->d_name, "_brp.snt");
+            const char *suffix = flow_suffix ? flow_suffix : brp_suffix;
+            if (!suffix) continue;
+            bool is_v2 = (flow_suffix != NULL);
 
-            /* Extract the session prefix (everything before _brp.snt) */
-            size_t prefix_len = brp_suffix - day_ent->d_name;
+            /* Extract the session prefix (everything before _flow.snt / _brp.snt) */
+            size_t prefix_len = suffix - day_ent->d_name;
             if (prefix_len >= 32) continue;
             char prefix[32];
             memcpy(prefix, day_ent->d_name, prefix_len);
@@ -1646,14 +1695,21 @@ void session_writer_recover(void)
             ESP_LOGW(TAG, "found interrupted session: %s/%s — writing metadata",
                      ent->d_name, prefix);
 
-            /* Read sample counts and start_epoch_ms from .snt headers */
+            /* Read sample counts and start_epoch_ms from .snt headers.
+             * v2: read flow.snt + press.snt + flow_mm.snt
+             * v1: read brp.snt + brp_mm.snt (backwards compat) */
             char path[400];
             uint32_t brp_samples = 0, sa2_samples = 0, pld_samples = 0, brp_mm_samples = 0;
+            uint32_t press_samples = 0;
             int64_t start_epoch_ms = 0;
             snt_header_t hdr;
             bool got_valid_header = false;
 
-            snprintf(path, sizeof(path), "%s/%s_brp.snt", day_path, prefix);
+            if (is_v2) {
+                snprintf(path, sizeof(path), "%s/%s_flow.snt", day_path, prefix);
+            } else {
+                snprintf(path, sizeof(path), "%s/%s_brp.snt", day_path, prefix);
+            }
             FILE *f = fopen(path, "rb");
             if (f) {
                 if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC) {
@@ -1673,12 +1729,27 @@ void session_writer_recover(void)
                 continue;
             }
 
-            snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", day_path, prefix);
+            if (is_v2) {
+                snprintf(path, sizeof(path), "%s/%s_flow_mm.snt", day_path, prefix);
+            } else {
+                snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", day_path, prefix);
+            }
             f = fopen(path, "rb");
             if (f) {
                 if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
                     brp_mm_samples = hdr.sample_count;
                 fclose(f);
+            }
+
+            /* v2: also read press.snt for press_samples */
+            if (is_v2) {
+                snprintf(path, sizeof(path), "%s/%s_press.snt", day_path, prefix);
+                f = fopen(path, "rb");
+                if (f) {
+                    if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
+                        press_samples = hdr.sample_count;
+                    fclose(f);
+                }
             }
 
             snprintf(path, sizeof(path), "%s/%s_sa2.snt", day_path, prefix);
@@ -1697,7 +1768,8 @@ void session_writer_recover(void)
                 fclose(f);
             }
 
-            /* Write session.json manually (no cJSON — stack-limited task) */
+            /* Write session.json manually (no cJSON — stack-limited task).
+             * v2 sessions include fmt=2 and press_samples; v1 sessions omit them. */
             f = fopen(json_path, "w");
             if (f) {
                 fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
@@ -1709,6 +1781,9 @@ void session_writer_recover(void)
                         (long long)start_epoch_ms,
                         (unsigned)brp_samples, (unsigned)brp_mm_samples,
                         (unsigned)sa2_samples, (unsigned)pld_samples);
+                if (is_v2) {
+                    fprintf(f, ",\"fmt\":2,\"press_samples\":%u", (unsigned)press_samples);
+                }
 
                 if (start_epoch_ms > 0) {
                     time_t start = (time_t)(start_epoch_ms / 1000);

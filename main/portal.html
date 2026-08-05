@@ -630,6 +630,7 @@ Save &amp; Reboot
 <div id="dash-chart-stack"></div>
 <div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:6px"></div>
 </div>
+<div id="dash-stream-quality" class="card" style="display:none;padding:12px 16px;font-size:.8rem;color:var(--text-muted);line-height:1.6"></div>
 </section>
 
 <!-- ═══════════════ STATUS TAB ═══════════════ -->
@@ -2021,7 +2022,8 @@ function toggleCalendar() {
   }
 }
 function closeCalendar() { var el = document.getElementById('dash-calendar'); if (el) el.style.display = 'none'; }
-function calStepMonth(delta) {
+function calStepMonth(delta, ev) {
+  if (ev) ev.stopPropagation();
   dashCalMonth += delta;
   if (dashCalMonth < 0) { dashCalMonth = 11; dashCalYear--; }
   else if (dashCalMonth > 11) { dashCalMonth = 0; dashCalYear++; }
@@ -2037,9 +2039,9 @@ function renderCalendar() {
   var todayD = new Date();
   var pad = function(n){ return String(n).padStart(2,'0'); };
   var html = '<div class="dash-cal-head">' +
-    '<button class="dash-cal-nav" onclick="calStepMonth(-1)">&lsaquo;</button>' +
+    '<button class="dash-cal-nav" onclick="calStepMonth(-1,event)">&lsaquo;</button>' +
     '<div class="dash-cal-title">' + monthName + '</div>' +
-    '<button class="dash-cal-nav" onclick="calStepMonth(1)">&rsaquo;</button></div>';
+    '<button class="dash-cal-nav" onclick="calStepMonth(1,event)">&rsaquo;</button></div>';
   html += '<div class="dash-cal-grid">';
   var dows = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
   for (var i = 0; i < 7; i++) html += '<div class="dash-cal-dow">' + dows[i] + '</div>';
@@ -2063,7 +2065,9 @@ function renderCalendar() {
   el.innerHTML = html;
 }
 
-/* Close the calendar when clicking outside the date navigator. */
+/* Close the calendar when clicking outside the date navigator.
+ * calStepMonth calls stopPropagation() so month-nav clicks don't reach here
+ * after renderCalendar() replaces innerHTML and detaches the clicked button. */
 document.addEventListener('click', function(e) {
   var cal = document.getElementById('dash-calendar');
   if (!cal || cal.style.display === 'none') return;
@@ -2388,31 +2392,33 @@ function readSntHeader(buf) {
            missing: missing, dataOff: dataOff, n: n };
 }
 
-/* Parse a BRP .snt file (flow + mask pressure) into per-channel arrays.
- * L1 MinMax (tier=1, n_ch=4): [flow_min, flow_max, press_min, press_max] — the
- *   overview waveform envelope; value = midpoint, min/max preserved for
- *   the envelope renderer.
- * L0 raw (tier=0, n_ch=2): [flow, pressure] — instantaneous 25 Hz samples.
+/* Parse a BRP/flow .snt file into per-channel arrays.
+ * v2 format: flow.snt (L0, 1-ch: flow) and flow_mm.snt (L1, 2-ch: flowMin/Max).
+ *   Pressure channels are absent in v2 — press arrays stay NaN (unused by UI
+ *   since the pressure graph uses PLD data).
+ * v1 (backwards compat): brp.snt (L0, 2-ch: flow+pressure) and
+ *   brp_mm.snt (L1, 4-ch: flowMin/Max + pressMin/Max).
  * Missing-data sentinel (v1 -1, v2 INT16_MIN) → NaN (gap).
- * Scaling: flow dig*0.6 = L/min, pressure dig*0.01 = cmH2O (matches
- * brp_press_phys()/LCD therapy graph). */
+ * Scaling: flow dig*0.6 = L/min, pressure dig*0.01 = cmH2O. */
 function parseSntBrp(buf) {
   var h = readSntHeader(buf);
   if (!h) return null;
   var dv = h.dv, n = h.n, missing = h.missing;
-  var isL1 = (h.tier === 1 && h.nCh === 4);
+  /* Detect L1 MinMax by tier=1.  v1 has 4 ch (flow+press), v2 has 2 ch (flow only). */
+  var isL1 = (h.tier === 1);
+  var hasPressL1 = isL1 && (h.nCh >= 4);  /* v1 brp_mm has pressure; v2 flow_mm does not */
+  var hasPressL0 = !isL1 && (h.nCh >= 2);  /* v1 brp has pressure; v2 flow does not */
   var t = new Float64Array(n);
   var flow = new Float64Array(n), press = new Float64Array(n);
   var flowMin = null, flowMax = null, pressMin = null, pressMax = null;
   if (isL1) {
     flowMin = new Float64Array(n); flowMax = new Float64Array(n);
-    pressMin = new Float64Array(n); pressMax = new Float64Array(n);
+    if (hasPressL1) { pressMin = new Float64Array(n); pressMax = new Float64Array(n); }
   }
   for (var i = 0; i < n; i++) {
     var off = h.dataOff + i * h.recBytes;
     if (isL1) {
       var fmn = dv.getInt16(off, true), fmx = dv.getInt16(off + 2, true);
-      var pmn = dv.getInt16(off + 4, true), pmx = dv.getInt16(off + 6, true);
       if (fmn === missing && fmx === missing) {
         flow[i] = NaN; flowMin[i] = NaN; flowMax[i] = NaN;
       } else {
@@ -2420,18 +2426,27 @@ function parseSntBrp(buf) {
         flowMax[i] = (fmx === missing) ? 0 : fmx * 0.6;
         flow[i] = (flowMin[i] + flowMax[i]) / 2;
       }
-      if (pmn === missing && pmx === missing) {
-        press[i] = NaN; pressMin[i] = NaN; pressMax[i] = NaN;
+      if (hasPressL1) {
+        var pmn = dv.getInt16(off + 4, true), pmx = dv.getInt16(off + 6, true);
+        if (pmn === missing && pmx === missing) {
+          press[i] = NaN; pressMin[i] = NaN; pressMax[i] = NaN;
+        } else {
+          pressMin[i] = (pmn === missing) ? 0 : pmn * 0.01;
+          pressMax[i] = (pmx === missing) ? 0 : pmx * 0.01;
+          press[i] = (pressMin[i] + pressMax[i]) / 2;
+        }
       } else {
-        pressMin[i] = (pmn === missing) ? 0 : pmn * 0.01;
-        pressMax[i] = (pmx === missing) ? 0 : pmx * 0.01;
-        press[i] = (pressMin[i] + pressMax[i]) / 2;
+        press[i] = NaN;  /* v2 flow_mm: no pressure channel */
       }
     } else {
       var f = dv.getInt16(off, true);
-      var p = dv.getInt16(off + 2, true);
       flow[i]  = (f === missing) ? NaN : f * 0.6;
-      press[i] = (p === missing) ? NaN : p * 0.01;
+      if (hasPressL0) {
+        var p = dv.getInt16(off + 2, true);
+        press[i] = (p === missing) ? NaN : p * 0.01;
+      } else {
+        press[i] = NaN;  /* v2 flow: no pressure channel */
+      }
     }
     t[i] = h.startMs + i * h.msPerRec;
   }
@@ -2620,6 +2635,7 @@ function clearSummary() {
     var e = document.getElementById(id); if (e) e.textContent = '--';
   });
   var s = document.getElementById('dash-summary'); if (s) s.style.display = 'none';
+  var sq = document.getElementById('dash-stream-quality'); if (sq) sq.style.display = 'none';
 }
 var dashSummary = null;   /* last /api/summary response for the current day */
 function loadSummary(noonDay, loadId) {
@@ -2810,6 +2826,44 @@ function renderSummary() {
   var panel = document.getElementById('dash-summary'); if (panel) panel.style.display = '';
 }
 
+/* ── Stream quality (v2 sessions only) ───────────────────────────────
+ * Aggregates BLE notification reception stats across all v2 sessions in
+ * the current noon-day.  v1 sessions don't have these fields, so the block
+ * is hidden when no v2 sessions are present.  Only sessions that passed
+ * the ≥60s duration filter (dashSessions) are counted. */
+function renderStreamQuality() {
+  var el = document.getElementById('dash-stream-quality');
+  if (!el || !dashSessions || !dashSessions.length) {
+    if (el) el.style.display = 'none';
+    return;
+  }
+  var notif = 0, gaps = 0, missing = 0, durMs = 0;
+  for (var i = 0; i < dashSessions.length; i++) {
+    var s = dashSessions[i];
+    if (!s || s.fmt < 2) continue;
+    notif  += (s.stream_notifications || 0);
+    gaps   += (s.gap_events || 0);
+    missing += (s.gap_missing || 0);
+    durMs  += (s.end_epoch_ms || 0) - (s.start_epoch_ms || 0);
+  }
+  if (notif === 0 && missing === 0) {
+    el.style.display = 'none';
+    return;
+  }
+  var expected = notif + missing;
+  var lossPct = expected > 0 ? (missing / expected * 100) : 0;
+  var durMin = durMs / 60000;
+  var per10 = (durMin > 0 && missing > 0) ? (missing / durMin * 10) : 0;
+  el.innerHTML =
+    '<span style="font-weight:600;color:var(--text)">Stream quality:</span> ' +
+    notif.toLocaleString() + ' notifications received, ' +
+    gaps + ' gap event' + (gaps !== 1 ? 's' : '') + ', ' +
+    missing + ' missing compensated, ' +
+    'loss rate ' + lossPct.toFixed(2) + '%' +
+    (per10 > 0 ? ', ' + per10.toFixed(1) + ' missing per 10 min' : '');
+  el.style.display = '';
+}
+
 /* ── Respiratory events overlay (Feature 4) ──────────────────────────
  * Events come from each session's events.snt (JSONL). We keep only the
  * TherapyEvents-RespiratoryEvents notifications, NTP-correct their timestamps
@@ -2978,6 +3032,7 @@ function loadDashboardData() {
     dashSessionData = c.sessionData;
     dashXRange = null;
     renderDashboardCharts();
+    renderStreamQuality();
     loadEvents(noonDay, myLoadId);
     dashIsLoading = false;
     dashProgDone();
@@ -3038,14 +3093,16 @@ function loadDashboardData() {
     renderDashboardCharts();
 
     /* Step 1: BRP L1 MinMax overview (flow + pressure) sequentially per
-     * session. The time axis is set once from the manifest and never moves. */
+     * session. The time axis is set once from the manifest and never moves.
+     * v2 format: fetch flow_mm (2-ch: flowMin/Max only).
+     * v1 (backwards compat): fetch brp_mm (4-ch: flowMin/Max + pressMin/Max). */
     var l1Done = 0;
     var l1Chain = gateChain;
     dashSessions.forEach(function(s, idx) {
       l1Chain = l1Chain.then(function() {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
         if (dashSessionData[idx].noTherapy) return;
-        return fetchSntFile(s.id, noonDay, 'brp_mm');
+        return fetchSntFile(s.id, noonDay, s.fmt >= 2 ? 'flow_mm' : 'brp_mm');
       }).then(function(buf) {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
         if (buf) {
@@ -3095,6 +3152,7 @@ function loadDashboardData() {
     }).then(function() {
       if (myLoadId !== dashLoadId) return;  /* cancelled */
       renderSummary();   /* leak percentiles now computable from PLD samples */
+      renderStreamQuality();
       /* Cache the overview (L1 + PLD) */
       if (!isToday(dateStr)) {
         dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
@@ -3103,16 +3161,18 @@ function loadDashboardData() {
       if (myLoadId === dashLoadId)
         dashProgShow('Loading detail...', W_EVENTS + W_BRP_MM + W_PLD, true);
 
-      /* Step 3: BRP L0 raw (background) — replaces the flow/pressure overview
+      /* Step 3: BRP L0 raw (background) — replaces the flow overview
        * with full-resolution 25 Hz samples for zoom detail. Requests do not
-       * begin until all overview data is ready or failed. */
+       * begin until all overview data is ready or failed.
+       * v2 format: fetch flow (1-ch: flow only).
+       * v1 (backwards compat): fetch brp (2-ch: flow + pressure). */
       var l0Done = 0;
       var l0Chain = Promise.resolve();
       dashSessions.forEach(function(s, idx) {
         l0Chain = l0Chain.then(function() {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
           if (dashSessionData[idx].noTherapy) return;
-          return fetchSntFile(s.id, noonDay, 'brp');
+          return fetchSntFile(s.id, noonDay, s.fmt >= 2 ? 'flow' : 'brp');
         }).then(function(buf) {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
           if (buf) {
