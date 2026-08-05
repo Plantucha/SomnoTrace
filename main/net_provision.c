@@ -41,7 +41,9 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "psram_task.h"
+#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
+#include "esp_https_ota.h"
 
 static const char *TAG = "netprov";
 
@@ -1665,7 +1667,8 @@ static void format_sd_task(void *arg)
 /* OTA flash task context — passed from httpd handler to the internal-stack task. */
 typedef struct {
     StreamBufferHandle_t sbuf;       /* data channel: httpd → flash task */
-    int total_size;                  /* expected image size */
+    int total_size;                  /* expected image size (0 = unknown/chunked) */
+    volatile bool eof;               /* download side finished sending data */
     esp_err_t result;                /* result from flash task */
     bool done;                       /* flash task finished */
 } ota_ctx_t;
@@ -1704,18 +1707,28 @@ static void ota_flash_task(void *arg)
     }
 
     int written = 0;
-    while (written < ctx->total_size) {
-        size_t want = ctx->total_size - written;
+    while (ctx->total_size > 0 ? (written < ctx->total_size) : !ctx->eof || xStreamBufferBytesAvailable(ctx->sbuf) > 0) {
+        size_t want;
+        if (ctx->total_size > 0) {
+            want = ctx->total_size - written;
+        } else {
+            want = OTA_CHUNK_SIZE;
+        }
         if (want > OTA_CHUNK_SIZE) want = OTA_CHUNK_SIZE;
-        size_t got = xStreamBufferReceive(ctx->sbuf, buf, want, pdMS_TO_TICKS(10000));
+        /* When total_size is unknown, use a short timeout so we can re-check eof */
+        size_t got = xStreamBufferReceive(ctx->sbuf, buf, want, pdMS_TO_TICKS(ctx->total_size > 0 ? 10000 : 500));
         if (got == 0) {
-            ESP_LOGE(TAG, "OTA: stream buffer timeout at %d/%d", written, ctx->total_size);
-            esp_ota_abort(ota_hdl);
-            free(buf);
-            ctx->result = ESP_ERR_TIMEOUT;
-            ctx->done = true;
-            vTaskDelete(NULL);
-            return;
+            if (ctx->total_size > 0) {
+                ESP_LOGE(TAG, "OTA: stream buffer timeout at %d/%d", written, ctx->total_size);
+                esp_ota_abort(ota_hdl);
+                free(buf);
+                ctx->result = ESP_ERR_TIMEOUT;
+                ctx->done = true;
+                vTaskDelete(NULL);
+                return;
+            }
+            /* chunked mode: no data yet, but not EOF — keep waiting */
+            continue;
         }
         err = esp_ota_write(ota_hdl, buf, got);
         if (err != ESP_OK) {
@@ -1758,21 +1771,24 @@ static void ota_flash_task(void *arg)
 static esp_err_t ota_upload_handler(httpd_req_t *req)
 {
     int total = req->content_len;
-    if (total <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_FAIL;
-    }
-    if (total > OTA_MAX_SIZE) {
+    bool chunked = (total <= 0);
+
+    if (!chunked && total > OTA_MAX_SIZE) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "image too large");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OTA: receiving %d bytes", total);
+    if (chunked) {
+        ESP_LOGI(TAG, "OTA: receiving chunked stream");
+    } else {
+        ESP_LOGI(TAG, "OTA: receiving %d bytes", total);
+    }
 
     /* Set up stream buffer and context for the flash task. */
     ota_ctx_t ctx = {
         .sbuf = xStreamBufferCreate(OTA_BUF_SIZE, 1),
         .total_size = total,
+        .eof = false,
         .result = ESP_FAIL,
         .done = false,
     };
@@ -1794,34 +1810,44 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     /* Feed data from the HTTP socket to the stream buffer. */
     uint8_t *recv_buf = heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
     if (!recv_buf) {
-        xStreamBufferSend(ctx.sbuf, NULL, 0, 0);  /* signal EOF */
+        ctx.eof = true;
         vStreamBufferDelete(ctx.sbuf);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_FAIL;
     }
 
     int received = 0;
-    while (received < total) {
-        int want = total - received;
+    while (chunked || received < total) {
+        int want = chunked ? OTA_CHUNK_SIZE : (total - received);
         if (want > OTA_CHUNK_SIZE) want = OTA_CHUNK_SIZE;
         int r = httpd_req_recv(req, (char *)recv_buf, want);
-        if (r <= 0) {
-            ESP_LOGE(TAG, "OTA: recv error at %d/%d", received, total);
+        if (r < 0) {
+            ESP_LOGE(TAG, "OTA: recv error at %d bytes", received);
+            break;
+        }
+        if (r == 0) {
+            /* chunked mode: end of stream */
+            break;
+        }
+        if (chunked && received + r > OTA_MAX_SIZE) {
+            ESP_LOGE(TAG, "OTA: chunked stream exceeded max size (%d)", OTA_MAX_SIZE);
             break;
         }
         /* Wait for space in the stream buffer (flash task may be slow). */
         size_t sent = xStreamBufferSend(ctx.sbuf, recv_buf, r, pdMS_TO_TICKS(10000));
         if (sent != (size_t)r) {
-            ESP_LOGE(TAG, "OTA: stream buffer full at %d/%d", received, total);
+            ESP_LOGE(TAG, "OTA: stream buffer full at %d bytes", received);
             break;
         }
         received += r;
     }
     free(recv_buf);
+    ctx.eof = true;  /* signal flash task that no more data is coming */
 
-    /* Wait for the flash task to finish. */
+    /* Wait for the flash task to finish.  Use a longer timeout for chunked
+     * mode since the data arrives over a potentially slow stream. */
     int wait_ms = 0;
-    while (!ctx.done && wait_ms < 30000) {
+    while (!ctx.done && wait_ms < 120000) {
         vTaskDelay(pdMS_TO_TICKS(100));
         wait_ms += 100;
     }
@@ -1853,162 +1879,99 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
 #define OTA_URL_MAX_LEN  512
 
-/* Context for the URL-download OTA path. The HTTP client event handler
- * pushes data into the same stream buffer mechanism as the upload path. */
+/* Progress tracking for URL-based OTA (polled by browser via /api/ota-progress). */
 typedef struct {
-    ota_ctx_t *ctx;
-    bool error;
-} ota_url_event_t;
+    volatile int total;       /* total bytes to download (0 = unknown) */
+    volatile int downloaded;  /* bytes downloaded so far */
+    volatile int flashed;     /* bytes flashed so far */
+    volatile bool active;     /* download in progress */
+    volatile bool done;       /* finished (check result) */
+    volatile bool ok;         /* true if flash succeeded */
+    char error[64];           /* error message if failed */
+} ota_progress_t;
+static ota_progress_t s_ota_progress;
 
-static esp_err_t ota_url_event_handler(esp_http_client_event_t *evt)
-{
-    ota_url_event_t *ue = (ota_url_event_t *)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        if (ue->error) return ESP_OK;
-        int sent = xStreamBufferSend(ue->ctx->sbuf, evt->data, evt->data_len, pdMS_TO_TICKS(10000));
-        if (sent != (int)evt->data_len) {
-            ESP_LOGE(TAG, "OTA URL: stream buffer full");
-            ue->error = true;
-        }
-    }
-    return ESP_OK;
-}
-
-/* OTA URL download task — runs on internal stack (esp_ota_* freezes cache). */
+/* OTA URL download task — uses ESP-IDF's esp_https_ota, which handles
+ * redirects, chunked/content-length bodies, and all esp_ota_* flashing
+ * internally. Runs on an internal-RAM stack (esp_ota_* freezes the cache). */
 static void ota_url_task(void *arg)
 {
     char *url = (char *)arg;
 
     ESP_LOGI(TAG, "OTA URL: downloading %s", url);
 
-    ota_ctx_t ctx = {
-        .sbuf = xStreamBufferCreate(OTA_BUF_SIZE, 1),
-        .total_size = 0,
-        .result = ESP_FAIL,
-        .done = false,
-    };
-    if (!ctx.sbuf) {
-        ESP_LOGE(TAG, "OTA URL: OOM (stream buffer)");
-        free(url);
-        vTaskDelete(NULL);
-        return;
-    }
+    memset((void *)&s_ota_progress, 0, sizeof(s_ota_progress));
+    s_ota_progress.active = true;
 
-    /* Launch flash task. total_size=0 means the flash task will use the
-     * partition size as the max and will keep reading until the stream
-     * buffer is drained (EOF signal). */
-    TaskHandle_t flash_task = NULL;
-    /* We need to know the content length before starting the flash task. */
-
-    ota_url_event_t ue = { .ctx = &ctx, .error = false };
-
-    esp_http_client_config_t config = {
+    esp_http_client_config_t http_cfg = {
         .url = url,
-        .event_handler = ota_url_event_handler,
-        .user_data = &ue,
-        .buffer_size = OTA_CHUNK_SIZE,
-        .buffer_size_tx = OTA_CHUNK_SIZE,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 30000,
         .keep_alive_enable = true,
+        /* GitHub's redirect Location URL is ~900 chars (signed Azure blob
+         * URL + JWT); the 512-byte default overflows with "Out of buffer". */
+        .buffer_size = 4096,
+        .buffer_size_tx = 2048,
     };
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        ESP_LOGE(TAG, "OTA URL: client init failed");
-        vStreamBufferDelete(ctx.sbuf);
-        free(url);
-        vTaskDelete(NULL);
-        return;
-    }
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &http_cfg,
+    };
 
-    esp_err_t err = esp_http_client_open(client, 0);
+    esp_https_ota_handle_t handle = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "OTA URL: open failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        vStreamBufferDelete(ctx.sbuf);
-        free(url);
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "OTA URL: begin failed: %s", esp_err_to_name(err));
+        strlcpy(s_ota_progress.error, esp_err_to_name(err), sizeof(s_ota_progress.error));
+        goto out;
     }
 
-    int content_length = esp_http_client_fetch_headers(client);
-    if (content_length <= 0) {
-        /* Some servers use chunked encoding; try reading anyway. */
-        ESP_LOGW(TAG, "OTA URL: no content-length, using chunked read");
-        content_length = 0;
-    }
-    if (content_length > OTA_MAX_SIZE) {
-        ESP_LOGE(TAG, "OTA URL: image too large (%d bytes)", content_length);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        vStreamBufferDelete(ctx.sbuf);
-        free(url);
-        vTaskDelete(NULL);
-        return;
+    s_ota_progress.total = esp_https_ota_get_image_size(handle);
+    ESP_LOGI(TAG, "OTA URL: image size %d bytes", s_ota_progress.total);
+
+    /* Pump the download/flash loop, updating progress as we go. */
+    while (1) {
+        err = esp_https_ota_perform(handle);
+        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) break;
+
+        int read = esp_https_ota_get_image_len_read(handle);
+        s_ota_progress.downloaded = read;
+        s_ota_progress.flashed = read;
     }
 
-    ctx.total_size = content_length;
-
-    /* Now launch the flash task with the known size. */
-    BaseType_t tr = xTaskCreate(ota_flash_task, "ota_flash", 8192, &ctx, 5, &flash_task);
-    if (tr != pdPASS) {
-        ESP_LOGE(TAG, "OTA URL: OOM (flash task)");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        vStreamBufferDelete(ctx.sbuf);
-        free(url);
-        vTaskDelete(NULL);
-        return;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA URL: perform failed: %s", esp_err_to_name(err));
+        strlcpy(s_ota_progress.error, esp_err_to_name(err), sizeof(s_ota_progress.error));
+        esp_https_ota_abort(handle);
+        goto out;
     }
 
-    /* If content_length is known, the event handler already feeds data.
-     * For chunked encoding, we need to read manually. */
-    if (content_length == 0) {
-        uint8_t *buf = malloc(OTA_CHUNK_SIZE);
-        if (!buf) {
-            ESP_LOGE(TAG, "OTA URL: OOM (read buf)");
-            ue.error = true;
-        } else {
-            int read;
-            while ((read = esp_http_client_read(client, (char *)buf, OTA_CHUNK_SIZE)) > 0) {
-                int sent = xStreamBufferSend(ctx.sbuf, buf, read, pdMS_TO_TICKS(10000));
-                if (sent != read) {
-                    ESP_LOGE(TAG, "OTA URL: stream buffer full");
-                    ue.error = true;
-                    break;
-                }
-            }
-            free(buf);
-        }
+    if (!esp_https_ota_is_complete_data_received(handle)) {
+        ESP_LOGE(TAG, "OTA URL: incomplete image received");
+        strlcpy(s_ota_progress.error, "incomplete image", sizeof(s_ota_progress.error));
+        esp_https_ota_abort(handle);
+        goto out;
     }
 
-    /* Wait for all data to be consumed and flash task to finish. */
-    if (content_length > 0) {
-        /* The event handler already fed data during fetch_headers/read. */
-        /* Wait for flash task to drain the buffer. */
+    err = esp_https_ota_finish(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA URL: finish failed: %s", esp_err_to_name(err));
+        strlcpy(s_ota_progress.error, esp_err_to_name(err), sizeof(s_ota_progress.error));
+        goto out;
     }
 
-    /* Wait for flash task to finish. */
-    int wait_ms = 0;
-    while (!ctx.done && wait_ms < 60000) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        wait_ms += 100;
-    }
+    ESP_LOGI(TAG, "OTA URL: flash complete, rebooting");
+    s_ota_progress.ok = true;
+    s_ota_progress.active = false;
+    s_ota_progress.done = true;
+    free(url);
+    psram_task_create(reboot_task, "ota_reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    vTaskDelete(NULL);
+    return;
 
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    vStreamBufferDelete(ctx.sbuf);
-
-    if (!ctx.done) {
-        ESP_LOGE(TAG, "OTA URL: flash task timed out");
-        if (flash_task) vTaskDelete(flash_task);
-    } else if (ctx.result == ESP_OK) {
-        ESP_LOGI(TAG, "OTA URL: flash complete, rebooting");
-        psram_task_create(reboot_task, "ota_reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
-    } else {
-        ESP_LOGE(TAG, "OTA URL: flash failed: %s", esp_err_to_name(ctx.result));
-    }
-
+out:
+    s_ota_progress.active = false;
+    s_ota_progress.done = true;
     free(url);
     vTaskDelete(NULL);
 }
@@ -2073,6 +2036,22 @@ static esp_err_t ota_url_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"message\":\"Download started. Device will reboot when complete.\"}");
+    return ESP_OK;
+}
+
+/* GET /api/ota-progress — returns current OTA URL download/flash progress. */
+static esp_err_t ota_progress_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    char resp[192];
+    snprintf(resp, sizeof(resp),
+             "{\"active\":%s,\"done\":%s,\"ok\":%s,\"total\":%d,\"downloaded\":%d,\"flashed\":%d,\"error\":\"%s\"}",
+             s_ota_progress.active ? "true" : "false",
+             s_ota_progress.done ? "true" : "false",
+             s_ota_progress.ok ? "true" : "false",
+             s_ota_progress.total, s_ota_progress.downloaded, s_ota_progress.flashed,
+             s_ota_progress.error);
+    httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
 
@@ -2264,6 +2243,10 @@ static esp_err_t start_webserver(void)
     /* OTA firmware download from URL endpoint */
     httpd_uri_t ota_url = { .uri = "/api/ota-url", .method = HTTP_POST, .handler = ota_url_handler };
     httpd_register_uri_handler(s_httpd, &ota_url);
+
+    /* OTA progress polling endpoint */
+    httpd_uri_t ota_prog = { .uri = "/api/ota-progress", .method = HTTP_GET, .handler = ota_progress_handler };
+    httpd_register_uri_handler(s_httpd, &ota_prog);
 
     /* Log stream endpoints (SSE, download, level control) */
     log_stream_register_handlers(s_httpd);

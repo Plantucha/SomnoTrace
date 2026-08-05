@@ -1699,7 +1699,11 @@ function otaSetBusy(busy) {
   advBtn.disabled = busy;
 }
 
-/* ── OTA: Download from URL ────────────────────────────────────── */
+/* ── OTA: Download from URL ──────────────────────────────────────
+ * The ESP32 downloads the firmware directly (handling TLS with the
+ * built-in cert bundle).  The browser polls /api/ota-progress for
+ * real-time progress bar updates.  This avoids CORS issues with
+ * cross-origin fetches from the device's IP to GitHub. */
 function otaUrlDownload() {
   var urlInput = document.getElementById('ota-url-input');
   var url = urlInput.value.trim();
@@ -1707,8 +1711,8 @@ function otaUrlDownload() {
   if (!confirm('Download and flash firmware from:\n' + url + '\n\nThe device will reboot automatically after the update completes.')) return;
 
   otaSetBusy(true);
-  otaShowProgress(0, 'Starting download…');
-  otaShowStatus('Downloading from URL…');
+  otaShowProgress(0, 'Starting…');
+  otaShowStatus('Downloading and flashing on device…');
 
   fetch('/api/ota-url', {
     method: 'POST',
@@ -1716,19 +1720,52 @@ function otaUrlDownload() {
     body: JSON.stringify({ url: url })
   }).then(function(r) {
     if (r.ok) {
-      otaShowProgress(100, 'Download started on device');
-      otaShowStatus('Download started. The device is downloading and flashing the firmware. It will reboot automatically when complete. This page will reconnect once the device is back.', 'success');
-      /* Poll for device coming back online */
-      setTimeout(otaWaitForReboot, 5000);
+      otaPollProgress();
     } else {
       return r.text().then(function(t) {
         throw new Error(t || 'Server error');
       });
     }
   }).catch(function(e) {
-    otaShowStatus('Download failed: ' + (e.message || 'network error'), 'error');
+    otaShowStatus('Failed to start: ' + (e.message || 'network error'), 'error');
     otaSetBusy(false);
     document.getElementById('ota-progress-wrap').style.display = 'none';
+  });
+}
+
+function otaPollProgress() {
+  fetch('/api/ota-progress', { cache: 'no-store' }).then(function(r) {
+    return r.json();
+  }).then(function(p) {
+    if (p.active || (!p.done && !p.error)) {
+      var pct = 0;
+      if (p.total > 0) {
+        pct = Math.round(p.downloaded / p.total * 100);
+      } else if (p.downloaded > 0) {
+        pct = -1; /* unknown total — show bytes only */
+      }
+      if (pct >= 0) {
+        otaShowProgress(pct, pct + '% (' + (p.downloaded / 1024).toFixed(0) + ' KB' +
+                        (p.total > 0 ? ' / ' + (p.total / 1024).toFixed(0) + ' KB' : '') + ')');
+      } else {
+        otaShowProgress(0, (p.downloaded / 1024).toFixed(0) + ' KB downloaded');
+      }
+      setTimeout(otaPollProgress, 500);
+    } else if (p.done && p.ok) {
+      otaShowProgress(100, '100%');
+      otaShowStatus('Flash complete. Device is rebooting…', 'success');
+      setTimeout(otaWaitForReboot, 3000);
+    } else if (p.done && p.error && p.error[0]) {
+      otaShowStatus('Flash failed: ' + p.error, 'error');
+      otaSetBusy(false);
+      document.getElementById('ota-progress-wrap').style.display = 'none';
+    } else {
+      /* Still in progress or indeterminate — keep polling */
+      setTimeout(otaPollProgress, 500);
+    }
+  }).catch(function() {
+    /* Device might be rebooting — check if it's back */
+    setTimeout(otaWaitForReboot, 2000);
   });
 }
 

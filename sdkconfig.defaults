@@ -144,6 +144,12 @@ CONFIG_MBEDTLS_HARDWARE_MPI=y
 # 10-40 KB of heap during the connection, which would exhaust internal RAM
 # when WiFi + BLE + libsmb2 are all active.
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Dynamic buffer: allocate TLS in/out content buffers on demand and free
+# them after the handshake. This reduces per-connection memory footprint
+# and allows two concurrent TLS connections (e.g. SleepHQ upload + OTA).
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER_PEER_CRED=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 
 # Certificate bundle for HTTPS (SleepHQ upload) — common set only
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
@@ -151,8 +157,12 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 
 # mbedTLS: minimise features — TLS client only, reduce buffer sizes
 # CONFIG_MBEDTLS_TLS_SERVER is not set
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+# IN_CONTENT_LEN must be the full TLS maximum (16384): some hosts
+# (release-assets.githubusercontent.com) send handshake records larger than
+# 4096, which fails with MBEDTLS_ERR_SSL_INVALID_RECORD (-0x7200).
+# MBEDTLS_DYNAMIC_BUFFER frees this again after the handshake.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 # CONFIG_MBEDTLS_SERVER_SSL_SESSION_TICKETS is not set
 # CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS is not set
 # CONFIG_MBEDTLS_SSL_RENEGOTIATION is not set
