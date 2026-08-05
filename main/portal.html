@@ -756,13 +756,32 @@ Maintenance Actions
 <svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
 Firmware Update (OTA)
 </div>
-<p style="color:var(--text-muted);font-size:.85rem;margin-bottom:16px">Upload a new firmware image (.bin) to update the device. The device will reboot automatically after a successful upload.</p>
+<p style="color:var(--text-muted);font-size:.85rem;margin-bottom:16px">Update the device firmware by downloading from a URL or uploading a .bin file. The device reboots automatically after a successful update.</p>
 
-<div style="display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;flex-direction:column;gap:16px">
+<!-- ── URL download ── -->
+<div style="display:flex;flex-direction:column;gap:8px">
+<label style="font-size:.85rem;font-weight:600;color:var(--text)">Download from URL</label>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<input type="text" id="ota-url-input" placeholder="https://example.com/somnotrace-ota.bin" style="font-size:.85rem;flex:1;min-width:200px;padding:8px 10px;border-radius:6px;border:1px solid var(--border-color);background:var(--input-bg);color:var(--text)">
+<button class="btn btn-primary" id="ota-url-btn" onclick="otaUrlDownload()">Download &amp; Flash</button>
+</div>
+<button class="btn" id="ota-adventurous-btn" onclick="otaFetchLatest()" style="font-size:.8rem;align-self:flex-start;padding:6px 14px">&#127922; I'm Feeling Adventurous</button>
+<div id="ota-url-status" class="status-msg" style="margin-top:2px"></div>
+</div>
+
+<div style="border-top:1px solid var(--border-color);margin:4px 0"></div>
+
+<!-- ── File upload ── -->
+<div style="display:flex;flex-direction:column;gap:8px">
+<label style="font-size:.85rem;font-weight:600;color:var(--text)">Upload from File</label>
 <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
 <input type="file" id="ota-file-input" accept=".bin" style="font-size:.85rem;flex:1;min-width:200px">
 <button class="btn btn-primary" id="ota-upload-btn" onclick="otaUpload()" disabled>Upload &amp; Flash</button>
 </div>
+</div>
+
+<!-- ── Shared progress + status ── -->
 <div id="ota-progress-wrap" style="display:none">
 <div style="background:var(--input-bg);border-radius:6px;height:24px;overflow:hidden;border:1px solid var(--border-color)">
 <div id="ota-progress-bar" style="height:100%;width:0%;background:var(--primary);transition:width .15s ease-out;border-radius:6px"></div>
@@ -1652,6 +1671,125 @@ document.getElementById('ota-file-input').addEventListener('change', function() 
   btn.disabled = !this.files || !this.files.length;
 });
 
+/* Shared OTA UI helpers — both URL and file paths use the same progress/status elements. */
+function otaShowProgress(pct, text) {
+  var progWrap = document.getElementById('ota-progress-wrap');
+  var progBar = document.getElementById('ota-progress-bar');
+  var progText = document.getElementById('ota-progress-text');
+  progWrap.style.display = 'block';
+  progBar.style.width = pct + '%';
+  progText.textContent = text || (pct + '%');
+}
+function otaShowStatus(msg, cls) {
+  var el = document.getElementById('ota-status');
+  el.textContent = msg;
+  el.className = 'status-msg' + (cls ? ' ' + cls : '');
+}
+function otaSetBusy(busy) {
+  var urlBtn = document.getElementById('ota-url-btn');
+  var uploadBtn = document.getElementById('ota-upload-btn');
+  var fileInput = document.getElementById('ota-file-input');
+  var urlInput = document.getElementById('ota-url-input');
+  var advBtn = document.getElementById('ota-adventurous-btn');
+  urlBtn.disabled = busy;
+  uploadBtn.disabled = busy || !fileInput.files || !fileInput.files.length;
+  fileInput.disabled = busy;
+  urlInput.disabled = busy;
+  advBtn.disabled = busy;
+}
+
+/* ── OTA: Download from URL ────────────────────────────────────── */
+function otaUrlDownload() {
+  var urlInput = document.getElementById('ota-url-input');
+  var url = urlInput.value.trim();
+  if (!url) { alert('Please enter a firmware URL.'); return; }
+  if (!confirm('Download and flash firmware from:\n' + url + '\n\nThe device will reboot automatically after the update completes.')) return;
+
+  otaSetBusy(true);
+  otaShowProgress(0, 'Starting download…');
+  otaShowStatus('Downloading from URL…');
+
+  fetch('/api/ota-url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url })
+  }).then(function(r) {
+    if (r.ok) {
+      otaShowProgress(100, 'Download started on device');
+      otaShowStatus('Download started. The device is downloading and flashing the firmware. It will reboot automatically when complete. This page will reconnect once the device is back.', 'success');
+      /* Poll for device coming back online */
+      setTimeout(otaWaitForReboot, 5000);
+    } else {
+      return r.text().then(function(t) {
+        throw new Error(t || 'Server error');
+      });
+    }
+  }).catch(function(e) {
+    otaShowStatus('Download failed: ' + (e.message || 'network error'), 'error');
+    otaSetBusy(false);
+    document.getElementById('ota-progress-wrap').style.display = 'none';
+  });
+}
+
+/* Poll until the device responds, then reload the page. */
+function otaWaitForReboot() {
+  fetch('/api/device/settings', { cache: 'no-store' }).then(function(r) {
+    if (r.ok) {
+      otaShowStatus('Device is back online! Reloading page…', 'success');
+      setTimeout(function() { location.reload(); }, 1500);
+    } else { setTimeout(otaWaitForReboot, 3000); }
+  }).catch(function() {
+    otaShowStatus('Waiting for device to reboot…', '');
+    otaShowProgress(100, 'Flashing… please wait');
+    setTimeout(otaWaitForReboot, 3000);
+  });
+}
+
+/* ── OTA: "I'm Feeling Adventurous" — fetch latest release from GitHub ── */
+function otaFetchLatest() {
+  var advBtn = document.getElementById('ota-adventurous-btn');
+  var urlInput = document.getElementById('ota-url-input');
+  var statusEl = document.getElementById('ota-url-status');
+
+  advBtn.disabled = true;
+  statusEl.textContent = 'Fetching latest release from GitHub…';
+  statusEl.className = 'status-msg';
+
+  /* GitHub API: get all releases, sort by published_at desc, pick first.
+   * Uses /releases instead of /releases/latest because the latter 404s
+   * when the newest release is a prerelease. */
+  fetch('https://api.github.com/repos/ilyakruchinin/SomnoTrace/releases', {
+    headers: { 'Accept': 'application/vnd.github+json' }
+  }).then(function(r) {
+    if (!r.ok) throw new Error('GitHub API returned ' + r.status);
+    return r.json();
+  }).then(function(rels) {
+    if (!rels || !rels.length) throw new Error('No releases found');
+    rels.sort(function(a, b) {
+      return (b.published_at || '').localeCompare(a.published_at || '');
+    });
+    var rel = rels[0];
+    var otaAsset = null;
+    if (rel.assets) {
+      for (var i = 0; i < rel.assets.length; i++) {
+        if (rel.assets[i].name && rel.assets[i].name.indexOf('-ota.bin') !== -1) {
+          otaAsset = rel.assets[i];
+          break;
+        }
+      }
+    }
+    if (!otaAsset) throw new Error('No *-ota.bin asset found in ' + rel.tag_name);
+    urlInput.value = otaAsset.browser_download_url;
+    statusEl.textContent = 'Found: ' + rel.tag_name + ' — ' + otaAsset.name + ' (' + (otaAsset.size / 1024).toFixed(0) + ' KB). Click "Download & Flash" to proceed.';
+    statusEl.className = 'status-msg success';
+  }).catch(function(e) {
+    statusEl.textContent = 'Failed to fetch latest release: ' + (e.message || 'network error');
+    statusEl.className = 'status-msg error';
+  }).then(function() {
+    advBtn.disabled = false;
+  });
+}
+
 function otaUpload() {
   var input = document.getElementById('ota-file-input');
   if (!input.files || !input.files.length) return;
@@ -1662,49 +1800,33 @@ function otaUpload() {
   }
   if (!confirm('Upload and flash "' + file.name + '" (' + (file.size / 1024).toFixed(0) + ' KB)?\nThe device will reboot automatically after the update completes.')) return;
 
-  var btn = document.getElementById('ota-upload-btn');
-  var statusEl = document.getElementById('ota-status');
-  var progWrap = document.getElementById('ota-progress-wrap');
-  var progBar = document.getElementById('ota-progress-bar');
-  var progText = document.getElementById('ota-progress-text');
-
-  btn.disabled = true;
-  input.disabled = true;
-  progWrap.style.display = 'block';
-  progBar.style.width = '0%';
-  progText.textContent = '0%';
-  statusEl.textContent = 'Uploading…';
-  statusEl.className = 'status-msg';
+  otaSetBusy(true);
+  otaShowProgress(0, '0%');
+  otaShowStatus('Uploading…');
 
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/ota', true);
   xhr.upload.onprogress = function(e) {
     if (e.lengthComputable) {
       var pct = Math.round(e.loaded / e.total * 100);
-      progBar.style.width = pct + '%';
-      progText.textContent = pct + '% (' + (e.loaded / 1024).toFixed(0) + ' / ' + (e.total / 1024).toFixed(0) + ' KB)';
+      otaShowProgress(pct, pct + '% (' + (e.loaded / 1024).toFixed(0) + ' / ' + (e.total / 1024).toFixed(0) + ' KB)');
     }
   };
   xhr.onload = function() {
     if (xhr.status === 200) {
-      progBar.style.width = '100%';
-      progText.textContent = '100%';
-      statusEl.textContent = 'Upload complete. Device is rebooting…';
-      statusEl.className = 'status-msg success';
+      otaShowProgress(100, '100%');
+      otaShowStatus('Upload complete. Device is rebooting…', 'success');
+      setTimeout(otaWaitForReboot, 3000);
     } else {
-      statusEl.textContent = 'Upload failed: ' + (xhr.responseText || 'server error');
-      statusEl.className = 'status-msg error';
-      btn.disabled = false;
-      input.disabled = false;
-      progWrap.style.display = 'none';
+      otaShowStatus('Upload failed: ' + (xhr.responseText || 'server error'), 'error');
+      otaSetBusy(false);
+      document.getElementById('ota-progress-wrap').style.display = 'none';
     }
   };
   xhr.onerror = function() {
-    statusEl.textContent = 'Upload failed — network error.';
-    statusEl.className = 'status-msg error';
-    btn.disabled = false;
-    input.disabled = false;
-    progWrap.style.display = 'none';
+    otaShowStatus('Upload failed — network error.', 'error');
+    otaSetBusy(false);
+    document.getElementById('ota-progress-wrap').style.display = 'none';
   };
   xhr.send(file);
 }
@@ -1994,14 +2116,16 @@ var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
  * src      — which parsed source sub-object the channel lives in ('brp'|'pld').
  * ch       — value key inside that sub-object (e.g. 'flow', 'press', 'leak').
  * minKey/maxKey — optional precomputed envelope arrays (only BRP L1 has them).
- * y        — fixed {min,max} axis range, or null for auto-scale (pressure).
+ * overlay  — optional second channel to plot on the same panel (e.g. EPR pressure).
+ * y        — fixed {min,max} axis range, or {min,max:null} for floored auto-scale.
  * height   — panel pixel height.
  */
 var DASH_SIGNALS = [
   { key:'flow',    label:'Breathing',  unit:'L/min', src:'brp', ch:'flow',
     minKey:'flowMin',  maxKey:'flowMax',  color:'#3b82f6',          y:{min:-150,max:150}, height:200, decimals:1 },
-  { key:'press',   label:'Pressure',   unit:'cmH\u2082O', src:'brp', ch:'press',
-    minKey:'pressMin', maxKey:'pressMax', color:'--color-pressure', y:null,               height:200, decimals:1 },
+  { key:'press',   label:'Pressure',   unit:'cmH\u2082O', src:'pld', ch:'press',
+    minKey:null, maxKey:null,            color:'--color-pressure', y:{min:0,max:null},    height:200, decimals:1,
+    overlay: { ch:'eprPress', label:'EPR', color:'#22c55e' } },
   { key:'leak',    label:'Leak Rate',  unit:'L/min', src:'pld', ch:'leak',
     minKey:null, maxKey:null,            color:'--color-leak',      y:{min:0,max:null},   height:200, decimals:1 },
   { key:'flowlim', label:'Flow Limit', unit:'',      src:'pld', ch:'flowlim',
@@ -2686,86 +2810,6 @@ function renderSummary() {
   var panel = document.getElementById('dash-summary'); if (panel) panel.style.display = '';
 }
 
-/* ── CPAP fixed-pressure flat lines (Feature 3) ──────────────────────
- * When a session's therapy mode is CPAP (fixed), the pressure panel shows two
- * flat lines — IPAP (set pressure) and EPAP (set − EPR when FullTime) — rather
- * than the fluctuating 25 Hz mask-pressure waveform. Non-CPAP sessions keep
- * the 25 Hz waveform. */
-function dashCpapInfo() {
-  var info = { any: false, minEpap: Infinity, maxIpap: -Infinity, spans: [] };
-  if (!dashSessions || !dashSessionData) return info;
-  for (var i = 0; i < dashSessions.length; i++) {
-    var st = dashSessionData[i] && dashSessionData[i].settings;
-    if (!st || st.mode !== 'CpapProfile' || typeof st.cpap_set !== 'number') continue;
-    var ipap = st.cpap_set;
-    var relief = (st.epr_enable && st.epr_type === 'FullTime' && typeof st.epr_level === 'number') ? st.epr_level : 0;
-    var epap = ipap - relief;
-    var s = dashSessions[i];
-    info.spans.push({ startMs: s.start_epoch_ms, endMs: s.end_epoch_ms || s.start_epoch_ms, ipap: ipap, epap: epap });
-    info.any = true;
-    if (epap < info.minEpap) info.minEpap = epap;
-    if (ipap > info.maxIpap) info.maxIpap = ipap;
-  }
-  return info;
-}
-/* Blank the pressure waveform inside CPAP spans so only the flat lines show. */
-function blankPressCpap(src) {
-  var ci = dashCpapInfo();
-  if (!ci.any || !src) return src;
-  for (var k = 0; k < src.t.length; k++) {
-    var t = src.t[k];
-    if (t == null) continue;
-    for (var s = 0; s < ci.spans.length; s++) {
-      if (t >= ci.spans[s].startMs && t <= ci.spans[s].endMs) { src.v[k] = NaN; break; }
-    }
-  }
-  return src;
-}
-/* uPlot y-range for the pressure panel: framed around the CPAP set/relief
- * pressures when CPAP is present, else a padded auto-fit. */
-function pressYRange(u, dmin, dmax) {
-  var ci = dashCpapInfo();
-  if (ci.any && isFinite(ci.minEpap) && isFinite(ci.maxIpap)) {
-    return [ci.minEpap - 1.5, ci.maxIpap + 1.5];
-  }
-  if (dmin == null || !isFinite(dmin)) return [0, 20];
-  var pad = Math.max(0.5, (dmax - dmin) * 0.1);
-  return [dmin - pad, dmax + pad];
-}
-/* uPlot draw hook: paint flat IPAP/EPAP lines over each visible CPAP span. */
-function pressDrawHook(u) {
-  var ci = dashCpapInfo();
-  if (!ci.any) return;
-  var ctx = u.ctx;
-  var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
-  ctx.save();
-  ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
-  var col = sigColorByKey('press');
-  for (var i = 0; i < ci.spans.length; i++) {
-    var sp = ci.spans[i];
-    var x0 = u.valToPos(sp.startMs, 'x', true);
-    var x1 = u.valToPos(sp.endMs, 'x', true);
-    if (x1 < left || x0 > left + wid) continue;
-    x0 = Math.max(x0, left); x1 = Math.min(x1, left + wid);
-    /* IPAP (solid) */
-    var yI = u.valToPos(sp.ipap, 'press', true);
-    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([]);
-    ctx.beginPath(); ctx.moveTo(x0, yI); ctx.lineTo(x1, yI); ctx.stroke();
-    /* EPAP (dashed) — only if EPR relief lowers it */
-    if (Math.abs(sp.epap - sp.ipap) > 0.05) {
-      var yE = u.valToPos(sp.epap, 'press', true);
-      ctx.setLineDash([4, 3]);
-      ctx.beginPath(); ctx.moveTo(x0, yE); ctx.lineTo(x1, yE); ctx.stroke();
-      ctx.setLineDash([]);
-    }
-  }
-  ctx.restore();
-}
-function sigColorByKey(key) {
-  for (var i = 0; i < DASH_SIGNALS.length; i++) if (DASH_SIGNALS[i].key === key) return sigColor(DASH_SIGNALS[i]);
-  return '#fb923c';
-}
-
 /* ── Respiratory events overlay (Feature 4) ──────────────────────────
  * Events come from each session's events.snt (JSONL). We keep only the
  * TherapyEvents-RespiratoryEvents notifications, NTP-correct their timestamps
@@ -2972,7 +3016,7 @@ function loadDashboardData() {
     });
     if (nFetch === 0) nFetch = 1;  /* avoid div-by-zero */
     /* Phase weights: overview 20%, pld 5%, detail 70% (brp L0 is the bulk).
-     * Events+settings share the first 5% (shimmer phase). */
+     * Events share the first 5% (shimmer phase). */
     var W_EVENTS = 5, W_BRP_MM = 20, W_PLD = 5, W_BRP = 70;
 
     /* Initialize per-session data slots. Each holds two independent sources:
@@ -2993,27 +3037,10 @@ function loadDashboardData() {
     dashProgShimmer('Preparing...');
     renderDashboardCharts();
 
-    /* Step 0: per-session therapy settings (mode / set pressure / EPR) for the
-     * pressure panel's CPAP flat lines. Tiny JSON; fetched first so the flat
-     * lines and pressure y-range are correct from the first waveform paint. */
-    var setChain = gateChain;
-    dashSessions.forEach(function(s, idx) {
-      setChain = setChain.then(function() {
-        if (myLoadId !== dashLoadId) return;  /* cancelled */
-        return fetch('/api/session/settings?session=' + s.id + '&date=' + noonDay)
-          .then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; });
-      }).then(function(st) {
-        if (myLoadId !== dashLoadId) return;
-        if (st && !st.error) dashSessionData[idx].settings = st;
-      });
-    });
-    /* Rebuild panels once settings are in so pressure flat-lines/range apply. */
-    var l1Done = 0;
-    setChain = setChain.then(function(){ if (myLoadId === dashLoadId) { renderDashboardCharts(); dashProgShow('Loading overview...', W_EVENTS, true); } });
-
     /* Step 1: BRP L1 MinMax overview (flow + pressure) sequentially per
      * session. The time axis is set once from the manifest and never moves. */
-    var l1Chain = setChain;
+    var l1Done = 0;
+    var l1Chain = gateChain;
     dashSessions.forEach(function(s, idx) {
       l1Chain = l1Chain.then(function() {
         if (myLoadId !== dashLoadId) return;  /* cancelled */
@@ -3164,9 +3191,15 @@ function updateDashView() {
   for (var i = 0; i < dashCharts.length; i++) {
     var chart = dashCharts[i];
     if (!chart) continue;
-    var src = buildSignalData(DASH_SIGNALS[i], cur, dashChartCols(chart));
-    if (DASH_SIGNALS[i].key === 'press') src = blankPressCpap(src);
-    chart.setData(src ? [src.t, src.v] : [[], []], false);
+    var sig = DASH_SIGNALS[i];
+    var src = buildSignalData(sig, cur, dashChartCols(chart));
+    if (sig.overlay) {
+      var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
+      var ovSrc = buildSignalData(ovSig, cur, dashChartCols(chart));
+      chart.setData([src ? src.t : ovSrc ? ovSrc.t : [], src ? src.v : [], ovSrc ? ovSrc.v : []], false);
+    } else {
+      chart.setData(src ? [src.t, src.v] : [[], []], false);
+    }
     chart.setScale('x', {min: cur.min, max: cur.max});
   }
   dashProgrammaticScale = false;
@@ -3175,15 +3208,18 @@ function updateDashView() {
 /* Build a single uPlot panel for one signal into container `el`. */
 function makeDashPanel(sig, el, cur) {
   var src = buildSignalData(sig, cur, dashChartCols(null, el));
-  if (sig.key === 'press') src = blankPressCpap(src);
-  var data = src ? [src.t, src.v] : [[], []];
+  var ovSrc = null;
+  if (sig.overlay) {
+    var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
+    ovSrc = buildSignalData(ovSig, cur, dashChartCols(null, el));
+  }
+  var data = sig.overlay
+    ? [src ? src.t : ovSrc ? ovSrc.t : [], src ? src.v : [], ovSrc ? ovSrc.v : []]
+    : (src ? [src.t, src.v] : [[], []]);
   /* Y scale: no sig.y -> fully auto; both bounds -> fixed; only min (max null)
-   * -> hard floor with a dynamic top (used by Snore, floored at 0).
-   * Pressure is special: framed around CPAP set/relief lines when present. */
+   * -> hard floor with a dynamic top (used by Snore, floored at 0). */
   var yScaleOpts;
-  if (sig.key === 'press') {
-    yScaleOpts = { auto: true, range: pressYRange };
-  } else if (!sig.y) {
+  if (!sig.y) {
     yScaleOpts = { auto: true };
   } else if (sig.y.max == null) {
     var floor = sig.y.min;
@@ -3202,7 +3238,10 @@ function makeDashPanel(sig, el, cur) {
       { label: 'Time', value: function(u, v) { return v == null ? '' : dashTimeFmt(u)(v); } },
       { label: sig.label, stroke: sigColor(sig),
         scale: sig.key, width: 0.5, points: { show: false }, spanGaps: false }
-    ],
+    ].concat(sig.overlay ? [
+      { label: sig.overlay.label, stroke: sig.overlay.color,
+        scale: sig.key, width: 0.5, points: { show: false }, spanGaps: false }
+    ] : []),
     scales: (function(){ var sc = { x: cur || {} }; sc[sig.key] = yScaleOpts; return sc; })(),
     axes: [
       { values: function(u, vals) { var tf = dashTimeFmt(u); return vals.map(function(v){return v==null?'':tf(v);}); },
@@ -3218,7 +3257,7 @@ function makeDashPanel(sig, el, cur) {
     },
     legend: { show: false },
     hooks: {
-      draw: (sig.key === 'press') ? [pressDrawHook] : (sig.key === 'flow' ? [breathEventsHook] : []),
+      draw: (sig.key === 'flow') ? [breathEventsHook] : [],
       ready: [function(u) { attachDashInteractions(u, el, sig); attachDashTooltip(u, el, sig); }],
       setScale: [function(u, key) {
         if (key !== 'x' || dashIsPanning || dashProgrammaticScale) return;
@@ -3264,6 +3303,12 @@ function renderDashboardCharts() {
     lbl.className = 'dash-signal-label';
     lbl.textContent = sig.unit ? (sig.label + ' (' + sig.unit + ')') : sig.label;
     lbl.style.color = sigColor(sig);
+    if (sig.overlay) {
+      var ovSpan = document.createElement('span');
+      ovSpan.textContent = '  ' + sig.overlay.label;
+      ovSpan.style.color = sig.overlay.color;
+      lbl.appendChild(ovSpan);
+    }
     var chartEl = document.createElement('div');
     chartEl.id = 'chart-' + sig.key;
     chartEl.style.cssText = 'position:relative;touch-action:pan-y';
@@ -3317,8 +3362,12 @@ function dashShowTip(chart, over, sig, clientX, clientY) {
   var val = data[1][bestIdx];
   if (val == null || isNaN(val) || ts == null) { tip.style.display = 'none'; return; }
   var swatch = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + sigColor(sig) + ';margin-right:5px"></span>';
-  tip.innerHTML = swatch + sig.label + ': ' + fmtSignalVal(sig, val) +
-    '<div style="opacity:.6;margin-top:2px">' + dashTimeFmt(chart)(ts) + '</div>';
+  var html = swatch + sig.label + ': ' + fmtSignalVal(sig, val);
+  if (sig.overlay && data[2] && data[2][bestIdx] != null && !isNaN(data[2][bestIdx])) {
+    html += '<br><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + sig.overlay.color + ';margin-right:5px"></span>' +
+            sig.overlay.label + ': ' + fmtSignalVal(sig, data[2][bestIdx]);
+  }
+  tip.innerHTML = html + '<div style="opacity:.6;margin-top:2px">' + dashTimeFmt(chart)(ts) + '</div>';
   tip.style.display = 'block';
   /* Position tooltip: default right+12 / above-40.  Flip left if it would
    * overflow the viewport's right edge; flip below if it would go above 0. */

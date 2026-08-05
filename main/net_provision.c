@@ -41,6 +41,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "psram_task.h"
+#include "esp_http_client.h"
 
 static const char *TAG = "netprov";
 
@@ -1848,6 +1849,233 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── OTA firmware download from URL ─────────────────────────────────── */
+
+#define OTA_URL_MAX_LEN  512
+
+/* Context for the URL-download OTA path. The HTTP client event handler
+ * pushes data into the same stream buffer mechanism as the upload path. */
+typedef struct {
+    ota_ctx_t *ctx;
+    bool error;
+} ota_url_event_t;
+
+static esp_err_t ota_url_event_handler(esp_http_client_event_t *evt)
+{
+    ota_url_event_t *ue = (ota_url_event_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        if (ue->error) return ESP_OK;
+        int sent = xStreamBufferSend(ue->ctx->sbuf, evt->data, evt->data_len, pdMS_TO_TICKS(10000));
+        if (sent != (int)evt->data_len) {
+            ESP_LOGE(TAG, "OTA URL: stream buffer full");
+            ue->error = true;
+        }
+    }
+    return ESP_OK;
+}
+
+/* OTA URL download task — runs on internal stack (esp_ota_* freezes cache). */
+static void ota_url_task(void *arg)
+{
+    char *url = (char *)arg;
+
+    ESP_LOGI(TAG, "OTA URL: downloading %s", url);
+
+    ota_ctx_t ctx = {
+        .sbuf = xStreamBufferCreate(OTA_BUF_SIZE, 1),
+        .total_size = 0,
+        .result = ESP_FAIL,
+        .done = false,
+    };
+    if (!ctx.sbuf) {
+        ESP_LOGE(TAG, "OTA URL: OOM (stream buffer)");
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Launch flash task. total_size=0 means the flash task will use the
+     * partition size as the max and will keep reading until the stream
+     * buffer is drained (EOF signal). */
+    TaskHandle_t flash_task = NULL;
+    /* We need to know the content length before starting the flash task. */
+
+    ota_url_event_t ue = { .ctx = &ctx, .error = false };
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = ota_url_event_handler,
+        .user_data = &ue,
+        .buffer_size = OTA_CHUNK_SIZE,
+        .buffer_size_tx = OTA_CHUNK_SIZE,
+        .timeout_ms = 30000,
+        .keep_alive_enable = true,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "OTA URL: client init failed");
+        vStreamBufferDelete(ctx.sbuf);
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA URL: open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        vStreamBufferDelete(ctx.sbuf);
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length <= 0) {
+        /* Some servers use chunked encoding; try reading anyway. */
+        ESP_LOGW(TAG, "OTA URL: no content-length, using chunked read");
+        content_length = 0;
+    }
+    if (content_length > OTA_MAX_SIZE) {
+        ESP_LOGE(TAG, "OTA URL: image too large (%d bytes)", content_length);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        vStreamBufferDelete(ctx.sbuf);
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ctx.total_size = content_length;
+
+    /* Now launch the flash task with the known size. */
+    BaseType_t tr = xTaskCreate(ota_flash_task, "ota_flash", 8192, &ctx, 5, &flash_task);
+    if (tr != pdPASS) {
+        ESP_LOGE(TAG, "OTA URL: OOM (flash task)");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        vStreamBufferDelete(ctx.sbuf);
+        free(url);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* If content_length is known, the event handler already feeds data.
+     * For chunked encoding, we need to read manually. */
+    if (content_length == 0) {
+        uint8_t *buf = malloc(OTA_CHUNK_SIZE);
+        if (!buf) {
+            ESP_LOGE(TAG, "OTA URL: OOM (read buf)");
+            ue.error = true;
+        } else {
+            int read;
+            while ((read = esp_http_client_read(client, (char *)buf, OTA_CHUNK_SIZE)) > 0) {
+                int sent = xStreamBufferSend(ctx.sbuf, buf, read, pdMS_TO_TICKS(10000));
+                if (sent != read) {
+                    ESP_LOGE(TAG, "OTA URL: stream buffer full");
+                    ue.error = true;
+                    break;
+                }
+            }
+            free(buf);
+        }
+    }
+
+    /* Wait for all data to be consumed and flash task to finish. */
+    if (content_length > 0) {
+        /* The event handler already fed data during fetch_headers/read. */
+        /* Wait for flash task to drain the buffer. */
+    }
+
+    /* Wait for flash task to finish. */
+    int wait_ms = 0;
+    while (!ctx.done && wait_ms < 60000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait_ms += 100;
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    vStreamBufferDelete(ctx.sbuf);
+
+    if (!ctx.done) {
+        ESP_LOGE(TAG, "OTA URL: flash task timed out");
+        if (flash_task) vTaskDelete(flash_task);
+    } else if (ctx.result == ESP_OK) {
+        ESP_LOGI(TAG, "OTA URL: flash complete, rebooting");
+        psram_task_create(reboot_task, "ota_reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    } else {
+        ESP_LOGE(TAG, "OTA URL: flash failed: %s", esp_err_to_name(ctx.result));
+    }
+
+    free(url);
+    vTaskDelete(NULL);
+}
+
+/* HTTP handler: POST /api/ota-url with JSON body {"url":"https://..."}.
+ * Launches a background task that downloads and flashes the firmware. */
+static esp_err_t ota_url_handler(httpd_req_t *req)
+{
+    char body[OTA_URL_MAX_LEN + 64];
+    int total = req->content_len;
+    if (total <= 0 || total > (int)sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body size");
+        return ESP_FAIL;
+    }
+    int received = 0;
+    while (received < total) {
+        int r = httpd_req_recv(req, body + received, total - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    body[received] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *url_item = cJSON_GetObjectItem(root, "url");
+    if (!url_item || !cJSON_IsString(url_item) || !url_item->valuestring[0]) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing \"url\"");
+        return ESP_FAIL;
+    }
+
+    /* Check URL starts with http:// or https:// */
+    const char *url = url_item->valuestring;
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "URL must start with http:// or https://");
+        return ESP_FAIL;
+    }
+
+    /* Copy URL for the background task (it frees it). */
+    char *url_copy = strdup(url);
+    cJSON_Delete(root);
+    if (!url_copy) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    /* Launch the download+flash task on an internal RAM stack. */
+    TaskHandle_t task = NULL;
+    BaseType_t tr = xTaskCreate(ota_url_task, "ota_url", 12288, url_copy, 5, &task);
+    if (tr != pdPASS) {
+        free(url_copy);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM (task)");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"message\":\"Download started. Device will reboot when complete.\"}");
+    return ESP_OK;
+}
+
 /* HTTP handler for consolidated actions. Body: {"action":"reset-state|delete-edfs|reset-all|recreate-edfs|format-sd"} */
 
 static esp_err_t actions_handler(httpd_req_t *req)
@@ -2032,6 +2260,10 @@ static esp_err_t start_webserver(void)
     /* OTA firmware upload endpoint */
     httpd_uri_t ota_upload = { .uri = "/api/ota", .method = HTTP_POST, .handler = ota_upload_handler };
     httpd_register_uri_handler(s_httpd, &ota_upload);
+
+    /* OTA firmware download from URL endpoint */
+    httpd_uri_t ota_url = { .uri = "/api/ota-url", .method = HTTP_POST, .handler = ota_url_handler };
+    httpd_register_uri_handler(s_httpd, &ota_url);
 
     /* Log stream endpoints (SSE, download, level control) */
     log_stream_register_handlers(s_httpd);
