@@ -299,6 +299,11 @@ body.fixed-height .logs-container {
   height: auto;
   min-height: 0;
 }
+
+/* ── Loading state for settings sections ─────────────────────────── */
+.loading-overlay{position:relative;pointer-events:none;opacity:.4}
+.loading-overlay::after{content:'';position:absolute;top:50%;left:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border:2px solid var(--border-color);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;pointer-events:auto}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 <link rel="stylesheet" href="/uplot.css">
 <script src="/uplot.js"></script>
@@ -433,7 +438,7 @@ Wellue/Viatom O2 Ring S Pulse Oximeter
 <div class="settings-section-header sta-only">
 <span class="step-num">3</span> Automatic Uploads (Data Destinations)
 </div>
-<div class="settings-grid-2col sta-only">
+<div class="settings-grid-2col sta-only" id="upload-cards-grid">
 <!-- Network Folder (SMB) -->
 <div class="card card-smb" id="smb-card">
 <div class="card-title">
@@ -554,7 +559,7 @@ SD Card File Access (FTP)
 Display & Sound
 </div>
 <p class="card-desc">These settings are applied immediately and do not require a reboot.</p>
-<details>
+<details id="display-sound-details">
 <summary>LCD & Speaker</summary>
 <div class="settings-grid-2col" style="margin-top:12px">
 <div class="form-group">
@@ -564,8 +569,8 @@ Display & Sound
 <div class="form-group">
 <label>Display mode <span id="therapy-status" class="setting-status"></span></label>
 <select id="lcd-therapy-mode" class="form-control" onchange="onLcdTherapyModeChange(this)">
-<option value="0">Show live graph</option>
-<option value="1">Backlight off</option>
+<option value="0">Show live graph during therapy</option>
+<option value="1">Backlight off during therapy</option>
 <option value="2">Backlight always off (battery)</option>
 </select>
 </div>
@@ -587,7 +592,7 @@ Display & Sound
 Therapy Interruption Alerts
 </div>
 <p class="card-desc">Get notified when therapy stops during a configured time window. Push notifications via ntfy.sh, with optional buzzer escalation. Acknowledge with a single press of the PLUS button.</p>
-<details>
+<details id="alert-settings-details">
 <summary>Alert settings</summary>
 <div style="margin-top:12px">
 <div class="form-group">
@@ -945,7 +950,12 @@ function switchTab(tabId) {
   /* Lazy-load Settings tab data on first visit. */
   if (tabId === 'settings' && !settingsLoaded) {
     settingsLoaded = true;
+    /* Show loading indicators on sections that will be populated */
+    setLoading('display-sound-details', true);
+    setLoading('alert-settings-details', true);
     if (!PORTAL_MODE) {
+      setLoading('upload-cards-grid', true);
+      setLoading('upload-status', true);
       bleRefresh();
       loadUploadConfig();
       loadUploadStatus();
@@ -954,6 +964,11 @@ function switchTab(tabId) {
     loadAlertConfig();
     scanWifi();
   }
+}
+
+function setLoading(id, on) {
+  var el = document.getElementById(id);
+  if (el) el.classList.toggle('loading-overlay', on);
 }
 
 function setTheme(theme) {
@@ -1696,7 +1711,10 @@ function loadDeviceSettings() {
       var avl = document.getElementById('alert-vol-val');
       if (avl) avl.textContent = sliderVal;
     }
-  }).catch(function() {});
+    setLoading('display-sound-details', false);
+  }).catch(function() {
+    setLoading('display-sound-details', false);
+  });
 }
 
 /* ── Alert Speaker Volume ──────────────────────────────────────── */
@@ -1793,7 +1811,10 @@ function loadAlertConfig() {
       else modeSel.value = 'sound';
       onAlertModeChange(modeSel);
     }
-  }).catch(function() {});
+    setLoading('alert-settings-details', false);
+  }).catch(function() {
+    setLoading('alert-settings-details', false);
+  });
 }
 function generateAlertTopic() {
   var chars = '0123456789abcdef';
@@ -1862,16 +1883,18 @@ function loadUploadConfig() {
       toggleCardDisabled('ftp-card', 'ftp-enabled');
     }
     updateSmbPreview();
-  }).catch(function() {});
+    setLoading('upload-cards-grid', false);
+  }).catch(function() {
+    setLoading('upload-cards-grid', false);
+  });
 }
 
 function loadUploadStatus() {
   fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
     var up = d.uploads;
-    if (!up) return;
     var el = document.getElementById('upload-status');
-    if (!el) return;
-    if (!up.days || !up.days.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload days yet.</div>'; return; }
+    if (!up || !el) { if (el) setLoading('upload-status', false); return; }
+    if (!up.days || !up.days.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload days yet.</div>'; setLoading('upload-status', false); return; }
     var h = '';
     up.days.forEach(function(dy) {
       h += '<div style="margin-bottom:8px;padding:8px;border:1px solid var(--card-border);border-radius:8px">';
@@ -1890,7 +1913,10 @@ function loadUploadStatus() {
       h += '</div>';
     });
     el.innerHTML = h;
-  }).catch(function() {});
+    setLoading('upload-status', false);
+  }).catch(function() {
+    setLoading('upload-status', false);
+  });
 }
 
 function updateSmbPreview() {
