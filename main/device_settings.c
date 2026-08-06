@@ -44,7 +44,7 @@ static const char *TAG = "dev_settings";
 #define DEFAULT_BRIGHTNESS       100 /* 10.0% */
 #define MIN_BRIGHTNESS           1   /* 0.1% */
 #define MAX_BRIGHTNESS           200 /* 20.0% */
-#define DEFAULT_ALERT_VOLUME     75
+#define DEFAULT_ALERT_VOLUME     65
 #define MIN_ALERT_VOLUME         50
 
 static device_settings_t s_settings;

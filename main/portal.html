@@ -571,9 +571,9 @@ Display & Sound
 </div>
 </div>
 <div class="form-group" style="margin-top:12px">
-<label>Alert Speaker Volume <span id="alert-vol-val" style="font-weight:normal;color:var(--text-muted)">75</span>%<span id="alert-vol-status" class="setting-status"></span></label>
+<label>Alert Speaker Volume <span id="alert-vol-val" style="font-weight:normal;color:var(--text-muted)">4</span><span id="alert-vol-status" class="setting-status"></span></label>
 <div style="display:flex;align-items:center;gap:8px">
-<input type="range" id="alert-volume" class="form-control" min="50" max="100" step="5" value="75" style="padding:0;flex:1" oninput="onAlertVolumeInput(this.value)">
+<input type="range" id="alert-volume" class="form-control" min="1" max="11" step="1" value="4" style="padding:0;flex:1" oninput="onAlertVolumeInput(this.value)">
 <button type="button" class="btn btn-sm" style="white-space:nowrap" onclick="testAlertVolume()">Test</button>
 </div>
 </div>
@@ -1688,9 +1688,13 @@ function loadDeviceSettings() {
     }
     var av = document.getElementById('alert-volume');
     if (av && typeof d.alert_volume === 'number') {
-      av.value = d.alert_volume;
+      /* API uses 50-100%, slider uses 1-11 */
+      var sliderVal = Math.round((d.alert_volume - 50) / 5) + 1;
+      if (sliderVal < 1) sliderVal = 1;
+      if (sliderVal > 11) sliderVal = 11;
+      av.value = sliderVal;
       var avl = document.getElementById('alert-vol-val');
-      if (avl) avl.textContent = d.alert_volume;
+      if (avl) avl.textContent = sliderVal;
     }
   }).catch(function() {});
 }
@@ -1698,16 +1702,20 @@ function loadDeviceSettings() {
 /* ── Alert Speaker Volume ──────────────────────────────────────── */
 var alertVolTimer = null;
 function onAlertVolumeInput(val) {
-  var v = parseInt(val) || 0;
+  var level = parseInt(val) || 1;
+  if (level < 1) level = 1;
+  if (level > 11) level = 11;
   var label = document.getElementById('alert-vol-val');
-  if (label) label.textContent = v;
+  if (label) label.textContent = level;
+  /* Convert level 1-11 to percent 50-100 */
+  var pct = 50 + (level - 1) * 5;
   setStatus('alert-vol-status', '…', null);
   if (alertVolTimer) clearTimeout(alertVolTimer);
   alertVolTimer = setTimeout(function() {
     fetch('/api/device/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ alert_volume: v })
+      body: JSON.stringify({ alert_volume: pct })
     }).then(function() {
       setStatus('alert-vol-status', '✓', true);
     }).catch(function() {
