@@ -49,6 +49,51 @@ void time_sync_get_ntp_server(char *server, size_t server_len);
 /* Returns true if system time has been synchronised via NTP. */
 bool time_sync_is_synced(void);
 
+/* ── Time-source provenance and degraded mode ──────────────────────── */
+
+typedef enum {
+    TIME_SRC_NONE = 0,       /* unusable — must not record            */
+    TIME_SRC_AS11_DRIFT,     /* degraded — AS11 clock + stored drift  */
+    TIME_SRC_NTP,            /* authoritative                         */
+} time_source_t;
+
+/* Returns the current time source. */
+time_source_t time_source_get(void);
+
+/* Returns true if the system clock is usable for recording (any source
+ * except TIME_SRC_NONE).  Replaces time_sync_is_synced() as the gate
+ * for therapy recording — NTP is no longer the only valid source. */
+bool time_is_usable(void);
+
+/* Returns the age of the drift sample in milliseconds (time since it was
+ * measured), or -1 if no drift sample is available. */
+int64_t time_source_drift_age_ms(void);
+
+/* Returns true if a drift sample is available (in NVS or already loaded).
+ * Can be called at boot before BLE connects to decide whether to enter
+ * degraded mode or reboot. */
+bool time_sync_has_drift(void);
+
+/* Persist the most recent valid clock drift to NVS for use by the
+ * degraded-mode fallback.  Called at session stop when clock_drift_valid.
+ * drift_ms: NTP_epoch_ms - AS11_epoch_ms (positive = AS11 is behind).
+ * measured_at_ms: NTP epoch ms when the drift was measured.
+ * Safe to call from PSRAM-stack tasks (delegates to nvs_writer). */
+void time_sync_save_drift(int64_t drift_ms, int64_t measured_at_ms);
+
+/* Attempt to recover time without NTP by combining the AS11 BLE clock
+ * with the most recently stored drift sample.
+ *
+ * 1. Load drift from NVS (or scan SD for newest _session.json with
+ *     clock_drift_valid as an upgrade fallback).
+ * 2. Call as11_ble_get_datetime() for the current AS11 wall clock.
+ * 3. settimeofday(as11_ms + drift_ms) and set TIME_SRC_AS11_DRIFT.
+ *
+ * Returns ESP_OK on success, ESP_ERR_NOT_FOUND if no drift sample,
+ * ESP_FAIL if AS11 clock query fails.  Must be called after the
+ * encrypted BLE session is established. */
+esp_err_t time_sync_recover_from_as11(void);
+
 /* Block until the initial NTP sync succeeds or all attempts are exhausted.
  * Makes up to 3 attempts with 15-second timeouts. Returns true on success.
  * Must be called after time_sync_init(). Subsequent periodic re-syncs do

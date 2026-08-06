@@ -573,6 +573,113 @@ Display
 </details>
 </div>
 
+<!-- Therapy Alert Config -->
+<div class="card advanced-section sta-only" id="alert-card" style="border-left-color:var(--accent-wifi)">
+<div class="card-title">
+<svg viewBox="0 0 24 24" style="fill:var(--accent-wifi)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+Therapy Interruption Alerts
+</div>
+<p class="card-desc">Get notified when therapy stops during a configured time window. Push notifications via ntfy.sh, with optional buzzer escalation. Acknowledge with a single press of the PLUS button.</p>
+<details>
+<summary>Alert settings</summary>
+<div style="margin-top:12px">
+<div class="form-group">
+<label><input type="checkbox" id="alert-enabled" onchange="autoSaveAlert()"> Enable therapy interruption alerts <span id="alert-save-status" class="setting-status"></span></label>
+</div>
+<div class="settings-grid-2col">
+<div class="form-group">
+<label>Window start</label>
+<select id="alert-win-start" class="form-control" onchange="autoSaveAlert()">
+<option value="1080">18:00</option>
+<option value="1140">19:00</option>
+<option value="1200">20:00</option>
+<option value="1260">21:00</option>
+<option value="1320">22:00</option>
+<option value="1380" selected>23:00</option>
+<option value="0">00:00</option>
+<option value="60">01:00</option>
+<option value="120">02:00</option>
+<option value="180">03:00</option>
+<option value="240">04:00</option>
+<option value="300">05:00</option>
+<option value="360" selected>06:00</option>
+<option value="420">07:00</option>
+<option value="480">08:00</option>
+<option value="540">09:00</option>
+<option value="600">10:00</option>
+<option value="660">11:00</option>
+<option value="720">12:00</option>
+</select>
+</div>
+<div class="form-group">
+<label>Window end</label>
+<select id="alert-win-end" class="form-control" onchange="autoSaveAlert()">
+<option value="1080">18:00</option>
+<option value="1140">19:00</option>
+<option value="1200">20:00</option>
+<option value="1260">21:00</option>
+<option value="1320">22:00</option>
+<option value="1380">23:00</option>
+<option value="0">00:00</option>
+<option value="60">01:00</option>
+<option value="120">02:00</option>
+<option value="180">03:00</option>
+<option value="240">04:00</option>
+<option value="300">05:00</option>
+<option value="360" selected>06:00</option>
+<option value="420">07:00</option>
+<option value="480">08:00</option>
+<option value="540">09:00</option>
+<option value="600">10:00</option>
+<option value="660">11:00</option>
+<option value="720">12:00</option>
+</select>
+</div>
+</div>
+<div class="form-group">
+<label>Delay after therapy stop (minutes) <span id="alert-delay1-val" style="font-weight:normal;color:var(--text-muted)">5</span></label>
+<input type="range" id="alert-delay1" class="form-control" min="1" max="20" step="1" value="5" style="padding:0" oninput="document.getElementById('alert-delay1-val').textContent=this.value" onchange="autoSaveAlert()">
+</div>
+<div class="form-group">
+<label>Alert mode</label>
+<select id="alert-mode" class="form-control" onchange="onAlertModeChange(this);autoSaveAlert()">
+<option value="both">Push + Sound</option>
+<option value="push">Push only</option>
+<option value="sound">Sound only</option>
+</select>
+</div>
+<div class="form-group" id="alert-delay2-group">
+<label>Delay after push before buzzer (minutes) <span id="alert-delay2-val" style="font-weight:normal;color:var(--text-muted)">5</span></label>
+<input type="range" id="alert-delay2" class="form-control" min="1" max="20" step="1" value="5" style="padding:0" oninput="document.getElementById('alert-delay2-val').textContent=this.value" onchange="autoSaveAlert()">
+</div>
+<div id="alert-ntfy-group">
+<div class="form-group">
+<label>ntfy server</label>
+<input type="text" id="alert-ntfy-srv" class="form-control" value="https://ntfy.sh" placeholder="https://ntfy.sh" onchange="autoSaveAlert()">
+</div>
+<div class="form-group">
+<label>ntfy topic <span style="font-size:.78rem;color:var(--text-muted)">(shared secret — anyone with the topic can read notifications)</span></label>
+<div style="display:flex;gap:8px">
+<input type="text" id="alert-ntfy-topic" class="form-control" placeholder="somnotrace-xxxxxxxxxxxxxxxx" onchange="autoSaveAlert()">
+<button type="button" class="btn btn-sm" onclick="generateAlertTopic();autoSaveAlert()" style="white-space:nowrap">Generate</button>
+</div>
+</div>
+<div class="form-group">
+<label>Priority</label>
+<select id="alert-ntfy-prio" class="form-control" onchange="autoSaveAlert()">
+<option value="3">Default (regular)</option>
+<option value="5" selected>Max (urgent)</option>
+</select>
+</div>
+</div>
+<div id="alert-push-group" style="margin-top:12px">
+<button type="button" class="btn btn-sm" onclick="sendAlertTestPush()">Send test push</button>
+<span id="alert-status" class="status-msg" style="margin-left:8px"></span>
+</div>
+</div>
+</details>
+</div>
+
 <!-- Sticky Floating Save & Reboot Bar -->
 <div id="save-footer" class="save-footer">
 <div class="save-info">
@@ -837,6 +944,7 @@ function switchTab(tabId) {
       loadUploadStatus();
     }
     loadDeviceSettings();
+    loadAlertConfig();
     scanWifi();
   }
 }
@@ -1285,8 +1393,16 @@ function loadStatusTab(d) {
   setEl('status-tz', d.tz_name || 'UTC');
   var ntpEl = document.getElementById('status-ntp');
   if (ntpEl) {
-    ntpEl.textContent = d.ntp_synced ? 'Synchronized' : 'Not synced';
-    ntpEl.style.color = d.ntp_synced ? 'var(--success)' : 'var(--warning)';
+    if (d.time_source === 'as11_drift') {
+      ntpEl.textContent = 'Degraded (AS11)';
+      ntpEl.style.color = 'var(--warning)';
+    } else if (d.ntp_synced) {
+      ntpEl.textContent = 'Synchronized';
+      ntpEl.style.color = 'var(--success)';
+    } else {
+      ntpEl.textContent = 'Not synced';
+      ntpEl.style.color = 'var(--warning)';
+    }
   }
   setEl('status-uptime', formatUptime(d.uptime));
 
@@ -1561,6 +1677,99 @@ function loadDeviceSettings() {
       mode.value = String(d.lcd_therapy_mode);
     }
   }).catch(function() {});
+}
+
+/* ── Therapy Alert Config ──────────────────────────────────────── */
+function onAlertModeChange(sel) {
+  var mode = sel.value;
+  var d2group = document.getElementById('alert-delay2-group');
+  if (d2group) d2group.style.display = (mode === 'both') ? '' : 'none';
+  var ntfyGroup = document.getElementById('alert-ntfy-group');
+  if (ntfyGroup) ntfyGroup.style.display = (mode === 'sound') ? 'none' : '';
+  var pushGroup = document.getElementById('alert-push-group');
+  if (pushGroup) pushGroup.style.display = (mode === 'sound') ? 'none' : '';
+}
+var alertSaveTimer = null;
+function autoSaveAlert() {
+  setStatus('alert-save-status', '…', null);
+  if (alertSaveTimer) clearTimeout(alertSaveTimer);
+  alertSaveTimer = setTimeout(function() {
+    var mode = (document.getElementById('alert-mode') || {}).value || 'both';
+    var body = {
+      enabled: !!(document.getElementById('alert-enabled') || {}).checked,
+      win_start: parseInt((document.getElementById('alert-win-start') || {}).value || '1380', 10),
+      win_end: parseInt((document.getElementById('alert-win-end') || {}).value || '360', 10),
+      delay1: parseInt((document.getElementById('alert-delay1') || {}).value || '5', 10),
+      push_en: mode === 'both' || mode === 'push',
+      ntfy_srv: (document.getElementById('alert-ntfy-srv') || {}).value || 'https://ntfy.sh',
+      ntfy_topic: (document.getElementById('alert-ntfy-topic') || {}).value || '',
+      ntfy_prio: parseInt((document.getElementById('alert-ntfy-prio') || {}).value || '5', 10),
+      delay2: parseInt((document.getElementById('alert-delay2') || {}).value || '5', 10),
+      buzz_en: mode === 'both' || mode === 'sound'
+    };
+    fetch('/api/alert/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function(r) {
+      setStatus('alert-save-status', r.ok ? '✓' : '✗', r.ok);
+    }).catch(function() {
+      setStatus('alert-save-status', '✗', false);
+    });
+  }, 300);
+}
+function loadAlertConfig() {
+  fetch('/api/alert/config').then(function(r){ return r.json(); }).then(function(d) {
+    var setVal = function(id, v) { var el = document.getElementById(id); if (el) el.value = v; };
+    var setTxt = function(id, v) { var el = document.getElementById(id); if (el) el.textContent = v; };
+    var setChk = function(id, v) { var el = document.getElementById(id); if (el) el.checked = !!v; };
+    setChk('alert-enabled', d.enabled);
+    setVal('alert-win-start', String(d.win_start || 1380));
+    setVal('alert-win-end', String(d.win_end || 360));
+    setVal('alert-delay1', d.delay1 || 5);
+    setTxt('alert-delay1-val', d.delay1 || 5);
+    setVal('alert-ntfy-srv', d.ntfy_srv || 'https://ntfy.sh');
+    setVal('alert-ntfy-topic', d.ntfy_topic || '');
+    setVal('alert-ntfy-prio', String(d.ntfy_prio || 5));
+    setVal('alert-delay2', d.delay2 || 5);
+    setTxt('alert-delay2-val', d.delay2 || 5);
+    var modeSel = document.getElementById('alert-mode');
+    if (modeSel) {
+      if (d.push_en && d.buzz_en) modeSel.value = 'both';
+      else if (d.push_en) modeSel.value = 'push';
+      else modeSel.value = 'sound';
+      onAlertModeChange(modeSel);
+    }
+  }).catch(function() {});
+}
+function generateAlertTopic() {
+  var chars = '0123456789abcdef';
+  var suffix = '';
+  for (var i = 0; i < 16; i++) suffix += chars[Math.floor(Math.random() * 16)];
+  var topic = 'somnotrace-' + suffix;
+  var el = document.getElementById('alert-ntfy-topic');
+  if (el) el.value = topic;
+}
+function sendAlertTestPush() {
+  var st = document.getElementById('alert-status');
+  if (st) { st.textContent = 'Sending...'; st.style.color = 'var(--text-muted)'; }
+  var mode = (document.getElementById('alert-mode') || {}).value || 'both';
+  var body = JSON.stringify({
+    push_en: mode === 'both' || mode === 'push',
+    ntfy_srv: (document.getElementById('alert-ntfy-srv') || {}).value || 'https://ntfy.sh',
+    ntfy_topic: (document.getElementById('alert-ntfy-topic') || {}).value || '',
+    ntfy_prio: parseInt((document.getElementById('alert-ntfy-prio') || {}).value || '5', 10)
+  });
+  fetch('/api/alert/test', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body
+  }).then(function(r) {
+    if (st) {
+      st.textContent = r.ok ? 'Test push sent' : 'Push failed';
+      st.style.color = r.ok ? 'var(--success)' : 'var(--danger)';
+    }
+    if (r.ok) setTimeout(function(){ if (st) st.textContent = ''; }, 3000);
+  }).catch(function() {
+    if (st) { st.textContent = 'Network error'; st.style.color = 'var(--danger)'; }
+  });
 }
 
 /* ── Upload Config ─────────────────────────────────────────────── */

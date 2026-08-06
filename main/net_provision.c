@@ -7,6 +7,7 @@
 #include "as11_ble.h"
 #include "time_sync.h"
 #include "uploader.h"
+#include "therapy_alert.h"
 #include "edf_gen.h"
 #include "sd_storage.h"
 #include "ff.h"
@@ -794,6 +795,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(resp, "tz_name", s_status_cache.tz_name);
     cJSON_AddStringToObject(resp, "ntp_server", s_status_cache.ntp_srv);
     cJSON_AddBoolToObject(resp, "ntp_synced", time_sync_is_synced());
+    const char *src_str = "none";
+    switch (time_source_get()) {
+        case TIME_SRC_NTP:        src_str = "ntp"; break;
+        case TIME_SRC_AS11_DRIFT: src_str = "as11_drift"; break;
+        default:                  src_str = "none"; break;
+    }
+    cJSON_AddStringToObject(resp, "time_source", src_str);
     time_t now_t = time(NULL);
     if (now_t > 1700000000) {
         struct tm tm_info;
@@ -853,6 +861,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
     /* Heap stats */
     cJSON_AddNumberToObject(resp, "ih_free", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    /* Therapy alert state */
+    cJSON *alert = cJSON_AddObjectToObject(resp, "alert");
+    cJSON_AddStringToObject(alert, "state", therapy_alert_state_str(therapy_alert_get_state()));
     cJSON_AddNumberToObject(resp, "ih_min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(resp, "ih_lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(resp, "ps_free", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -1399,6 +1411,86 @@ static esp_err_t upload_config_post_handler(httpd_req_t *req)
 }
 
 /* ── Device settings endpoints ─────────────────────────────────────── */
+
+/* ── Therapy alert config endpoints ─────────────────────────────────── */
+
+static esp_err_t alert_config_get_handler(httpd_req_t *req)
+{
+    char *json = NULL;
+    if (therapy_alert_get_config_json(&json) != ESP_OK || !json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t alert_config_post_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 2048) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_FAIL;
+    }
+    char *body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    if (therapy_alert_save_config_json(body) != ESP_OK) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid config");
+        return ESP_FAIL;
+    }
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t alert_test_push_handler(httpd_req_t *req)
+{
+    char *body = NULL;
+    int total = req->content_len;
+    if (total > 0 && total <= 2048) {
+        body = malloc(total + 1);
+        if (body) {
+            int received = httpd_req_recv(req, body, total);
+            if (received < 0) {
+                free(body);
+                body = NULL;
+            } else {
+                body[received] = '\0';
+            }
+        }
+    }
+
+    esp_err_t err = therapy_alert_send_test_push(body);
+    free(body);
+
+    if (err != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "{\"ok\":false,\"error\":\"push failed\"}");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* ── Device settings endpoints (cont'd) ────────────────────────────── */
 
 static esp_err_t device_settings_get_handler(httpd_req_t *req)
 {
@@ -2141,10 +2233,11 @@ static esp_err_t start_webserver(void)
      * NVS executor to it) here, before httpd_start. Both are idempotent. */
     nvs_writer_init();
     uploader_set_nvs_executor((uploader_nvs_exec_fn_t)nvs_writer_run);
+    therapy_alert_set_nvs_executor((alert_nvs_exec_fn_t)nvs_writer_run);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 42;
+    config.max_uri_handlers = 45;
     config.stack_size = 8192;
     config.max_open_sockets = 24;
     config.recv_wait_timeout = 2;       /* close idle keep-alive sockets fast */
@@ -2227,6 +2320,14 @@ static esp_err_t start_webserver(void)
     httpd_uri_t dev_post = { .uri = "/api/device/settings", .method = HTTP_POST, .handler = device_settings_post_handler };
     httpd_register_uri_handler(s_httpd, &dev_get);
     httpd_register_uri_handler(s_httpd, &dev_post);
+
+    /* Therapy alert config endpoints */
+    httpd_uri_t alert_cfg_get = { .uri = "/api/alert/config", .method = HTTP_GET, .handler = alert_config_get_handler };
+    httpd_uri_t alert_cfg_post = { .uri = "/api/alert/config", .method = HTTP_POST, .handler = alert_config_post_handler };
+    httpd_uri_t alert_test = { .uri = "/api/alert/test", .method = HTTP_POST, .handler = alert_test_push_handler };
+    httpd_register_uri_handler(s_httpd, &alert_cfg_get);
+    httpd_register_uri_handler(s_httpd, &alert_cfg_post);
+    httpd_register_uri_handler(s_httpd, &alert_test);
 
     /* Reboot endpoint */
     httpd_uri_t reboot_post = { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler };

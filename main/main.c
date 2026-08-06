@@ -46,6 +46,7 @@
 #include "device_settings.h"
 #include "bsp_audio.h"
 #include "crash_diag.h"
+#include "therapy_alert.h"
 
 
 static const char *TAG = "somnotrace";
@@ -162,6 +163,10 @@ void app_main(void)
         session_writer_recover();
     }
 
+    /* 4b. Init therapy alert subsystem (loads config from NVS). */
+    therapy_alert_set_beep_fn(bsp_audio_beep);
+    therapy_alert_init();
+
     /* 5. Load config from NVS. */
     struct netprov_config cfg;
     bool has_creds = netprov_load_config(&cfg);
@@ -199,40 +204,57 @@ void app_main(void)
         /* ── Initial NTP sync with failure handling ─── */
         bool ntp_ok = time_sync_wait_initial();
         if (!ntp_ok) {
-            ESP_LOGE(TAG, "initial NTP sync failed — alarm + reboot");
+            /* NTP failed.  Check if we can fall back to AS11 + stored drift. */
+            if (time_sync_has_drift()) {
+                ESP_LOGW(TAG, "NTP sync failed — entering degraded mode (AS11 drift available)");
 
-            /* Show failure message on screen */
-            const char *fail_lines[] = {
-                "NTP Sync Failed",
-                "Hold BOOT for Wi-Fi setup",
-            };
-            show_status("Error", fail_lines, 2);
+                const char *deg_lines[] = {
+                    "Degraded Mode",
+                    "No NTP — using AS11 clock",
+                };
+                show_status("SomnoTrace", deg_lines, 2);
 
-            /* Sound audible alarm: 5 beeps of 1s on / 1s off, loud.
-             * Poll s_softap_requested during the silence gaps so the BOOT
-             * button can cancel the alarm and enter SoftAP instead of
-             * rebooting into the same NTP failure. */
-            if (bsp_audio_init() == ESP_OK) {
-                for (int i = 0; i < 5; i++) {
-                    bsp_audio_beep(880, 1000, 60);
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    if (s_softap_requested) break;
+                /* Single beep to signal degraded mode (not an error). */
+                if (bsp_audio_init() == ESP_OK) {
+                    bsp_audio_beep(660, 200, 40);
                 }
+                /* Proceed — time will be recovered from AS11 after BLE connects. */
             } else {
-                ESP_LOGE(TAG, "audio init failed — silent reboot");
-            }
+                ESP_LOGE(TAG, "initial NTP sync failed and no drift sample — alarm + reboot");
 
-            if (s_softap_requested) {
-                ESP_LOGW(TAG, "BOOT pressed during NTP alarm: entering SoftAP");
-                enter_softap(&cfg);
-                while (true) {
-                    vTaskDelay(pdMS_TO_TICKS(1000));
+                /* Show failure message on screen */
+                const char *fail_lines[] = {
+                    "NTP Sync Failed",
+                    "Hold BOOT for Wi-Fi setup",
+                };
+                show_status("Error", fail_lines, 2);
+
+                /* Sound audible alarm: 5 beeps of 1s on / 1s off, loud.
+                 * Poll s_softap_requested during the silence gaps so the BOOT
+                 * button can cancel the alarm and enter SoftAP instead of
+                 * rebooting into the same NTP failure. */
+                if (bsp_audio_init() == ESP_OK) {
+                    for (int i = 0; i < 5; i++) {
+                        bsp_audio_beep(880, 1000, 60);
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                        if (s_softap_requested) break;
+                    }
+                } else {
+                    ESP_LOGE(TAG, "audio init failed — silent reboot");
                 }
-            }
 
-            /* Hard reboot */
-            vTaskDelay(pdMS_TO_TICKS(500));
-            esp_restart();
+                if (s_softap_requested) {
+                    ESP_LOGW(TAG, "BOOT pressed during NTP alarm: entering SoftAP");
+                    enter_softap(&cfg);
+                    while (true) {
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                    }
+                }
+
+                /* Hard reboot */
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            }
         }
 
         if (sd_storage_is_ready()) {
@@ -318,6 +340,14 @@ void app_main(void)
                     const char *lines[] = {
                         "Wi-Fi Disconnected",
                         "Reconnecting...",
+                    };
+                    bsp_display_show_lines("SomnoTrace", lines, 2);
+                } else if (time_source_get() == TIME_SRC_AS11_DRIFT) {
+                    char ip_line[32];
+                    snprintf(ip_line, sizeof(ip_line), "IP: %s", link.ip);
+                    const char *lines[] = {
+                        "Degraded Mode",
+                        ip_line,
                     };
                     bsp_display_show_lines("SomnoTrace", lines, 2);
                 } else {

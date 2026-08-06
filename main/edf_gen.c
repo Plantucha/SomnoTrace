@@ -2084,10 +2084,18 @@ static void build_current_day_record(str_day_record_t *rec,
 
     /* [6-30] Settings from settings_json (same as build_str_data_values) */
     /* Create a temporary ctx with no data so build_str_data_values just
-     * fills settings and leaves stats as -1. */
-    summary_ctx_t empty_ctx;
-    memset(&empty_ctx, 0, sizeof(empty_ctx));
-    build_str_data_values(&empty_ctx, rec->values, settings_json);
+     * fills settings and leaves stats as -1.
+     *
+     * Heap-allocated: sizeof(summary_ctx_t) is ~5.6 KB, which on the stack
+     * pushed this frame to 6,688 bytes and overflowed the EDF task stack
+     * (generate_str_edf heap-allocates its own ctx for the same reason). */
+    summary_ctx_t *empty_ctx = calloc(1, sizeof(summary_ctx_t));
+    if (!empty_ctx) {
+        ESP_LOGE(TAG, "STR.edf: calloc failed for current-day ctx");
+        return;
+    }
+    build_str_data_values(empty_ctx, rec->values, settings_json);
+    free(empty_ctx);
 
     ESP_LOGI(TAG, "STR.edf: synthesized current day record "
              "(MaskOn=%d MaskOff=%d Duration=%d)",

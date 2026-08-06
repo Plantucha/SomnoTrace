@@ -28,6 +28,8 @@
 #include "post_therapy.h"
 #include "edf_gen.h"
 #include "uploader.h"
+#include "time_sync.h"
+#include "therapy_alert.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -416,6 +418,14 @@ static void write_session_json(session_writer_t *s, const char *state)
     cJSON_AddNumberToObject(root, "clock_drift_ms", (double)s->clock_drift_ms);
     cJSON_AddBoolToObject(root, "clock_drift_valid", s->clock_drift_valid);
 
+    const char *src_str = "none";
+    switch (time_source_get()) {
+        case TIME_SRC_NTP:        src_str = "ntp"; break;
+        case TIME_SRC_AS11_DRIFT: src_str = "as11_drift"; break;
+        default:                  src_str = "none"; break;
+    }
+    cJSON_AddStringToObject(root, "time_source", src_str);
+
     if (s_device_addr[0]) cJSON_AddStringToObject(root, "as11_device", s_device_addr);
     if (s_client_id[0]) cJSON_AddStringToObject(root, "as11_client_id", s_client_id);
 
@@ -653,6 +663,11 @@ esp_err_t session_writer_stop(session_writer_t *s)
     s->end_time_us = esp_timer_get_time();
     s->end_epoch_ms = end_epoch_ms;
     if (have_drift) { s->clock_drift_ms = clock_drift_ms; s->clock_drift_valid = true; }
+
+    /* Persist drift for degraded-mode fallback (NTP unavailable on next boot). */
+    if (have_drift) {
+        time_sync_save_drift(clock_drift_ms, end_epoch_ms);
+    }
 
     /* Signal flush_task to exit BEFORE doing any cleanup.
      * flush_task might be sleeping or about to call flush_all.
@@ -1224,7 +1239,8 @@ static void write_event(session_writer_t *s, const cJSON *msg)
  * files and writes to /somnotrace/EDF/ — no shared state with the live
  * session writer.
  *
- * The task allocates its own stack (16KB) and self-deletes when done. */
+ * The task uses a 16KB PSRAM stack (allocated by stop_task) and self-deletes
+ * when done. */
 typedef struct {
     char     session_dir[MAX_SESSION_DIR_LEN];
     char     session_id[32];
@@ -1239,6 +1255,25 @@ typedef struct {
  * the pointers here and free them the next time stop_task runs. */
 static StackType_t *s_prev_edf_stack = NULL;
 static StaticTask_t *s_prev_edf_tcb = NULL;
+
+/* Report remaining stack for the EDF tasks.  These run the deepest call
+ * chain in the firmware (edf_gen_generate → generate_str_edf →
+ * build_current_day_record) and previously overflowed a 10 KB stack.
+ * Logging the high-water mark turns a future regression into a visible
+ * warning instead of a panic. */
+#define EDF_STACK_WARN_BYTES  2048
+
+static void log_edf_stack_headroom(const char *who)
+{
+    /* uxTaskGetStackHighWaterMark returns the minimum free stack in words. */
+    UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    if (free_bytes < EDF_STACK_WARN_BYTES) {
+        ESP_LOGW(TAG, "%s: LOW STACK — only %u bytes free at peak "
+                 "(increase edf_stack_size)", who, (unsigned)free_bytes);
+    } else {
+        ESP_LOGI(TAG, "%s: peak stack headroom %u bytes", who, (unsigned)free_bytes);
+    }
+}
 
 static void edf_task(void *arg)
 {
@@ -1269,6 +1304,7 @@ static void edf_task(void *arg)
     } else {
         ESP_LOGE(TAG, "edf_task: NULL args");
     }
+    log_edf_stack_headroom("edf_task");
     ESP_LOGI(TAG, "edf_task: done");
     vTaskDelete(NULL);
 }
@@ -1318,6 +1354,7 @@ static void spool_refresh_task(void *arg)
     }
     free(a);
 
+    log_edf_stack_headroom("spool_refresh_task");
     ESP_LOGI(TAG, "spool_refresh_task: done");
     vTaskDelete(NULL);
 }
@@ -1425,7 +1462,7 @@ static void stop_task(void *arg)
          *
          * The StaticTask_t (TCB) must be in internal RAM (FreeRTOS requirement).
          * The stack and TCB are freed by the NEXT stop_task invocation. */
-        const uint32_t edf_stack_size = 10240;
+        const uint32_t edf_stack_size = 16384;
         StackType_t *edf_stack = heap_caps_malloc(edf_stack_size, MALLOC_CAP_SPIRAM);
         StaticTask_t *edf_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
 
@@ -1520,6 +1557,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
             s_therapy_stopped = true;
             bsp_display_set_therapy_active(false);
+            therapy_alert_on_therapy_stop();
             if (s && s->active) {
                 write_event(s, msg);
                 /* Run stop in a separate task so notif_proc_task can process
@@ -1534,6 +1572,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         if (start) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
             s_therapy_stopped = false;
+            therapy_alert_on_therapy_start();
             /* Always activate the live graph — the display should show the
              * waveform regardless of whether SD recording succeeds.  Flow
              * data from push_flow() is discarded when s_mode != GRAPH. */

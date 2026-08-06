@@ -27,6 +27,8 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <dirent.h>
+#include <stdio.h>
 
 #include "esp_log.h"
 #include "esp_sntp.h"
@@ -38,12 +40,18 @@
 
 #include "esp_netif_sntp.h"
 
+#include "as11_ble.h"
+#include "sd_storage.h"
+#include "cJSON.h"
+
 static const char *TAG = "time_sync";
 
 #define NVS_NAMESPACE    "cfg"
 #define NVS_KEY_TZ_STR   "tz_str"
 #define NVS_KEY_TZ_NAME  "tz_name"
 #define NVS_KEY_NTP_SRV  "ntp_srv"
+#define NVS_KEY_DRIFT    "drift_ms"
+#define NVS_KEY_DRIFT_AT "drift_at"
 #define TZ_STR_MAX       64
 #define TZ_NAME_MAX      40
 #define NTP_SRV_MAX      64
@@ -54,9 +62,16 @@ static const char *TAG = "time_sync";
 static bool s_synced = false;
 static bool s_initial_sync_done = false;
 
+/* ── Time-source provenance ─────────────────────────────────────────── */
+static time_source_t s_source = TIME_SRC_NONE;
+static int64_t s_drift_ms = 0;       /* last known drift (NTP - AS11) */
+static int64_t s_drift_at_ms = 0;    /* NTP epoch ms when drift was measured */
+static bool s_drift_loaded = false;  /* true once s_drift_ms/at loaded from NVS */
+
 static void sntp_sync_cb(struct timeval *tv)
 {
     s_synced = true;
+    s_source = TIME_SRC_NTP;
     time_t now = tv->tv_sec;
     struct tm tm_info;
     localtime_r(&now, &tm_info);
@@ -175,6 +190,216 @@ void time_sync_get_ntp_server(char *server, size_t server_len)
 bool time_sync_is_synced(void)
 {
     return s_synced;
+}
+
+/* ── Time-source provenance API ─────────────────────────────────────── */
+
+static bool load_drift_from_nvs(void);
+
+time_source_t time_source_get(void)
+{
+    return s_source;
+}
+
+bool time_is_usable(void)
+{
+    return s_source != TIME_SRC_NONE;
+}
+
+int64_t time_source_drift_age_ms(void)
+{
+    if (s_drift_at_ms == 0) return -1;
+    int64_t now_ms = (int64_t)time(NULL) * 1000;
+    return now_ms - s_drift_at_ms;
+}
+
+bool time_sync_has_drift(void)
+{
+    if (s_drift_loaded) return true;
+    return load_drift_from_nvs();
+}
+
+/* ── Drift persistence ─────────────────────────────────────────────── */
+
+typedef struct {
+    int64_t drift_ms;
+    int64_t measured_at_ms;
+} drift_save_args_t;
+
+static esp_err_t do_save_drift(void *arg)
+{
+    const drift_save_args_t *a = (const drift_save_args_t *)arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_i64(h, NVS_KEY_DRIFT, a->drift_ms);
+    if (err == ESP_OK) err = nvs_set_i64(h, NVS_KEY_DRIFT_AT, a->measured_at_ms);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+void time_sync_save_drift(int64_t drift_ms, int64_t measured_at_ms)
+{
+    s_drift_ms = drift_ms;
+    s_drift_at_ms = measured_at_ms;
+    s_drift_loaded = true;
+
+    drift_save_args_t args = { .drift_ms = drift_ms, .measured_at_ms = measured_at_ms };
+    esp_err_t err = nvs_writer_run(do_save_drift, &args);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "drift saved: %lld ms (measured at %lld)",
+                 (long long)drift_ms, (long long)measured_at_ms);
+    } else {
+        ESP_LOGW(TAG, "drift NVS save failed: %s", esp_err_to_name(err));
+    }
+}
+
+/* Load drift from NVS into s_drift_ms / s_drift_at_ms.
+ * Returns true if a valid drift sample was found. */
+static bool load_drift_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+
+    int64_t drift = 0, at = 0;
+    bool ok = (nvs_get_i64(h, NVS_KEY_DRIFT, &drift) == ESP_OK &&
+               nvs_get_i64(h, NVS_KEY_DRIFT_AT, &at) == ESP_OK);
+    nvs_close(h);
+
+    if (ok) {
+        s_drift_ms = drift;
+        s_drift_at_ms = at;
+        s_drift_loaded = true;
+        ESP_LOGI(TAG, "drift loaded from NVS: %lld ms (age %lld s)",
+                 (long long)drift,
+                 (long long)((time(NULL) * 1000 - at) / 1000));
+    }
+    return ok;
+}
+
+/* Fallback: scan SD session JSONs for the newest clock_drift_valid entry.
+ * Used when NVS has no drift keys (upgrade path for existing devices). */
+static bool load_drift_from_sd(void)
+{
+    char streams_path[64];
+    snprintf(streams_path, sizeof(streams_path), "%s", SD_STREAMS_DIR);
+
+    DIR *streams_dir = opendir(streams_path);
+    if (!streams_dir) return false;
+
+    int64_t best_drift = 0;
+    int64_t best_start = 0;
+    bool found = false;
+
+    struct dirent *day_entry;
+    while ((day_entry = readdir(streams_dir)) != NULL) {
+        if (day_entry->d_name[0] == '.') continue;
+
+        char day_path[320];
+        snprintf(day_path, sizeof(day_path), "%s/%s", streams_path, day_entry->d_name);
+        DIR *day_dir = opendir(day_path);
+        if (!day_dir) continue;
+
+        struct dirent *f_entry;
+        while ((f_entry = readdir(day_dir)) != NULL) {
+            const char *name = f_entry->d_name;
+            size_t nlen = strlen(name);
+            if (nlen < 13 || strcmp(name + nlen - 13, "_session.json") != 0)
+                continue;
+
+            char json_path[768];
+            snprintf(json_path, sizeof(json_path), "%s/%s", day_path, name);
+            FILE *f = fopen(json_path, "r");
+            if (!f) continue;
+
+            fseek(f, 0, SEEK_END);
+            long fsize = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (fsize <= 0 || fsize > 8192) { fclose(f); continue; }
+
+            char *buf = malloc(fsize + 1);
+            if (!buf) { fclose(f); continue; }
+            size_t rd = fread(buf, 1, fsize, f);
+            fclose(f);
+            buf[rd] = '\0';
+
+            cJSON *root = cJSON_Parse(buf);
+            free(buf);
+            if (!root) continue;
+
+            cJSON *valid = cJSON_GetObjectItem(root, "clock_drift_valid");
+            if (valid && cJSON_IsTrue(valid)) {
+                cJSON *d = cJSON_GetObjectItem(root, "clock_drift_ms");
+                cJSON *s = cJSON_GetObjectItem(root, "start_epoch_ms");
+                if (d && cJSON_IsNumber(d) && s && cJSON_IsNumber(s)) {
+                    int64_t start = (int64_t)d->valuedouble;
+                    if (!found || start > best_start) {
+                        best_start = start;
+                        best_drift = (int64_t)d->valuedouble;
+                        found = true;
+                    }
+                }
+            }
+            cJSON_Delete(root);
+        }
+        closedir(day_dir);
+    }
+    closedir(streams_dir);
+
+    if (found) {
+        s_drift_ms = best_drift;
+        s_drift_at_ms = best_start;
+        s_drift_loaded = true;
+        ESP_LOGI(TAG, "drift loaded from SD: %lld ms (session start %lld)",
+                 (long long)best_drift, (long long)best_start);
+    }
+    return found;
+}
+
+esp_err_t time_sync_recover_from_as11(void)
+{
+    if (s_source == TIME_SRC_NTP) {
+        ESP_LOGI(TAG, "recover_from_as11: already NTP-synced, nothing to do");
+        return ESP_OK;
+    }
+
+    /* Load drift from NVS, or fall back to SD scan for upgrades. */
+    if (!s_drift_loaded) {
+        if (!load_drift_from_nvs() && !load_drift_from_sd()) {
+            ESP_LOGW(TAG, "recover_from_as11: no drift sample available");
+            return ESP_ERR_NOT_FOUND;
+        }
+    }
+
+    /* Query AS11 wall clock. */
+    int64_t as11_ms = 0;
+    esp_err_t err = as11_ble_get_datetime(&as11_ms);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "recover_from_as11: GetDateTime failed: %s",
+                 esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    /* Apply: wall = AS11 + drift. */
+    int64_t wall_ms = as11_ms + s_drift_ms;
+    struct timeval tv = { .tv_sec = wall_ms / 1000, .tv_usec = (wall_ms % 1000) * 1000 };
+    settimeofday(&tv, NULL);
+
+    s_source = TIME_SRC_AS11_DRIFT;
+
+    time_t now = (time_t)(wall_ms / 1000);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    ESP_LOGW(TAG, "time recovered from AS11 + drift: "
+             "%04d-%02d-%02d %02d:%02d:%02d "
+             "(AS11=%lld drift=%lld ms, drift age=%lld s)",
+             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
+             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+             (long long)as11_ms, (long long)s_drift_ms,
+             (long long)(time_source_drift_age_ms() / 1000));
+
+    return ESP_OK;
 }
 
 esp_err_t time_sync_init(void)

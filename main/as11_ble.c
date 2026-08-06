@@ -42,6 +42,7 @@
 #include "session_writer.h"
 #include "bsp_display.h"
 #include "time_sync.h"
+#include "therapy_alert.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -938,6 +939,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGW(TAG, "disconnected (reason=%d)", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_session_encrypted = false;
+        therapy_alert_on_ble_disconnect();
 
         /* Auto-reconnect if we have valid pairing info, the disconnect
          * was not intentional, and we were in the PAIRED state.
@@ -1987,20 +1989,29 @@ static void reconnect_task(void *arg)
     }
     free(rpc);
 
-    /* ---- Wait for NTP time sync before subscribing to events or
+    /* ---- Wait for usable time before subscribing to events or
      * starting the data stream.  Therapy recording depends on accurate
-     * NTP time for session timestamps, clock drift calculation, and
-     * spool staleness detection.  If we start streaming before NTP sync,
-     * a TherapyStart notification could trigger session recording with
-     * wrong timestamps.
+     * time for session timestamps, clock drift calculation, and spool
+     * staleness detection.
      *
-     * NTP sync is a hard dependency — without it, no stream subscriptions
-     * are created and therapy recording cannot start.  This blocks
-     * indefinitely until NTP syncs. */
-    while (!time_sync_is_synced()) {
-        vTaskDelay(pdMS_TO_TICKS(500));
+     * Primary source: NTP (time_sync_is_synced()).
+     * Fallback: AS11 clock + stored drift (time_sync_recover_from_as11()).
+     * If neither is available, block until NTP eventually syncs. */
+    if (!time_sync_is_synced()) {
+        ESP_LOGI(TAG, "reconnect: NTP not synced, attempting AS11 drift recovery");
+        esp_err_t rec = time_sync_recover_from_as11();
+        if (rec == ESP_OK) {
+            ESP_LOGI(TAG, "reconnect: time recovered from AS11 + drift (degraded mode)");
+        } else {
+            ESP_LOGW(TAG, "reconnect: AS11 drift recovery failed (%s), "
+                     "blocking until NTP syncs", esp_err_to_name(rec));
+            while (!time_is_usable()) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+        }
     }
-    ESP_LOGI(TAG, "reconnect: NTP synced, proceeding with stream setup");
+    ESP_LOGI(TAG, "reconnect: time usable (source=%d), proceeding with stream setup",
+             (int)time_source_get());
 
     /* ---- Subscribe to therapy events (encrypted) ----
      * Four event selectors:

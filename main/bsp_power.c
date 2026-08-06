@@ -22,6 +22,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "nvs_writer.h"
+#include "therapy_alert.h"
 
 #define BSP_PIN_BAT_EN   2
 #define BSP_PIN_KEY_PWR  5
@@ -134,7 +135,7 @@ static void button_monitor_task(void *arg)
             s_btn.boot_held_ms = 0;
         }
 
-        /* --- PLUS button: double-click = stop therapy --- */
+        /* --- PLUS button: double-click = stop therapy, single-click = alert ack --- */
         if (gpio_get_level(BSP_PIN_KEY_PLUS) == 0) {
             int now_ms = (int)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
@@ -155,11 +156,32 @@ static void button_monitor_task(void *arg)
 
                 s_btn.plus_last_press_ms = -1;
             } else {
+                /* First press: record timestamp and wait for release. */
                 s_btn.plus_last_press_ms = now_ms;
             }
 
+            /* Wait for button release. */
             while (gpio_get_level(BSP_PIN_KEY_PLUS) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(poll_ms));
+            }
+
+            /* If this was a single press (not consumed by double-click),
+             * wait for the double-click window to expire, then fire
+             * single-click action (alert acknowledgement). */
+            if (s_btn.plus_last_press_ms >= 0) {
+                int release_ms = (int)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                int remaining = double_click_window_ms -
+                                (release_ms - s_btn.plus_last_press_ms);
+                if (remaining > 0) {
+                    vTaskDelay(pdMS_TO_TICKS(remaining));
+                }
+                /* If no second press arrived during the window, resolve as single-click. */
+                if (s_btn.plus_last_press_ms >= 0 &&
+                    gpio_get_level(BSP_PIN_KEY_PLUS) == 1) {
+                    ESP_LOGI(TAG, "PLUS button single-click — alert acknowledge");
+                    therapy_alert_acknowledge();
+                    s_btn.plus_last_press_ms = -1;
+                }
             }
         }
 

@@ -591,6 +591,22 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
     return errors > 0 ? ESP_FAIL : ESP_OK;
 }
 
+/* Return the AS11-clock timestamp at which the noon-day period containing
+ * as11_ms closes (i.e. the following noon). */
+static int64_t noon_period_end(int64_t as11_ms)
+{
+    time_t t = (time_t)(as11_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    if (tm.tm_hour >= 12) t += 86400;  /* period ends at NEXT day's noon */
+    struct tm noon_tm;
+    localtime_r(&t, &noon_tm);
+    noon_tm.tm_hour = 12;
+    noon_tm.tm_min = 0;
+    noon_tm.tm_sec = 0;
+    return (int64_t)mktime(&noon_tm) * 1000;
+}
+
 /* Wait for the AS11 to update its Summary spool after TherapyStop, then
  * pull the fresh data.  Called from a low-priority task (core 0).
  *
@@ -600,6 +616,22 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
  * handler.  This function polls session_writer_snc_changed() every 3 seconds
  * (just checking a flag — no BLE RPC needed) and pulls the spool when the
  * flag is set.
+ *
+ * IMPORTANT — when waiting is pointless:
+ * The AS11 only writes the Summary record for a noon-day period *after that
+ * period closes*, at the following noon.  It never publishes a partial record
+ * for the in-progress day.  Verified against device logs: a session ending
+ * 06:45 on Aug 5 (period 20260804, closing at noon Aug 5) saw the AS11 return
+ * only the already-closed 20260803 record, even after an _SNC push; the
+ * 20260804 record first appeared in a pull made after noon that same day.
+ *
+ * Since the period containing the session end is by definition still open at
+ * session end, retrying cannot make the record appear — it would just burn
+ * 120 s and delay EDF generation and upload.  So we check first and return
+ * immediately when the period is still open.  The STR generator handles this
+ * by synthesizing the current-day record from session data, and the next
+ * session after the noon rollover picks up the AS11-authoritative record via
+ * the 30-day lookback pull and regenerates STR.edf.
  *
  * Fallback: if no _SNC notification arrives within 2 minutes (e.g.
  * subscription wasn't accepted, or BLE dropped the notification), we
@@ -611,6 +643,18 @@ bool post_therapy_wait_spool_current(int64_t end_epoch_ms, int64_t clock_drift_m
 {
     const int max_attempts = 40;
     const int retry_delay_ms = 3000;
+
+    /* clock_drift_ms = NTP - AS11, so AS11 = NTP - drift. */
+    int64_t as11_end_ms = end_epoch_ms - clock_drift_ms;
+    int64_t as11_now_ms = (int64_t)time(NULL) * 1000 - clock_drift_ms;
+    int64_t period_end_ms = noon_period_end(as11_end_ms);
+    if (as11_now_ms < period_end_ms) {
+        ESP_LOGI(TAG, "spool_refresh: noon-day period still open "
+                 "(closes in %lld s) — AS11 has not written this day's record "
+                 "yet and will not until then; skipping wait",
+                 (long long)((period_end_ms - as11_now_ms) / 1000));
+        return false;
+    }
 
     /* Clear any stale _SNC flag from before this session's TherapyStop. */
     session_writer_snc_changed(NULL);
