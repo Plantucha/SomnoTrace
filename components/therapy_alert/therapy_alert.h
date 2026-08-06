@@ -75,11 +75,17 @@ typedef esp_err_t (*alert_beep_fn_t)(int freq_hz, int duration_ms, uint8_t volum
 /* NVS executor function signature (matches nvs_writer_run). */
 typedef esp_err_t (*alert_nvs_exec_fn_t)(esp_err_t (*fn)(void *), void *arg);
 
+/* Therapy-active checker (matches bsp_display_is_therapy_active). */
+typedef bool (*alert_therapy_active_fn_t)(void);
+
 /* Inject the buzzer function (called from main.c at init). */
 void therapy_alert_set_beep_fn(alert_beep_fn_t fn);
 
 /* Inject the NVS executor (called from main.c at init, like uploader). */
 void therapy_alert_set_nvs_executor(alert_nvs_exec_fn_t fn);
+
+/* Inject the therapy-active checker (called from main.c at init). */
+void therapy_alert_set_therapy_active_fn(alert_therapy_active_fn_t fn);
 
 /* ── Lifecycle ──────────────────────────────────────────────────────── */
 

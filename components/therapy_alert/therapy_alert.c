@@ -45,11 +45,13 @@ static const char *TAG = "therapy_alert";
 #define NVS_KEY_CFG    "cfg"
 
 /* ── Injected functions ─────────────────────────────────────────────── */
-static alert_beep_fn_t     s_beep_fn  = NULL;
-static alert_nvs_exec_fn_t s_nvs_exec = NULL;
+static alert_beep_fn_t          s_beep_fn  = NULL;
+static alert_nvs_exec_fn_t       s_nvs_exec = NULL;
+static alert_therapy_active_fn_t s_therapy_active_fn = NULL;
 
 void therapy_alert_set_beep_fn(alert_beep_fn_t fn)    { s_beep_fn = fn; }
 void therapy_alert_set_nvs_executor(alert_nvs_exec_fn_t fn) { s_nvs_exec = fn; }
+void therapy_alert_set_therapy_active_fn(alert_therapy_active_fn_t fn) { s_therapy_active_fn = fn; }
 
 /* ── Config ─────────────────────────────────────────────────────────── */
 static therapy_alert_config_t s_cfg = ALERT_DEFAULTS;
@@ -62,6 +64,10 @@ static SemaphoreHandle_t s_state_mtx = NULL;
 /* Timer handles (FreeRTOS task-based timers) */
 static TaskHandle_t s_alert_task_h = NULL;
 static bool s_task_cancel = false;
+
+/* Forward declarations */
+static void cancel_alert_routine(void);
+static void reevaluate_state(void);
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
 
@@ -81,6 +87,26 @@ static int current_minutes_from_midnight(void)
     struct tm tm;
     localtime_r(&now, &tm);
     return tm.tm_hour * 60 + tm.tm_min;
+}
+
+/* Check if the wall clock has been set (not still at epoch 0). */
+static bool time_is_set(void)
+{
+    return time(NULL) > 1700000000;  /* > Nov 2023 */
+}
+
+/* Check if therapy is currently active via the injected checker. */
+static bool therapy_is_active(void)
+{
+    return s_therapy_active_fn ? s_therapy_active_fn() : false;
+}
+
+/* Check if current time is inside the configured alert window. */
+static bool currently_in_window(void)
+{
+    if (!time_is_set()) return false;
+    int now_min = current_minutes_from_midnight();
+    return time_in_window(now_min, s_cfg.win_start, s_cfg.win_end);
 }
 
 const char *therapy_alert_state_str(alert_state_t st)
@@ -180,6 +206,8 @@ esp_err_t therapy_alert_save_config_json(const char *json_str)
         ESP_LOGI(TAG, "config saved: en=%d win=%d-%d d1=%d push=%d buzz=%d",
                  cfg.enabled, cfg.win_start, cfg.win_end, cfg.delay1,
                  cfg.push_en, cfg.buzz_en);
+        /* Re-evaluate state: schedule change may arm/disarm */
+        reevaluate_state();
     }
     return err;
 }
@@ -306,12 +334,24 @@ static void alert_routine_task(void *arg)
 
     for (int waited = 0; waited < delay1_ms; waited += 1000) {
         if (s_task_cancel) goto done;
+        if (!s_cfg.enabled || !currently_in_window()) {
+            ESP_LOGI(TAG, "alert routine: disabled or outside window during delay1 — aborting");
+            set_state(ALERT_DISARMED);
+            goto done;
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     if (s_task_cancel) goto done;
 
     /* Check if still in PENDING state (could have been ACKED or disarmed) */
     if (therapy_alert_get_state() != ALERT_PENDING) goto done;
+
+    /* Safety: don't send push if we've exited the window during delay1 */
+    if (!currently_in_window()) {
+        ESP_LOGI(TAG, "alert routine: outside window after delay1 — aborting before push");
+        set_state(ALERT_DISARMED);
+        goto done;
+    }
 
     /* Phase 2: send push notification (if enabled) */
     if (s_cfg.push_en && s_cfg.ntfy_topic[0]) {
@@ -339,11 +379,23 @@ static void alert_routine_task(void *arg)
         ESP_LOGI(TAG, "alert routine: waiting %d ms before buzzer", delay2_ms);
         for (int waited = 0; waited < delay2_ms; waited += 1000) {
             if (s_task_cancel) goto done;
+            if (!s_cfg.enabled || !currently_in_window()) {
+                ESP_LOGI(TAG, "alert routine: disabled or outside window during delay2 — aborting");
+                set_state(ALERT_DISARMED);
+                goto done;
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
     if (s_task_cancel) goto done;
+
+    /* Safety: don't buzz if we've exited the window */
+    if (!currently_in_window()) {
+        ESP_LOGI(TAG, "alert routine: outside window before buzzer — aborting");
+        set_state(ALERT_DISARMED);
+        goto done;
+    }
 
     /* Phase 4: buzzer (if enabled) */
     if (s_cfg.buzz_en) {
@@ -379,11 +431,56 @@ static void cancel_alert_routine(void)
     }
 }
 
+/* ── State re-evaluation ────────────────────────────────────────────── */
+
+/* Re-evaluate the alert state based on current conditions.
+ * Called by the periodic monitor task and after config changes.
+ * Does NOT re-arm from ACKED — only a new TherapyStart can do that. */
+static void reevaluate_state(void)
+{
+    if (!s_cfg.enabled || !time_is_set()) {
+        alert_state_t st = therapy_alert_get_state();
+        if (st != ALERT_DISARMED && st != ALERT_ACKED) {
+            ESP_LOGI(TAG, "reevaluate: alerts disabled or clock unset — disarming");
+            cancel_alert_routine();
+            set_state(ALERT_DISARMED);
+        }
+        return;
+    }
+
+    bool in_win = currently_in_window();
+    bool therapy_on = therapy_is_active();
+    alert_state_t st = therapy_alert_get_state();
+
+    if (in_win && therapy_on && st == ALERT_DISARMED) {
+        /* Window open + therapy active + not yet armed → ARM */
+        set_state(ALERT_ARMED);
+        ESP_LOGI(TAG, "reevaluate: therapy active inside window — armed");
+    } else if (!in_win && (st == ALERT_ARMED || st == ALERT_PENDING ||
+                            st == ALERT_PUSH_SENT || st == ALERT_BUZZING)) {
+        /* Window closed → disarm and cancel any running routine */
+        ESP_LOGI(TAG, "reevaluate: outside window — disarming (was %s)",
+                 therapy_alert_state_str(st));
+        cancel_alert_routine();
+        set_state(ALERT_DISARMED);
+    }
+}
+
+static void window_monitor_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(30000));  /* check every 30 s */
+        reevaluate_state();
+    }
+}
+
 /* ── Event hooks ────────────────────────────────────────────────────── */
 
 void therapy_alert_on_therapy_start(void)
 {
     if (!s_cfg.enabled) return;
+    if (!time_is_set()) return;
 
     int now_min = current_minutes_from_midnight();
     if (time_in_window(now_min, s_cfg.win_start, s_cfg.win_end)) {
@@ -403,7 +500,12 @@ void therapy_alert_on_therapy_stop(void)
 
     alert_state_t st = therapy_alert_get_state();
     if (st == ALERT_ARMED) {
-        ESP_LOGI(TAG, "therapy stop while armed — starting alert routine");
+        if (!currently_in_window()) {
+            ESP_LOGI(TAG, "therapy stop outside window — disarming (no alert)");
+            set_state(ALERT_DISARMED);
+            return;
+        }
+        ESP_LOGI(TAG, "therapy stop while armed inside window — starting alert routine");
         start_alert_routine();
     } else {
         ESP_LOGD(TAG, "therapy stop while %s — ignoring", therapy_alert_state_str(st));
@@ -451,5 +553,9 @@ esp_err_t therapy_alert_init(void)
     if (!s_state_mtx) return ESP_ERR_NO_MEM;
 
     s_state = ALERT_DISARMED;
+
+    /* Start the periodic window monitor task */
+    xTaskCreatePinnedToCore(window_monitor_task, "alert_monitor", 2048,
+                            NULL, 2, NULL, 0);
     return ESP_OK;
 }

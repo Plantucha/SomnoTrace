@@ -167,6 +167,7 @@ void app_main(void)
 
     /* 4b. Init therapy alert subsystem (loads config from NVS). */
     therapy_alert_set_beep_fn(bsp_audio_beep);
+    therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);
     therapy_alert_init();
 
     /* 5. Load config from NVS. */
