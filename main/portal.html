@@ -546,16 +546,16 @@ SD Card File Access (FTP)
 
 <!-- Display (real-time, no reboot needed) -->
 <div class="settings-section-header sta-only">
-<span class="step-num">5</span> Display
+<span class="step-num">5</span> Display & Sound
 </div>
 <div class="card advanced-section sta-only" style="border-left-color:var(--accent-ble)">
 <div class="card-title">
 <svg viewBox="0 0 24 24" style="fill:var(--accent-ble)"><path d="M21 2H3a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7v2H8v2h8v-2h-2v-2h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zm0 14H3V4h18v12z"/></svg>
-Display
+Display & Sound
 </div>
 <p class="card-desc">These settings are applied immediately and do not require a reboot.</p>
 <details>
-<summary>Display settings</summary>
+<summary>LCD & Speaker</summary>
 <div class="settings-grid-2col" style="margin-top:12px">
 <div class="form-group">
 <label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">10</span><span id="brightness-status" class="setting-status"></span></label>
@@ -568,6 +568,13 @@ Display
 <option value="1">Backlight off</option>
 <option value="2">Backlight always off (battery)</option>
 </select>
+</div>
+</div>
+<div class="form-group" style="margin-top:12px">
+<label>Alert Speaker Volume <span id="alert-vol-val" style="font-weight:normal;color:var(--text-muted)">75</span>%<span id="alert-vol-status" class="setting-status"></span></label>
+<div style="display:flex;align-items:center;gap:8px">
+<input type="range" id="alert-volume" class="form-control" min="50" max="100" step="5" value="75" style="padding:0;flex:1" oninput="onAlertVolumeInput(this.value)">
+<button type="button" class="btn btn-sm" style="white-space:nowrap" onclick="testAlertVolume()">Test</button>
 </div>
 </div>
 </details>
@@ -1394,14 +1401,17 @@ function loadStatusTab(d) {
   var ntpEl = document.getElementById('status-ntp');
   if (ntpEl) {
     if (d.time_source === 'as11_drift') {
-      ntpEl.textContent = 'Degraded (AS11)';
+      ntpEl.innerHTML = '\u26A0\uFE0F Estimated time';
       ntpEl.style.color = 'var(--warning)';
+      ntpEl.style.fontWeight = '700';
     } else if (d.ntp_synced) {
       ntpEl.textContent = 'Synchronized';
       ntpEl.style.color = 'var(--success)';
+      ntpEl.style.fontWeight = '';
     } else {
       ntpEl.textContent = 'Not synced';
       ntpEl.style.color = 'var(--warning)';
+      ntpEl.style.fontWeight = '';
     }
   }
   setEl('status-uptime', formatUptime(d.uptime));
@@ -1676,7 +1686,43 @@ function loadDeviceSettings() {
     if (mode && typeof d.lcd_therapy_mode === 'number') {
       mode.value = String(d.lcd_therapy_mode);
     }
+    var av = document.getElementById('alert-volume');
+    if (av && typeof d.alert_volume === 'number') {
+      av.value = d.alert_volume;
+      var avl = document.getElementById('alert-vol-val');
+      if (avl) avl.textContent = d.alert_volume;
+    }
   }).catch(function() {});
+}
+
+/* ── Alert Speaker Volume ──────────────────────────────────────── */
+var alertVolTimer = null;
+function onAlertVolumeInput(val) {
+  var v = parseInt(val) || 0;
+  var label = document.getElementById('alert-vol-val');
+  if (label) label.textContent = v;
+  setStatus('alert-vol-status', '…', null);
+  if (alertVolTimer) clearTimeout(alertVolTimer);
+  alertVolTimer = setTimeout(function() {
+    fetch('/api/device/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alert_volume: v })
+    }).then(function() {
+      setStatus('alert-vol-status', '✓', true);
+    }).catch(function() {
+      setStatus('alert-vol-status', '✗', false);
+    });
+  }, 200);
+}
+
+function testAlertVolume() {
+  setStatus('alert-vol-status', '…', null);
+  fetch('/api/device/test-beep', { method: 'POST' }).then(function() {
+    setStatus('alert-vol-status', '✓', true);
+  }).catch(function() {
+    setStatus('alert-vol-status', '✗', false);
+  });
 }
 
 /* ── Therapy Alert Config ──────────────────────────────────────── */

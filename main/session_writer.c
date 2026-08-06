@@ -664,8 +664,12 @@ esp_err_t session_writer_stop(session_writer_t *s)
     s->end_epoch_ms = end_epoch_ms;
     if (have_drift) { s->clock_drift_ms = clock_drift_ms; s->clock_drift_valid = true; }
 
-    /* Persist drift for degraded-mode fallback (NTP unavailable on next boot). */
-    if (have_drift) {
+    /* Persist drift for degraded-mode fallback (NTP unavailable on next boot).
+     * Only save when the ESP clock is NTP-authoritative — in degraded mode
+     * the wall clock is itself derived from AS11 + old drift, so
+     * recalculating drift here would create a feedback loop that
+     * accumulates error on every degraded-mode session. */
+    if (have_drift && time_source_get() == TIME_SRC_NTP) {
         time_sync_save_drift(clock_drift_ms, end_epoch_ms);
     }
 

@@ -124,6 +124,11 @@ static char s_status_title[STATUS_TITLE_LEN];
 static char s_status_lines[MAX_STATUS_LINES][STATUS_LINE_LEN];
 static int  s_status_nlines = 0;
 
+/* Persistent notice banner rendered at the bottom of the status screen in
+ * warning colours.  Independent of the status lines above so transient
+ * messages (Wi-Fi reconnecting, SD errors) can never clobber it. */
+static char s_notice[STATUS_LINE_LEN] = "";
+
 /* Battery indicator state */
 static int s_batt_percent = -1;   /* -1 = unknown/not set */
 static bool s_batt_charging = false;
@@ -970,6 +975,8 @@ static void render_status(void)
     bool as11_paired = s_as11_paired;
     int batt_pct = s_batt_percent;
     bool batt_chg = s_batt_charging;
+    char notice[STATUS_LINE_LEN];
+    memcpy(notice, s_notice, sizeof(notice));
     xSemaphoreGive(s_state_mutex);
 
     const uint16_t bg = rgb565(0, 0, 0);
@@ -1030,7 +1037,51 @@ static void render_status(void)
         y += line_h;
     }
 
+    /* ── Persistent notice banner (bottom, amber) ──────────────────────
+     * Drawn last and anchored to the bottom edge so it survives whatever
+     * the status lines above happen to say. */
+    if (notice[0]) {
+        const uint16_t notice_col = rgb565(255, 190, 30);
+        const uint16_t notice_bg  = rgb565(46, 34, 0);
+
+        int band_h = roboto_body.height + 10;
+        int band_y = LCD_V_RES - band_h;
+        fb_fill_rect(0, band_y, LCD_H_RES, band_h, notice_bg);
+
+        /* Warning triangle, drawn from primitives (the font has no glyph). */
+        int tri_h = 11;
+        int tri_x = 8;
+        int tri_y = band_y + (band_h - tri_h) / 2;
+        for (int row = 0; row < tri_h; row++) {
+            int half = (row * 6) / tri_h;
+            fb_fill_rect(tri_x + 6 - half, tri_y + row, half * 2 + 1, 1, notice_col);
+        }
+        /* Exclamation mark punched out of the triangle. */
+        fb_fill_rect(tri_x + 6, tri_y + 4, 1, 4, notice_bg);
+        fb_fill_rect(tri_x + 6, tri_y + 9, 1, 1, notice_bg);
+
+        int tw = str_width_aa(&roboto_body, notice);
+        int tx = tri_x + 16 + ((LCD_H_RES - tri_x - 16) - tw) / 2;
+        if (tx < tri_x + 16) tx = tri_x + 16;
+        fb_draw_string_aa(tx, band_y + 5, &roboto_body, notice, notice_col);
+    }
+
     lcd_flush();
+}
+
+void bsp_display_set_notice(const char *text)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (text && text[0]) {
+        strncpy(s_notice, text, STATUS_LINE_LEN - 1);
+        s_notice[STATUS_LINE_LEN - 1] = '\0';
+    } else {
+        s_notice[0] = '\0';
+    }
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
 /* The single owner of the framebuffer and LCD panel. Renders the current

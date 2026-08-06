@@ -96,6 +96,7 @@ static const char *TAG = "bsp_audio";
 static i2c_master_dev_handle_t s_i2c_dev = NULL;
 static i2s_chan_handle_t s_i2s_tx = NULL;
 static bool s_initialized = false;
+static uint8_t s_global_volume = 100;  /* scales all beep calls */
 
 /* ── I2C helpers ──────────────────────────────────────────────────── */
 static esp_err_t es_write_reg(uint8_t reg, uint8_t val)
@@ -108,6 +109,17 @@ static esp_err_t es_write_reg(uint8_t reg, uint8_t val)
 static esp_err_t es8311_init(void)
 {
     esp_err_t ret = ESP_OK;
+
+    /* Reset the codec FIRST — on warm reboot (esp_restart()) the ES8311
+     * retains its previous state and may NACK register writes until reset.
+     * Retry a few times to let the I2C bus recover. */
+    for (int i = 0; i < 5; i++) {
+        esp_err_t r = es_write_reg(ES8311_RESET_REG00, 0x80);
+        if (r == ESP_OK) break;
+        ESP_LOGW(TAG, "ES8311 reset retry %d/5: %s", i + 1, esp_err_to_name(r));
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     /* Enhance I2C noise immunity (write twice for reliability) */
     ret |= es_write_reg(ES8311_GPIO_REG44, 0x08);
@@ -124,9 +136,6 @@ static esp_err_t es8311_init(void)
     ret |= es_write_reg(ES8311_SYSTEM_REG0C, 0x00);
     ret |= es_write_reg(ES8311_SYSTEM_REG10, 0x1F);
     ret |= es_write_reg(ES8311_SYSTEM_REG11, 0x7F);
-
-    /* Reset codec, slave mode (bit6=0) */
-    ret |= es_write_reg(ES8311_RESET_REG00, 0x80);
 
     /* Select MCLK from pin (bit7=0), not inverted (bit6=0), enable clock */
     ret |= es_write_reg(ES8311_CLK_MANAGER_REG01, 0x3F);
@@ -302,8 +311,11 @@ esp_err_t bsp_audio_beep(int freq_hz, int duration_ms, uint8_t volume)
     if (!s_initialized || !s_i2s_tx) return ESP_ERR_INVALID_STATE;
     if (freq_hz <= 0 || duration_ms <= 0) return ESP_ERR_INVALID_ARG;
 
-    /* Map volume 0-100 to codec DAC register 0x00-0xFF */
-    uint8_t vol_reg = (uint8_t)((volume * 0xFF) / 100);
+    /* Map volume 0-100 to codec DAC register 0x00-0xFF.
+     * Scale by s_global_volume so the user-configured alert volume
+     * applies universally to all beeps. */
+    uint8_t effective_vol = (uint8_t)((volume * s_global_volume) / 100);
+    uint8_t vol_reg = (uint8_t)((effective_vol * 0xFF) / 100);
     es_write_reg(ES8311_DAC_REG32, vol_reg);
 
     /* Generate one period of square wave */
@@ -354,4 +366,20 @@ esp_err_t bsp_audio_beep(int freq_hz, int duration_ms, uint8_t volume)
 
     free(buf);
     return ESP_OK;
+}
+
+void bsp_audio_set_volume(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    s_global_volume = percent;
+    ESP_LOGI(TAG, "global alert volume set to %u%%", percent);
+}
+
+esp_err_t bsp_audio_test_beep(void)
+{
+    if (!s_initialized) {
+        esp_err_t ret = bsp_audio_init();
+        if (ret != ESP_OK) return ret;
+    }
+    return bsp_audio_beep(880, 300, 100);
 }

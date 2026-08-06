@@ -11,6 +11,11 @@
 esp_err_t bsp_display_init(void);
 void bsp_display_show_number(uint32_t value);
 void bsp_display_show_lines(const char *title, const char *const *lines, int n_lines);
+
+/* Persistent amber notice banner across the bottom of the status screen.
+ * Survives any subsequent bsp_display_show_lines() call, so transient
+ * messages cannot hide it. Pass NULL or "" to clear. */
+void bsp_display_set_notice(const char *text);
 void bsp_display_set_wifi_connected(bool connected);
 void bsp_display_set_as11_paired(bool paired);
 void bsp_display_set_battery(int percent, bool charging);

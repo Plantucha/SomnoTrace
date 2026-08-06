@@ -47,6 +47,7 @@
 #include "bsp_audio.h"
 #include "crash_diag.h"
 #include "therapy_alert.h"
+#include "nvs_flash.h"
 
 
 static const char *TAG = "somnotrace";
@@ -125,6 +126,7 @@ void app_main(void)
     device_settings_t dev_cfg;
     device_settings_load(&dev_cfg);
     bsp_display_set_brightness(dev_cfg.brightness);
+    bsp_audio_set_volume(dev_cfg.alert_volume);
 
     /* 4b. Initialise BLE (AirSense 11 pairing). Non-fatal on failure. */
     if (as11_ble_init() != ESP_OK) {
@@ -191,117 +193,196 @@ void app_main(void)
 
     bool in_softap = false;
     uint32_t softap_start_ticks = 0;
+    bool wifi_connected = false;
+    bool degraded_mode = false;
+    bool ntp_ok = false;
+
+    /* Always initialise time sync: loads the timezone from NVS (no network
+     * needed) and starts SNTP (which will simply time out without Wi-Fi). */
+    time_sync_init();
 
     if (err == ESP_OK) {
+        wifi_connected = true;
         ESP_LOGI(TAG, "Wi-Fi connected, IP=%s", ip);
         ESP_LOGI(TAG, "[heap] after WiFi: internal free=%u min=%u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         bsp_display_set_wifi_connected(true);
         netprov_start_connected_server(ip);
-        time_sync_init();
 
         /* ── Initial NTP sync with failure handling ─── */
-        bool ntp_ok = time_sync_wait_initial();
+        ntp_ok = time_sync_wait_initial();
         if (!ntp_ok) {
-            /* NTP failed.  Check if we can fall back to AS11 + stored drift. */
-            if (time_sync_has_drift()) {
-                ESP_LOGW(TAG, "NTP sync failed — entering degraded mode (AS11 drift available)");
-
-                const char *deg_lines[] = {
-                    "Degraded Mode",
-                    "No NTP — using AS11 clock",
-                };
-                show_status("SomnoTrace", deg_lines, 2);
-
-                /* Single beep to signal degraded mode (not an error). */
-                if (bsp_audio_init() == ESP_OK) {
-                    bsp_audio_beep(660, 200, 40);
+            ESP_LOGW(TAG, "NTP sync failed");
+        }
+        if (!ntp_ok && time_sync_has_drift() && as11_ble_is_paired()) {
+            /* Drift is only useful if we can read the AS11 clock over BLE.
+             * Wait for BLE to connect before entering degraded mode. */
+            const char *wait_lines[] = { "Waiting for CPAP..." };
+            show_status("SomnoTrace", wait_lines, 1);
+            for (int i = 0; i < 30; i++) {
+                if (strcmp(as11_ble_get_status(), AS11_STATUS_PAIRED) == 0) {
+                    degraded_mode = true;
+                    break;
                 }
-                /* Proceed — time will be recovered from AS11 after BLE connects. */
-            } else {
-                ESP_LOGE(TAG, "initial NTP sync failed and no drift sample — alarm + reboot");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            if (!degraded_mode) {
+                ESP_LOGW(TAG, "BLE not connected after 30s — drift unusable");
+            }
+        }
+    } else {
+        ESP_LOGW(TAG, "Wi-Fi connect failed");
+        if (time_sync_has_drift() && as11_ble_is_paired()) {
+            /* Wi-Fi failed but we might still use AS11 clock + drift.
+             * BLE reconnect has been running since boot — by now the fast
+             * retries are done.  Give it a short window to connect. */
+            for (int i = 0; i < 30; i++) {
+                if (strcmp(as11_ble_get_status(), AS11_STATUS_PAIRED) == 0) {
+                    degraded_mode = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            if (!degraded_mode) {
+                ESP_LOGW(TAG, "BLE not connected after 30s — drift unusable");
+            }
+        }
+    }
 
-                /* Show failure message on screen */
+    /* ── Handle degraded mode (no NTP, but drift available) ─── */
+    if (degraded_mode) {
+        ESP_LOGW(TAG, "Entering degraded mode: clock estimated from AS11 + stored drift");
+
+        /* Persistent banner rather than a status screen: the status lines are
+         * reused for Wi-Fi/SD messages and would otherwise hide this. */
+        bsp_display_set_notice("Estimated time");
+
+        if (bsp_audio_init() == ESP_OK) {
+            bsp_audio_beep(660, 300, 100);
+        }
+        /* Proceed — time will be recovered from AS11 after BLE connects. */
+    }
+
+    /* ── Handle total time failure (no NTP, no drift) ─── */
+    if (!degraded_mode) {
+        /* No drift available. If Wi-Fi also failed or NTP failed, we need
+         * to either reboot or enter SoftAP (reboot-loop guard). */
+        bool time_failed = !wifi_connected || (wifi_connected && !ntp_ok);
+        if (time_failed) {
+            nvs_handle_t nvs_h;
+            int boot_fail_count = 0;
+            if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
+                nvs_get_i32(nvs_h, "boot_fail", (int32_t *)&boot_fail_count);
+                boot_fail_count++;
+                nvs_set_i32(nvs_h, "boot_fail", boot_fail_count);
+                nvs_commit(nvs_h);
+                nvs_close(nvs_h);
+            }
+
+            if (boot_fail_count >= 3) {
+                ESP_LOGW(TAG, "3+ consecutive boot failures — entering SoftAP for user intervention");
+                if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
+                    nvs_set_i32(nvs_h, "boot_fail", 0);
+                    nvs_commit(nvs_h);
+                    nvs_close(nvs_h);
+                }
+                enter_softap(&cfg);
+                in_softap = true;
+                softap_start_ticks = xTaskGetTickCount();
+            } else {
+                ESP_LOGE(TAG, "No time source (attempt %d/3) — alarm + reboot",
+                         boot_fail_count);
+
                 const char *fail_lines[] = {
-                    "NTP Sync Failed",
-                    "Hold BOOT for Wi-Fi setup",
+                    wifi_connected ? "NTP Sync Failed" : "No Wi-Fi / No NTP",
+                    "Hold BOOT for setup",
                 };
                 show_status("Error", fail_lines, 2);
 
-                /* Sound audible alarm: 5 beeps of 1s on / 1s off, loud.
-                 * Poll s_softap_requested during the silence gaps so the BOOT
-                 * button can cancel the alarm and enter SoftAP instead of
-                 * rebooting into the same NTP failure. */
                 if (bsp_audio_init() == ESP_OK) {
                     for (int i = 0; i < 5; i++) {
-                        bsp_audio_beep(880, 1000, 60);
+                        bsp_audio_beep(880, 1000, 100);
                         vTaskDelay(pdMS_TO_TICKS(1000));
                         if (s_softap_requested) break;
                     }
-                } else {
-                    ESP_LOGE(TAG, "audio init failed — silent reboot");
                 }
 
                 if (s_softap_requested) {
-                    ESP_LOGW(TAG, "BOOT pressed during NTP alarm: entering SoftAP");
+                    ESP_LOGW(TAG, "BOOT pressed during alarm: entering SoftAP");
                     enter_softap(&cfg);
                     while (true) {
                         vTaskDelay(pdMS_TO_TICKS(1000));
                     }
                 }
 
-                /* Hard reboot */
                 vTaskDelay(pdMS_TO_TICKS(500));
                 esp_restart();
             }
         }
+    } else {
+        /* Degraded mode — reset boot failure counter. */
+        nvs_handle_t nvs_h;
+        if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
+            nvs_set_i32(nvs_h, "boot_fail", 0);
+            nvs_commit(nvs_h);
+            nvs_close(nvs_h);
+        }
+    }
 
-        if (sd_storage_is_ready()) {
-            /* Configure FTP server from uploader config (NVS) */
-            uploader_config_t upcfg;
-            if (uploader_load_config(&upcfg) == ESP_OK && upcfg.ftp_enabled) {
-                ftp_anonymous_mode = upcfg.ftp_anonymous;
-                if (upcfg.ftp_anonymous) {
-                    strlcpy(ftp_user, "anonymous", sizeof(ftp_user));
-                    strlcpy(ftp_pass, "anonymous@", sizeof(ftp_pass));
+    /* ── Normal boot continuation (Wi-Fi connected or degraded mode) ─── */
+    if (!in_softap) {
+        if (wifi_connected) {
+            if (sd_storage_is_ready()) {
+                uploader_config_t upcfg;
+                if (uploader_load_config(&upcfg) == ESP_OK && upcfg.ftp_enabled) {
+                    ftp_anonymous_mode = upcfg.ftp_anonymous;
+                    if (upcfg.ftp_anonymous) {
+                        strlcpy(ftp_user, "anonymous", sizeof(ftp_user));
+                        strlcpy(ftp_pass, "anonymous@", sizeof(ftp_pass));
+                    } else {
+                        strlcpy(ftp_user, upcfg.ftp_user, sizeof(ftp_user));
+                        strlcpy(ftp_pass, upcfg.ftp_pass, sizeof(ftp_pass));
+                    }
+                    ftp_server_start();
+                    ESP_LOGI(TAG, "FTP server started (%s mode)",
+                             upcfg.ftp_anonymous ? "anonymous" : "authenticated");
                 } else {
-                    strlcpy(ftp_user, upcfg.ftp_user, sizeof(ftp_user));
-                    strlcpy(ftp_pass, upcfg.ftp_pass, sizeof(ftp_pass));
+                    ESP_LOGI(TAG, "FTP server disabled in config");
                 }
-                ftp_server_start();
-                ESP_LOGI(TAG, "FTP server started (%s mode)",
-                         upcfg.ftp_anonymous ? "anonymous" : "authenticated");
-            } else {
-                ESP_LOGI(TAG, "FTP server disabled in config");
             }
+            uploader_init();
+
+            char ip_line[32];
+            snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
+            netprov_link_t link;
+            netprov_get_link(&link);
+            const char *lines[] = {
+                link.ssid[0] ? link.ssid : "Wi-Fi Connected",
+                ip_line,
+            };
+            show_status("SomnoTrace", lines, 2);
+        } else {
+            /* Booted without Wi-Fi.  Recording still works (time comes from
+             * the AS11), but keep hunting for a configured network in the
+             * background so a router power blip heals itself. */
+            ESP_LOGI(TAG, "starting link supervisor for background Wi-Fi retry");
+            netprov_start_link_supervisor();
+            netprov_request_rescan();
+
+            const char *lines[] = {
+                "Offline",
+                "Retrying Wi-Fi...",
+            };
+            show_status("SomnoTrace", lines, 2);
         }
 
-        /* Initialise upload system (needs Wi-Fi + NVS + SD card). */
-        uploader_init();
-
-        char ip_line[32];
-        snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
-
-        netprov_link_t link;
-        netprov_get_link(&link);
-        const char *lines[] = {
-            link.ssid[0] ? link.ssid : "Wi-Fi Connected",
-            ip_line,
-        };
-        show_status("SomnoTrace", lines, 2);
-
-        /* Boot complete: apply backlight policy (turns off LCD if
-         * LCD_THERAPY_ALWAYS_OFF mode is selected for battery saving). */
         bsp_display_apply_backlight_policy(false);
-    } else {
-        ESP_LOGW(TAG, "Wi-Fi connect failed, entering SoftAP");
-        enter_softap(&cfg);
-        in_softap = true;
-        softap_start_ticks = xTaskGetTickCount();
     }
 
     int refresh_counter = 0;
+    static bool post_connect_init_done = false;
+    if (wifi_connected) post_connect_init_done = true;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (s_softap_requested && !in_softap) {
@@ -336,24 +417,48 @@ void app_main(void)
                 netprov_link_t link;
                 netprov_get_link(&link);
 
+                /* Deferred init: if we booted offline and Wi-Fi just came up,
+                 * start the web server and uploader now. */
+                if (link.up && !post_connect_init_done) {
+                    ESP_LOGI(TAG, "Wi-Fi recovered after offline boot — starting services");
+                    bsp_display_set_wifi_connected(true);
+                    netprov_start_connected_server(link.ip);
+                    if (sd_storage_is_ready()) {
+                        uploader_config_t upcfg;
+                        if (uploader_load_config(&upcfg) == ESP_OK && upcfg.ftp_enabled) {
+                            ftp_anonymous_mode = upcfg.ftp_anonymous;
+                            if (upcfg.ftp_anonymous) {
+                                strlcpy(ftp_user, "anonymous", sizeof(ftp_user));
+                                strlcpy(ftp_pass, "anonymous@", sizeof(ftp_pass));
+                            } else {
+                                strlcpy(ftp_user, upcfg.ftp_user, sizeof(ftp_user));
+                                strlcpy(ftp_pass, upcfg.ftp_pass, sizeof(ftp_pass));
+                            }
+                            ftp_server_start();
+                        }
+                    }
+                    uploader_init();
+                    post_connect_init_done = true;
+
+                    /* Try NTP now that we have a network. */
+                    if (!ntp_ok) {
+                        ntp_ok = time_sync_wait_initial();
+                        if (ntp_ok) {
+                            /* NTP succeeded — clear the notice banner. */
+                            bsp_display_set_notice(NULL);
+                        }
+                    }
+                }
+
                 if (!link.up) {
                     const char *lines[] = {
-                        "Wi-Fi Disconnected",
-                        "Reconnecting...",
-                    };
-                    bsp_display_show_lines("SomnoTrace", lines, 2);
-                } else if (time_source_get() == TIME_SRC_AS11_DRIFT) {
-                    char ip_line[32];
-                    snprintf(ip_line, sizeof(ip_line), "IP: %s", link.ip);
-                    const char *lines[] = {
-                        "Degraded Mode",
-                        ip_line,
+                        "Offline",
+                        "Retrying Wi-Fi...",
                     };
                     bsp_display_show_lines("SomnoTrace", lines, 2);
                 } else {
                     char ip_line[32];
                     snprintf(ip_line, sizeof(ip_line), "IP: %s", link.ip);
-
                     const char *ssid_str = link.ssid[0] ? link.ssid : "Wi-Fi Connected";
                     if (sd_storage_is_ready()) {
                         const char *lines[] = {

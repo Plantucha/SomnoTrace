@@ -25,6 +25,7 @@
 #include "freertos/stream_buffer.h"
 #include "bsp_display.h"
 #include "bsp_power.h"
+#include "bsp_audio.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -1537,6 +1538,18 @@ static esp_err_t device_settings_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t audio_test_beep_handler(httpd_req_t *req)
+{
+    esp_err_t ret = bsp_audio_test_beep();
+    if (ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "audio unavailable");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 /* ── Actions: Reset State, Delete EDFs, Reset All, Recreate EDFs ───── */
 
 /* Recursively delete a directory and all its contents. */
@@ -2321,6 +2334,10 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &dev_get);
     httpd_register_uri_handler(s_httpd, &dev_post);
 
+    /* Audio test beep endpoint */
+    httpd_uri_t beep_test = { .uri = "/api/device/test-beep", .method = HTTP_POST, .handler = audio_test_beep_handler };
+    httpd_register_uri_handler(s_httpd, &beep_test);
+
     /* Therapy alert config endpoints */
     httpd_uri_t alert_cfg_get = { .uri = "/api/alert/config", .method = HTTP_GET, .handler = alert_config_get_handler };
     httpd_uri_t alert_cfg_post = { .uri = "/api/alert/config", .method = HTTP_POST, .handler = alert_config_post_handler };
@@ -2510,6 +2527,20 @@ esp_err_t netprov_start_portal(const struct netprov_config *cfg, char *ap_ip_out
     return start_webserver();
 }
 
+void netprov_start_link_supervisor(void)
+{
+    static bool supervisor_started = false;
+    if (supervisor_started) return;
+    psram_task_create(link_supervisor_task, "link_sup", 4096,
+                      NULL, 3, tskNO_AFFINITY, NULL, NULL);
+    supervisor_started = true;
+}
+
+void netprov_request_rescan(void)
+{
+    s_rescan_requested = true;
+}
+
 esp_err_t netprov_start_connected_server(const char *ip)
 {
     s_portal_mode = false;
@@ -2518,12 +2549,7 @@ esp_err_t netprov_start_connected_server(const char *ip)
     /* Start the link supervisor for autonomous failover.  The task checks
      * s_rescan_requested which is raised by the event handler after repeated
      * failed reconnects to the current SSID. */
-    static bool supervisor_started = false;
-    if (!supervisor_started) {
-        psram_task_create(link_supervisor_task, "link_sup", 4096,
-                          NULL, 3, tskNO_AFFINITY, NULL, NULL);
-        supervisor_started = true;
-    }
+    netprov_start_link_supervisor();
 
     return start_webserver();
 }

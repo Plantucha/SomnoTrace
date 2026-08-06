@@ -288,7 +288,7 @@ static void run_buzzer(void)
     }
     for (int i = 0; i < 5; i++) {
         if (s_task_cancel) break;
-        s_beep_fn(880, 1000, 60);
+        s_beep_fn(880, 1000, 100);
         if (s_task_cancel) break;
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

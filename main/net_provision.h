@@ -67,6 +67,14 @@ esp_err_t netprov_start_portal(const struct netprov_config *cfg, char *ap_ip_out
 /* Start the web server in connected (STA) mode showing the device IP. */
 esp_err_t netprov_start_connected_server(const char *ip);
 
+/* Start the autonomous link supervisor without a web server. Used when the
+ * boot-time connect failed so the device keeps trying to reach a configured
+ * network in the background (e.g. after a router power blip). Idempotent. */
+void netprov_start_link_supervisor(void);
+
+/* Ask the link supervisor to attempt a full scan-and-connect cycle now. */
+void netprov_request_rescan(void);
+
 /* Task entry for the captive DNS server (wildcard hijack). 
  * arg is ignored; starts automatically inside netprov_start_portal. */
 void netprov_dns_task(void *arg);

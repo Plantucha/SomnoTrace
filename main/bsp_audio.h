@@ -36,3 +36,10 @@ esp_err_t bsp_audio_init(void);
  * duration_ms: how long to play
  * volume: 0-100 percent (mapped to codec DAC volume) */
 esp_err_t bsp_audio_beep(int freq_hz, int duration_ms, uint8_t volume);
+
+/* Set the global alert volume (0-100). All subsequent bsp_audio_beep()
+ * calls scale their volume parameter by this value. */
+void bsp_audio_set_volume(uint8_t percent);
+
+/* Play a short test beep at the current global volume. */
+esp_err_t bsp_audio_test_beep(void);
