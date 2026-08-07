@@ -166,23 +166,43 @@ static void button_monitor_task(void *arg)
             }
 
             /* If this was a single press (not consumed by double-click),
-             * wait for the double-click window to expire, then fire
-             * single-click action (alert acknowledgement). */
+             * poll for a second press during the double-click window.
+             * If none arrives, fire single-click action (alert acknowledge). */
             if (s_btn.plus_last_press_ms >= 0) {
                 int release_ms = (int)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                int remaining = double_click_window_ms -
-                                (release_ms - s_btn.plus_last_press_ms);
-                if (remaining > 0) {
-                    vTaskDelay(pdMS_TO_TICKS(remaining));
+                int deadline = release_ms + double_click_window_ms -
+                               (release_ms - s_btn.plus_last_press_ms);
+                while ((int)(xTaskGetTickCount() * portTICK_PERIOD_MS) < deadline) {
+                    vTaskDelay(pdMS_TO_TICKS(poll_ms));
+                    if (gpio_get_level(BSP_PIN_KEY_PLUS) == 0) {
+                        /* Second press arrived — handle as double-click */
+                        ESP_LOGI(TAG, "PLUS button double-click");
+                        if (bsp_display_is_therapy_active()) {
+                            ESP_LOGI(TAG, "stopping therapy via EnterStandby RPC");
+                            esp_err_t ret = as11_ble_stop_therapy();
+                            if (ret != ESP_OK) {
+                                ESP_LOGW(TAG, "stop_therapy failed: %s",
+                                         esp_err_to_name(ret));
+                            }
+                        } else {
+                            ESP_LOGD(TAG, "PLUS double-click: therapy not active, ignoring");
+                        }
+                        s_btn.plus_last_press_ms = -1;
+                        /* Wait for release before resuming normal polling */
+                        while (gpio_get_level(BSP_PIN_KEY_PLUS) == 0) {
+                            vTaskDelay(pdMS_TO_TICKS(poll_ms));
+                        }
+                        goto plus_done;
+                    }
                 }
-                /* If no second press arrived during the window, resolve as single-click. */
-                if (s_btn.plus_last_press_ms >= 0 &&
-                    gpio_get_level(BSP_PIN_KEY_PLUS) == 1) {
+                /* Window expired with no second press — resolve as single-click */
+                if (s_btn.plus_last_press_ms >= 0) {
                     ESP_LOGI(TAG, "PLUS button single-click — alert acknowledge");
                     therapy_alert_acknowledge();
                     s_btn.plus_last_press_ms = -1;
                 }
             }
+        plus_done: ;
         }
 
         vTaskDelay(pdMS_TO_TICKS(poll_ms));

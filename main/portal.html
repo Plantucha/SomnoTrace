@@ -301,8 +301,9 @@ body.fixed-height .logs-container {
 }
 
 /* ── Loading state for settings sections ─────────────────────────── */
-.loading-overlay{position:relative;pointer-events:none;opacity:.4}
-.loading-overlay::after{content:'';position:absolute;top:50%;left:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border:2px solid var(--border-color);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;pointer-events:auto}
+.loading-overlay{position:relative;pointer-events:none}
+.loading-overlay::before{content:'';position:absolute;inset:0;background:var(--card-bg);opacity:.9;z-index:5;border-radius:inherit}
+.loading-overlay::after{content:'';position:absolute;top:50%;left:50%;width:32px;height:32px;margin:-16px 0 0 -16px;border:3px solid var(--border-color);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;pointer-events:auto;box-shadow:0 0 12px var(--primary-glow);z-index:10}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 <link rel="stylesheet" href="/uplot.css">
@@ -726,7 +727,7 @@ Save &amp; Reboot
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">AHI</div><div class="stat-val" id="stat-ahi">--</div><span class="badge badge-green" id="stat-ahi-badge">--</span></div>
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Usage Time</div><div class="stat-val" id="stat-usage">--</div><span class="badge badge-green" id="stat-usage-badge">--</span></div>
 <div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Leak Rate</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green" id="stat-leak-badge">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Median Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange" id="stat-press-badge">--</span></div>
+<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Average Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange" id="stat-press-badge">--</span></div>
 </div>
 <div id="dash-progress" class="dash-progress-wrap">
 <div class="dash-progress-track"><div class="dash-progress-fill" id="dash-progress-fill"></div></div>
@@ -955,6 +956,7 @@ function switchTab(tabId) {
     setLoading('alert-settings-details', true);
     if (!PORTAL_MODE) {
       setLoading('upload-cards-grid', true);
+      setLoading('ftp-card', true);
       setLoading('upload-status', true);
       bleRefresh();
       loadUploadConfig();
@@ -1884,8 +1886,10 @@ function loadUploadConfig() {
     }
     updateSmbPreview();
     setLoading('upload-cards-grid', false);
+    setLoading('ftp-card', false);
   }).catch(function() {
     setLoading('upload-cards-grid', false);
+    setLoading('ftp-card', false);
   });
 }
 
@@ -3115,7 +3119,7 @@ function renderSummary() {
   /* 2 decimals: leak averages are often well under 1 L/min, where 1 decimal
    * hides real differences (0.6248 shows as "0.6" instead of "0.62"). */
   setStat('stat-leak', leak && leak.mean != null ? num(leak.mean, 2) + ' L/min' : '--');
-  setStat('stat-press', press && press.median != null ? num(press.median, 1) + ' cmH\u2082O' : '--');
+  setStat('stat-press', press && press.mean != null ? num(press.mean, 2) + ' cmH\u2082O' : '--');
 
   /* Event breakdown (computed indices preferred over spool) */
   var brk = document.getElementById('dash-breakdown');
