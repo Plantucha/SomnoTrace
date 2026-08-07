@@ -93,9 +93,11 @@ static const char *TAG = "bsp_audio";
 #define MCLK_MULT       I2S_MCLK_MULTIPLE_256
 
 /* ── State ────────────────────────────────────────────────────────── */
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static i2c_master_dev_handle_t s_i2c_dev = NULL;
 static i2s_chan_handle_t s_i2s_tx = NULL;
-static bool s_initialized = false;
+static bool s_bus_ready = false;   /* I2C bus + device set up */
+static bool s_initialized = false; /* full init (codec + I2S + PA) done */
 static uint8_t s_global_volume = 100;  /* scales all beep calls */
 
 /* ── I2C helpers ──────────────────────────────────────────────────── */
@@ -113,11 +115,16 @@ static esp_err_t es8311_init(void)
     /* Reset the codec FIRST — on warm reboot (esp_restart()) the ES8311
      * retains its previous state and may NACK register writes until reset.
      * Retry a few times to let the I2C bus recover. */
+    bool reset_ok = false;
     for (int i = 0; i < 5; i++) {
         esp_err_t r = es_write_reg(ES8311_RESET_REG00, 0x80);
-        if (r == ESP_OK) break;
+        if (r == ESP_OK) { reset_ok = true; break; }
         ESP_LOGW(TAG, "ES8311 reset retry %d/5: %s", i + 1, esp_err_to_name(r));
         vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (!reset_ok) {
+        ESP_LOGE(TAG, "ES8311 reset failed after 5 retries");
+        return ESP_ERR_INVALID_STATE;
     }
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -195,11 +202,9 @@ static esp_err_t es8311_init(void)
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
-esp_err_t bsp_audio_init(void)
+static esp_err_t i2c_bus_setup(void)
 {
-    if (s_initialized) return ESP_OK;
-
-    esp_err_t ret = ESP_OK;
+    if (s_bus_ready) return ESP_OK;
 
     /* ── I2C master bus ─── */
     i2c_master_bus_config_t bus_cfg = {
@@ -210,8 +215,7 @@ esp_err_t bsp_audio_init(void)
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
-    i2c_master_bus_handle_t bus_handle;
-    ret = i2c_new_master_bus(&bus_cfg, &bus_handle);
+    esp_err_t ret = i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C bus init failed: %s", esp_err_to_name(ret));
         return ret;
@@ -221,12 +225,12 @@ esp_err_t bsp_audio_init(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     /* Probe for ES8311; also scan bus for diagnostics if not found */
-    esp_err_t probe = i2c_master_probe(bus_handle, ES8311_ADDR, 100);
+    esp_err_t probe = i2c_master_probe(s_i2c_bus, ES8311_ADDR, 100);
     ESP_LOGI(TAG, "I2C probe 0x%02X: %s", ES8311_ADDR, probe == ESP_OK ? "OK" : esp_err_to_name(probe));
     if (probe != ESP_OK) {
         ESP_LOGW(TAG, "ES8311 not found, scanning bus...");
         for (uint8_t addr = 1; addr < 0x80; addr++) {
-            if (i2c_master_probe(bus_handle, addr, 50) == ESP_OK) {
+            if (i2c_master_probe(s_i2c_bus, addr, 50) == ESP_OK) {
                 ESP_LOGW(TAG, "  found device at 0x%02X", addr);
             }
         }
@@ -239,11 +243,23 @@ esp_err_t bsp_audio_init(void)
         .device_address = ES8311_ADDR,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
-    ret = i2c_master_bus_add_device(bus_handle, &dev_cfg, &s_i2c_dev);
+    ret = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C device add failed: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    s_bus_ready = true;
+    return ESP_OK;
+}
+
+esp_err_t bsp_audio_init(void)
+{
+    if (s_initialized) return ESP_OK;
+
+    /* I2C bus setup (skipped on retry if already done) */
+    esp_err_t ret = i2c_bus_setup();
+    if (ret != ESP_OK) return ret;
 
     /* ── ES8311 codec ─── */
     ret = es8311_init();
