@@ -512,6 +512,18 @@ SleepHQ Cloud Upload
 </div>
 
 <!-- Section 4: Remote File Access (FTP) -->
+<div class="card sta-only" style="border-left-color:var(--primary)">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M11 7h2v2h-2V7zm0 4h2v6h-2v-6zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+Upload Window
+</div>
+<p class="card-desc">How many of the most recent days are ever considered for upload. This also caps &ldquo;Reset Upload State&rdquo;, so re-syncing cannot start uploading months of history at once.</p>
+<div class="form-group">
+<label for="upload-max-days">Days to keep in sync</label>
+<input type="number" class="form-control" id="upload-max-days" min="1" max="366" value="30" data-dirty="false" oninput="markDirty(this)">
+</div>
+</div>
+
 <div class="settings-section-header sta-only">
 <span class="step-num">4</span> Remote File Access (FTP Server)
 </div>
@@ -787,12 +799,16 @@ Save &amp; Reboot
 <div class="card-title" style="justify-content:space-between">
 <div style="display:flex;align-items:center;gap:8px">
 <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
-Recent Upload Activity &amp; Sync History
+Upload Progress
 </div>
-<button class="btn btn-outline btn-sm" type="button" onclick="loadUploadStatus()">Refresh Status</button>
+<button class="btn btn-outline btn-sm" type="button" onclick="loadUploadStatus()">Refresh</button>
 </div>
-<p class="card-desc">History of daily sleep session files processed and uploaded to network folders or cloud storage.</p>
-<div id="upload-status" style="font-size:.82rem;color:var(--text-muted);max-height:260px;overflow-y:auto;margin-top:8px"></div>
+<p class="card-desc">Each destination is tracked independently, per session. Only new sessions are uploaded.</p>
+<div id="upload-progress" style="margin-top:4px"></div>
+<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--card-border);margin-top:12px;padding-top:10px;font-size:.82rem">
+<span style="color:var(--text-muted)">Status</span>
+<span id="upload-status-line" style="color:var(--text)">&mdash;</span>
+</div>
 </div>
 </section>
 
@@ -957,7 +973,7 @@ function switchTab(tabId) {
     if (!PORTAL_MODE) {
       setLoading('upload-cards-grid', true);
       setLoading('ftp-card', true);
-      setLoading('upload-status', true);
+      setLoading('upload-progress', true);
       bleRefresh();
       loadUploadConfig();
       loadUploadStatus();
@@ -1538,7 +1554,8 @@ function saveAll() {
         anonymous: ftpAuthSel ? (ftpAuthSel.value === 'anonymous') : true,
         user: valOf('ftp-user'),
         pass: ftpPass || PW_SENTINEL_UPLOAD
-      }
+      },
+      max_days: parseInt(valOf('upload-max-days'), 10) || 30
     };
     promises.push(
       fetch('/api/uploads/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(uploadBody) })
@@ -1884,6 +1901,11 @@ function loadUploadConfig() {
       updateFtpAuthMode();
       toggleCardDisabled('ftp-card', 'ftp-enabled');
     }
+    if (typeof d.max_days === 'number') setVal('upload-max-days', d.max_days);
+    if (typeof d.max_days_cap === 'number') {
+      var mdEl = document.getElementById('upload-max-days');
+      if (mdEl) mdEl.max = d.max_days_cap;
+    }
     updateSmbPreview();
     setLoading('upload-cards-grid', false);
     setLoading('ftp-card', false);
@@ -1893,33 +1915,92 @@ function loadUploadConfig() {
   });
 }
 
+function fmtAgo(sec) {
+  if (!sec) return null;
+  var d = Math.floor(Date.now() / 1000) - sec;
+  if (d < 0) d = 0;
+  if (d < 90) return d + ' s ago';
+  if (d < 5400) return Math.round(d / 60) + ' min ago';
+  if (d < 172800) return Math.round(d / 3600) + ' h ago';
+  return Math.round(d / 86400) + ' days ago';
+}
+
+function fmtLeft(sec) {
+  if (sec == null) return '';
+  if (sec < 90) return sec + ' s';
+  return Math.round(sec / 60) + ' min';
+}
+
+/* One row per backend: label, done/total days, bar, and a single sub-line
+ * that says either what is being uploaded now or why it is waiting. */
+function renderBackendRow(b) {
+  var done = b.days_done || 0, total = b.days_total || 0;
+  var pct = total > 0 ? Math.round((done / total) * 100) : (b.configured ? 100 : 0);
+  var colour = b.id === 'sleephq' ? 'var(--accent, #a78bfa)' : 'var(--primary, #38bdf8)';
+
+  var glyph = '', gcol = 'var(--text-muted)';
+  if (!b.configured) { glyph = ''; }
+  else if (b.state === 'uploading') { glyph = '&#8635;'; gcol = 'var(--primary)'; }
+  else if (b.state === 'cooldown') { glyph = '&#9888;'; gcol = 'var(--warning)'; }
+  else if (total > 0 && done >= total) { glyph = '&#10003;'; gcol = 'var(--success)'; }
+
+  var h = '<div style="margin-bottom:14px">';
+  h += '<div style="display:flex;justify-content:space-between;align-items:baseline">';
+  h += '<span style="font-weight:600;color:' + colour + '">' + b.label + '</span>';
+  if (b.configured) {
+    h += '<span style="font-variant-numeric:tabular-nums">' + done + ' / ' + total +
+         ' <span style="color:' + gcol + '">' + glyph + '</span></span>';
+  } else {
+    h += '<span style="color:var(--text-muted);font-size:.8rem">Not configured</span>';
+  }
+  h += '</div>';
+
+  if (b.configured) {
+    h += '<div style="height:6px;border-radius:3px;background:var(--card-border);margin-top:6px;overflow:hidden">';
+    h += '<div style="height:100%;width:' + pct + '%;background:' + colour +
+         ';transition:width .4s"></div></div>';
+
+    var sub = '';
+    if (b.state === 'uploading' && b.cur) {
+      sub = 'Uploading ' + b.cur.day;
+      if (b.cur.units) sub += ' \u00b7 session ' + b.cur.unit + '/' + b.cur.units;
+    } else if (b.state === 'cooldown') {
+      sub = (b.err_permanent ? 'Needs attention' : 'Retry in ' + fmtLeft(b.retry_in_s));
+      if (b.err) sub += ' \u2014 ' + b.err;
+    } else {
+      var ago = fmtAgo(b.last_ok_s);
+      sub = ago ? 'Last upload: ' + ago : 'No uploads yet';
+    }
+    var subCol = b.state === 'cooldown' ? 'var(--warning)' : 'var(--text-muted)';
+    h += '<div style="font-size:.78rem;color:' + subCol + ';margin-top:5px">' + sub + '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
 function loadUploadStatus() {
-  fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
-    var up = d.uploads;
-    var el = document.getElementById('upload-status');
-    if (!up || !el) { if (el) setLoading('upload-status', false); return; }
-    if (!up.days || !up.days.length) { el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload days yet.</div>'; setLoading('upload-status', false); return; }
-    var h = '';
-    up.days.forEach(function(dy) {
-      h += '<div style="margin-bottom:8px;padding:8px;border:1px solid var(--card-border);border-radius:8px">';
-      h += '<strong>' + dy.day + '</strong><br>';
-      if (dy.backends) {
-        var bes = dy.backends;
-        for (var name in bes) {
-          if (name.startsWith('_')) continue;
-          var st = bes[name];
-          var c = st === 'ok' ? 'var(--success)' : st === 'failed' ? 'var(--danger)' : 'var(--warning)';
-          h += '<span style="color:' + c + '">' + name + ': ' + st + '</span>';
-          if (bes._attempts > 0) h += ' <span style="color:var(--text-muted)">(' + bes._attempts + ' attempts)</span>';
-          h += '<br>';
-        }
+  fetch('/api/uploads/progress').then(function(r){ return r.json(); }).then(function(d) {
+    var el = document.getElementById('upload-progress');
+    var line = document.getElementById('upload-status-line');
+    if (!el) { setLoading('upload-progress', false); return; }
+
+    var bes = (d && d.backends) || [];
+    if (!bes.length) {
+      el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload destination configured.</div>';
+    } else {
+      el.innerHTML = bes.map(renderBackendRow).join('');
+    }
+
+    if (line) {
+      var txt = (d && d.status) || '\u2014';
+      if (d && d.next_scan_s > 0 && !d.scanning) {
+        txt += ' \u00b7 next check ' + fmtLeft(d.next_scan_s);
       }
-      h += '</div>';
-    });
-    el.innerHTML = h;
-    setLoading('upload-status', false);
+      line.textContent = txt;
+    }
+    setLoading('upload-progress', false);
   }).catch(function() {
-    setLoading('upload-status', false);
+    setLoading('upload-progress', false);
   });
 }
 

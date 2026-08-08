@@ -22,7 +22,7 @@
  */
 
 #include "uploader.h"
-#include "uploader_state.h"
+#include "upload_paths.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -45,11 +45,6 @@
 #include "cJSON.h"
 #include "mbedtls/md5.h"
 
-/* SD card paths — must match sd_storage.h */
-#define SD_MOUNT_POINT      "/somnotrace"
-#define SD_SDCARD_DIR       SD_MOUNT_POINT "/SDCARD"
-#define SD_SDCARD_DATALOG   SD_SDCARD_DIR "/DATALOG"
-#define SD_SDCARD_SETTINGS  SD_SDCARD_DIR "/SETTINGS"
 
 static const char *TAG = "upload_shq";
 
@@ -659,177 +654,166 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
 
 /* ── Upload all files for a session ─────────────────────────────────── */
 
-static upload_result_t shq_upload_day(const char *day_folder)
-{
-    uploader_config_t cfg;
-    uploader_load_config(&cfg);
+/* ── Backend interface ──────────────────────────────────────────────
+ *
+ * One TLS connection (and one OAuth token) spans the whole run; an *import*
+ * spans one day.  A day's import therefore contains only that day's pending
+ * groups plus the root bundle, which is exactly what SleepHQ needs to
+ * interpret them — partial-day imports are normal and expected.
+ *
+ * The root bundle is sent for every import, not just when it changed: without
+ * STR.edf the sessions in that import cannot be interpreted. */
 
-    if (!cfg.shq_client_id[0] || !cfg.shq_client_secret[0]) {
-        return UPLOAD_NOT_CONFIGURED;
-    }
-
-    ESP_LOGI(TAG, "SleepHQ upload: day %s", day_folder);
-
-    /* Open a single TLS connection for the entire session.
-     * All API calls and file uploads reuse this one connection —
-     * only one TLS handshake for the whole session. */
-    esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = SHQ_TIMEOUT_MS,
-    };
-
-    esp_tls_t *tls = esp_tls_init();
-    if (!tls) {
-        ESP_LOGE(TAG, "esp_tls_init failed");
-        return UPLOAD_FAILED;
-    }
-
-    char url[128];
-    snprintf(url, sizeof(url), "https://%s", SHQ_HOST);
-
-    int ret = esp_tls_conn_http_new_sync(url, &tls_cfg, tls);
-    if (ret != 1) {
-        ESP_LOGE(TAG, "TLS connect to %s failed (ret=%d)", SHQ_HOST, ret);
-        esp_tls_conn_destroy(tls);
-        return UPLOAD_FAILED;
-    }
-
-    ESP_LOGI(TAG, "TLS connected to %s", SHQ_HOST);
-
-    /* 1. Authenticate */
-    esp_err_t err = shq_authenticate(tls, &cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "authentication failed");
-        esp_tls_conn_destroy(tls);
-        return UPLOAD_FAILED;
-    }
-
-    /* 2. Discover team */
-    err = shq_discover_team(tls);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "team discovery failed");
-        esp_tls_conn_destroy(tls);
-        return UPLOAD_FAILED;
-    }
-
-    /* 3. Create import */
-    char import_id[32] = {0};
-    err = shq_create_import(tls, import_id, sizeof(import_id));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "import creation failed");
-        esp_tls_conn_destroy(tls);
-        return UPLOAD_FAILED;
-    }
-
-    int files_uploaded = 0;
-    int failures = 0;
-
-    /* 4. Upload all EDF files from DATALOG/day_folder/ */
-    char local_day_dir[256];
-    snprintf(local_day_dir, sizeof(local_day_dir), "%s/%s", SD_SDCARD_DATALOG, day_folder);
-
-    char remote_subpath[64];
-    snprintf(remote_subpath, sizeof(remote_subpath), "/DATALOG/%s", day_folder);
-
-    DIR *d = opendir(local_day_dir);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (strstr(ent->d_name, ".edf") == NULL) continue;
-
-            char local_path[512];
-            snprintf(local_path, sizeof(local_path), "%s/%s", local_day_dir, ent->d_name);
-
-            if (shq_upload_file(tls, import_id, local_path, remote_subpath,
-                                ent->d_name) == UPLOAD_OK) {
-                files_uploaded++;
-            } else {
-                failures++;
-            }
-        }
-        closedir(d);
-    } else {
-        ESP_LOGW(TAG, "  cannot open %s", local_day_dir);
-    }
-
-    if (files_uploaded == 0) {
-        ESP_LOGW(TAG, "no EDF files uploaded for day %s", day_folder);
-        esp_tls_conn_destroy(tls);
-        return UPLOAD_FAILED;
-    }
-
-    /* 5. Upload mandatory root files */
-    const char *root_files[] = {
-        "/STR.edf",
-        "/Identification.json",
-        "/Identification.crc",
-        NULL
-    };
-
-    for (int i = 0; root_files[i]; i++) {
-        char local_path[300];
-        snprintf(local_path, sizeof(local_path), "%s%s", SD_SDCARD_DIR, root_files[i]);
-
-        struct stat st;
-        if (stat(local_path, &st) != 0) continue;
-
-        const char *fname = root_files[i] + 1;
-
-        if (shq_upload_file(tls, import_id, local_path, "", fname) == UPLOAD_OK) {
-            files_uploaded++;
-        } else {
-            failures++;
-        }
-    }
-
-    /* Upload settings files */
-    d = opendir(SD_SDCARD_SETTINGS);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (ent->d_name[0] == '.') continue;
-
-            char local_path[400];
-            snprintf(local_path, sizeof(local_path), "%s/%s", SD_SDCARD_SETTINGS, ent->d_name);
-
-            if (shq_upload_file(tls, import_id, local_path, "/SETTINGS",
-                                ent->d_name) == UPLOAD_OK) {
-                files_uploaded++;
-            } else {
-                failures++;
-            }
-        }
-        closedir(d);
-    }
-
-    ESP_LOGI(TAG, "uploaded %d files (%d failures)", files_uploaded, failures);
-
-    /* 6. Process import (finalize) */
-    err = shq_process_import(tls, import_id);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "import processing failed (files may still be queued)");
-    }
-
-    esp_tls_conn_destroy(tls);
-
-    if (failures > 0) {
-        ESP_LOGW(TAG, "SleepHQ upload completed with %d failures", failures);
-        return UPLOAD_FAILED;
-    }
-
-    ESP_LOGI(TAG, "SleepHQ upload complete for day %s", day_folder);
-    return UPLOAD_OK;
-}
-
-/* ── Backend interface ──────────────────────────────────────────────── */
+static esp_tls_t *s_tls;                  /* live for the whole run */
+static char s_import_id[32];
+static int  s_day_files;                  /* files sent in the current import */
 
 static bool shq_is_configured(void)
 {
     return uploader_is_sleephq_configured();
 }
 
+static upload_result_t shq_session_begin(void)
+{
+    uploader_config_t cfg;
+    uploader_load_config(&cfg);
+    if (!cfg.shq_client_id[0] || !cfg.shq_client_secret[0])
+        return UPLOAD_NOT_CONFIGURED;
+
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = SHQ_TIMEOUT_MS,
+    };
+
+    s_tls = esp_tls_init();
+    if (!s_tls) {
+        ESP_LOGE(TAG, "esp_tls_init failed");
+        return UPLOAD_ERR_TRANSIENT;
+    }
+
+    char url[128];
+    snprintf(url, sizeof(url), "https://%s", SHQ_HOST);
+    if (esp_tls_conn_http_new_sync(url, &tls_cfg, s_tls) != 1) {
+        ESP_LOGE(TAG, "TLS connect to %s failed", SHQ_HOST);
+        esp_tls_conn_destroy(s_tls);
+        s_tls = NULL;
+        return UPLOAD_ERR_TRANSIENT;
+    }
+    ESP_LOGI(TAG, "TLS connected to %s", SHQ_HOST);
+
+    if (shq_authenticate(s_tls, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "authentication failed");
+        esp_tls_conn_destroy(s_tls);
+        s_tls = NULL;
+        /* Credentials the server refuses will not start working on retry, so
+         * report it as permanent and let the UI say so. */
+        return UPLOAD_ERR_PERMANENT;
+    }
+    if (shq_discover_team(s_tls) != ESP_OK) {
+        ESP_LOGE(TAG, "team discovery failed");
+        esp_tls_conn_destroy(s_tls);
+        s_tls = NULL;
+        return UPLOAD_ERR_TRANSIENT;
+    }
+    return UPLOAD_OK;
+}
+
+static void shq_session_end(void)
+{
+    if (!s_tls) return;
+    esp_tls_conn_destroy(s_tls);
+    s_tls = NULL;
+    s_import_id[0] = '\0';
+}
+
+static upload_result_t shq_day_begin(const char *day)
+{
+    if (!s_tls) return UPLOAD_ERR_TRANSIENT;
+    s_import_id[0] = '\0';
+    s_day_files = 0;
+
+    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id)) != ESP_OK) {
+        ESP_LOGE(TAG, "import creation failed for day %s", day);
+        return UPLOAD_ERR_TRANSIENT;
+    }
+    ESP_LOGI(TAG, "day %s -> import %s", day, s_import_id);
+    return UPLOAD_OK;
+}
+
+static upload_result_t shq_put_group(const char *day, const upload_group_ref_t *g)
+{
+    if (!s_tls || !s_import_id[0] || !g) return UPLOAD_ERR_TRANSIENT;
+
+    char remote_subpath[64];
+    snprintf(remote_subpath, sizeof(remote_subpath), "/DATALOG/%s", day);
+
+    for (int i = 0; i < g->n_files; i++) {
+        char local[512];
+        snprintf(local, sizeof(local), "%s/%s/%s", SD_SDCARD_DATALOG, day,
+                 g->files[i]);
+
+        if (shq_upload_file(s_tls, s_import_id, local, remote_subpath,
+                            g->files[i]) != UPLOAD_OK) {
+            ESP_LOGW(TAG, "  failed to upload %s", g->files[i]);
+            return UPLOAD_ERR_TRANSIENT;
+        }
+        s_day_files++;
+    }
+    ESP_LOGI(TAG, "  group %s: %d file(s)", g->prefix, g->n_files);
+    return UPLOAD_OK;
+}
+
+static upload_result_t shq_put_bundle(const char *day,
+                                     const upload_bundle_ref_t *b, bool changed)
+{
+    (void)day;
+    (void)changed;   /* always required inside an import — see header note */
+    if (!s_tls || !s_import_id[0] || !b) return UPLOAD_ERR_TRANSIENT;
+
+    for (int i = 0; i < b->n_files; i++) {
+        const char *subpath = b->in_settings[i] ? "/SETTINGS" : "";
+        if (shq_upload_file(s_tls, s_import_id, b->paths[i], subpath,
+                            b->names[i]) != UPLOAD_OK) {
+            ESP_LOGW(TAG, "  failed to upload %s", b->names[i]);
+            return UPLOAD_ERR_TRANSIENT;
+        }
+        s_day_files++;
+    }
+    ESP_LOGI(TAG, "  root bundle: %d file(s)", b->n_files);
+    return UPLOAD_OK;
+}
+
+static upload_result_t shq_day_end(const char *day, bool any_uploaded)
+{
+    if (!s_tls || !s_import_id[0]) return UPLOAD_ERR_TRANSIENT;
+
+    /* An import with no files would leave an empty record in the user's
+     * SleepHQ history; skip processing it. */
+    if (!any_uploaded && s_day_files == 0) {
+        ESP_LOGI(TAG, "day %s: nothing sent, import left unprocessed", day);
+        s_import_id[0] = '\0';
+        return UPLOAD_OK;
+    }
+
+    esp_err_t err = shq_process_import(s_tls, s_import_id);
+    s_import_id[0] = '\0';
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "import processing failed for day %s", day);
+        return UPLOAD_ERR_TRANSIENT;
+    }
+    ESP_LOGI(TAG, "day %s uploaded (%d file(s))", day, s_day_files);
+    return UPLOAD_OK;
+}
+
 const upload_backend_t sleephq_backend = {
-    .name = "sleephq",
+    .id = "sleephq",
+    .label = "SleepHQ Cloud",
+    .bundle_only_ok = false,    /* would create an import with no sessions */
     .is_configured = shq_is_configured,
-    .upload_day = shq_upload_day,
+    .session_begin = shq_session_begin,
+    .day_begin = shq_day_begin,
+    .put_group = shq_put_group,
+    .put_bundle = shq_put_bundle,
+    .day_end = shq_day_end,
+    .session_end = shq_session_end,
 };

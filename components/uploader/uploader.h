@@ -25,37 +25,84 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include "upload_scan.h"
 
 /* ── Upload backend interface ──────────────────────────────────────────
  *
  * Each backend (SMB, SleepHQ, future additions) implements this interface.
- * Backends are registered at init and called sequentially by the upload
- * orchestration task — one at a time to avoid memory contention between
- * TLS (SleepHQ) and SMB socket buffers. */
+ * Only one backend runs at a time, to avoid memory contention between TLS
+ * (SleepHQ) and SMB socket buffers.
+ *
+ * The interface is split into a connection scope, a day scope and a per-group
+ * transfer so that tracking can be per group while the *transport* stays
+ * batched: one connect per backend per run, and for SleepHQ one import per
+ * day.  Per-group tracking must never become per-group connecting — that
+ * would be slower than the day-level uploader it replaces.
+ *
+ * Call order driven by the scheduler:
+ *
+ *   session_begin()
+ *     day_begin(day)                      for each day with pending groups
+ *       put_group(day, group)             for each pending group only
+ *       put_bundle(day, bundle, changed)  root files (see note below)
+ *     day_end(day, any_uploaded)
+ *   session_end()
+ *
+ * put_bundle() is offered once per day. The backend decides what to do with
+ * it: SleepHQ must include the root files in every import for the sessions to
+ * be interpretable, whereas SMB only needs to re-send them when `changed` is
+ * true. Returning UPLOAD_OK for a deliberate skip is correct and expected. */
 
 typedef enum {
-    UPLOAD_OK,              /* session fully uploaded to this backend      */
-    UPLOAD_FAILED,          /* upload attempted but failed                  */
+    UPLOAD_OK = 0,          /* transferred, or deliberately skipped         */
     UPLOAD_NOT_CONFIGURED,  /* backend has no valid config — skipped        */
+    UPLOAD_ERR_TRANSIENT,   /* timeout / unreachable / 5xx — retry later    */
+    UPLOAD_ERR_PERMANENT,   /* auth rejected / 4xx — retry, but surface it  */
 } upload_result_t;
 
+/* Kept as an alias so existing backend code reads naturally; any error maps
+ * onto the transient ladder unless the backend is more specific. */
+#define UPLOAD_FAILED  UPLOAD_ERR_TRANSIENT
+
 typedef struct {
-    const char *name;       /* "smb" | "sleephq" | ...                      */
+    const char *id;         /* "smb" | "sleephq" — stable tracking key      */
+    const char *label;      /* "NAS (SMB)" — shown in the UI                */
+
+    /* May this backend be contacted when the ONLY thing that changed is the
+     * root bundle, with no new session groups to send?
+     *
+     * True for a plain file tree like SMB: copying five files over is
+     * harmless. False for SleepHQ, where every visit creates an import, and
+     * an import holding root files but no session data is just clutter in the
+     * user's history. A false here means the bundle waits and rides along
+     * with the next session upload instead — at worst a day of staleness,
+     * since a genuinely changed STR.edf with no new sessions only happens
+     * when the AS11 revises an earlier day's summary. */
+    bool bundle_only_ok;
 
     /* Check if this backend has valid configuration (config keys in NVS). */
     bool (*is_configured)(void);
 
-    /* Upload all EDF files for one noon-day + mandatory root files.
-     *
-     * Parameter:
-     *   day_folder  - noon-based DATALOG subfolder, e.g. "20260629"
-     *
-     * The backend opens one connection, uploads ALL .edf files in
-     * DATALOG/{day_folder}/, then uploads root files (STR.edf,
-     * Identification.json, SETTINGS/) once.
-     *
-     * Returns UPLOAD_OK on success, UPLOAD_FAILED on error. */
-    upload_result_t (*upload_day)(const char *day_folder);
+    /* Open the connection: TCP/SMB session or TLS + auth. */
+    upload_result_t (*session_begin)(void);
+
+    /* Enter a day: create the remote folder (SMB) or open an import (SHQ). */
+    upload_result_t (*day_begin)(const char *day);
+
+    /* Transfer every file of one group. All-or-nothing: return an error
+     * unless every file in the group was accepted. */
+    upload_result_t (*put_group)(const char *day, const upload_group_ref_t *g);
+
+    /* Offer the root bundle for this day (see note above). */
+    upload_result_t (*put_bundle)(const char *day,
+                                  const upload_bundle_ref_t *b, bool changed);
+
+    /* Leave a day: finalise the import (SHQ) or nothing (SMB).
+     * any_uploaded is false when the day had no pending groups left. */
+    upload_result_t (*day_end)(const char *day, bool any_uploaded);
+
+    /* Close the connection. Always called if session_begin() succeeded. */
+    void (*session_end)(void);
 } upload_backend_t;
 
 /* ── Configuration ──────────────────────────────────────────────────── */
@@ -79,6 +126,12 @@ typedef struct {
     bool ftp_anonymous;      /* true = anonymous, false = user/pass auth    */
     char ftp_user[32];       /* FTP username (when not anonymous)           */
     char ftp_pass[32];       /* FTP password (when not anonymous)           */
+
+    /* Upload window in days (newest first).  Bounds the periodic scan, the
+     * progress denominators, and above all a manual "reset upload state" so
+     * one click cannot start re-uploading a year of history.
+     * Default UPLOAD_DEFAULT_MAX_DAYS (30), hard cap UPLOAD_MAX_DAYS_CAP. */
+    int  max_days;
 } uploader_config_t;
 
 /* ── Public API ─────────────────────────────────────────────────────── */
@@ -90,13 +143,22 @@ typedef struct {
  * Call once at boot after nvs_flash_init() and sd_storage_init(). */
 esp_err_t uploader_init(void);
 
-/* Notify the uploader that EDF generation for a session is complete.
- * This is the primary event trigger — called after edf_gen_generate()
- * finishes successfully. Adds the noon-day to the upload queue and wakes
- * the upload task. If the day was already uploaded, it is "dirtied"
- * (reset to pending) so the whole day is re-uploaded with the new data.
- * Safe to call from any task. */
-void uploader_on_day_ready(const char *day_folder);
+/* ── Event triggers ───────────────────────────────────────────────────
+ * All are safe to call from any task; they only post to the scheduler. */
+
+/* An export finished for this noon-day.  The day is rescanned and only the
+ * groups that are new (or previously failed) are uploaded — unlike the old
+ * day-level tracker, an already-uploaded session is not re-sent. */
+void uploader_on_export_complete(const char *day_folder);
+
+/* This day's exported files were replaced (rebuild-day / recreate-edfs), so
+ * whatever a backend holds for it is stale.  Drops the day's tracking state
+ * so every group in it is uploaded again. */
+void uploader_on_day_invalidated(const char *day_folder);
+
+/* Ask for an immediate reconciliation of the card against the tracking state
+ * (the periodic scan otherwise runs every 10 minutes). */
+void uploader_request_scan(void);
 
 /* Register a backend. Called during uploader_init() for built-in backends. */
 void uploader_register_backend(const upload_backend_t *backend);
@@ -138,9 +200,20 @@ bool uploader_is_sleephq_enabled(void);
 /* Check if FTP server is enabled in config. */
 bool uploader_is_ftp_enabled(void);
 
-/* Get upload status as a JSON string (for web UI).
+/* Compact upload progress for the web UI: one entry per backend with its
+ * state, days done/total and, while uploading, the current day and unit.
+ * Bounded in size regardless of how much history exists.
  * Caller must free() the returned string. */
-esp_err_t uploader_get_status_json(char **out_json);
+esp_err_t uploader_get_progress_json(char **out_json);
+
+/* One-line summary for /api/status (header badge): how many units are still
+ * outstanding across configured backends, and the worst backend state
+ * ("idle" | "uploading" | "cooldown"). */
+void uploader_get_summary(int *out_pending, const char **out_worst);
+
+/* Debug: the parsed tracking state for one day ("YYYYMMDD").
+ * Caller must free() the returned string. */
+esp_err_t uploader_get_day_state_json(const char *day, char **out_json);
 
 /* Get upload config as a JSON string (for web UI).
  * Passwords/secrets are masked. Caller must free() the returned string. */
@@ -150,7 +223,7 @@ esp_err_t uploader_get_config_json(char **out_json);
  * Parses the JSON and stores values in NVS. */
 esp_err_t uploader_save_config_json(const char *json_str);
 
-/* Clear all upload state (session tracking, per-backend status).
- * Resets in-memory state and writes empty state file to LittleFS.
- * After calling this, all sessions will be re-queued for upload. */
+/* Clear all upload tracking state, then rescan and re-upload — bounded by
+ * config.max_days, so this cannot start an unbounded re-upload.
+ * Asynchronous: the work happens on the scheduler task. */
 esp_err_t uploader_reset_state(void);

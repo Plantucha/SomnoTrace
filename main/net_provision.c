@@ -7,6 +7,7 @@
 #include "as11_ble.h"
 #include "time_sync.h"
 #include "uploader.h"
+#include "upload_sched.h"
 #include "therapy_alert.h"
 #include "edf_gen.h"
 #include "sd_storage.h"
@@ -848,16 +849,16 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         }
     }
 
-    /* Upload status (only in connected mode) */
+    /* Upload summary (only in connected mode).
+     * Deliberately tiny: the dashboard polls this every few seconds, so the
+     * detail lives behind /api/uploads/progress instead. */
     if (!s_portal_mode) {
-        char *up_json = NULL;
-        if (uploader_get_status_json(&up_json) == ESP_OK && up_json) {
-            cJSON *up_obj = cJSON_Parse(up_json);
-            if (up_obj) {
-                cJSON_AddItemToObject(resp, "uploads", up_obj);
-            }
-            free(up_json);
-        }
+        int pending = 0;
+        const char *worst = "idle";
+        uploader_get_summary(&pending, &worst);
+        cJSON *up = cJSON_AddObjectToObject(resp, "uploads");
+        cJSON_AddNumberToObject(up, "pending", pending);
+        cJSON_AddStringToObject(up, "state", worst);
     }
 
     /* Heap stats */
@@ -1366,6 +1367,44 @@ static esp_err_t download_get_handler(httpd_req_t *req)
 
 /* ── Upload config and status endpoints ────────────────────────────── */
 
+/* Compact per-backend upload progress for the Uploads card. */
+static esp_err_t upload_progress_get_handler(httpd_req_t *req)
+{
+    char *json = NULL;
+    if (uploader_get_progress_json(&json) != ESP_OK || !json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "progress failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    free(json);
+    return ESP_OK;
+}
+
+/* Debug: the parsed tracking state for one day, e.g.
+ * /api/uploads/state?day=20260807 */
+static esp_err_t upload_state_get_handler(httpd_req_t *req)
+{
+    char query[64] = {0};
+    char day[16] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "day", day, sizeof(day)) != ESP_OK ||
+        strlen(day) != 8) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "day=YYYYMMDD required");
+        return ESP_FAIL;
+    }
+
+    char *json = NULL;
+    if (uploader_get_day_state_json(day, &json) != ESP_OK || !json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "state failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    free(json);
+    return ESP_OK;
+}
+
 static esp_err_t upload_config_get_handler(httpd_req_t *req)
 {
     char *json = NULL;
@@ -1601,22 +1640,6 @@ static void recursive_delete(const char *path)
     rmdir(path);
 }
 
-/* Scan SDCARD/DATALOG for day folders and queue each for upload. */
-static void scan_and_queue_uploads(void)
-{
-    DIR *d = opendir(SD_SDCARD_DATALOG);
-    if (!d) return;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_type != DT_DIR) continue;
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-            continue;
-        /* Each subdirectory is a noon-day folder — queue it. */
-        uploader_on_day_ready(ent->d_name);
-    }
-    closedir(d);
-}
-
 /* Background task for recreate EDFs (long-running, needs large stack). */
 typedef struct {
     char session_dir[256];
@@ -1758,7 +1781,10 @@ static void recreate_edfs_task(void *arg)
         }
         if (!dup && n_queued_days < 64) {
             strlcpy(queued_days[n_queued_days++], day_folder, sizeof(queued_days[0]));
-            uploader_on_day_ready(day_folder);
+            /* Every file in this day was just regenerated, so whatever the
+             * backends hold is stale — drop the tracking state rather than
+             * only announcing the day. */
+            uploader_on_day_invalidated(day_folder);
         }
     }
 
@@ -1779,7 +1805,9 @@ static void rebuild_day_task(void *arg)
     esp_err_t ret = edf_gen_rebuild_day(day);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "rebuild_day_task: %s rebuilt, queueing for upload", day);
-        uploader_on_day_ready(day);
+        /* The day's files were replaced: discard what the backends were told
+         * before, then re-offer the day. */
+        uploader_on_day_invalidated(day);
     } else {
         ESP_LOGE(TAG, "rebuild_day_task: %s failed: %s — not queueing upload",
                  day, esp_err_to_name(ret));
@@ -2236,9 +2264,10 @@ static esp_err_t actions_handler(httpd_req_t *req)
 
     esp_err_t err = ESP_OK;
     if (strcmp(action, "reset-state") == 0) {
+        /* Clears tracking and re-uploads, bounded by the configured upload
+         * window; the scheduler does the work asynchronously. */
         ESP_LOGI(TAG, "action: reset upload state");
         uploader_reset_state();
-        scan_and_queue_uploads();
     } else if (strcmp(action, "delete-edfs") == 0) {
         /* Destructive: refused while recording, exporting or uploading. */
         if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
@@ -2338,6 +2367,9 @@ static esp_err_t start_webserver(void)
     /* Let the uploader participate in storage arbitration so it never reads a
      * day folder while a rebuild is replacing it. */
     uploader_set_lease_fns(uploader_lease_acquire, uploader_lease_release);
+    /* Periodic upload scans yield to a live therapy recording; event-driven
+     * uploads still run, since they matter more than a housekeeping scan. */
+    upload_sched_set_busy_fn(sd_storage_recording_active);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
@@ -2414,10 +2446,14 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &dl_hdl);
 
     /* Upload configuration endpoints (status folded into /api/status) */
+    httpd_uri_t up_prog_get = { .uri = "/api/uploads/progress", .method = HTTP_GET, .handler = upload_progress_get_handler };
+    httpd_uri_t up_state_get = { .uri = "/api/uploads/state", .method = HTTP_GET, .handler = upload_state_get_handler };
     httpd_uri_t up_cfg_get = { .uri = "/api/uploads/config", .method = HTTP_GET, .handler = upload_config_get_handler };
     httpd_uri_t up_cfg_post = { .uri = "/api/uploads/config", .method = HTTP_POST, .handler = upload_config_post_handler };
     httpd_register_uri_handler(s_httpd, &up_cfg_get);
     httpd_register_uri_handler(s_httpd, &up_cfg_post);
+    httpd_register_uri_handler(s_httpd, &up_prog_get);
+    httpd_register_uri_handler(s_httpd, &up_state_get);
 
     /* Device settings endpoints (brightness, LCD therapy mode) */
     httpd_uri_t dev_get = { .uri = "/api/device/settings", .method = HTTP_GET, .handler = device_settings_get_handler };

@@ -22,57 +22,36 @@
  */
 
 #include "uploader.h"
-#include "uploader_state.h"
+#include "upload_index.h"
+#include "upload_scan.h"
+#include "upload_sched.h"
+#include "upload_migrate.h"   /* DECOMMISSION AFTER v0.7.x */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
-#include "esp_heap_caps.h"
-
-/* LittleFS */
-/* LittleFS removed: uploader state now lives on the SD card. */
 
 static const char *TAG = "uploader";
 
-/* ── Constants ──────────────────────────────────────────────────────── */
-
-#define UPLOAD_TASK_STACK      12288
-#define UPLOAD_TASK_PRIORITY   4    /* low — below BLE notif (10) and EDF (5) */
-#define UPLOAD_QUEUE_LEN       16
-#define RETRY_INTERVAL_MS      30000   /* check for retries every 30s */
-#define MAX_RETRY_ATTEMPTS     5
-
-/* Exponential backoff delays (ms) for retries */
-static const int retry_delays_ms[] = {30000, 60000, 120000, 300000, 600000};
-#define N_RETRY_DELAYS (int)(sizeof(retry_delays_ms) / sizeof(retry_delays_ms[0]))
-
 #define NVS_NAMESPACE  "uploader"
 
-/* ── Internal state ─────────────────────────────────────────────────── */
+/* ── Internal state ───────────────────────────────────────────────────
+ *
+ * Scheduling, retry and tracking state all live in upload_sched /
+ * upload_index now; this file owns configuration, the backend registry and
+ * the public API only. */
 
-typedef struct {
-    char day_folder[16];
-} upload_event_t;
-
-static QueueHandle_t s_queue = NULL;
-static SemaphoreHandle_t s_state_mutex = NULL;
-static upload_state_t *s_state = NULL;
 static uploader_config_t s_config;
 static bool s_initialised = false;
 
-/* Registered backends */
-#define MAX_BACKENDS 4
+#define MAX_BACKENDS UPLOAD_MAX_BACKENDS
 static const upload_backend_t *s_backends[MAX_BACKENDS];
 static int s_n_backends = 0;
 
@@ -82,7 +61,7 @@ void uploader_register_backend(const upload_backend_t *backend)
 {
     if (!backend || s_n_backends >= MAX_BACKENDS) return;
     s_backends[s_n_backends++] = backend;
-    ESP_LOGI(TAG, "registered backend: %s", backend->name);
+    ESP_LOGI(TAG, "registered backend: %s", backend->id);
 }
 
 /* External backend declarations */
@@ -101,6 +80,7 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
     cfg->shq_enabled   = true;
     cfg->ftp_enabled   = true;
     cfg->ftp_anonymous = true;
+    cfg->max_days      = UPLOAD_DEFAULT_MAX_DAYS;
 
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
@@ -116,6 +96,14 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
     cfg->shq_enabled   = (nvs_get_u8(h, "shq_en", &u8val) == ESP_OK) ? u8val : 1;
     cfg->ftp_enabled   = (nvs_get_u8(h, "ftp_en", &u8val) == ESP_OK) ? u8val : 1;
     cfg->ftp_anonymous = (nvs_get_u8(h, "ftp_anon", &u8val) == ESP_OK) ? u8val : 1;
+
+    /* Upload window: how many of the newest days are ever considered. Caps a
+     * manual "reset state" so it cannot kick off months of re-uploading. */
+    int32_t i32val;
+    cfg->max_days = (nvs_get_i32(h, "max_days", &i32val) == ESP_OK)
+                    ? (int)i32val : UPLOAD_DEFAULT_MAX_DAYS;
+    if (cfg->max_days < 1) cfg->max_days = 1;
+    if (cfg->max_days > UPLOAD_MAX_DAYS_CAP) cfg->max_days = UPLOAD_MAX_DAYS_CAP;
 
     size_t len;
     len = sizeof(cfg->smb_host);
@@ -174,6 +162,7 @@ static esp_err_t do_uploader_save_config(void *arg)
     nvs_set_u8(h, "shq_en", cfg->shq_enabled ? 1 : 0);
     nvs_set_u8(h, "ftp_en", cfg->ftp_enabled ? 1 : 0);
     nvs_set_u8(h, "ftp_anon", cfg->ftp_anonymous ? 1 : 0);
+    nvs_set_i32(h, "max_days", cfg->max_days);
     nvs_set_str(h, "smb_host", cfg->smb_host);
     nvs_set_str(h, "smb_share", cfg->smb_share);
     nvs_set_str(h, "smb_user", cfg->smb_user);
@@ -259,6 +248,9 @@ esp_err_t uploader_get_config_json(char **out_json)
     cJSON_AddBoolToObject(shq, "configured", uploader_is_sleephq_configured());
     cJSON_AddItemToObject(root, "sleephq", shq);
 
+    cJSON_AddNumberToObject(root, "max_days", uploader_max_days());
+    cJSON_AddNumberToObject(root, "max_days_cap", UPLOAD_MAX_DAYS_CAP);
+
     cJSON *ftp = cJSON_CreateObject();
     cJSON_AddBoolToObject(ftp, "enabled", s_config.ftp_enabled);
     cJSON_AddBoolToObject(ftp, "anonymous", s_config.ftp_anonymous);
@@ -318,6 +310,14 @@ esp_err_t uploader_save_config_json(const char *json_str)
         }
     }
 
+    cJSON *md = cJSON_GetObjectItem(root, "max_days");
+    if (md && cJSON_IsNumber(md)) {
+        int v = md->valueint;
+        if (v < 1) v = 1;
+        if (v > UPLOAD_MAX_DAYS_CAP) v = UPLOAD_MAX_DAYS_CAP;
+        cfg.max_days = v;
+    }
+
     cJSON *ftp = cJSON_GetObjectItem(root, "ftp");
     if (ftp) {
         cJSON *v;
@@ -342,223 +342,61 @@ esp_err_t uploader_save_config_json(const char *json_str)
     return ret;
 }
 
-/* ── Status JSON for web UI ─────────────────────────────────────────── */
+/* ── Progress / status for the web UI ───────────────────────────────── */
 
-esp_err_t uploader_get_status_json(char **out_json)
+esp_err_t uploader_get_progress_json(char **out_json)
 {
-    if (!out_json) return ESP_ERR_INVALID_ARG;
+    return upload_sched_progress_json(out_json);
+}
 
-    if (!s_state_mutex || !s_state) {
-        *out_json = strdup("{\"sessions\":[]}");
-        return *out_json ? ESP_OK : ESP_ERR_NO_MEM;
-    }
+void uploader_get_summary(int *out_pending, const char **out_worst)
+{
+    upload_sched_summary(out_pending, out_worst);
+}
 
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    esp_err_t ret = uploader_state_to_json(s_state, out_json);
-    xSemaphoreGive(s_state_mutex);
-
-    return ret;
+esp_err_t uploader_get_day_state_json(const char *day, char **out_json)
+{
+    if (!day || !out_json) return ESP_ERR_INVALID_ARG;
+    return upload_index_day_to_json((uint32_t)strtoul(day, NULL, 10), out_json);
 }
 
 /* ── Reset state ─────────────────────────────────────────────────────── */
 
 esp_err_t uploader_reset_state(void)
 {
-    if (!s_state_mutex || !s_state) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    memset(s_state, 0, sizeof(*s_state));
-    uploader_state_save(s_state);
-    xSemaphoreGive(s_state_mutex);
-
-    ESP_LOGI(TAG, "upload state cleared");
+    /* Clearing and rescanning happens on the scheduler task so it cannot race
+     * an upload in progress. */
+    upload_sched_request_reset();
     return ESP_OK;
 }
 
-/* ── Upload task ────────────────────────────────────────────────────── */
+/* ── Hooks used by upload_sched (same component, no app dependency) ──── */
 
-static void process_day(const char *day_folder)
+int uploader_max_days(void)
 {
-    ESP_LOGI(TAG, "processing day %s", day_folder);
+    int d = s_config.max_days;
+    if (d <= 0) d = UPLOAD_DEFAULT_MAX_DAYS;
+    if (d > UPLOAD_MAX_DAYS_CAP) d = UPLOAD_MAX_DAYS_CAP;
+    return d;
+}
 
-    /* Do not read a day that an export/rebuild may be replacing.  Leaving it
-     * pending is correct: check_retries() will pick it up again. */
-    if (s_lease_acquire && !s_lease_acquire(5000)) {
-        ESP_LOGW(TAG, "  storage busy (export in progress) — deferring day %s",
-                 day_folder);
-        return;
+int uploader_enabled_backends(const upload_backend_t **out, int max_out)
+{
+    int n = 0;
+    for (int i = 0; i < s_n_backends && n < max_out; i++) {
+        if (s_backends[i]) out[n++] = s_backends[i];
     }
+    return n;
+}
 
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    day_state_t *day = uploader_state_find_or_create(s_state, day_folder);
-    if (day) {
-        for (int i = 0; i < day->n_backends; i++) {
-            if (day->backends[i].status == ST_OK) {
-                ESP_LOGI(TAG, "  backend %s: dirtying (was OK) for re-upload", day->backends[i].name);
-                day->backends[i].status = ST_PENDING;
-            }
-        }
-    }
-    xSemaphoreGive(s_state_mutex);
+bool uploader_lease_take(uint32_t timeout_ms)
+{
+    return s_lease_acquire ? s_lease_acquire(timeout_ms) : true;
+}
 
-    for (int i = 0; i < s_n_backends; i++) {
-        const upload_backend_t *be = s_backends[i];
-        if (!be || !be->is_configured || !be->is_configured()) {
-            ESP_LOGI(TAG, "  backend %s: not configured, skipping", be ? be->name : "?");
-            continue;
-        }
-
-        bool already_ok = false;
-        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-        day = uploader_state_find_or_create(s_state, day_folder);
-        if (day) {
-            backend_state_t *bs = uploader_state_backend_find_or_create(day, be->name);
-            already_ok = bs && bs->status == ST_OK;
-        }
-        xSemaphoreGive(s_state_mutex);
-        if (already_ok) {
-            ESP_LOGI(TAG, "  backend %s: already OK, skipping", be->name);
-            continue;
-        }
-
-        ESP_LOGI(TAG, "  backend %s: uploading...", be->name);
-        upload_result_t result = be->upload_day(day_folder);
-        upload_status_t st;
-        switch (result) {
-        case UPLOAD_OK:
-            st = ST_OK;
-            ESP_LOGI(TAG, "  backend %s: OK", be->name);
-            break;
-        case UPLOAD_NOT_CONFIGURED:
-            st = ST_PENDING;
-            ESP_LOGI(TAG, "  backend %s: not configured", be->name);
-            break;
-        default:
-            st = ST_FAILED;
-            ESP_LOGW(TAG, "  backend %s: FAILED", be->name);
-            break;
-        }
-
-        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-        day = uploader_state_find_or_create(s_state, day_folder);
-        if (day) {
-            backend_state_t *bs = uploader_state_backend_find_or_create(day, be->name);
-            if (bs) {
-                bs->status = st;
-                if (st == ST_OK || st == ST_FAILED) {
-                    bs->attempts++;
-                    bs->last_try_ms = (int64_t)time(NULL) * 1000;
-                }
-            }
-        }
-        xSemaphoreGive(s_state_mutex);
-    }
-
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    uploader_state_save(s_state);
-    xSemaphoreGive(s_state_mutex);
-
+void uploader_lease_give(void)
+{
     if (s_lease_release) s_lease_release();
-}
-
-static void check_retries(void)
-{
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-
-    int64_t now_ms = (int64_t)time(NULL) * 1000;
-
-    for (int i = 0; i < s_state->n_days; i++) {
-        day_state_t *s = &s_state->days[i];
-        bool needs_retry = false;
-
-        for (int j = 0; j < s->n_backends; j++) {
-            backend_state_t *b = &s->backends[j];
-            if (b->status == ST_FAILED && b->attempts < MAX_RETRY_ATTEMPTS) {
-                int delay_idx = b->attempts - 1;
-                if (delay_idx < 0) delay_idx = 0;
-                if (delay_idx >= N_RETRY_DELAYS) delay_idx = N_RETRY_DELAYS - 1;
-                int delay = retry_delays_ms[delay_idx];
-                int64_t elapsed = now_ms - b->last_try_ms;
-                if (elapsed >= delay) {
-                    ESP_LOGI(TAG, "retry: day %s backend %s: attempt %d, elapsed %lldms (delay was %dms)",
-                             s->day_folder, b->name, b->attempts + 1,
-                             (long long)elapsed, delay);
-                    needs_retry = true;
-                    break;
-                }
-            }
-        }
-
-        if (needs_retry) {
-            ESP_LOGI(TAG, "retry: day %s needs retry", s->day_folder);
-            upload_event_t ev = {0};
-            strlcpy(ev.day_folder, s->day_folder, sizeof(ev.day_folder));
-            xQueueSend(s_queue, &ev, 0);
-        }
-    }
-
-    xSemaphoreGive(s_state_mutex);
-}
-
-static void upload_task(void *arg)
-{
-    ESP_LOGI(TAG, "upload task started on core %d", xPortGetCoreID());
-
-    /* On boot, re-queue any pending/failed days */
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    const char *days[UPLOAD_MAX_DAYS];
-
-    const char *be_names[MAX_BACKENDS];
-    int n_be = 0;
-    for (int i = 0; i < s_n_backends; i++) {
-        if (s_backends[i] && s_backends[i]->is_configured && s_backends[i]->is_configured()) {
-            be_names[n_be++] = s_backends[i]->name;
-        }
-    }
-
-    int n_pending = uploader_state_get_pending(s_state, be_names, n_be,
-                                                days, UPLOAD_MAX_DAYS);
-    xSemaphoreGive(s_state_mutex);
-
-    for (int i = 0; i < n_pending; i++) {
-        upload_event_t ev = {0};
-        strlcpy(ev.day_folder, days[i], sizeof(ev.day_folder));
-        xQueueSend(s_queue, &ev, 0);
-    }
-
-    if (n_pending > 0) {
-        ESP_LOGI(TAG, "queued %d pending days from state", n_pending);
-    }
-
-    /* Main loop: wait for events, process, then periodic retry check */
-    TickType_t last_retry_check = xTaskGetTickCount();
-
-    while (true) {
-        upload_event_t ev;
-        TickType_t now = xTaskGetTickCount();
-        TickType_t wait_ticks = pdMS_TO_TICKS(RETRY_INTERVAL_MS);
-
-        /* Time until next retry check */
-        TickType_t since_check = now - last_retry_check;
-        if (since_check < pdMS_TO_TICKS(RETRY_INTERVAL_MS)) {
-            wait_ticks = pdMS_TO_TICKS(RETRY_INTERVAL_MS) - since_check;
-        }
-
-        if (xQueueReceive(s_queue, &ev, wait_ticks) == pdTRUE) {
-            process_day(ev.day_folder);
-        }
-
-        /* Periodic retry check */
-        now = xTaskGetTickCount();
-        if (now - last_retry_check >= pdMS_TO_TICKS(RETRY_INTERVAL_MS)) {
-            last_retry_check = now;
-            check_retries();
-        }
-    }
-
-    vTaskDelete(NULL);
 }
 
 /* ── Public API ─────────────────────────────────────────────────────── */
@@ -567,101 +405,69 @@ esp_err_t uploader_init(void)
 {
     if (s_initialised) return ESP_OK;
 
-    /* 1. Upload state persists on the SD card (mounted by sd_storage_init at
-     *    boot, before uploader_init). No flash filesystem to mount here. */
-
-    /* 2. Allocate upload state in PSRAM to keep internal RAM free for
-     *    DMA-critical WiFi/BLE buffers. */
-    s_state = heap_caps_calloc(1, sizeof(upload_state_t), MALLOC_CAP_SPIRAM);
-    if (!s_state) {
-        /* Fall back to regular malloc if PSRAM unavailable */
-        s_state = calloc(1, sizeof(upload_state_t));
-    }
-    if (!s_state) {
-        ESP_LOGE(TAG, "failed to allocate upload state (%u bytes)",
-                 (unsigned)sizeof(upload_state_t));
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "upload state allocated: %u bytes (PSRAM=%s)",
-             (unsigned)sizeof(upload_state_t),
-             heap_caps_check_integrity(MALLOC_CAP_SPIRAM, false) ? "yes" : "no");
-
-    /* 3. Create state mutex */
-    s_state_mutex = xSemaphoreCreateMutex();
-    if (!s_state_mutex) return ESP_ERR_NO_MEM;
-
-    /* 4. Load config from NVS */
     uploader_load_config(&s_config);
 
-    /* 5. Load upload state from the SD card */
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    uploader_state_load(s_state);
-    uploader_state_prune(s_state, 30);
-    xSemaphoreGive(s_state_mutex);
+    esp_err_t ret = upload_index_init();
+    if (ret != ESP_OK) return ret;
 
-    /* 6. Register backends */
+    /* Backends must be registered before the index loads, so that their slots
+     * are assigned in a stable order and the state files can be attributed. */
     uploader_register_backend(&smb_backend);
     uploader_register_backend(&sleephq_backend);
-
-    /* 7. Create event queue */
-    s_queue = xQueueCreate(UPLOAD_QUEUE_LEN, sizeof(upload_event_t));
-    if (!s_queue) return ESP_ERR_NO_MEM;
-
-    /* 8. Start upload task on core 0 (same as BLE, but low priority).
-     * PSRAM-backed stack: upload state now lives on the SD card (SDMMC, not
-     * SPI flash) and the task performs no flash erase/write, so it never runs
-     * during a flash-cache freeze — safe for an external-memory stack under
-     * CONFIG_SPI_FLASH_AUTO_SUSPEND. The TCB must stay in internal RAM
-     * (FreeRTOS requirement). Stack/TCB are allocated once and live for the
-     * lifetime of the task, so they are never freed. Falls back to an internal
-     * dynamic stack if the PSRAM allocation fails. */
-    static StackType_t *upload_stack = NULL;
-    static StaticTask_t *upload_tcb = NULL;
-    TaskHandle_t upload_handle = NULL;
-    upload_stack = heap_caps_malloc(UPLOAD_TASK_STACK, MALLOC_CAP_SPIRAM);
-    upload_tcb   = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-    if (upload_stack && upload_tcb) {
-        upload_handle = xTaskCreateStaticPinnedToCore(
-            upload_task, "uploader", UPLOAD_TASK_STACK, NULL,
-            UPLOAD_TASK_PRIORITY, upload_stack, upload_tcb, 0);
-    } else {
-        ESP_LOGW(TAG, "uploader PSRAM stack alloc failed, using internal stack");
-        free(upload_stack); free(upload_tcb);
-        upload_stack = NULL; upload_tcb = NULL;
-        xTaskCreatePinnedToCore(upload_task, "uploader", UPLOAD_TASK_STACK, NULL,
-                                UPLOAD_TASK_PRIORITY, &upload_handle, 0);
+    for (int i = 0; i < s_n_backends; i++) {
+        upload_index_backend_slot(s_backends[i]->id);
     }
 
-    if (!upload_handle) {
-        ESP_LOGE(TAG, "failed to create upload task");
-        return ESP_ERR_NO_MEM;
-    }
+    upload_index_load(uploader_max_days());
+
+    /* DECOMMISSION AFTER v0.7.x — carries day-level state across the switch to
+     * per-group tracking so an already-synced device does not re-upload
+     * everything once.  See upload_migrate.h. */
+    upload_migrate_legacy_state();
+
+    ret = upload_sched_init();
+    if (ret != ESP_OK) return ret;
 
     s_initialised = true;
-    ESP_LOGI(TAG, "uploader initialised (%d backends, %d days in state)",
-             s_n_backends, s_state->n_days);
-
-    /* Log heap diagnostics for debugging memory issues */
-    ESP_LOGI(TAG, "heap: internal free=%u min=%u | PSRAM free=%u min=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
-
+    ESP_LOGI(TAG, "uploader initialised (window %d days)", uploader_max_days());
     return ESP_OK;
 }
 
-void uploader_on_day_ready(const char *day_folder)
+/* ── Event triggers ─────────────────────────────────────────────────── */
+
+static uint32_t day_to_num(const char *day_folder)
 {
-    if (!s_initialised || !day_folder) return;
+    if (!day_folder || strlen(day_folder) != 8) return 0;
+    for (int i = 0; i < 8; i++) {
+        if (day_folder[i] < '0' || day_folder[i] > '9') return 0;
+    }
+    return (uint32_t)strtoul(day_folder, NULL, 10);
+}
 
-    ESP_LOGI(TAG, "day ready for upload: %s", day_folder);
+void uploader_on_export_complete(const char *day_folder)
+{
+    if (!s_initialised) return;
+    uint32_t day = day_to_num(day_folder);
+    if (!day) {
+        ESP_LOGW(TAG, "ignoring export notification for invalid day '%s'",
+                 day_folder ? day_folder : "(null)");
+        return;
+    }
+    ESP_LOGI(TAG, "export complete: %s", day_folder);
+    upload_sched_notify_export(day);
+}
 
-    /* Queue the upload event — dirtying and state save happen in
-     * process_day() on the uploader task (internal stack).  Do NOT
-     * do flash I/O here: callers may run on a PSRAM stack, and flash
-     * operations disable the cache, making PSRAM inaccessible. */
-    upload_event_t ev = {0};
-    strlcpy(ev.day_folder, day_folder, sizeof(ev.day_folder));
-    xQueueSend(s_queue, &ev, portMAX_DELAY);
+void uploader_on_day_invalidated(const char *day_folder)
+{
+    if (!s_initialised) return;
+    uint32_t day = day_to_num(day_folder);
+    if (!day) return;
+    ESP_LOGI(TAG, "day %s invalidated", day_folder);
+    upload_sched_notify_invalidate(day);
+}
+
+void uploader_request_scan(void)
+{
+    if (!s_initialised) return;
+    upload_sched_request_scan();
 }

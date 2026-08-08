@@ -1259,7 +1259,7 @@ static void sw_post_task(void *arg)
             if (tm.tm_hour < 12) { t -= 86400; localtime_r(&t, &tm); }
             snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-            uploader_on_day_ready(day_folder);
+            uploader_on_export_complete(day_folder);
         } else {
             ESP_LOGW(TAG, "post: EDF generation failed, not triggering upload");
         }

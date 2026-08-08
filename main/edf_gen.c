@@ -3771,6 +3771,16 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                           "(<1500) — no therapy delivered, skipping all "
                           "per-session EDF files", session_id,
                      (unsigned)brp_samples);
+
+            /* The day folder was created before we knew there would be nothing
+             * to put in it.  Leaving it behind makes the card look as though a
+             * day exists, which skews anything that enumerates DATALOG — the
+             * uploader's day window included.  rmdir() only succeeds on an
+             * empty directory, so a day that already holds real sessions is
+             * untouched. */
+            if (rmdir(day_dir) == 0) {
+                ESP_LOGI(TAG, "removed empty day folder %s", day_dir);
+            }
         }
     }
 
