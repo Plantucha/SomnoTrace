@@ -77,6 +77,8 @@ static void log_coredump_summary(void)
 {
     /* Check whether a valid core dump image exists on flash. */
     if (esp_core_dump_image_check() != ESP_OK) {
+        ESP_LOGW(TAG, "core dump image check failed — partition may be empty, "
+                      "corrupt, or erased by bootloader (CHECK_BOOT)");
         return;
     }
 

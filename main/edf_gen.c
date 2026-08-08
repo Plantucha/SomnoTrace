@@ -3558,8 +3558,12 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     bool no_therapy = false;
     if (!therapy_gated) {
         char brp_snt[300];
-        snprintf(brp_snt, sizeof(brp_snt), "%s/%s_brp.snt", session_dir, session_id);
+        snprintf(brp_snt, sizeof(brp_snt), "%s/%s_flow.snt", session_dir, session_id);
         FILE *bf = fopen(brp_snt, "rb");
+        if (!bf) {
+            snprintf(brp_snt, sizeof(brp_snt), "%s/%s_brp.snt", session_dir, session_id);
+            bf = fopen(brp_snt, "rb");
+        }
         uint32_t brp_samples = 0;
         if (bf) {
             snt_header_t bhdr;

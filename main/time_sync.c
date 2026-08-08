@@ -402,11 +402,18 @@ esp_err_t time_sync_recover_from_as11(void)
     return ESP_OK;
 }
 
-esp_err_t time_sync_init(void)
+void time_sync_apply_saved_timezone(void)
 {
     char tz_str[TZ_STR_MAX];
     time_sync_get_timezone(tz_str, sizeof(tz_str));
     apply_timezone(tz_str);
+}
+
+esp_err_t time_sync_init(void)
+{
+    /* Idempotent — also called early in app_main() so that any session
+     * started during BLE reconnect gets a local-time session id. */
+    time_sync_apply_saved_timezone();
 
     /* Check for a user-configured custom NTP server in NVS. */
     char ntp_srv[NTP_SRV_MAX];

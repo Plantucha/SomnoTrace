@@ -39,6 +39,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -332,13 +333,24 @@ static void flush_all(session_writer_t *s)
     flush_sa2(s);
     flush_pld(s);
 
-    /* sync all files */
-    if (s->flow.f_l0) { fflush(s->flow.f_l0); update_snt_header_sample_count(s->flow.f_l0, s->flow.sample_count); }
-    if (s->flow.f_l1) { fflush(s->flow.f_l1); update_snt_header_sample_count(s->flow.f_l1, s->flow_mm_count); }
-    if (s->press.f_l0) { fflush(s->press.f_l0); update_snt_header_sample_count(s->press.f_l0, s->press.sample_count); }
-    if (s->sa2.f_l0) { fflush(s->sa2.f_l0); update_snt_header_sample_count(s->sa2.f_l0, s->sa2.sample_count); }
-    if (s->pld.f_l0) { fflush(s->pld.f_l0); update_snt_header_sample_count(s->pld.f_l0, s->pld.sample_count); }
-    if (s->f_events) fflush(s->f_events);
+    /* sync all files.
+     *
+     * fflush() only pushes the newlib stdio buffer into FATFS via write() —
+     * it does NOT call f_sync(), so the FAT directory entry (file size),
+     * the cluster chain and the FSINFO block stay in FATFS RAM.  If the
+     * device resets before fclose(), the directory entry still reports
+     * 0 bytes and every sample written since the file was opened becomes
+     * unreachable (orphaned clusters), which is exactly how session
+     * 20260808_012019 lost 4h39m of therapy data to an INT_WDT reset.
+     *
+     * fsync() maps to f_sync() in ESP-IDF's vfs_fat, committing the
+     * metadata to the card and bounding crash loss to one flush interval. */
+    if (s->flow.f_l0) { fflush(s->flow.f_l0); update_snt_header_sample_count(s->flow.f_l0, s->flow.sample_count); fsync(fileno(s->flow.f_l0)); }
+    if (s->flow.f_l1) { fflush(s->flow.f_l1); update_snt_header_sample_count(s->flow.f_l1, s->flow_mm_count); fsync(fileno(s->flow.f_l1)); }
+    if (s->press.f_l0) { fflush(s->press.f_l0); update_snt_header_sample_count(s->press.f_l0, s->press.sample_count); fsync(fileno(s->press.f_l0)); }
+    if (s->sa2.f_l0) { fflush(s->sa2.f_l0); update_snt_header_sample_count(s->sa2.f_l0, s->sa2.sample_count); fsync(fileno(s->sa2.f_l0)); }
+    if (s->pld.f_l0) { fflush(s->pld.f_l0); update_snt_header_sample_count(s->pld.f_l0, s->pld.sample_count); fsync(fileno(s->pld.f_l0)); }
+    if (s->f_events) { fflush(s->f_events); fsync(fileno(s->f_events)); }
 
     ESP_LOGI(TAG, "flush: flow=%u press=%u sa2=%u pld=%u samples",
              (unsigned)s->flow.sample_count,
@@ -1763,13 +1775,37 @@ void session_writer_recover(void)
                 fclose(f);
             }
 
-            /* Skip sessions with no readable .snt header (0-byte files from
-             * crash before FATFS flush).  No data was written, and defaulting
-             * start_epoch_ms to 0 produces invalid 19691231 EDF folders. */
+            /* No readable .snt header (0-byte directory entry from a crash
+             * before the FAT metadata was committed).  Rather than discarding
+             * the session outright — which is how 4h39m of therapy was lost
+             * to an INT_WDT reset — reconstruct start_epoch_ms from the
+             * session id (YYYYMMDD_HHMMSS) so the metadata is still written
+             * and the day-bucketing stays correct instead of defaulting to 0
+             * and producing an invalid 19691231 EDF folder. */
             if (!got_valid_header) {
-                ESP_LOGW(TAG, "skipping interrupted session %s/%s — no valid .snt header (crash before flush?)",
+                struct tm tm_id = {0};
+                int y, mo, d, h, mi, sec;
+                if (sscanf(prefix, "%4d%2d%2d_%2d%2d%2d",
+                           &y, &mo, &d, &h, &mi, &sec) == 6) {
+                    tm_id.tm_year = y - 1900;
+                    tm_id.tm_mon  = mo - 1;
+                    tm_id.tm_mday = d;
+                    tm_id.tm_hour = h;
+                    tm_id.tm_min  = mi;
+                    tm_id.tm_sec  = sec;
+                    tm_id.tm_isdst = -1;
+                    time_t t_id = mktime(&tm_id);
+                    if (t_id > 0) start_epoch_ms = (int64_t)t_id * 1000;
+                }
+                if (start_epoch_ms <= 0) {
+                    ESP_LOGW(TAG, "skipping interrupted session %s/%s — no valid .snt header "
+                                  "and unparseable session id",
+                             ent->d_name, prefix);
+                    continue;
+                }
+                ESP_LOGW(TAG, "interrupted session %s/%s — no valid .snt header "
+                              "(crash before FAT sync?); start time reconstructed from id",
                          ent->d_name, prefix);
-                continue;
             }
 
             if (is_v2) {

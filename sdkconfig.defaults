@@ -213,3 +213,11 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=3
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_SHA256=y
+# Don't let the bootloader erase a partial/corrupt core dump before the
+# app can read it.  With CHECK_BOOT=y the bootloader was erasing
+# incomplete INT_WDT coredumps, leaving crash_diag with nothing to log.
+# CONFIG_ESP_COREDUMP_CHECK_BOOT is not set
+# Give the panic handler time to finish writing the core dump to flash
+# before rebooting.  The default 0 s caused incomplete/missing coredumps
+# on INT_WDT resets (the Aug 8 crash produced nothing recoverable).
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=2

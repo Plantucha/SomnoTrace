@@ -33,6 +33,13 @@
  * falls back to public NTP pools. Defaults to UTC if no timezone is set. */
 esp_err_t time_sync_init(void);
 
+/* Apply the timezone stored in NVS to the C library (setenv TZ + tzset)
+ * without touching SNTP.  Safe to call before the network is up, and called
+ * again by time_sync_init().  Call this early in app_main() so that a session
+ * started during a mid-therapy BLE reconnect is named in local time rather
+ * than UTC. */
+void time_sync_apply_saved_timezone(void);
+
 /* Get/set timezone as POSIX TZ string and IANA name, stored in NVS.
  * tz_str: e.g. "AEST-10AEDT,M10.1.0,M4.1.0/3"
  * tz_name: e.g. "Australia/Melbourne" (for UI re-selection only) */

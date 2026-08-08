@@ -128,6 +128,12 @@ void app_main(void)
     bsp_display_set_brightness(dev_cfg.brightness);
     bsp_audio_set_volume(dev_cfg.alert_volume);
 
+    /* 4a-bis. Apply the saved timezone now, before BLE can reconnect.
+     * as11_ble_init() may find therapy already running and start a session
+     * immediately; without TZ applied the session id is generated in UTC
+     * (e.g. 20260807_200019 for a session that really began 06:00 local). */
+    time_sync_apply_saved_timezone();
+
     /* 4b. Initialise BLE (AirSense 11 pairing). Non-fatal on failure. */
     if (as11_ble_init() != ESP_OK) {
         ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
