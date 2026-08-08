@@ -117,6 +117,18 @@ typedef esp_err_t (*uploader_nvs_task_fn_t)(void *arg);
 typedef esp_err_t (*uploader_nvs_exec_fn_t)(uploader_nvs_task_fn_t fn, void *arg);
 void uploader_set_nvs_executor(uploader_nvs_exec_fn_t exec);
 
+/* Storage-lease hooks (injected for the same reason as the NVS executor:
+ * this component does not depend on the app).
+ *
+ * The uploader reads a day folder that a rebuild may be replacing, so it
+ * takes a lease for the duration of each day it uploads.  acquire() returns
+ * false if the lease is unavailable, in which case the day is left pending
+ * and retried later rather than read mid-replacement. */
+typedef bool (*uploader_lease_acquire_fn_t)(uint32_t timeout_ms);
+typedef void (*uploader_lease_release_fn_t)(void);
+void uploader_set_lease_fns(uploader_lease_acquire_fn_t acquire,
+                            uploader_lease_release_fn_t release);
+
 /* Check if specific backends are configured and enabled. */
 bool uploader_is_smb_configured(void);
 bool uploader_is_sleephq_configured(void);

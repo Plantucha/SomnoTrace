@@ -154,6 +154,37 @@ void crash_diag_check(void)
         ESP_LOGI(TAG, "reset reason: %s (%d)", reset_reason_str(reason), (int)reason);
     }
 
+    /* ── Log the watchdog configuration alongside the reason ──────────
+     * An INT_WDT reset means interrupts were disabled for longer than this
+     * timeout, so the configured value is needed to interpret the event at
+     * all.  Logging it every boot means a report from the field carries the
+     * threshold with it, and makes it obvious when the timeout has been
+     * temporarily raised as a diagnostic probe rather than left at the
+     * production value. */
+#if defined(CONFIG_ESP_INT_WDT)
+    ESP_LOGI(TAG, "watchdogs: INT_WDT enabled, timeout=%d ms",
+             (int)CONFIG_ESP_INT_WDT_TIMEOUT_MS);
+#else
+    ESP_LOGW(TAG, "watchdogs: INT_WDT DISABLED");
+#endif
+#if defined(CONFIG_ESP_TASK_WDT_EN)
+    ESP_LOGI(TAG, "watchdogs: TASK_WDT enabled, timeout=%d s",
+             (int)CONFIG_ESP_TASK_WDT_TIMEOUT_S);
+#else
+    ESP_LOGI(TAG, "watchdogs: TASK_WDT disabled");
+#endif
+    if (reason == ESP_RST_INT_WDT) {
+        ESP_LOGW(TAG, "INT_WDT: interrupts were disabled > %d ms — suspect a "
+                 "long driver critical section (SDMMC is the usual candidate); "
+                 "check the storage latency report below",
+#if defined(CONFIG_ESP_INT_WDT)
+                 (int)CONFIG_ESP_INT_WDT_TIMEOUT_MS
+#else
+                 0
+#endif
+                 );
+    }
+
     /* ── Log boot-time heap stats ────────────────────────────────────── */
     ESP_LOGI(TAG, "[heap] boot: internal free=%u, PSRAM free=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

@@ -22,6 +22,7 @@
  */
 
 #include "post_therapy.h"
+#include "as11_time.h"
 #include "as11_ble.h"
 #include "session_writer.h"
 #include "sd_storage.h"
@@ -99,19 +100,16 @@ static int64_t extract_clock_b(const uint8_t *rec, size_t rec_len)
     return extract_scalar_field(rec, rec_len, 40);
 }
 
-/* Compute noon-based day folder (YYYYMMDD) from epoch ms.
- * Sessions before noon belong to the previous day's folder. */
+/* Compute the noon-based day label (YYYYMMDD) for an AS11-clock timestamp.
+ *
+ * The AS11 defines its reporting day noon-to-noon in ITS OWN timezone, so the
+ * label must be derived with the device's offset rather than the ESP's.  When
+ * the two differ, using ESP local time shifts every Summary record a day (see
+ * as11_time.h and issue #75).  as11_time_noon_day() falls back to ESP local
+ * time when the offset is not yet known. */
 static void noon_day_from_epoch(int64_t epoch_ms, char *out, size_t out_len)
 {
-    time_t t = (time_t)(epoch_ms / 1000);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    if (tm.tm_hour < 12) {
-        t -= 86400;
-        localtime_r(&t, &tm);
-    }
-    snprintf(out, out_len, "%04d%02d%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    as11_time_noon_day(epoch_ms, out, out_len);
 }
 
 /* ── File helpers ───────────────────────────────────────────────────── */
@@ -255,7 +253,11 @@ static esp_err_t collect_summary_spool(int64_t clock_drift_ms)
             int64_t period_start = extract_period_start(rec, rec_len);
             if (period_start > 0) {
                 char day_label[16];
-                noon_day_from_epoch(period_start, day_label, sizeof(day_label));
+                /* Deriving variant: PeriodStart is a noon stamp, so this also
+                 * teaches as11_time the device's offset on the very first
+                 * record — before collect_settings() has run. */
+                as11_time_noon_day_for_period_start(period_start, day_label,
+                                                    sizeof(day_label));
 
                 char spool_path[300];
                 snprintf(spool_path, sizeof(spool_path), "%s/%s.spool",
@@ -362,6 +364,15 @@ static esp_err_t collect_settings(const char *dir, const char *prefix)
     if (!settings) {
         ESP_LOGW(TAG, "failed to get device settings");
         return ESP_FAIL;
+    }
+
+    /* The device reports its own UTC offset here; capture it so Summary
+     * PeriodStart values can be mapped onto the AS11's noon-day boundaries
+     * even before any spool record has been parsed. */
+    as11_offset_t as11_off;
+    if (as11_time_offset_from_settings(settings, &as11_off)) {
+        ESP_LOGI(TAG, "AS11 timezone offset %d min (from device settings)",
+                 (int)(as11_off / 60));
     }
 
     char path[330];
@@ -497,7 +508,11 @@ static esp_err_t refresh_today_summary_spool(int64_t end_epoch_ms,
             int64_t period_start = extract_period_start(rec, rec_len);
             if (period_start > 0) {
                 char day_label[16];
-                noon_day_from_epoch(period_start, day_label, sizeof(day_label));
+                /* Deriving variant: PeriodStart is a noon stamp, so this also
+                 * teaches as11_time the device's offset on the very first
+                 * record — before collect_settings() has run. */
+                as11_time_noon_day_for_period_start(period_start, day_label,
+                                                    sizeof(day_label));
 
                 char spool_path[300];
                 snprintf(spool_path, sizeof(spool_path), "%s/%s.spool",

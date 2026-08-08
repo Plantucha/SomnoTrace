@@ -85,3 +85,43 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json);
 esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                            int64_t start_epoch_ms, int64_t end_epoch_ms,
                            int64_t clock_drift_ms);
+
+/* ── Split generation passes ───────────────────────────────────────────
+ * A generation call writes two kinds of artifact:
+ *
+ *   PER_SESSION  BRP/PLD/SA2/EVE/CSL under <out_root>/DATALOG/<noon-day>/
+ *   SHARED       <out_root>/STR.edf, Identification.json/.crc and
+ *                SETTINGS/CurrentSettings.json/.crc
+ *
+ * The shared artifacts are NOT session-local: STR.edf is a multi-day
+ * cumulative file, and when no Summary spool covers the day its record is
+ * synthesised from the single session passed in.  Rebuilding a day by
+ * calling the generator once per session would therefore leave STR
+ * reflecting whichever session happened to be last.  Splitting the passes
+ * makes the aggregation explicit: run PER_SESSION for every session, then
+ * SHARED exactly once. */
+#define EDF_GEN_PER_SESSION   (1u << 0)
+#define EDF_GEN_SHARED        (1u << 1)
+#define EDF_GEN_ALL           (EDF_GEN_PER_SESSION | EDF_GEN_SHARED)
+
+/* As edf_gen_generate(), but writes into out_root and honours the pass
+ * flags.  out_root must be an existing-or-creatable directory; pass
+ * SD_SDCARD_DIR for the live export. */
+esp_err_t edf_gen_generate_ex(const char *out_root,
+                              const char *session_dir, const char *session_id,
+                              int64_t start_epoch_ms, int64_t end_epoch_ms,
+                              int64_t clock_drift_ms, uint32_t flags);
+
+/* Rebuild the export for exactly one noon-day, as a transaction.
+ *
+ * Generates every session of that day into a staging directory, and only
+ * swaps it into place once all of them succeeded — so a partial failure
+ * leaves the previous good export untouched.  Then runs the shared pass
+ * once.  Takes the storage export lease for the whole operation, so it
+ * cannot run concurrently with another export, an upload of the same day,
+ * or a destructive action.
+ *
+ * day_folder is "YYYYMMDD" (noon-based).  Returns ESP_OK only if the day
+ * was fully rebuilt and published — the caller may then queue it for
+ * upload. */
+esp_err_t edf_gen_rebuild_day(const char *day_folder);

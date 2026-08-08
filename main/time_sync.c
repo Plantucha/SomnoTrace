@@ -67,6 +67,7 @@ static time_source_t s_source = TIME_SRC_NONE;
 static int64_t s_drift_ms = 0;       /* last known drift (NTP - AS11) */
 static int64_t s_drift_at_ms = 0;    /* NTP epoch ms when drift was measured */
 static bool s_drift_loaded = false;  /* true once s_drift_ms/at loaded from NVS */
+static const char *s_drift_src = "none";  /* provenance of s_drift_ms */
 
 static void sntp_sync_cb(struct timeval *tv)
 {
@@ -219,6 +220,28 @@ bool time_sync_has_drift(void)
     return load_drift_from_nvs();
 }
 
+static bool load_drift_from_sd(void);
+
+bool time_sync_get_drift_snapshot(time_drift_snapshot_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    out->source = "none";
+
+    if (!s_drift_loaded) {
+        /* NVS first, then the SD upgrade fallback (devices that predate the
+         * NVS keys still have drift recorded in session manifests). */
+        if (!load_drift_from_nvs()) load_drift_from_sd();
+    }
+    if (!s_drift_loaded) return false;
+
+    out->available = true;
+    out->drift_ms = s_drift_ms;
+    out->measured_at_ms = s_drift_at_ms;
+    out->source = s_drift_src;
+    return true;
+}
+
 /* ── Drift persistence ─────────────────────────────────────────────── */
 
 typedef struct {
@@ -244,6 +267,7 @@ void time_sync_save_drift(int64_t drift_ms, int64_t measured_at_ms)
     s_drift_ms = drift_ms;
     s_drift_at_ms = measured_at_ms;
     s_drift_loaded = true;
+    s_drift_src = "nvs";
 
     drift_save_args_t args = { .drift_ms = drift_ms, .measured_at_ms = measured_at_ms };
     esp_err_t err = nvs_writer_run(do_save_drift, &args);
@@ -271,6 +295,7 @@ static bool load_drift_from_nvs(void)
         s_drift_ms = drift;
         s_drift_at_ms = at;
         s_drift_loaded = true;
+        s_drift_src = "nvs";
         ESP_LOGI(TAG, "drift loaded from NVS: %lld ms (age %lld s)",
                  (long long)drift,
                  (long long)((time(NULL) * 1000 - at) / 1000));
@@ -333,7 +358,12 @@ static bool load_drift_from_sd(void)
                 cJSON *d = cJSON_GetObjectItem(root, "clock_drift_ms");
                 cJSON *s = cJSON_GetObjectItem(root, "start_epoch_ms");
                 if (d && cJSON_IsNumber(d) && s && cJSON_IsNumber(s)) {
-                    int64_t start = (int64_t)d->valuedouble;
+                    /* Select by session START time, not by the drift value.
+                     * This previously read d->valuedouble (the drift), so the
+                     * "newest sample wins" comparison actually ranked by drift
+                     * magnitude and s_drift_at_ms was set to a drift, making
+                     * the reported age meaningless. */
+                    int64_t start = (int64_t)s->valuedouble;
                     if (!found || start > best_start) {
                         best_start = start;
                         best_drift = (int64_t)d->valuedouble;
@@ -351,6 +381,7 @@ static bool load_drift_from_sd(void)
         s_drift_ms = best_drift;
         s_drift_at_ms = best_start;
         s_drift_loaded = true;
+        s_drift_src = "sd";
         ESP_LOGI(TAG, "drift loaded from SD: %lld ms (session start %lld)",
                  (long long)best_drift, (long long)best_start);
     }

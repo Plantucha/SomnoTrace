@@ -134,15 +134,17 @@ void app_main(void)
      * (e.g. 20260807_200019 for a session that really began 06:00 local). */
     time_sync_apply_saved_timezone();
 
-    /* 4b. Initialise BLE (AirSense 11 pairing). Non-fatal on failure. */
-    if (as11_ble_init() != ESP_OK) {
-        ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
-    }
-    ESP_LOGI(TAG, "[heap] after BLE init: internal free=%u min=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
-
-    /* 4c. Initialise SD card storage and session writer. Non-fatal. */
+    /* 4b. Initialise SD card storage and session writer BEFORE BLE.
+     *
+     * Ordering is load-bearing, not cosmetic.  as11_ble_init() starts
+     * reconnect_task, which can find therapy already running and drive
+     * session_writer_on_stream_data_raw() into session_writer_start() from
+     * the first StreamData notification.  If that happened before
+     * session_writer_init(), session_writer_start() would take a NULL
+     * s_active_mutex; and session_writer_recover() — which treats "no
+     * session.json" as "interrupted" — could stamp the *live* session as
+     * interrupted.  Initialising storage and running recovery first removes
+     * both races instead of relying on reconnect_task being slow. */
     esp_err_t sd_ret = sd_storage_init();
     if (sd_ret != ESP_OK) {
         ESP_LOGE(TAG, "SD card init failed; session storage unavailable");
@@ -167,11 +169,26 @@ void app_main(void)
         /* Hold the warning for 3 seconds before continuing boot */
         vTaskDelay(pdMS_TO_TICKS(3000));
     } else {
-        session_writer_init();
+        if (session_writer_init() != ESP_OK) {
+            /* The storage worker could not be created, so no session can be
+             * durably recorded.  Say so now rather than discovering it at
+             * TherapyStop, when the night is already lost. */
+            ESP_LOGE(TAG, "session writer init failed; recording unavailable");
+            bsp_display_set_notice("Recording OFF");
+        }
         session_writer_recover();
     }
 
-    /* 4b. Init therapy alert subsystem (loads config from NVS). */
+    /* 4c. Initialise BLE (AirSense 11 pairing). Non-fatal on failure.
+     * Runs after storage init + crash recovery (see 4b). */
+    if (as11_ble_init() != ESP_OK) {
+        ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
+    }
+    ESP_LOGI(TAG, "[heap] after BLE init: internal free=%u min=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+
+    /* 4d. Init therapy alert subsystem (loads config from NVS). */
     therapy_alert_set_beep_fn(bsp_audio_beep);
     therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);
     therapy_alert_init();

@@ -21,10 +21,46 @@
  * (https://github.com/ilyakruchinin)." See the NOTICE file for details.
  */
 
+/* ────────────────────────────────────────────────────────────────────
+ *  Architecture (see spec/archive/TODO-resume-after-reboot-take3.md)
+ *
+ *  Two persistent workers own everything that can block:
+ *
+ *   sw_storage  — owns every session file and every filesystem operation:
+ *                 mkdir, open, header write, sample write, event write,
+ *                 header update, fsync, close, manifest write, checkpoint.
+ *                 Created once at init with a static command queue.
+ *
+ *   sw_post     — owns the post-stop pipeline: the stop-time GetDateTime
+ *                 RPC, post-therapy spool collection, EDF generation and
+ *                 the upload trigger.  Created once at init; no per-stop
+ *                 task allocation (a failed allocation used to leave a
+ *                 session that was never finalised).
+ *
+ *  The BLE notification path performs NO filesystem I/O.  It appends
+ *  samples to a producer-owned batch and enqueues:
+ *      - lifecycle commands (open / finalize)
+ *      - immutable stream batches (flow+pressure travel together)
+ *      - event records (pre-formatted JSON strings)
+ *
+ *  Flow and pressure share one batch descriptor and one sample count so
+ *  they can never drift out of lockstep.  Batches are drawn from a small
+ *  per-session PSRAM pool, so a slow card produces a bounded, counted
+ *  backlog instead of silent sample loss.
+ *
+ *  Durability ordering per commit (never claim durability early):
+ *      1. write detached batch payloads
+ *      2. fflush data
+ *      3. update stream headers
+ *      4. fsync every affected stream
+ *      5. write the checkpoint slot
+ *      6. fsync the checkpoint
+ * ──────────────────────────────────────────────────────────────────── */
+
 #include "session_writer.h"
 #include "sd_storage.h"
-#include "bsp_display.h"
 #include "as11_ble.h"
+#include "bsp_display.h"
 #include "post_therapy.h"
 #include "edf_gen.h"
 #include "uploader.h"
@@ -43,11 +79,13 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_crc.h"
 #include "cJSON.h"
 #include "psram_task.h"
 
@@ -72,129 +110,240 @@ typedef struct __attribute__((packed)) {
     uint32_t reserved2;
 } snt_header_t;              /* 28 bytes (packed) */
 
-#define SNT_HEADER_SIZE  sizeof(snt_header_t)   /* 28 bytes (packed) */
+#define SNT_HEADER_SIZE  sizeof(snt_header_t)
 
-/* ── Session state ────────────────────────────────────────────────── */
+/* ── Recovery journal (.ckpt) ─────────────────────────────────────────
+ * Fixed-size binary journal with two alternating slots.  A checkpoint is
+ * only written after the data it describes has been fsync'd, so it can
+ * never over-promise.  Recovery picks the slot with the highest sequence
+ * number and a valid CRC, which makes a torn write during the checkpoint
+ * update harmless (the older slot is still intact). */
 
-#define FLUSH_INTERVAL_SEC   60
-#define FLUSH_TASK_STACK     4096
-#define MAX_SESSION_DIR_LEN  128
+#define CKPT_MAGIC      0x534E5443u   /* "SNTC" */
+#define CKPT_VERSION    1
+#define CKPT_SLOTS      2
 
-/* Per-stream file handles and counters */
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t seq;              /* monotonically increasing               */
+    uint32_t flow_count;       /* durable per-stream record counts       */
+    uint32_t press_count;
+    uint32_t flow_mm_count;
+    uint32_t sa2_count;
+    uint32_t pld_count;
+    int64_t  start_epoch_ms;
+    int64_t  elapsed_us;       /* monotonic since session start          */
+    int64_t  last_stream_us;   /* monotonic at last StreamData received   */
+    uint32_t crc32;            /* over all preceding bytes               */
+} snt_ckpt_t;
+
+#define CKPT_SLOT_SIZE  sizeof(snt_ckpt_t)
+
+/* ── Buffer geometry ──────────────────────────────────────────────────
+ * Capacities are per batch, and a session holds SW_BATCH_POOL batches, so
+ * total producer headroom is capacity × pool.  That is a better use of
+ * RAM than one larger buffer: it absorbs a slow card without ever letting
+ * the producer block on I/O. */
+
+#define BRP_CAP              1500   /* 60 s @ 25 Hz, per channel */
+#define SA2_CAP               180   /* 180 s @ 1 Hz              */
+#define PLD_CAP               300   /* 600 s @ 0.5 Hz            */
+#define BRP_COMMIT_THRESHOLD 1400   /* hand off before clipping  */
+#define SW_BATCH_POOL           3
+
+/* Maximum time therapy data may sit uncommitted.  Configurable policy
+ * rather than a hardcoded tick: this bounds crash loss.  30 s is the
+ * deliberate starting point — tightening it increases SD activity, which
+ * is still a suspect for the INT_WDT reset. */
+#ifndef SW_COMMIT_INTERVAL_MS
+#define SW_COMMIT_INTERVAL_MS   30000
+#endif
+
+/* Close an orphaned session when StreamData stops arriving (missed
+ * TherapyStop with no following TherapyStart).  Monotonic, not wall clock. */
+#ifndef SW_STALE_TIMEOUT_MS
+#define SW_STALE_TIMEOUT_MS     600000   /* 10 min */
+#endif
+
+/* A StreamData discontinuity at least this long is not compensated — the
+ * session is split so the gap is never rendered as continuous samples. */
+#ifndef SW_SPLIT_GAP_MS
+#define SW_SPLIT_GAP_MS         120000   /* 2 min */
+#endif
+
+/* Ignore a repeated TherapyStart this soon after a session started; it is
+ * an echo, not a new therapy cycle. */
+#define SW_START_DEBOUNCE_MS    15000
+
+#define SW_STORAGE_QUEUE_LEN    24
+#define SW_POST_QUEUE_LEN        4
+#define MAX_SESSION_DIR_LEN    128
+
+/* ── Stream batch ─────────────────────────────────────────────────────
+ * Immutable once handed to the storage worker.  Flow and pressure share
+ * n_brp: they are appended in lockstep and must be written in lockstep. */
+
 typedef struct {
-    FILE    *f_l0;       /* L0 interleaved raw */
-    FILE    *f_l1;       /* L1 MinMax sidecar (BRP only) */
-    uint32_t sample_count;   /* total samples written to file (per channel) */
+    int16_t  brp_flow[BRP_CAP];
+    int16_t  brp_press[BRP_CAP];
+    uint32_t n_brp;
+    int16_t  sa2_hr[SA2_CAP];
+    int16_t  sa2_spo2[SA2_CAP];
+    uint32_t n_sa2;
+    int16_t  pld[PLD_CAP][12];
+    uint32_t n_pld;
+    int64_t  elapsed_us;      /* monotonic span covered by this batch */
+    int64_t  last_stream_us;
+} stream_batch_t;
+
+/* ── Storage worker commands ──────────────────────────────────────── */
+
+typedef enum {
+    SW_CMD_OPEN = 0,   /* create dir, open files, sync headers        */
+    SW_CMD_BATCH,      /* write one detached batch                    */
+    SW_CMD_EVENT,      /* write one pre-formatted JSON event line     */
+    SW_CMD_FINALIZE,   /* final commit, close, write manifest         */
+} sw_cmd_type_t;
+
+typedef struct {
+    sw_cmd_type_t     type;
+    session_writer_t *s;
+    stream_batch_t   *batch;        /* SW_CMD_BATCH: returned to pool  */
+    char             *event_json;   /* SW_CMD_EVENT: worker frees      */
+    /* SW_CMD_FINALIZE payload */
+    int64_t           end_epoch_ms;
+    int64_t           clock_drift_ms;
+    bool              drift_valid;
+    const char       *drift_source;
+    int64_t           drift_measured_at_ms;
+    const char       *state;        /* static string                   */
+    bool              free_session; /* worker owns the struct (no sw_post) */
+    SemaphoreHandle_t done;
+} sw_cmd_t;
+
+/* ── Post-stop pipeline job ───────────────────────────────────────── */
+
+typedef struct {
+    session_writer_t *s;            /* freed by sw_post when done      */
+    int64_t           end_epoch_ms;
+    const char       *state;        /* "completed" | "timed_out" | ... */
+    bool              allow_ble;    /* false when BLE is the reason    */
+} sw_post_job_t;
+
+/* ── Per-stream file state (storage worker only) ──────────────────── */
+
+typedef struct {
+    FILE    *f_l0;
+    FILE    *f_l1;
+    uint32_t sample_count;   /* durable records written (per channel) */
 } stream_files_t;
 
 struct session_writer {
-    char     dir[MAX_SESSION_DIR_LEN];   /* noon-day folder path */
-    char     session_id[32];      /* YYYYMMDD_HHMMSS[_n] — file prefix */
-    int64_t  start_time_us;       /* boot-relative us (for duration) */
-    int64_t  start_epoch_ms;      /* NTP epoch ms at session start */
-    int64_t  end_time_us;         /* boot-relative us (for duration) */
-    int64_t  end_epoch_ms;        /* NTP epoch ms at session stop */
-    bool     active;
+    /* ── identity (set by producer at create, dir/id finalised by worker) */
+    char     dir[MAX_SESSION_DIR_LEN];
+    char     session_id[40];
+    int64_t  start_time_us;
+    int64_t  start_epoch_ms;
+    int64_t  end_time_us;
+    int64_t  end_epoch_ms;
 
-    /* v2 format: flow and pressure are stored in separate .snt files.
-     * v1 (backwards compat) stored both interleaved in a single brp.snt.
-     * The web UI only needs flow for the breathing graph — pressure comes
-     * from PLD — so splitting them halves the HTTP transfer for the dashboard.
-     * EDF export reads both files and interleaves them into BRP.edf to match
-     * the AS11 native format. */
-    stream_files_t flow;    /* 25 Hz, 1 ch: flow (40ms natural) */
-    stream_files_t press;   /* 25 Hz, 1 ch: mask_pressure (40ms natural) */
-    stream_files_t sa2;     /* 1 Hz, 2 ch: heart_rate + spo2 (decimated from 5 Hz report) */
-    stream_files_t pld;     /* 0.5 Hz, 12 ch (0.5 Hz natural, decimated from 5 Hz report) */
-    FILE    *f_events;
-    uint32_t flow_mm_count; /* L1 MinMax records written (flow only) */
+    /* ── producer state ──────────────────────────────────────────── */
+    volatile bool     active;
+    SemaphoreHandle_t fill_mutex;
+    stream_batch_t   *fill;          /* current producer batch          */
+    QueueHandle_t     batch_pool;    /* free stream_batch_t*            */
+    stream_batch_t   *batches[SW_BATCH_POOL];
 
-    int64_t  clock_drift_ms;   /* NTP time - AS11 device time at session stop */
-    bool     clock_drift_valid; /* true when clock_drift_ms was successfully queried */
+    uint8_t  sa2_countdown;
+    uint8_t  pld_countdown;
 
-    /* recent buffer: holds data between flushes */
-    SemaphoreHandle_t mutex;
-    TaskHandle_t flush_task_handle;  /* flush task for this session */
-
-    /* BRP recent buffer (largest, 25 Hz × 2 ch × 60 s = 3000 samples) */
-    int16_t brp_flow[1500];
-    int16_t brp_press[1500];
-    uint32_t brp_buf_count;     /* samples in buffer (per channel) */
-
-    /* SA2 recent buffer (1 Hz × 2 ch × 60 s = 60 samples) */
-    int16_t sa2_hr[60];
-    int16_t sa2_spo2[60];
-    uint32_t sa2_buf_count;
-    uint8_t sa2_countdown;     /* decimation: write SA2 every 5th notification (5 Hz / 5 = 1 Hz) */
-
-    /* PLD recent buffer (0.5 Hz × 12 ch × 60 s = 30 samples) */
-    int16_t pld_buf[300][12];
-    uint32_t pld_buf_count;
-    uint8_t pld_countdown;     /* decimation: write PLD every 10th notification */
-
-    /* ── Missing-packet compensation ────────────────────────────────
-     * StreamData notifications include a "startTime" ISO8601 timestamp
-     * for the first sample in each report.  Under normal operation the
-     * gap between consecutive notifications is ~200ms (reportIntervalMs).
-     * A dropped BLE notification produces a gap of ~400ms+, which we
-     * detect by comparing startTime values.
-     *
-     * Compensation strategy (all signal types): hold previous value.
-     *   BRP (25Hz waveform): gaps are typically 200-400ms (1-2 dropped
-     *     notifications = 5-10 samples).  Breath cycle is ~3-5s, so a
-     *     200-400ms hold is <10% of a cycle and visually indistinguishable
-     *     from real data.  Using sentinels (SNT_MISSING) produces visible
-     *     artifacts in OSCAR/SleepHQ (clamped to dig_min → displayed as
-     *     -120 L/min flow spike).  The AS11 native EDF never has missing
-     *     BRP data (direct SD card write, no BLE), so there is no native
-     *     sentinel convention for BRP.
-     *   SA2 (1Hz vitals):    hold previous value — HR/SpO2 change over
-     *     minutes; a 200ms-1s gap is clinically negligible.
-     *   PLD (0.5Hz metrics):  hold previous value — all PLD signals are
-     *     2-second summaries that change slowly; holding is a tiny error.
-     *
-     * See: https://github.com/ilyakruchinin/SomnoTrace/issues/20 */
-    int64_t  prev_stream_ms;     /* ms-since-midnight from last startTime */
-    bool     prev_stream_ms_valid;  /* false until first notification */
-    int16_t  last_flow;          /* last known Flow for hold-on-gap */
-    int16_t  last_press;         /* last known Press for hold-on-gap */
-    bool     last_brp_valid;     /* true after first BRP sample received */
-    int16_t  last_hr;            /* last known HR for hold-on-gap */
-    int16_t  last_spo2;          /* last known SpO2 for hold-on-gap */
-    int16_t  last_pld[12];       /* last known PLD row for hold-on-gap */
-    bool     last_hr_valid;      /* true after first HR sample received */
-    bool     last_spo2_valid;
+    /* missing-packet compensation / hold-last-value cache */
+    int64_t  prev_stream_ms;
+    bool     prev_stream_ms_valid;
+    int16_t  last_flow, last_press;
+    bool     last_brp_valid;
+    int16_t  last_hr, last_spo2;
+    bool     last_hr_valid, last_spo2_valid;
+    int16_t  last_pld[12];
     bool     last_pld_valid;
 
-    /* Session-level gap statistics (logged at session stop) */
-    uint32_t stream_notifications;  /* total StreamData notifications received */
-    uint32_t gap_events;            /* number of gap detections (compensated) */
-    uint32_t gap_missing_total;     /* total missing notifications compensated */
+    /* ── stats (producer writes, worker reads at finalize) ────────── */
+    uint32_t stream_notifications;
+    uint32_t gap_events;
+    uint32_t gap_missing_total;
+    uint32_t gap_long_events;      /* uncompensated discontinuities    */
+    uint64_t gap_long_ms_total;
+    int64_t  gap_long_first_ms;    /* offset from session start        */
+    int64_t  gap_long_last_ms;
+    uint32_t brp_dropped;
+    uint32_t sa2_dropped;
+    uint32_t pld_dropped;
+    uint32_t batch_dropped;
+    uint32_t event_dropped;
 
-    /* events: simple JSON line file, flushed with data */
+    /* ── monotonic activity tracking (watchdog) ───────────────────── */
+    volatile int64_t last_stream_us;
+
+    /* ── storage worker state ─────────────────────────────────────── */
+    stream_files_t flow;
+    stream_files_t press;
+    stream_files_t sa2;
+    stream_files_t pld_f;
+    FILE    *f_events;
+    FILE    *f_ckpt;
+    uint32_t flow_mm_count;
+    uint32_t ckpt_seq;
+    int64_t  committed_elapsed_us;
+    int64_t  committed_last_stream_us;
+    bool     files_open;
+    bool     have_uncommitted;
+
+    /* ── failure state (worker writes, anyone reads) ──────────────── */
+    volatile bool storage_failed;
+    volatile uint32_t io_errors;
+    char     first_io_error[80];
+
+    /* ── drift / timing metadata (filled at finalize) ─────────────── */
+    int64_t  clock_drift_ms;
+    bool     clock_drift_valid;
+    const char *clock_drift_source;
+    int64_t  clock_drift_measured_at_ms;
 };
+
+/* ── Module state ─────────────────────────────────────────────────── */
 
 static session_writer_t *s_active = NULL;
 static SemaphoreHandle_t s_active_mutex = NULL;
-/* Set to true on TherapyStop, false on TherapyStart.
- * Used by the auto-start logic in session_writer_on_stream_data_raw to
- * prevent starting a new session from flow/pressure data alone when therapy
- * has been explicitly stopped.  Without this, the residual pressure decay
- * after TherapyStop could trigger a spurious auto-start. */
+static QueueHandle_t     s_storage_q = NULL;
+static QueueHandle_t     s_post_q = NULL;
+static TaskHandle_t      s_storage_task = NULL;
+static TaskHandle_t      s_post_task = NULL;
+static bool              s_ready = false;
+
+/* Set on TherapyStop, cleared on TherapyStart.  RAM-only, so it is false
+ * after any reset — which is what arms mid-therapy auto-start.  The stale
+ * watchdog deliberately does NOT set it (that would block auto-start on
+ * reconnect). */
 static bool s_therapy_stopped = false;
 
-/* _SNC (Summary update counter) tracking — set when ValueChange
- * notification is received via the _SNC event subscription. */
+/* TherapyStart de-duplication: an echoed start must not rotate a healthy
+ * session, but a genuine one must (a missed TherapyStop otherwise glues
+ * two nights together, and StreamData keeps resetting any timeout). */
+static char    s_last_start_report[32] = {0};
+
 static volatile bool s_snc_changed = false;
 static volatile int64_t s_snc_value = -1;
 
 static char s_device_addr[32] = {0};
 static char s_client_id[64] = {0};
 
+static void sw_request_finalize(session_writer_t *s, const char *state,
+                                int64_t end_epoch_ms, bool allow_ble);
+
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
-/* Compute the noon-based day folder (YYYYMMDD) from local time.
- * Sessions before noon belong to the previous day's folder. */
 static void noon_day_folder_local(time_t t, char *out, size_t out_len)
 {
     struct tm tm;
@@ -207,7 +356,6 @@ static void noon_day_folder_local(time_t t, char *out, size_t out_len)
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 }
 
-/* Generate session timestamp prefix: YYYYMMDD_HHMMSS */
 static void make_session_id(char *out, size_t out_len)
 {
     time_t now = time(NULL);
@@ -218,8 +366,122 @@ static void make_session_id(char *out, size_t out_len)
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-static void write_snt_header(FILE *f, uint8_t tier, uint16_t hz_x10,
-                             uint8_t n_ch, int64_t start_epoch_ms)
+static uint32_t snt_record_bytes(const snt_header_t *h)
+{
+    uint32_t n = (uint32_t)h->n_channels * (uint32_t)h->sample_bytes;
+    return n ? n : 2;
+}
+
+/* ── Storage latency instrumentation ─────────────────────────────────
+ * The INT_WDT root cause is still unknown and SDMMC is the leading suspect,
+ * so every blocking filesystem operation is timed.  This is the evidence
+ * that must exist BEFORE the commit interval is shortened: tightening it
+ * increases SD activity, and if a long driver critical section is the
+ * culprit, that would make the crash more frequent rather than less. */
+
+typedef enum {
+    SW_OP_OPEN = 0,
+    SW_OP_WRITE,
+    SW_OP_FLUSH,
+    SW_OP_HEADER,
+    SW_OP_FSYNC,
+    SW_OP_MANIFEST,
+    SW_OP_CKPT,
+    SW_OP_COUNT
+} sw_op_t;
+
+static const char *const sw_op_names[SW_OP_COUNT] = {
+    "open", "write", "flush", "header", "fsync", "manifest", "ckpt"
+};
+
+static struct {
+    uint32_t max_us[SW_OP_COUNT];
+    uint64_t total_us[SW_OP_COUNT];
+    uint32_t count[SW_OP_COUNT];
+    uint32_t over_100ms;
+    uint32_t over_1s;
+} s_lat;
+
+/* Slow enough to be worth a line in the log on its own. */
+#define SW_SLOW_OP_US   250000
+
+static inline int64_t lat_begin(void) { return esp_timer_get_time(); }
+
+static void lat_end(sw_op_t op, int64_t t0)
+{
+    int64_t dt = esp_timer_get_time() - t0;
+    if (dt < 0) return;
+    uint32_t us = (uint32_t)dt;
+    if (us > s_lat.max_us[op]) s_lat.max_us[op] = us;
+    s_lat.total_us[op] += us;
+    s_lat.count[op]++;
+    if (us >= 1000000) s_lat.over_1s++;
+    else if (us >= 100000) s_lat.over_100ms++;
+    if (us >= SW_SLOW_OP_US) {
+        ESP_LOGW(TAG, "slow SD %s: %u ms (core %d)", sw_op_names[op],
+                 (unsigned)(us / 1000), xPortGetCoreID());
+    }
+}
+
+static void lat_report(void)
+{
+    ESP_LOGI(TAG, "SD latency (max/avg us): "
+             "write=%u/%u flush=%u/%u header=%u/%u fsync=%u/%u "
+             "ckpt=%u/%u manifest=%u/%u open=%u/%u; >100ms=%u >1s=%u",
+             (unsigned)s_lat.max_us[SW_OP_WRITE],
+             (unsigned)(s_lat.count[SW_OP_WRITE] ? s_lat.total_us[SW_OP_WRITE] / s_lat.count[SW_OP_WRITE] : 0),
+             (unsigned)s_lat.max_us[SW_OP_FLUSH],
+             (unsigned)(s_lat.count[SW_OP_FLUSH] ? s_lat.total_us[SW_OP_FLUSH] / s_lat.count[SW_OP_FLUSH] : 0),
+             (unsigned)s_lat.max_us[SW_OP_HEADER],
+             (unsigned)(s_lat.count[SW_OP_HEADER] ? s_lat.total_us[SW_OP_HEADER] / s_lat.count[SW_OP_HEADER] : 0),
+             (unsigned)s_lat.max_us[SW_OP_FSYNC],
+             (unsigned)(s_lat.count[SW_OP_FSYNC] ? s_lat.total_us[SW_OP_FSYNC] / s_lat.count[SW_OP_FSYNC] : 0),
+             (unsigned)s_lat.max_us[SW_OP_CKPT],
+             (unsigned)(s_lat.count[SW_OP_CKPT] ? s_lat.total_us[SW_OP_CKPT] / s_lat.count[SW_OP_CKPT] : 0),
+             (unsigned)s_lat.max_us[SW_OP_MANIFEST],
+             (unsigned)(s_lat.count[SW_OP_MANIFEST] ? s_lat.total_us[SW_OP_MANIFEST] / s_lat.count[SW_OP_MANIFEST] : 0),
+             (unsigned)s_lat.max_us[SW_OP_OPEN],
+             (unsigned)(s_lat.count[SW_OP_OPEN] ? s_lat.total_us[SW_OP_OPEN] / s_lat.count[SW_OP_OPEN] : 0),
+             (unsigned)s_lat.over_100ms, (unsigned)s_lat.over_1s);
+}
+
+/* Record an I/O failure once, loudly, and surface it to the user.  Silent
+ * loss becoming visible loss is most of the value of this path. */
+static void io_fail(session_writer_t *s, const char *what)
+{
+    if (!s) return;
+    s->io_errors++;
+    if (!s->storage_failed) {
+        s->storage_failed = true;
+        snprintf(s->first_io_error, sizeof(s->first_io_error), "%s: %s",
+                 what, strerror(errno));
+        ESP_LOGE(TAG, "STORAGE FAILURE (%s) — errno=%d (%s)",
+                 what, errno, strerror(errno));
+        bsp_display_set_notice("SD write error");
+    } else {
+        ESP_LOGW(TAG, "storage error #%u (%s)", (unsigned)s->io_errors, what);
+    }
+}
+
+static bool write_exact(session_writer_t *s, FILE *f, const void *data,
+                        size_t len, const char *what)
+{
+    if (!f || len == 0) return f != NULL;
+    int64_t t0 = lat_begin();
+    size_t n = fwrite(data, 1, len, f);
+    lat_end(SW_OP_WRITE, t0);
+    if (n != len) {
+        io_fail(s, what);
+        return false;
+    }
+    return true;
+}
+
+/* ── Header write / repair ────────────────────────────────────────── */
+
+static bool write_snt_header(session_writer_t *s, FILE *f, uint8_t tier,
+                             uint16_t hz_x10, uint8_t n_ch,
+                             int64_t start_epoch_ms)
 {
     snt_header_t hdr = {
         .magic = SNT_MAGIC,
@@ -233,44 +495,291 @@ static void write_snt_header(FILE *f, uint8_t tier, uint16_t hz_x10,
         .sample_count = 0,
         .reserved2 = 0,
     };
-    fwrite(&hdr, 1, SNT_HEADER_SIZE, f);
+    return write_exact(s, f, &hdr, SNT_HEADER_SIZE, "header write");
 }
 
-static void update_snt_header_sample_count(FILE *f, uint32_t count)
+static bool update_snt_header_sample_count(session_writer_t *s, FILE *f,
+                                           uint32_t count)
 {
-    if (!f) return;
+    if (!f) return true;
+    int64_t th = lat_begin();
     long pos = ftell(f);
-    fseek(f, offsetof(snt_header_t, sample_count), SEEK_SET);
-    fwrite(&count, sizeof(uint32_t), 1, f);
-    fflush(f);
-    fseek(f, pos, SEEK_SET);
+    if (fseek(f, offsetof(snt_header_t, sample_count), SEEK_SET) != 0) {
+        io_fail(s, "header seek");
+        return false;
+    }
+    bool ok = write_exact(s, f, &count, sizeof(uint32_t), "header update");
+    if (fflush(f) != 0) { io_fail(s, "header flush"); ok = false; }
+    lat_end(SW_OP_HEADER, th);
+    if (fseek(f, pos, SEEK_SET) != 0) { io_fail(s, "header restore"); ok = false; }
+    return ok;
 }
 
-/* ── Flush ────────────────────────────────────────────────────────── */
+/* ── Batch pool ───────────────────────────────────────────────────── */
 
-/* v2 format: flow and pressure are written to separate .snt files.
- * v1 (backwards compat) interleaved both into a single brp.snt with a
- * 4-channel brp_mm.snt sidecar (flowMin/Max + pressMin/Max).
- * v2 writes flow.snt (1-ch), press.snt (1-ch), and flow_mm.snt (2-ch:
- * flowMin/Max only — pressure overview is not needed by the web UI since
- * the pressure graph uses PLD data). */
-static void flush_flow(session_writer_t *s)
+static void batch_reset(stream_batch_t *b)
 {
-    if (!s->flow.f_l0 || s->brp_buf_count == 0) return;
+    b->n_brp = 0;
+    b->n_sa2 = 0;
+    b->n_pld = 0;
+    b->elapsed_us = 0;
+    b->last_stream_us = 0;
+}
 
-    /* L0: flow only (1 channel per sample) */
-    for (uint32_t i = 0; i < s->brp_buf_count; i++) {
-        fwrite(&s->brp_flow[i], sizeof(int16_t), 1, s->flow.f_l0);
+static bool batch_pool_create(session_writer_t *s)
+{
+    s->batch_pool = xQueueCreate(SW_BATCH_POOL, sizeof(stream_batch_t *));
+    if (!s->batch_pool) return false;
+    for (int i = 0; i < SW_BATCH_POOL; i++) {
+        /* Large sample buffers live in PSRAM: they are never touched from an
+         * ISR, and internal RAM is shared with Wi-Fi/BLE DMA. */
+        s->batches[i] = heap_caps_calloc(1, sizeof(stream_batch_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s->batches[i]) {
+            s->batches[i] = calloc(1, sizeof(stream_batch_t));
+        }
+        if (!s->batches[i]) {
+            ESP_LOGE(TAG, "batch pool alloc failed at %d", i);
+            return false;
+        }
+        if (i > 0) {
+            /* batches[0] becomes the initial fill buffer. */
+            xQueueSend(s->batch_pool, &s->batches[i], 0);
+        }
+    }
+    s->fill = s->batches[0];
+    batch_reset(s->fill);
+    return true;
+}
+
+static void batch_pool_destroy(session_writer_t *s)
+{
+    if (s->batch_pool) {
+        stream_batch_t *b;
+        while (xQueueReceive(s->batch_pool, &b, 0) == pdTRUE) { /* drain */ }
+        vQueueDelete(s->batch_pool);
+        s->batch_pool = NULL;
+    }
+    for (int i = 0; i < SW_BATCH_POOL; i++) {
+        free(s->batches[i]);
+        s->batches[i] = NULL;
+    }
+    s->fill = NULL;
+}
+
+/* Hand the current fill batch to the storage worker and take a fresh one.
+ * Caller holds fill_mutex.  Returns false if the batch could not be handed
+ * off (pool exhausted or queue full) — the caller keeps filling and the
+ * loss is counted, never silent. */
+static bool swap_and_enqueue_locked(session_writer_t *s)
+{
+    if (!s->fill || s->fill->n_brp == 0) {
+        if (!s->fill || (s->fill->n_sa2 == 0 && s->fill->n_pld == 0))
+            return true;   /* nothing to commit */
     }
 
-    /* L1: 1-second MinMax for flow only (25 samples per second) */
+    stream_batch_t *next = NULL;
+    if (xQueueReceive(s->batch_pool, &next, 0) != pdTRUE) {
+        s->batch_dropped++;
+        return false;
+    }
+
+    stream_batch_t *full = s->fill;
+    full->last_stream_us = s->last_stream_us;
+    full->elapsed_us = esp_timer_get_time() - s->start_time_us;
+
+    sw_cmd_t cmd = { .type = SW_CMD_BATCH, .s = s, .batch = full };
+    if (xQueueSend(s_storage_q, &cmd, 0) != pdTRUE) {
+        /* Put the spare back; keep filling the current batch. */
+        xQueueSend(s->batch_pool, &next, 0);
+        s->batch_dropped++;
+        return false;
+    }
+
+    batch_reset(next);
+    s->fill = next;
+    return true;
+}
+
+static void producer_commit(session_writer_t *s)
+{
+    if (!s || !s->fill_mutex) return;
+    xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
+    swap_and_enqueue_locked(s);
+    xSemaphoreGive(s->fill_mutex);
+}
+
+/* ── Checkpoint ───────────────────────────────────────────────────── */
+
+static void ckpt_write(session_writer_t *s)
+{
+    if (!s->f_ckpt) return;
+
+    snt_ckpt_t c = {
+        .magic = CKPT_MAGIC,
+        .version = CKPT_VERSION,
+        .reserved = 0,
+        .seq = ++s->ckpt_seq,
+        .flow_count = s->flow.sample_count,
+        .press_count = s->press.sample_count,
+        .flow_mm_count = s->flow_mm_count,
+        .sa2_count = s->sa2.sample_count,
+        .pld_count = s->pld_f.sample_count,
+        .start_epoch_ms = s->start_epoch_ms,
+        .elapsed_us = s->committed_elapsed_us,
+        .last_stream_us = s->committed_last_stream_us,
+        .crc32 = 0,
+    };
+    c.crc32 = esp_rom_crc32_le(0, (const uint8_t *)&c,
+                               sizeof(c) - sizeof(uint32_t));
+
+    int64_t t0 = lat_begin();
+    long off = (long)((s->ckpt_seq % CKPT_SLOTS) * CKPT_SLOT_SIZE);
+    if (fseek(s->f_ckpt, off, SEEK_SET) != 0) { io_fail(s, "ckpt seek"); return; }
+    if (!write_exact(s, s->f_ckpt, &c, sizeof(c), "ckpt write")) return;
+    if (fflush(s->f_ckpt) != 0) { io_fail(s, "ckpt flush"); return; }
+    if (fsync(fileno(s->f_ckpt)) != 0) io_fail(s, "ckpt fsync");
+    lat_end(SW_OP_CKPT, t0);
+}
+
+/* Read the newest valid checkpoint slot.  Returns false if none. */
+static bool ckpt_read_best(const char *path, snt_ckpt_t *out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    bool found = false;
+    for (int i = 0; i < CKPT_SLOTS; i++) {
+        snt_ckpt_t c;
+        if (fseek(f, (long)(i * CKPT_SLOT_SIZE), SEEK_SET) != 0) break;
+        if (fread(&c, 1, sizeof(c), f) != sizeof(c)) continue;
+        if (c.magic != CKPT_MAGIC || c.version != CKPT_VERSION) continue;
+        uint32_t crc = esp_rom_crc32_le(0, (const uint8_t *)&c,
+                                        sizeof(c) - sizeof(uint32_t));
+        if (crc != c.crc32) continue;
+        if (!found || c.seq > out->seq) { *out = c; found = true; }
+    }
+    fclose(f);
+    return found;
+}
+
+/* ── Storage worker: file lifecycle ───────────────────────────────── */
+
+static void storage_open(session_writer_t *s)
+{
+    char path[MAX_SESSION_DIR_LEN + 64];
+    int64_t t_open = lat_begin();
+
+    if (mkdir(s->dir, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "failed to create noon-day dir %s: %s",
+                 s->dir, strerror(errno));
+        io_fail(s, "mkdir");
+        return;
+    }
+
+    /* DST fallback / same-second restart: the same local timestamp can occur
+     * twice.  Resolve here (worker context) rather than on the notification
+     * path, then keep the resolved id — sw_post reads it only after this
+     * command has run. */
+    {
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/%s_flow.snt", s->dir, s->session_id);
+        if (stat(path, &st) == 0) {
+            /* Bounded so "<base>_<n>" always fits in session_id. */
+            char base[32];
+            strlcpy(base, s->session_id, sizeof(base));
+            bool resolved = false;
+            for (int n = 2; n < 100; n++) {
+                snprintf(path, sizeof(path), "%s/%s_%d_flow.snt", s->dir, base, n);
+                if (stat(path, &st) != 0) {
+                    snprintf(s->session_id, sizeof(s->session_id), "%s_%d", base, n);
+                    resolved = true;
+                    break;
+                }
+            }
+            if (!resolved) {
+                ESP_LOGE(TAG, "cannot find unique session prefix for %s", base);
+                io_fail(s, "session id collision");
+                return;
+            }
+        }
+    }
+
+    int64_t start_ms = s->start_epoch_ms;
+    bool ok = true;
+
+    snprintf(path, sizeof(path), "%s/%s_flow.snt", s->dir, s->session_id);
+    s->flow.f_l0 = fopen(path, "wb");
+    ok = ok && s->flow.f_l0 && write_snt_header(s, s->flow.f_l0, 0, 250, 1, start_ms);
+
+    snprintf(path, sizeof(path), "%s/%s_press.snt", s->dir, s->session_id);
+    s->press.f_l0 = fopen(path, "wb");
+    ok = ok && s->press.f_l0 && write_snt_header(s, s->press.f_l0, 0, 250, 1, start_ms);
+
+    snprintf(path, sizeof(path), "%s/%s_flow_mm.snt", s->dir, s->session_id);
+    s->flow.f_l1 = fopen(path, "wb");
+    ok = ok && s->flow.f_l1 && write_snt_header(s, s->flow.f_l1, 1, 10, 2, start_ms);
+
+    snprintf(path, sizeof(path), "%s/%s_sa2.snt", s->dir, s->session_id);
+    s->sa2.f_l0 = fopen(path, "wb");
+    ok = ok && s->sa2.f_l0 && write_snt_header(s, s->sa2.f_l0, 0, 10, 2, start_ms);
+
+    snprintf(path, sizeof(path), "%s/%s_pld.snt", s->dir, s->session_id);
+    s->pld_f.f_l0 = fopen(path, "wb");
+    ok = ok && s->pld_f.f_l0 && write_snt_header(s, s->pld_f.f_l0, 0, 5, 12, start_ms);
+
+    snprintf(path, sizeof(path), "%s/%s_events.snt", s->dir, s->session_id);
+    s->f_events = fopen(path, "w");
+    if (!s->f_events) ESP_LOGW(TAG, "failed to open events file (non-fatal)");
+
+    snprintf(path, sizeof(path), "%s/%s.ckpt", s->dir, s->session_id);
+    s->f_ckpt = fopen(path, "wb+");
+    if (!s->f_ckpt) ESP_LOGW(TAG, "failed to open checkpoint file (non-fatal)");
+
+    if (!ok) {
+        ESP_LOGE(TAG, "failed to open/initialise .snt files for %s", s->session_id);
+        io_fail(s, "session open");
+        return;
+    }
+
+    /* Make the session identity durable NOW.  fflush() only pushes stdio
+     * into FATFS RAM; without fsync() the directory entry still reports 0
+     * bytes, which is how a reset inside the first commit interval used to
+     * leave an unrecoverable session. */
+    FILE *all[] = { s->flow.f_l0, s->press.f_l0, s->flow.f_l1,
+                    s->sa2.f_l0, s->pld_f.f_l0, s->f_events };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        if (!all[i]) continue;
+        if (fflush(all[i]) != 0) io_fail(s, "open flush");
+        if (fsync(fileno(all[i])) != 0) io_fail(s, "open fsync");
+    }
+
+    s->files_open = true;
+    s->committed_elapsed_us = 0;
+    s->committed_last_stream_us = 0;
+    ckpt_write(s);
+    lat_end(SW_OP_OPEN, t_open);
+
+    ESP_LOGI(TAG, "=== SESSION STARTED: %s ===", s->session_id);
+    ESP_LOGI(TAG, "dir: %s", s->dir);
+}
+
+/* Write one detached batch.  No locks held: the batch is immutable. */
+static void storage_write_batch(session_writer_t *s, stream_batch_t *b)
+{
+    if (!s->files_open) return;
+
+    /* flow (L0) + 1 Hz MinMax sidecar (L1) */
+    for (uint32_t i = 0; i < b->n_brp; i++) {
+        if (!write_exact(s, s->flow.f_l0, &b->brp_flow[i], sizeof(int16_t),
+                         "flow write")) return;
+    }
     if (s->flow.f_l1) {
-        uint32_t n_sec = s->brp_buf_count / 25;
+        uint32_t n_sec = b->n_brp / 25;
         for (uint32_t sec = 0; sec < n_sec; sec++) {
             uint32_t base = sec * 25;
             int16_t fmn = INT16_MAX, fmx = INT16_MIN;
             for (int j = 0; j < 25; j++) {
-                int16_t fv = s->brp_flow[base + j];
+                int16_t fv = b->brp_flow[base + j];
                 if (fv != SNT_MISSING) {
                     if (fv < fmn) fmn = fv;
                     if (fv > fmx) fmx = fv;
@@ -278,157 +787,165 @@ static void flush_flow(session_writer_t *s)
             }
             if (fmn == INT16_MAX) { fmn = fmx = SNT_MISSING; }
             int16_t mm[2] = { fmn, fmx };
-            fwrite(mm, sizeof(int16_t), 2, s->flow.f_l1);
+            if (!write_exact(s, s->flow.f_l1, mm, sizeof(mm), "flow_mm write"))
+                return;
             s->flow_mm_count++;
         }
     }
+    /* pressure — same count as flow, by construction */
+    for (uint32_t i = 0; i < b->n_brp; i++) {
+        if (!write_exact(s, s->press.f_l0, &b->brp_press[i], sizeof(int16_t),
+                         "press write")) return;
+    }
+    s->flow.sample_count += b->n_brp;
+    s->press.sample_count += b->n_brp;
 
-    s->flow.sample_count += s->brp_buf_count;
+    for (uint32_t i = 0; i < b->n_sa2; i++) {
+        int16_t pair[2] = { b->sa2_hr[i], b->sa2_spo2[i] };
+        if (!write_exact(s, s->sa2.f_l0, pair, sizeof(pair), "sa2 write")) return;
+    }
+    s->sa2.sample_count += b->n_sa2;
+
+    for (uint32_t i = 0; i < b->n_pld; i++) {
+        if (!write_exact(s, s->pld_f.f_l0, b->pld[i], sizeof(int16_t) * 12,
+                         "pld write")) return;
+    }
+    s->pld_f.sample_count += b->n_pld;
+
+    if (b->elapsed_us > s->committed_elapsed_us)
+        s->committed_elapsed_us = b->elapsed_us;
+    if (b->last_stream_us > s->committed_last_stream_us)
+        s->committed_last_stream_us = b->last_stream_us;
+
+    s->have_uncommitted = true;
 }
 
-static void flush_press(session_writer_t *s)
+/* Ordered durability commit: data → headers → fsync → checkpoint → fsync. */
+static void storage_commit(session_writer_t *s)
 {
-    if (!s->press.f_l0 || s->brp_buf_count == 0) return;
+    if (!s->files_open || !s->have_uncommitted) return;
 
-    /* L0: pressure only (1 channel per sample, no L1 sidecar) */
-    for (uint32_t i = 0; i < s->brp_buf_count; i++) {
-        fwrite(&s->brp_press[i], sizeof(int16_t), 1, s->press.f_l0);
+    struct { FILE *f; uint32_t count; } items[] = {
+        { s->flow.f_l0,  s->flow.sample_count  },
+        { s->flow.f_l1,  s->flow_mm_count      },
+        { s->press.f_l0, s->press.sample_count },
+        { s->sa2.f_l0,   s->sa2.sample_count   },
+        { s->pld_f.f_l0, s->pld_f.sample_count },
+    };
+
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        if (!items[i].f) continue;
+        int64_t t0 = lat_begin();
+        if (fflush(items[i].f) != 0) io_fail(s, "data flush");
+        lat_end(SW_OP_FLUSH, t0);
+    }
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        if (!items[i].f) continue;
+        update_snt_header_sample_count(s, items[i].f, items[i].count);
+    }
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        if (!items[i].f) continue;
+        int64_t t0 = lat_begin();
+        if (fsync(fileno(items[i].f)) != 0) io_fail(s, "data fsync");
+        lat_end(SW_OP_FSYNC, t0);
+    }
+    if (s->f_events) {
+        if (fflush(s->f_events) != 0) io_fail(s, "events flush");
+        if (fsync(fileno(s->f_events)) != 0) io_fail(s, "events fsync");
     }
 
-    s->press.sample_count += s->brp_buf_count;
-    s->brp_buf_count = 0;
+    /* Only now may the checkpoint claim these counts are durable. */
+    ckpt_write(s);
+    s->have_uncommitted = false;
+
+    ESP_LOGI(TAG, "commit: flow=%u press=%u sa2=%u pld=%u seq=%u",
+             (unsigned)s->flow.sample_count, (unsigned)s->press.sample_count,
+             (unsigned)s->sa2.sample_count, (unsigned)s->pld_f.sample_count,
+             (unsigned)s->ckpt_seq);
+
+    /* Every 10th commit (~5 min at the default interval), summarise SD
+     * latency so a degrading card shows up in the log before it costs a
+     * night of data. */
+    if ((s->ckpt_seq % 10) == 0) lat_report();
 }
 
-static void flush_sa2(session_writer_t *s)
+/* ── Manifest ─────────────────────────────────────────────────────── */
+
+static void write_manifest(session_writer_t *s, const char *state)
 {
-    if (!s->sa2.f_l0 || s->sa2_buf_count == 0) return;
-
-    for (uint32_t i = 0; i < s->sa2_buf_count; i++) {
-        int16_t pair[2] = { s->sa2_hr[i], s->sa2_spo2[i] };
-        fwrite(pair, sizeof(int16_t), 2, s->sa2.f_l0);
-    }
-    s->sa2.sample_count += s->sa2_buf_count;
-    s->sa2_buf_count = 0;
-}
-
-static void flush_pld(session_writer_t *s)
-{
-    if (!s->pld.f_l0 || s->pld_buf_count == 0) return;
-
-    for (uint32_t i = 0; i < s->pld_buf_count; i++) {
-        fwrite(s->pld_buf[i], sizeof(int16_t), 12, s->pld.f_l0);
-    }
-    s->pld.sample_count += s->pld_buf_count;
-    s->pld_buf_count = 0;
-}
-
-static void flush_all(session_writer_t *s)
-{
-    if (!s) return;
-
-    xSemaphoreTake(s->mutex, portMAX_DELAY);
-
-    flush_flow(s);
-    flush_press(s);
-    flush_sa2(s);
-    flush_pld(s);
-
-    /* sync all files.
-     *
-     * fflush() only pushes the newlib stdio buffer into FATFS via write() —
-     * it does NOT call f_sync(), so the FAT directory entry (file size),
-     * the cluster chain and the FSINFO block stay in FATFS RAM.  If the
-     * device resets before fclose(), the directory entry still reports
-     * 0 bytes and every sample written since the file was opened becomes
-     * unreachable (orphaned clusters), which is exactly how session
-     * 20260808_012019 lost 4h39m of therapy data to an INT_WDT reset.
-     *
-     * fsync() maps to f_sync() in ESP-IDF's vfs_fat, committing the
-     * metadata to the card and bounding crash loss to one flush interval. */
-    if (s->flow.f_l0) { fflush(s->flow.f_l0); update_snt_header_sample_count(s->flow.f_l0, s->flow.sample_count); fsync(fileno(s->flow.f_l0)); }
-    if (s->flow.f_l1) { fflush(s->flow.f_l1); update_snt_header_sample_count(s->flow.f_l1, s->flow_mm_count); fsync(fileno(s->flow.f_l1)); }
-    if (s->press.f_l0) { fflush(s->press.f_l0); update_snt_header_sample_count(s->press.f_l0, s->press.sample_count); fsync(fileno(s->press.f_l0)); }
-    if (s->sa2.f_l0) { fflush(s->sa2.f_l0); update_snt_header_sample_count(s->sa2.f_l0, s->sa2.sample_count); fsync(fileno(s->sa2.f_l0)); }
-    if (s->pld.f_l0) { fflush(s->pld.f_l0); update_snt_header_sample_count(s->pld.f_l0, s->pld.sample_count); fsync(fileno(s->pld.f_l0)); }
-    if (s->f_events) { fflush(s->f_events); fsync(fileno(s->f_events)); }
-
-    ESP_LOGI(TAG, "flush: flow=%u press=%u sa2=%u pld=%u samples",
-             (unsigned)s->flow.sample_count,
-             (unsigned)s->press.sample_count,
-             (unsigned)s->sa2.sample_count,
-             (unsigned)s->pld.sample_count);
-
-    xSemaphoreGive(s->mutex);
-}
-
-/* ── Flush task ───────────────────────────────────────────────────── */
-
-static void flush_task(void *arg)
-{
-    session_writer_t *s = (session_writer_t *)arg;
-    while (s && s->active) {
-        /* Wait for flush interval OR until woken by stop_task */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FLUSH_INTERVAL_SEC * 1000));
-        if (s->active) {
-            ESP_LOGI(TAG, "periodic flush tick");
-            flush_all(s);
-        }
-    }
-    vTaskDelete(NULL);
-}
-
-/* ── Session JSON ─────────────────────────────────────────────────── */
-
-static void write_session_json(session_writer_t *s, const char *state)
-{
-    char path[MAX_SESSION_DIR_LEN + 48];
+    char path[MAX_SESSION_DIR_LEN + 64];
+    char tmp[MAX_SESSION_DIR_LEN + 72];
     snprintf(path, sizeof(path), "%s/%s_session.json", s->dir, s->session_id);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "id", s->session_id);
-
     cJSON_AddNumberToObject(root, "start_epoch_ms", (double)s->start_epoch_ms);
-    if (s->end_epoch_ms > 0) {
+    if (s->end_epoch_ms > 0)
         cJSON_AddNumberToObject(root, "end_epoch_ms", (double)s->end_epoch_ms);
-    }
 
-    char iso_start[32], iso_end[32];
+    char iso[32];
     struct tm tm;
     time_t start = (time_t)(s->start_epoch_ms / 1000);
     localtime_r(&start, &tm);
-    strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
-    cJSON_AddStringToObject(root, "start_iso", iso_start);
-
+    strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%S", &tm);
+    cJSON_AddStringToObject(root, "start_iso", iso);
     if (s->end_epoch_ms > 0) {
         time_t end = (time_t)(s->end_epoch_ms / 1000);
         localtime_r(&end, &tm);
-        strftime(iso_end, sizeof(iso_end), "%Y-%m-%dT%H:%M:%S", &tm);
-        cJSON_AddStringToObject(root, "end_iso", iso_end);
+        strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%S", &tm);
+        cJSON_AddStringToObject(root, "end_iso", iso);
     }
 
     cJSON_AddStringToObject(root, "state", state);
-
-    /* v2 format marker: flow and pressure are in separate .snt files.
-     * v1 sessions (created before this change) do not have this field;
-     * readers default to fmt=1 and use the legacy brp.snt / brp_mm.snt files. */
     cJSON_AddNumberToObject(root, "fmt", 2);
 
-    /* Sample counts — field names kept as brp_samples / brp_mm_samples for
-     * backwards compatibility with existing manifest readers; they now
-     * reflect the flow file's sample count. */
     cJSON_AddNumberToObject(root, "brp_samples", (double)s->flow.sample_count);
     cJSON_AddNumberToObject(root, "brp_mm_samples", (double)s->flow_mm_count);
     cJSON_AddNumberToObject(root, "press_samples", (double)s->press.sample_count);
     cJSON_AddNumberToObject(root, "sa2_samples", (double)s->sa2.sample_count);
-    cJSON_AddNumberToObject(root, "pld_samples", (double)s->pld.sample_count);
+    cJSON_AddNumberToObject(root, "pld_samples", (double)s->pld_f.sample_count);
 
-    /* Stream quality: BLE notification reception statistics. */
     cJSON_AddNumberToObject(root, "stream_notifications", (double)s->stream_notifications);
     cJSON_AddNumberToObject(root, "gap_events", (double)s->gap_events);
     cJSON_AddNumberToObject(root, "gap_missing", (double)s->gap_missing_total);
 
+    /* Uncompensated discontinuities: recorded honestly rather than padded. */
+    if (s->gap_long_events) {
+        cJSON_AddNumberToObject(root, "gap_long_events", (double)s->gap_long_events);
+        cJSON_AddNumberToObject(root, "gap_long_ms", (double)s->gap_long_ms_total);
+        cJSON_AddNumberToObject(root, "gap_long_first_offset_ms", (double)s->gap_long_first_ms);
+        cJSON_AddNumberToObject(root, "gap_long_last_offset_ms", (double)s->gap_long_last_ms);
+    }
+
+    /* Silent loss becoming visible loss. */
+    if (s->brp_dropped || s->sa2_dropped || s->pld_dropped ||
+        s->batch_dropped || s->event_dropped) {
+        cJSON_AddNumberToObject(root, "brp_dropped", (double)s->brp_dropped);
+        cJSON_AddNumberToObject(root, "sa2_dropped", (double)s->sa2_dropped);
+        cJSON_AddNumberToObject(root, "pld_dropped", (double)s->pld_dropped);
+        cJSON_AddNumberToObject(root, "batch_dropped", (double)s->batch_dropped);
+        cJSON_AddNumberToObject(root, "event_dropped", (double)s->event_dropped);
+    }
+    if (s->io_errors) {
+        cJSON_AddNumberToObject(root, "io_errors", (double)s->io_errors);
+        cJSON_AddStringToObject(root, "io_error_first", s->first_io_error);
+    }
+
     cJSON_AddNumberToObject(root, "clock_drift_ms", (double)s->clock_drift_ms);
     cJSON_AddBoolToObject(root, "clock_drift_valid", s->clock_drift_valid);
+    cJSON_AddStringToObject(root, "clock_drift_source",
+                            s->clock_drift_source ? s->clock_drift_source : "none");
+    if (s->clock_drift_measured_at_ms > 0)
+        cJSON_AddNumberToObject(root, "clock_drift_measured_at_ms",
+                                (double)s->clock_drift_measured_at_ms);
+    /* A measured drift and an estimate must never look alike to a consumer. */
+    cJSON_AddBoolToObject(root, "clock_drift_usable",
+                          s->clock_drift_valid ||
+                          (s->clock_drift_source &&
+                           strcmp(s->clock_drift_source, "none") != 0));
+
+    cJSON_AddNumberToObject(root, "end_source_checkpoint_seq", (double)s->ckpt_seq);
 
     const char *src_str = "none";
     switch (time_source_get()) {
@@ -443,311 +960,495 @@ static void write_session_json(session_writer_t *s, const char *state)
 
     char *json_str = cJSON_Print(root);
     cJSON_Delete(root);
+    if (!json_str) return;
 
-    FILE *f = fopen(path, "w");
+    /* temp → checked write → fflush → fsync → rename.  A crash must never
+     * leave a half-written manifest that recovery would trust. */
+    bool ok = false;
+    int64_t t_man = lat_begin();
+    size_t len = strlen(json_str);
+    FILE *f = fopen(tmp, "w");
     if (f) {
-        fputs(json_str, f);
-        fclose(f);
-        ESP_LOGI(TAG, "wrote %s (state=%s)", path, state);
-    } else {
+        ok = (fwrite(json_str, 1, len, f) == len);
+        if (ok && fflush(f) != 0) ok = false;
+        if (ok && fsync(fileno(f)) != 0) ok = false;
+        if (fclose(f) != 0) ok = false;
+    }
+    if (ok) {
+        unlink(path);                       /* FATFS cannot rename-over */
+        if (rename(tmp, path) != 0) ok = false;
+    }
+    lat_end(SW_OP_MANIFEST, t_man);
+    if (!ok) {
+        unlink(tmp);
+        io_fail(s, "manifest write");
         ESP_LOGE(TAG, "failed to write %s", path);
+    } else {
+        ESP_LOGI(TAG, "wrote %s (state=%s)", path, state);
     }
     free(json_str);
+}
+
+static void storage_finalize(session_writer_t *s, const sw_cmd_t *cmd)
+{
+    s->end_epoch_ms = cmd->end_epoch_ms;
+    s->end_time_us = esp_timer_get_time();
+    s->clock_drift_ms = cmd->clock_drift_ms;
+    s->clock_drift_valid = cmd->drift_valid;
+    s->clock_drift_source = cmd->drift_source;
+    s->clock_drift_measured_at_ms = cmd->drift_measured_at_ms;
+
+    storage_commit(s);
+
+    if (s->flow.f_l0)  { fclose(s->flow.f_l0);  s->flow.f_l0 = NULL; }
+    if (s->flow.f_l1)  { fclose(s->flow.f_l1);  s->flow.f_l1 = NULL; }
+    if (s->press.f_l0) { fclose(s->press.f_l0); s->press.f_l0 = NULL; }
+    if (s->sa2.f_l0)   { fclose(s->sa2.f_l0);   s->sa2.f_l0 = NULL; }
+    if (s->pld_f.f_l0) { fclose(s->pld_f.f_l0); s->pld_f.f_l0 = NULL; }
+    if (s->f_events)   { fclose(s->f_events);   s->f_events = NULL; }
+    if (s->f_ckpt)     { fclose(s->f_ckpt);     s->f_ckpt = NULL; }
+    s->files_open = false;
+
+    /* Never claim "completed" when storage failed — that is the difference
+     * between a trustworthy manifest and a plausible-looking lie. */
+    const char *state = cmd->state;
+    if (s->storage_failed) state = "storage_failed";
+    write_manifest(s, state);
+
+    ESP_LOGI(TAG, "=== SESSION STOPPED: %s (%s) ===", s->session_id, state);
+    ESP_LOGI(TAG, "flow=%u press=%u sa2=%u pld=%u total samples",
+             (unsigned)s->flow.sample_count, (unsigned)s->press.sample_count,
+             (unsigned)s->sa2.sample_count, (unsigned)s->pld_f.sample_count);
+
+    if (s->stream_notifications > 0) {
+        uint32_t expected = s->stream_notifications + s->gap_missing_total;
+        uint32_t loss_bps = expected ? (s->gap_missing_total * 10000) / expected : 0;
+        ESP_LOGI(TAG, "stream quality: %u notifications received, "
+                 "%u gap events, %u missing compensated, loss rate %u.%02u%%",
+                 (unsigned)s->stream_notifications, (unsigned)s->gap_events,
+                 (unsigned)s->gap_missing_total, loss_bps / 100, loss_bps % 100);
+    }
+    if (s->gap_long_events) {
+        ESP_LOGW(TAG, "uncompensated discontinuities: %u events, %llu ms total",
+                 (unsigned)s->gap_long_events,
+                 (unsigned long long)s->gap_long_ms_total);
+    }
+    if (s->brp_dropped || s->sa2_dropped || s->pld_dropped ||
+        s->batch_dropped || s->event_dropped) {
+        ESP_LOGW(TAG, "dropped: brp=%u sa2=%u pld=%u batches=%u events=%u",
+                 (unsigned)s->brp_dropped, (unsigned)s->sa2_dropped,
+                 (unsigned)s->pld_dropped, (unsigned)s->batch_dropped,
+                 (unsigned)s->event_dropped);
+    }
+
+    lat_report();
+
+    batch_pool_destroy(s);
+    if (s->fill_mutex) { vSemaphoreDelete(s->fill_mutex); s->fill_mutex = NULL; }
+}
+
+/* ── Storage worker task ──────────────────────────────────────────── */
+
+static void sw_storage_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "storage worker started on core %d", xPortGetCoreID());
+
+    int64_t last_commit_us = esp_timer_get_time();
+
+    while (1) {
+        sw_cmd_t cmd;
+        if (xQueueReceive(s_storage_q, &cmd, pdMS_TO_TICKS(500)) == pdTRUE) {
+            switch (cmd.type) {
+            case SW_CMD_OPEN:
+                storage_open(cmd.s);
+                last_commit_us = esp_timer_get_time();
+                break;
+
+            case SW_CMD_BATCH:
+                storage_write_batch(cmd.s, cmd.batch);
+                /* Return the buffer to the producer pool immediately. */
+                if (cmd.s->batch_pool)
+                    xQueueSend(cmd.s->batch_pool, &cmd.batch, 0);
+                break;
+
+            case SW_CMD_EVENT:
+                if (cmd.s->f_events && cmd.event_json) {
+                    if (fputs(cmd.event_json, cmd.s->f_events) < 0 ||
+                        fputc('\n', cmd.s->f_events) < 0) {
+                        io_fail(cmd.s, "event write");
+                    }
+                }
+                free(cmd.event_json);
+                break;
+
+            case SW_CMD_FINALIZE: {
+                session_writer_t *fs = cmd.s;
+                bool own = cmd.free_session;
+                storage_finalize(fs, &cmd);
+                if (cmd.done) xSemaphoreGive(cmd.done);
+                /* Normally sw_post owns the struct and frees it after the
+                 * export pipeline; only the fallback path hands it to us. */
+                if (own) free(fs);
+                break;
+            }
+            }
+            /* Fall through to the periodic check rather than `continue`, so a
+             * continuously busy queue cannot starve the commit interval or the
+             * stale-session watchdog. */
+        }
+
+        /* Periodic: bound uncommitted time, and close orphaned sessions. */
+        session_writer_t *s = s_active;
+        int64_t now = esp_timer_get_time();
+
+        if (s && s->active) {
+            if ((now - last_commit_us) / 1000 >= SW_COMMIT_INTERVAL_MS) {
+                producer_commit(s);          /* swap producer buffer  */
+                last_commit_us = now;
+                /* The batch lands on the queue; drain it before committing so
+                 * the checkpoint covers it. */
+                sw_cmd_t pending;
+                while (xQueuePeek(s_storage_q, &pending, 0) == pdTRUE &&
+                       pending.type == SW_CMD_BATCH) {
+                    if (xQueueReceive(s_storage_q, &pending, 0) != pdTRUE) break;
+                    storage_write_batch(pending.s, pending.batch);
+                    if (pending.s->batch_pool)
+                        xQueueSend(pending.s->batch_pool, &pending.batch, 0);
+                }
+                storage_commit(s);
+            }
+
+            /* Stale-session watchdog: monotonic, so a wall-clock step or an
+             * AS11 time-of-day jump cannot defeat it. */
+            int64_t idle_ms = (now - s->last_stream_us) / 1000;
+            if (s->last_stream_us > 0 && idle_ms >= SW_STALE_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "no StreamData for %lld ms — closing orphaned session",
+                         (long long)idle_ms);
+                sw_request_finalize(s, "timed_out",
+                                    (int64_t)time(NULL) * 1000, false);
+            }
+        } else if (s == NULL) {
+            last_commit_us = now;
+        }
+    }
+}
+
+/* ── Post-stop pipeline task ──────────────────────────────────────── */
+
+static void sw_post_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "post worker started on core %d", xPortGetCoreID());
+
+    while (1) {
+        sw_post_job_t job;
+        if (xQueueReceive(s_post_q, &job, portMAX_DELAY) != pdTRUE) continue;
+        session_writer_t *s = job.s;
+        if (!s) continue;
+
+        /* 1. Establish drift with honest provenance.
+         *
+         * The stop-time GetDateTime RPC is the authoritative source, but it
+         * is unavailable exactly when the link dropped — which is the common
+         * case for a timed-out session.  Never block on it there. */
+        int64_t drift_ms = 0;
+        bool drift_valid = false;
+        const char *drift_source = "none";
+        int64_t drift_at = job.end_epoch_ms;
+
+        if (job.allow_ble) {
+            int64_t as11_ms = 0;
+            if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
+                drift_ms = job.end_epoch_ms - as11_ms;
+                drift_valid = true;
+                drift_source = "measured_stop";
+                ESP_LOGI(TAG, "clock_drift_ms = %lld (stop-time)", (long long)drift_ms);
+            } else if (as11_ble_get_clock_drift(&drift_ms) == ESP_OK) {
+                drift_valid = true;
+                drift_source = "measured_prestream";
+                ESP_LOGI(TAG, "clock_drift_ms = %lld (pre-stream)", (long long)drift_ms);
+            }
+        }
+        if (!drift_valid) {
+            time_drift_snapshot_t snap;
+            if (time_sync_get_drift_snapshot(&snap) && snap.available) {
+                drift_ms = snap.drift_ms;
+                drift_at = snap.measured_at_ms;
+                drift_source = snap.source;   /* "nvs" | "sd" */
+                ESP_LOGW(TAG, "clock_drift_ms = %lld (estimate from %s)",
+                         (long long)drift_ms, drift_source);
+            } else {
+                ESP_LOGW(TAG, "clock_drift_ms unavailable");
+            }
+        }
+
+        /* 2. Hand the drift to the storage worker and wait for the files to
+         * be finalised, so the manifest is complete before anything reads it. */
+        SemaphoreHandle_t done = xSemaphoreCreateBinary();
+        sw_cmd_t fin = {
+            .type = SW_CMD_FINALIZE,
+            .s = s,
+            .end_epoch_ms = job.end_epoch_ms,
+            .clock_drift_ms = drift_ms,
+            .drift_valid = drift_valid,
+            .drift_source = drift_source,
+            .drift_measured_at_ms = drift_at,
+            .state = job.state,
+            .done = done,
+        };
+        xQueueSend(s_storage_q, &fin, portMAX_DELAY);
+        if (done) {
+            xSemaphoreTake(done, pdMS_TO_TICKS(60000));
+            vSemaphoreDelete(done);
+        }
+
+        /* 3. Persist drift only when the clock was NTP-authoritative, else a
+         * degraded-mode session would feed its own estimate back in. */
+        if (drift_valid && time_source_get() == TIME_SRC_NTP) {
+            time_sync_save_drift(drift_ms, job.end_epoch_ms);
+        }
+
+        char session_dir[MAX_SESSION_DIR_LEN];
+        char session_id[40];
+        strlcpy(session_dir, s->dir, sizeof(session_dir));
+        strlcpy(session_id, s->session_id, sizeof(session_id));
+        int64_t start_epoch_ms = s->start_epoch_ms;
+        int64_t end_epoch_ms = s->end_epoch_ms;
+        int64_t stop_boot_us = s->end_time_us;
+        bool storage_failed = s->storage_failed;
+
+        free(s);
+        s = NULL;
+
+        if (storage_failed) {
+            ESP_LOGE(TAG, "post: storage failed for %s — skipping export",
+                     session_id);
+            continue;
+        }
+
+        /* 4. Post-therapy collection (BLE spool pulls + Get RPC). */
+        bool spool_current = false;
+        if (job.allow_ble) {
+            ESP_LOGI(TAG, "post: starting post-therapy collection");
+            post_therapy_collect(session_dir, session_id, start_epoch_ms,
+                                 drift_ms, end_epoch_ms, &spool_current);
+            if (!spool_current) {
+                ESP_LOGI(TAG, "post: waiting for Summary spool to become current");
+                bool fresh = post_therapy_wait_spool_current(end_epoch_ms, drift_ms);
+                int64_t elapsed_ms = (esp_timer_get_time() - stop_boot_us) / 1000;
+                ESP_LOGI(TAG, "post: spool %s after %lld ms from stop",
+                         fresh ? "CURRENT" : "STALE (timeout)",
+                         (long long)elapsed_ms);
+            }
+        } else {
+            ESP_LOGW(TAG, "post: BLE unavailable, skipping spool collection for %s",
+                     session_id);
+        }
+
+        /* 5. EDF generation + upload trigger.  Runs here rather than in a
+         * per-stop task: one persistent worker means no allocation can fail
+         * at the exact moment a session needs exporting. */
+        esp_err_t ret = edf_gen_generate(session_dir, session_id,
+                                        start_epoch_ms, end_epoch_ms, drift_ms);
+        if (ret == ESP_OK) {
+            char day_folder[32];
+            time_t t = (time_t)(start_epoch_ms / 1000);
+            struct tm tm;
+            localtime_r(&t, &tm);
+            if (tm.tm_hour < 12) { t -= 86400; localtime_r(&t, &tm); }
+            snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+            uploader_on_day_ready(day_folder);
+        } else {
+            ESP_LOGW(TAG, "post: EDF generation failed, not triggering upload");
+        }
+
+        UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+        if (free_bytes < 2048) {
+            ESP_LOGW(TAG, "post worker: LOW STACK — %u bytes free at peak",
+                     (unsigned)free_bytes);
+        } else {
+            ESP_LOGI(TAG, "post worker: peak stack headroom %u bytes",
+                     (unsigned)free_bytes);
+        }
+    }
 }
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
 esp_err_t session_writer_init(void)
 {
+    if (s_ready) return ESP_OK;
+
     s_active_mutex = xSemaphoreCreateMutex();
     if (!s_active_mutex) return ESP_ERR_NO_MEM;
-    ESP_LOGI(TAG, "session writer initialised");
+
+    s_storage_q = xQueueCreate(SW_STORAGE_QUEUE_LEN, sizeof(sw_cmd_t));
+    s_post_q = xQueueCreate(SW_POST_QUEUE_LEN, sizeof(sw_post_job_t));
+    if (!s_storage_q || !s_post_q) {
+        ESP_LOGE(TAG, "session writer queue alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Persistent workers, created once.  If either cannot be created the
+     * caller disables recording visibly, rather than discovering the
+     * problem at TherapyStop when the night is already lost. */
+    s_storage_task = psram_task_create(sw_storage_task, "sw_storage", 8192,
+                                       NULL, 8, tskNO_AFFINITY, NULL, NULL);
+    if (!s_storage_task) {
+        ESP_LOGE(TAG, "storage worker creation failed");
+        return ESP_ERR_NO_MEM;
+    }
+    s_post_task = psram_task_create(sw_post_task, "sw_post", 16384,
+                                    NULL, 5, 1, NULL, NULL);
+    if (!s_post_task) {
+        ESP_LOGE(TAG, "post worker creation failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_ready = true;
+    ESP_LOGI(TAG, "session writer initialised (commit interval %d ms, "
+             "stale timeout %d ms)", SW_COMMIT_INTERVAL_MS, SW_STALE_TIMEOUT_MS);
     return ESP_OK;
 }
 
 session_writer_t *session_writer_start(void)
 {
+    if (!s_ready) {
+        ESP_LOGE(TAG, "cannot start session: writer not initialised");
+        return NULL;
+    }
     if (!sd_storage_is_ready()) {
         ESP_LOGE(TAG, "cannot start session: SD not ready");
         return NULL;
     }
+    if (!sd_storage_reserve_for_recording()) {
+        ESP_LOGE(TAG, "cannot start session: insufficient free space");
+        return NULL;
+    }
 
-    /* Stop any previously active session BEFORE creating a new one.
-     * We must NOT hold s_active_mutex while calling session_writer_stop(),
-     * because session_writer_stop() itself takes s_active_mutex — using a
-     * regular (non-recursive) mutex would deadlock.
-     *
-     * Instead: grab s_active under the mutex, clear it, release the mutex,
-     * then stop the previous session without holding the lock. */
+    /* Rotate any previous session through the normal stop pipeline. */
     xSemaphoreTake(s_active_mutex, portMAX_DELAY);
     session_writer_t *prev = s_active;
     s_active = NULL;
     xSemaphoreGive(s_active_mutex);
-
     if (prev) {
-        ESP_LOGW(TAG, "session already active, stopping previous");
-        session_writer_stop(prev);
-        free(prev);
+        ESP_LOGW(TAG, "session already active, rotating");
+        prev->active = false;
+        sw_request_finalize(prev, "rotated", (int64_t)time(NULL) * 1000, true);
     }
 
     session_writer_t *s = calloc(1, sizeof(session_writer_t));
-    if (!s) {
-        return NULL;
-    }
+    if (!s) return NULL;
 
-    s->mutex = xSemaphoreCreateMutex();
-    if (!s->mutex) {
+    s->fill_mutex = xSemaphoreCreateMutex();
+    if (!s->fill_mutex) { free(s); return NULL; }
+    if (!batch_pool_create(s)) {
+        batch_pool_destroy(s);
+        vSemaphoreDelete(s->fill_mutex);
         free(s);
         return NULL;
     }
 
-    s->pld_countdown = 1;  /* first notification writes PLD immediately */
-    s->sa2_countdown = 1;  /* first notification writes SA2 immediately */
-
-    /* Missing-packet compensation: no previous startTime until first
-     * notification arrives; no cached values to hold until first sample. */
-    s->prev_stream_ms_valid = false;
-    s->last_brp_valid = false;
-    s->last_hr_valid = false;
-    s->last_spo2_valid = false;
-    s->last_pld_valid = false;
-    s->stream_notifications = 0;
-    s->gap_events = 0;
-    s->gap_missing_total = 0;
-
-    make_session_id(s->session_id, sizeof(s->session_id));
-
-    /* Compute noon-day folder (YYYYMMDD) from local time.
-     * Sessions before noon belong to the previous day's folder. */
-    char noon_day[16];
-    noon_day_folder_local(time(NULL), noon_day, sizeof(noon_day));
-
-    /* Create the noon-day folder under .somnotrace/sessions/streams/ */
-    snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_STREAMS_DIR, noon_day);
-    if (mkdir(s->dir, 0775) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "failed to create noon-day dir %s: %s", s->dir, strerror(errno));
-        free(s);
-        return NULL;
-    }
-
-    /* Check for filename collision (DST fallback — same local timestamp
-     * occurs twice). If any file with this prefix exists, append _2, _3, etc.
-     * v2 checks _flow.snt; v1 used _brp.snt (no collision across formats). */
-    {
-        char check_path[MAX_SESSION_DIR_LEN + 48];
-        snprintf(check_path, sizeof(check_path), "%s/%s_flow.snt", s->dir, s->session_id);
-        struct stat st;
-        if (stat(check_path, &st) == 0) {
-            for (int suffix = 2; suffix < 100; suffix++) {
-                snprintf(check_path, sizeof(check_path), "%s/%s_%d_flow.snt",
-                         s->dir, s->session_id, suffix);
-                if (stat(check_path, &st) != 0) {
-                    char sid_with_suffix[40];
-                    snprintf(sid_with_suffix, sizeof(sid_with_suffix),
-                             "%s_%d", s->session_id, suffix);
-                    strlcpy(s->session_id, sid_with_suffix, sizeof(s->session_id));
-                    break;
-                }
-            }
-            if (stat(check_path, &st) == 0) {
-                ESP_LOGE(TAG, "cannot find unique session prefix for %s", s->session_id);
-                free(s);
-                return NULL;
-            }
-        }
-    }
-
+    s->pld_countdown = 1;
+    s->sa2_countdown = 1;
+    s->clock_drift_source = "none";
     s->start_time_us = esp_timer_get_time();
     s->start_epoch_ms = (int64_t)time(NULL) * 1000;
+    s->last_stream_us = s->start_time_us;
+
+    make_session_id(s->session_id, sizeof(s->session_id));
+    char noon_day[16];
+    noon_day_folder_local(time(NULL), noon_day, sizeof(noon_day));
+    snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_STREAMS_DIR, noon_day);
+
     s->active = true;
+    /* Declare the recording so destructive maintenance actions are refused
+     * for its duration (raw capture outranks derived output). */
+    sd_storage_recording_begin();
 
-    /* Open files and write headers.
-     * Files are flat in the noon-day folder, prefixed with the session timestamp. */
-    char path[MAX_SESSION_DIR_LEN + 48];
-    int64_t start_epoch_ms = s->start_epoch_ms;
-
-    /* v2 format: flow.snt (1-ch, 25 Hz) + press.snt (1-ch, 25 Hz) +
-     * flow_mm.snt (2-ch: flowMin/Max, 1 Hz).
-     * v1 (backwards compat) used brp.snt (2-ch, 25 Hz) + brp_mm.snt (4-ch, 1 Hz). */
-    snprintf(path, sizeof(path), "%s/%s_flow.snt", s->dir, s->session_id);
-    s->flow.f_l0 = fopen(path, "wb");
-    if (s->flow.f_l0) write_snt_header(s->flow.f_l0, 0, 250, 1, start_epoch_ms);  /* 25 Hz, 1 ch */
-
-    snprintf(path, sizeof(path), "%s/%s_press.snt", s->dir, s->session_id);
-    s->press.f_l0 = fopen(path, "wb");
-    if (s->press.f_l0) write_snt_header(s->press.f_l0, 0, 250, 1, start_epoch_ms);  /* 25 Hz, 1 ch */
-
-    snprintf(path, sizeof(path), "%s/%s_flow_mm.snt", s->dir, s->session_id);
-    s->flow.f_l1 = fopen(path, "wb");
-    if (s->flow.f_l1) write_snt_header(s->flow.f_l1, 1, 10, 2, start_epoch_ms);  /* 1 Hz, 2 ch (flowMin/Max) */
-
-    snprintf(path, sizeof(path), "%s/%s_sa2.snt", s->dir, s->session_id);
-    s->sa2.f_l0 = fopen(path, "wb");
-    if (s->sa2.f_l0) write_snt_header(s->sa2.f_l0, 0, 10, 2, start_epoch_ms);  /* 1 Hz */
-
-    snprintf(path, sizeof(path), "%s/%s_pld.snt", s->dir, s->session_id);
-    s->pld.f_l0 = fopen(path, "wb");
-    if (s->pld.f_l0) write_snt_header(s->pld.f_l0, 0, 5, 12, start_epoch_ms);  /* 0.5 Hz */
-
-    snprintf(path, sizeof(path), "%s/%s_events.snt", s->dir, s->session_id);
-    s->f_events = fopen(path, "w");
-    if (!s->f_events) {
-        ESP_LOGW(TAG, "failed to open events file (non-fatal)");
-    }
-
-    if (!s->flow.f_l0 || !s->press.f_l0 || !s->sa2.f_l0 || !s->pld.f_l0) {
-        ESP_LOGE(TAG, "failed to open .snt files");
-        /* No mutex held — safe to call session_writer_stop directly. */
-        session_writer_stop(s);
-        free(s);
-        return NULL;
-    }
-
-    /* Publish the new session as s_active.  This is the only point where
-     * s_active is set; notif_proc_task and stream_data_raw will now route
-     * data to this session. */
+    /* Publish before the files exist on purpose.  The producer can start
+     * filling immediately while the worker creates and syncs the headers,
+     * so the notifications that arrive during file setup are buffered
+     * rather than dropped — mid-therapy auto-start is detected from the
+     * very first StreamData notification. */
     xSemaphoreTake(s_active_mutex, portMAX_DELAY);
     s_active = s;
     xSemaphoreGive(s_active_mutex);
 
-    /* Start flush task */
-    s->flush_task_handle = psram_task_create(flush_task, "session_flush", FLUSH_TASK_STACK, s, 5, tskNO_AFFINITY, NULL, NULL);
-
-    ESP_LOGI(TAG, "=== SESSION STARTED: %s ===", s->session_id);
-    ESP_LOGI(TAG, "dir: %s", s->dir);
+    sw_cmd_t cmd = { .type = SW_CMD_OPEN, .s = s };
+    if (xQueueSend(s_storage_q, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGE(TAG, "failed to enqueue session open");
+        xSemaphoreTake(s_active_mutex, portMAX_DELAY);
+        if (s_active == s) s_active = NULL;
+        xSemaphoreGive(s_active_mutex);
+        s->active = false;
+        sd_storage_recording_end();
+        batch_pool_destroy(s);
+        vSemaphoreDelete(s->fill_mutex);
+        free(s);
+        return NULL;
+    }
 
     return s;
+}
+
+/* Request finalisation.  Never performs I/O or BLE work in the caller's
+ * context: the storage worker closes the files and the post worker runs the
+ * export pipeline. */
+static void sw_request_finalize(session_writer_t *s, const char *state,
+                                int64_t end_epoch_ms, bool allow_ble)
+{
+    if (!s) return;
+
+    /* Clear s_active first so a TherapyStart arriving during the stop
+     * pipeline creates a fresh session instead of writing into this one. */
+    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
+    bool was_active = s->active;
+    s->active = false;
+    if (s_active == s) s_active = NULL;
+    xSemaphoreGive(s_active_mutex);
+    if (was_active) sd_storage_recording_end();
+
+    /* Hand off whatever the producer still holds, before FINALIZE is queued;
+     * the queue is FIFO, so the batch is written first. */
+    producer_commit(s);
+
+    sw_post_job_t job = {
+        .s = s,
+        .end_epoch_ms = end_epoch_ms,
+        .state = state,
+        .allow_ble = allow_ble,
+    };
+    if (xQueueSend(s_post_q, &job, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        /* Post queue full: finalise the files anyway so the raw data is never
+         * left unfinished, and let the day rebuild handle the export. */
+        ESP_LOGE(TAG, "post queue full — finalising files without export");
+        sw_cmd_t fin = {
+            .type = SW_CMD_FINALIZE, .s = s,
+            .end_epoch_ms = end_epoch_ms,
+            .drift_source = "none",
+            .state = state,
+            .free_session = true,   /* nobody downstream owns it now */
+        };
+        /* The stale-session watchdog runs ON the storage worker.  Queueing to
+         * our own queue with portMAX_DELAY would self-deadlock if it were
+         * full, so finalise inline when we are already that task. */
+        if (xTaskGetCurrentTaskHandle() == s_storage_task) {
+            storage_finalize(s, &fin);
+            free(s);
+        } else if (xQueueSend(s_storage_q, &fin, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            ESP_LOGE(TAG, "storage queue full — session %s left unfinalised "
+                     "(recovery will repair it on next boot)", s->session_id);
+        }
+    }
 }
 
 esp_err_t session_writer_stop(session_writer_t *s)
 {
     if (!s) return ESP_OK;
-
-    /* Clear s_active and mark session inactive BEFORE the GetDateTime RPC.
-     *
-     * The GetDateTime RPC blocks ~50-100ms waiting for the AS11 response,
-     * which is processed by notif_proc_task.  If s_active still points to
-     * this session during that window, a TherapyStart notification arriving
-     * in notif_proc_task would see s->active==true and NOT create a new
-     * session — the new therapy's stream data and TherapyStart event would
-     * be written to the old (closing) session's .snt files, gluing two
-     * sessions together.
-     *
-     * By clearing s_active first (under the mutex, then releasing it), any
-     * TherapyStart during the RPC will correctly start a new session via
-     * session_writer_start().  The old session's flush/close continues in
-     * parallel on this thread, operating on the local pointer s, which is
-     * safe because s->active=false prevents new data writes. */
-    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
-    s->active = false;
-    if (s_active == s) s_active = NULL;
-    xSemaphoreGive(s_active_mutex);
-
-    /* Query AS11 clock (blocks on RPC — s_active is already clear, so
-     * notif_proc_task can process the response and any TherapyStart
-     * without interfering with this stop). */
-    int64_t end_epoch_ms = (int64_t)time(NULL) * 1000;
-    int64_t as11_ms = 0;
-    int64_t clock_drift_ms = 0;
-    bool have_drift = false;
-
-    if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
-        clock_drift_ms = end_epoch_ms - as11_ms;
-        have_drift = true;
-        ESP_LOGI(TAG, "clock_drift_ms = %lld (stop-time, NTP=%lld AS11=%lld)",
-                 (long long)clock_drift_ms,
-                 (long long)end_epoch_ms,
-                 (long long)as11_ms);
-    } else {
-        int64_t drift = 0;
-        if (as11_ble_get_clock_drift(&drift) == ESP_OK) {
-            clock_drift_ms = drift;
-            have_drift = true;
-            ESP_LOGI(TAG, "clock_drift_ms = %lld (pre-stream fallback)",
-                     (long long)clock_drift_ms);
-        } else {
-            ESP_LOGW(TAG, "clock_drift_ms unavailable");
-        }
-    }
-
-    /* No mutex needed here — s_active is already cleared and s->active=false
-     * prevents concurrent writers from using this session. */
-    s->end_time_us = esp_timer_get_time();
-    s->end_epoch_ms = end_epoch_ms;
-    if (have_drift) { s->clock_drift_ms = clock_drift_ms; s->clock_drift_valid = true; }
-
-    /* Persist drift for degraded-mode fallback (NTP unavailable on next boot).
-     * Only save when the ESP clock is NTP-authoritative — in degraded mode
-     * the wall clock is itself derived from AS11 + old drift, so
-     * recalculating drift here would create a feedback loop that
-     * accumulates error on every degraded-mode session. */
-    if (have_drift && time_source_get() == TIME_SRC_NTP) {
-        time_sync_save_drift(clock_drift_ms, end_epoch_ms);
-    }
-
-    /* Signal flush_task to exit BEFORE doing any cleanup.
-     * flush_task might be sleeping or about to call flush_all.
-     * By setting s->active=false and sending notification first,
-     * flush_task will see active==false and exit without touching files. */
-    if (s->flush_task_handle) {
-        xTaskNotifyGive(s->flush_task_handle);
-        int wait = 0;
-        while (eTaskGetState(s->flush_task_handle) != eDeleted && wait < 100) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            wait++;
-        }
-        if (wait >= 100) {
-            ESP_LOGW(TAG, "flush_task did not exit in 1s, proceeding anyway");
-        }
-        s->flush_task_handle = NULL;
-    }
-
-    /* Final flush */
-    flush_all(s);
-
-    /* Close data files first to free file descriptors */
-    if (s->flow.f_l0) { fclose(s->flow.f_l0); s->flow.f_l0 = NULL; }
-    if (s->flow.f_l1) { fclose(s->flow.f_l1); s->flow.f_l1 = NULL; }
-    if (s->press.f_l0) { fclose(s->press.f_l0); s->press.f_l0 = NULL; }
-    if (s->sa2.f_l0) { fclose(s->sa2.f_l0); s->sa2.f_l0 = NULL; }
-    if (s->pld.f_l0) { fclose(s->pld.f_l0); s->pld.f_l0 = NULL; }
-    if (s->f_events) { fclose(s->f_events); s->f_events = NULL; }
-
-    /* Write session.json (after closing data files to avoid FD exhaustion) */
-    write_session_json(s, "completed");
-
-    ESP_LOGI(TAG, "=== SESSION STOPPED: %s ===", s->session_id);
-    ESP_LOGI(TAG, "flow=%u press=%u sa2=%u pld=%u total samples",
-             (unsigned)s->flow.sample_count,
-             (unsigned)s->press.sample_count,
-             (unsigned)s->sa2.sample_count,
-             (unsigned)s->pld.sample_count);
-
-    /* Stream data quality summary: shows how many notifications were
-     * received, how many gap events were detected and compensated for,
-     * and the effective packet loss rate.  A loss rate of 0.00% means
-     * no dropped notifications; 0.13% is typical for problematic BLE
-     * links.  This helps users assess whether their data is complete. */
-    if (s->stream_notifications > 0) {
-        uint32_t expected = s->stream_notifications + s->gap_missing_total;
-        uint32_t loss_bps = (s->gap_missing_total * 10000) / expected; /* bps = 0.01% units */
-        ESP_LOGI(TAG, "stream quality: %u notifications received, "
-                 "%u gap events, %u missing compensated, "
-                 "loss rate %u.%02u%%",
-                 (unsigned)s->stream_notifications,
-                 (unsigned)s->gap_events,
-                 (unsigned)s->gap_missing_total,
-                 loss_bps / 100, loss_bps % 100);
-    }
-
-    /* s_active was already cleared above (before GetDateTime RPC). */
-
-    if (s->mutex) vSemaphoreDelete(s->mutex);
-    /* NOTE: s is NOT freed here — the caller (stop_task) needs to read
-     * s->clock_drift_ms and s->start_epoch_ms after this function returns.
-     * The caller is responsible for calling free(s). */
-    s->mutex = NULL;  /* prevent double-delete */
-
+    sw_request_finalize(s, "completed", (int64_t)time(NULL) * 1000, true);
     return ESP_OK;
 }
 
@@ -767,16 +1468,41 @@ void session_writer_set_device_info(const char *addr, const char *client_id)
     if (client_id) strlcpy(s_client_id, client_id, sizeof(s_client_id));
 }
 
+bool session_writer_snc_changed(int64_t *out_value)
+{
+    if (!s_snc_changed) return false;
+    s_snc_changed = false;
+    if (out_value) *out_value = s_snc_value;
+    return true;
+}
+
+/* ── Event queueing (no I/O on the notification path) ─────────────── */
+
+static void queue_event_json(session_writer_t *s, char *json_str)
+{
+    if (!s || !json_str) { free(json_str); return; }
+    sw_cmd_t cmd = { .type = SW_CMD_EVENT, .s = s, .event_json = json_str };
+    if (xQueueSend(s_storage_q, &cmd, 0) != pdTRUE) {
+        s->event_dropped++;
+        free(json_str);
+    }
+}
+
+static void write_event(session_writer_t *s, const cJSON *msg)
+{
+    if (!s || !s->active) return;
+    queue_event_json(s, cJSON_PrintUnformatted(msg));
+}
+
 /* ── Notification parsing ─────────────────────────────────────────── */
 
-/* Check an EventNotification for therapy start/stop events.
- * The AS11 sends EventNotification with params.dataId="UsageEvents-TherapyStatusEvents"
- * and params.events[] containing objects with an "event" field.
- * Returns true if a therapy start/stop event is found. */
-static bool check_event_notification(const cJSON *msg, bool *out_start, bool *out_stop)
+/* Check an EventNotification for therapy start/stop events. */
+static bool check_event_notification(const cJSON *msg, bool *out_start,
+                                     bool *out_stop, const char **out_report)
 {
     *out_start = false;
     *out_stop = false;
+    if (out_report) *out_report = NULL;
 
     cJSON *params = cJSON_GetObjectItem(msg, "params");
     if (!params) return false;
@@ -793,6 +1519,9 @@ static bool check_event_notification(const cJSON *msg, bool *out_start, bool *ou
 
         if (strcmp(event->valuestring, "TherapyStart") == 0) {
             *out_start = true;
+            cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
+            if (out_report && rt && cJSON_IsString(rt))
+                *out_report = rt->valuestring;
         } else if (strcmp(event->valuestring, "TherapyStop") == 0) {
             *out_stop = true;
         }
@@ -802,8 +1531,6 @@ static bool check_event_notification(const cJSON *msg, bool *out_start, bool *ou
 
 /* ── Fast-path StreamData parser (bypasses cJSON) ─────────────────── */
 
-/* Stream key identifiers — index into results arrays.
- * Order matches the pld_names layout for PLD channels (0-11). */
 enum {
     KEY_PATIENT_FLOW = 0,
     KEY_MASK_PRESSURE,
@@ -824,8 +1551,6 @@ enum {
     KEY_COUNT
 };
 
-/* Key lookup table — name, pre-computed length, key id.
- * Sorted by length for bucket-matching in the single-pass scanner. */
 typedef struct { const char *name; int len; int id; } key_entry_t;
 static const key_entry_t s_keys[] = {
     {"SpO2",                          4,  KEY_SPO2},
@@ -847,9 +1572,6 @@ static const key_entry_t s_keys[] = {
 };
 #define N_KEYS (int)(sizeof(s_keys) / sizeof(s_keys[0]))
 
-/* Parse a JSON number array, scaling values by 100 into int16_t.
- * null values become -1. No strtod, no double arithmetic.
- * Returns count of values parsed. Advances *p past closing ']'. */
 static int parse_scaled_array(const char **p, const char *end, int16_t *out, int max_out)
 {
     const char *s = *p;
@@ -862,7 +1584,7 @@ static int parse_scaled_array(const char **p, const char *end, int16_t *out, int
         if (s >= end || *s == ']') break;
 
         if (s + 3 < end && s[0] == 'n' && s[1] == 'u' && s[2] == 'l' && s[3] == 'l') {
-            out[count++] = SNT_MISSING;  /* null → missing sentinel */
+            out[count++] = SNT_MISSING;
             s += 4;
             continue;
         }
@@ -896,9 +1618,6 @@ static int parse_scaled_array(const char **p, const char *end, int16_t *out, int
     return count;
 }
 
-/* Match a key of known length against the key table.
- * Returns key id or -1 if no match. Keys are grouped by length
- * in s_keys, so we only compare against same-length entries. */
 static int match_key(const char *key, int klen)
 {
     for (int i = 0; i < N_KEYS; i++) {
@@ -908,18 +1627,9 @@ static int match_key(const char *key, int klen)
     return -1;
 }
 
-/* Parse the time portion of an ISO8601 "startTime" string into
- * milliseconds-since-midnight.  The AS11 always uses the format
- * "YYYY-MM-DDTHH:MM:SS.mmmZ" (fixed-width, UTC).  We extract only
- * the H/M/S/ms fields — sufficient for detecting 200ms gaps between
- * consecutive StreamData notifications without a full date parser.
- *
- * Returns -1 if the string is too short or malformed. */
 static int64_t parse_starttime_ms(const char *s, int len)
 {
-    /* Minimum: "YYYY-MM-DDTHH:MM:SS.mmmZ" = 24 chars */
     if (len < 24) return -1;
-    /* Sanity: check digit positions */
     if (s[11] < '0' || s[11] > '9') return -1;
     int h   = (s[11] - '0') * 10 + (s[12] - '0');
     int m   = (s[14] - '0') * 10 + (s[15] - '0');
@@ -928,76 +1638,53 @@ static int64_t parse_starttime_ms(const char *s, int len)
     return (int64_t)h * 3600000 + m * 60000 + sec * 1000 + ms;
 }
 
-/* Fast-path: process StreamData from raw JSON in a single linear pass.
- *
- * StartStream sends short tags (_RFL, _MKP, _MKF, etc.) but the AS11
- * normalizes them to long names in StreamData (per rpc_streams.md):
- *   _RFL → PatientFlow, _MKP → MaskPressure
- *   _MKF → MaskPressure-TwoSecond, _MKI → InspiratoryPressure-TwoSecond, etc.
- *   _RR2, _TD2, _MV2, _TGT, _IE2 have no long name — echoed as-is.
- *   _HRT → HeartRate, _SAO → SpO2
- *
- * Single-pass: walks the JSON once, matching keys by length-bucketed
- * comparison. Values are parsed directly to scaled int16_t (×100),
- * avoiding strtod and double arithmetic entirely. */
 void session_writer_on_stream_data_raw(const char *json, int len)
 {
     session_writer_t *s = session_writer_get_active();
 
-    /* One-time log of raw StreamData for key-name verification */
     static bool s_first_logged = false;
     if (!s_first_logged) {
         s_first_logged = true;
-        int log_len = len < 400 ? len : 400;
-        ESP_LOGI(TAG, "StreamData first notification (first %d bytes): %.*s",
-                 log_len, log_len, json);
+        ESP_LOGI(TAG, "first StreamData (%d bytes): %.*s", len,
+                 len > 512 ? 512 : len, json);
     }
 
-    const char *end = json + len;
     const char *p = json;
+    const char *end = json + len;
 
-    /* Parsed results — filled during single-pass scan */
-    int16_t flow_vals[32];  int flow_n = 0;
-    int16_t press_vals[32]; int press_n = 0;
-    int16_t pld_vals[12] = {0}; bool pld_found[12] = {false};
-    int16_t hr_val = 0;     bool hr_found = false;
-    int16_t spo2_val = 0;   bool spo2_found = false;
-    int64_t cur_stream_ms = -1;   /* startTime parsed from this notification */
+    int16_t flow_vals[32], press_vals[32];
+    int flow_n = 0, press_n = 0;
+    int16_t hr_val = -1, spo2_val = -1;
+    bool hr_found = false, spo2_found = false;
+    int16_t pld_vals[12];
+    bool pld_found[12] = {false};
+    for (int i = 0; i < 12; i++) pld_vals[i] = -1;
 
-    /* Single-pass scan: walk JSON, extract all key→value pairs.
-     * Handles two value types: arrays (signal data) and strings
-     * (startTime).  The scanner peeks at the character after ':' to
-     * decide which path to take. */
+    int64_t cur_stream_ms = -1;
+    {
+        const char *st = strstr(json, "\"startTime\"");
+        if (st) {
+            const char *q = strchr(st + 11, '"');
+            if (q) {
+                q++;
+                const char *qe = strchr(q, '"');
+                if (qe) cur_stream_ms = parse_starttime_ms(q, (int)(qe - q));
+            }
+        }
+    }
+
     while (p < end) {
         while (p < end && *p != '"') p++;
         if (p >= end) break;
-        p++; /* skip opening quote */
+        p++;
         const char *key_start = p;
         while (p < end && *p != '"') p++;
         if (p >= end) break;
-        int klen = p - key_start;
-        p++; /* skip closing quote */
-
-        while (p < end && (*p == ' ' || *p == '\t')) p++;
-        if (p >= end || *p != ':') continue;
+        int klen = (int)(p - key_start);
         p++;
-        while (p < end && (*p == ' ' || *p == '\t')) p++;
-        if (p >= end) continue;
 
-        /* startTime is a string value — extract for gap detection */
-        if (klen == 9 && strncmp(key_start, "startTime", 9) == 0) {
-            if (*p == '"') {
-                p++;
-                const char *str_start = p;
-                while (p < end && *p != '"') p++;
-                int slen = (int)(p - str_start);
-                if (p < end) p++; /* skip closing quote */
-                cur_stream_ms = parse_starttime_ms(str_start, slen);
-            }
-            continue;
-        }
-
-        /* Signal data is always a JSON array */
+        while (p < end && (*p == ' ' || *p == ':')) p++;
+        if (p >= end) break;
         if (*p != '[') continue;
 
         int id = match_key(key_start, klen);
@@ -1041,16 +1728,15 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         if (abs(flow_vals[j]) > 50) has_active_flow = true;
     }
 
-    /* Mask pressure: during therapy, pressure is always >= 4 cmH2O (400).
-     * At idle, the AS11 sends a baseline flow (~0.5 L/s) and low pressure
-     * (~0.4 cmH2O). Require both flow AND pressure to avoid false triggers. */
     bool has_therapy_pressure = false;
     for (int j = 0; j < press_n; j++) {
         if (press_vals[j] > 200) has_therapy_pressure = true;
     }
 
-    /* Edge case: auto-start session if flow and pressure indicate active therapy */
-    if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped && has_active_flow && has_therapy_pressure) {
+    /* Edge case: auto-start session if flow and pressure indicate active
+     * therapy (reboot mid-therapy, or ESP powered on after the AS11). */
+    if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped
+        && has_active_flow && has_therapy_pressure) {
         ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
         bsp_display_set_therapy_active(true);
         s = session_writer_start();
@@ -1062,478 +1748,178 @@ void session_writer_on_stream_data_raw(const char *json, int len)
 
     if (!s || !session_writer_is_active(s)) return;
 
-    xSemaphoreTake(s->mutex, portMAX_DELAY);
+    s->last_stream_us = esp_timer_get_time();
+
+    xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
 
     s->stream_notifications++;
+    stream_batch_t *b = s->fill;
 
     /* ── Missing-packet compensation ───────────────────────────────
-     * Detect dropped StreamData notifications by comparing the current
-     * startTime to the previous notification's startTime.  Normal gap
-     * is ~200ms (reportIntervalMs).  The AS11 clock has ±3ms jitter,
-     * so we use a threshold of 280ms (>1 sample interval beyond normal)
-     * to flag a gap.  Each missing notification = 5 BRP samples (25Hz ×
-     * 200ms) and advances the SA2/PLD decimation counters by 1.
-     *
-     * Compensation per signal type:
-     *   BRP: hold previous flow/pressure (short gaps, <10% of breath cycle)
-     *   SA2: hold previous HR/SpO2 (slow vitals, change over minutes)
-     *   PLD: hold previous row (2s summaries, change slowly)
-     *
-     * The gap is measured in ms and converted to missing-notification
-     * count via integer division by 200.  This is exact because the
-     * AS11's startTime advances in ~200ms steps. */
+     * Short gaps hold the previous value (visually indistinguishable and
+     * matching AS11 conventions).  Long gaps are NOT padded: minutes of
+     * fabricated data would be worse than an honest boundary, so they are
+     * counted and — beyond SW_SPLIT_GAP_MS — the session is split. */
+    bool want_split = false;
     if (cur_stream_ms >= 0 && s->prev_stream_ms_valid) {
         int64_t gap = cur_stream_ms - s->prev_stream_ms;
-        /* Handle midnight rollover (86400000 ms/day) */
         if (gap < 0) gap += 86400000;
-        /* Normal gap ~200ms; threshold 280ms = 200 + 2×40ms sample */
         if (gap > 280) {
             int missing = (int)((gap - 100) / 200);
             if (missing > 0 && missing < 50) {
                 ESP_LOGW(TAG, "StreamData gap: %lldms (%d missing notifications), "
                          "inserting compensation", (long long)gap, missing);
-
                 s->gap_events++;
                 s->gap_missing_total += missing;
 
-                /* BRP: hold last flow/pressure for 5 samples per missing
-                 * notification.  Gaps are typically 1-2 notifications
-                 * (200-400ms), which is <10% of a breath cycle. */
                 for (int m = 0; m < missing; m++) {
-                    uint32_t base = s->brp_buf_count;
-                    if (base + 5 <= 1500 && s->last_brp_valid) {
+                    uint32_t base = b->n_brp;
+                    if (base + 5 <= BRP_CAP && s->last_brp_valid) {
                         for (int j = 0; j < 5; j++) {
-                            s->brp_flow[base + j] = s->last_flow;
-                            s->brp_press[base + j] = s->last_press;
+                            b->brp_flow[base + j] = s->last_flow;
+                            b->brp_press[base + j] = s->last_press;
                         }
-                        s->brp_buf_count = base + 5;
+                        b->n_brp = base + 5;
+                    } else if (s->last_brp_valid) {
+                        s->brp_dropped += 5;
                     }
                 }
-
-                /* SA2: advance decimation counter, hold previous value
-                 * on each wrap.  The counter decrements from 5→0; each
-                 * time it hits 0 we write a sample.  We simulate the
-                 * missed decrements to keep the counter synchronized. */
                 for (int m = 0; m < missing; m++) {
                     if (s->sa2_countdown <= 1) {
                         s->sa2_countdown = 5;
-                        if (s->sa2_buf_count < 60) {
-                            s->sa2_hr[s->sa2_buf_count] =
-                                s->last_hr_valid ? s->last_hr : SNT_MISSING;
-                            s->sa2_spo2[s->sa2_buf_count] =
-                                s->last_spo2_valid ? s->last_spo2 : SNT_MISSING;
-                            s->sa2_buf_count++;
+                        if (b->n_sa2 < SA2_CAP) {
+                            b->sa2_hr[b->n_sa2] = s->last_hr_valid ? s->last_hr : SNT_MISSING;
+                            b->sa2_spo2[b->n_sa2] = s->last_spo2_valid ? s->last_spo2 : SNT_MISSING;
+                            b->n_sa2++;
+                        } else {
+                            s->sa2_dropped++;
                         }
                     } else {
                         s->sa2_countdown--;
                     }
                 }
-
-                /* PLD: same approach — advance decimation counter,
-                 * hold previous row on each wrap. */
                 for (int m = 0; m < missing; m++) {
                     if (s->pld_countdown <= 1) {
                         s->pld_countdown = 10;
-                        if (s->last_pld_valid && s->pld_buf_count < 300) {
+                        if (s->last_pld_valid && b->n_pld < PLD_CAP) {
                             for (int k = 0; k < 12; k++)
-                                s->pld_buf[s->pld_buf_count][k] = s->last_pld[k];
-                            s->pld_buf_count++;
+                                b->pld[b->n_pld][k] = s->last_pld[k];
+                            b->n_pld++;
+                        } else if (s->last_pld_valid) {
+                            s->pld_dropped++;
                         }
                     } else {
                         s->pld_countdown--;
                     }
                 }
+            } else if (missing >= 50) {
+                /* Uncompensated discontinuity — record it honestly. */
+                int64_t offset_ms = s->start_epoch_ms > 0
+                    ? (esp_timer_get_time() - s->start_time_us) / 1000 : 0;
+                s->gap_long_events++;
+                s->gap_long_ms_total += (uint64_t)gap;
+                if (s->gap_long_first_ms == 0) s->gap_long_first_ms = offset_ms;
+                s->gap_long_last_ms = offset_ms;
+                ESP_LOGW(TAG, "long StreamData gap: %lld ms (%d notifications) — "
+                         "not compensated", (long long)gap, missing);
+                if (gap >= SW_SPLIT_GAP_MS) want_split = true;
             }
         }
     }
 
-    /* Update previous startTime for next notification's gap check */
     if (cur_stream_ms >= 0) {
         s->prev_stream_ms = cur_stream_ms;
         s->prev_stream_ms_valid = true;
     }
 
-    /* BRP: PatientFlow + MaskPressure (25 Hz, 40ms natural interval).
-     * Flow and pressure arrive together (one value per 40ms tick) and must be
-     * appended in lockstep at the SAME cumulative buffer position.  Missing
-     * samples in either channel use the SNT_MISSING sentinel.
-     *
-     * Recording starts at TherapyStart (session_writer_start) and ends at
-     * TherapyStop (session_writer_stop), matching AS11 export behavior.
-     * Archive analysis confirms BRP starts ~5-9s after TherapyStart and
-     * ends at TherapyStop ≈ MaskOff time. */
+    if (want_split) {
+        /* Split rather than emit a continuous-looking timeline across a
+         * multi-minute hole.  .snt assumes uniform sampling, so a gap this
+         * large cannot be represented honestly inside one session. */
+        xSemaphoreGive(s->fill_mutex);
+        ESP_LOGW(TAG, "splitting session at long gap");
+        sw_request_finalize(s, "split", (int64_t)time(NULL) * 1000, true);
+        s = session_writer_start();
+        if (!s) return;
+        xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
+        b = s->fill;
+        s->prev_stream_ms = cur_stream_ms;
+        s->prev_stream_ms_valid = true;
+    }
+
+    /* BRP: flow + pressure appended in lockstep at the same buffer index. */
     {
-        uint32_t base = s->brp_buf_count;
+        uint32_t base = b->n_brp;
         int n_pairs = flow_n > press_n ? flow_n : press_n;
-        for (int j = 0; j < n_pairs && base + j < 1500; j++) {
-            s->brp_flow[base + j]  = (j < flow_n)  ? flow_vals[j]  : SNT_MISSING;
-            s->brp_press[base + j] = (j < press_n) ? press_vals[j] : SNT_MISSING;
+        int room = (int)(BRP_CAP - base);
+        int added = n_pairs;
+        if (added > room) {
+            s->brp_dropped += (uint32_t)(added - room);
+            added = room;
         }
-        uint32_t added = (uint32_t)n_pairs;
-        if (base + added > 1500) added = 1500 - base;
-        s->brp_buf_count = base + added;
-        /* Cache last known BRP values for gap hold */
+        for (int j = 0; j < added; j++) {
+            b->brp_flow[base + j]  = (j < flow_n)  ? flow_vals[j]  : SNT_MISSING;
+            b->brp_press[base + j] = (j < press_n) ? press_vals[j] : SNT_MISSING;
+        }
+        b->n_brp = base + (uint32_t)added;
         if (added > 0) {
-            uint32_t last = base + added - 1;
-            if (last < 1500) {
-                s->last_flow = s->brp_flow[last];
-                s->last_press = s->brp_press[last];
-                s->last_brp_valid = true;
-            }
+            s->last_flow = b->brp_flow[b->n_brp - 1];
+            s->last_press = b->brp_press[b->n_brp - 1];
+            s->last_brp_valid = true;
         }
     }
 
-    /* SA2: HeartRate + SpO2 (1 Hz, decimated from 5 Hz notifications).
-     * Take every 5th notification to get 1 Hz. */
+    /* SA2: 1 Hz, decimated from the 5 Hz report. */
     if (--s->sa2_countdown == 0) {
         s->sa2_countdown = 5;
-        if (s->sa2_buf_count < 60) {
-            s->sa2_hr[s->sa2_buf_count] = hr_found ? hr_val : -1;
-            s->sa2_spo2[s->sa2_buf_count] = spo2_found ? spo2_val : -1;
-            s->sa2_buf_count++;
+        if (b->n_sa2 < SA2_CAP) {
+            b->sa2_hr[b->n_sa2] = hr_found ? hr_val : -1;
+            b->sa2_spo2[b->n_sa2] = spo2_found ? spo2_val : -1;
+            b->n_sa2++;
+        } else {
+            s->sa2_dropped++;
         }
-        /* Cache last known values for gap hold */
         if (hr_found) { s->last_hr = hr_val; s->last_hr_valid = true; }
         if (spo2_found) { s->last_spo2 = spo2_val; s->last_spo2_valid = true; }
-    } else if (spo2_found && s->sa2_buf_count > 0) {
-        /* Update SpO2 for the most recent SA2 sample */
-        s->sa2_spo2[s->sa2_buf_count - 1] = spo2_val;
-        if (spo2_found) { s->last_spo2 = spo2_val; s->last_spo2_valid = true; }
+    } else if (spo2_found && b->n_sa2 > 0) {
+        b->sa2_spo2[b->n_sa2 - 1] = spo2_val;
+        s->last_spo2 = spo2_val;
+        s->last_spo2_valid = true;
     }
 
-    /* PLD: 12 channels, all 0.5 Hz (2s natural interval).
-     * Decimate to 0.5 Hz — write every 10th notification (5 Hz / 10 = 0.5 Hz).
-     * Unsupported signals are absent from StreamData — channels stay -1. */
+    /* PLD: 12 channels at 0.5 Hz, decimated from the 5 Hz report. */
     if (--s->pld_countdown == 0) {
         s->pld_countdown = 10;
         bool any_found = false;
         for (int k = 0; k < 12; k++) {
             if (pld_found[k]) { any_found = true; break; }
         }
-        if (any_found && s->pld_buf_count < 300) {
-            for (int k = 0; k < 12; k++)
-                s->pld_buf[s->pld_buf_count][k] = pld_found[k] ? pld_vals[k] : -1;
-            s->pld_buf_count++;
-            /* Cache last known PLD row for gap hold */
-            for (int k = 0; k < 12; k++)
-                s->last_pld[k] = s->pld_buf[s->pld_buf_count - 1][k];
-            s->last_pld_valid = true;
-        }
-    }
-
-    /* Flush if buffers are getting full */
-    if (s->brp_buf_count >= 1400) { flush_flow(s); flush_press(s); }
-    if (s->sa2_buf_count >= 55) flush_sa2(s);
-    if (s->pld_buf_count >= 280) flush_pld(s);
-
-    xSemaphoreGive(s->mutex);
-}
-
-/* Write an event as a JSON line to events.snt */
-static void write_event(session_writer_t *s, const cJSON *msg)
-{
-    if (!s || !s->f_events) return;
-
-    char *json_str = cJSON_PrintUnformatted(msg);
-    if (json_str) {
-        fputs(json_str, s->f_events);
-        fputc('\n', s->f_events);
-        free(json_str);
-    }
-}
-
-/* ── EDF generation task ──────────────────────────────────────────────
- *
- * EDF generation is pure CPU + SD-card I/O — no BLE interaction needed.
- * It runs in a dedicated task pinned to core 1 (the core not running the
- * NimBLE host / notif_proc_task) at low priority (5, below notif_proc's 10)
- * so it never blocks or delays stream notification processing.
- *
- * If a new therapy session starts while EDF generation is still running,
- * stream data continues to flow through notif_proc_task on core 0 without
- * any interference.  The EDF task simply reads from the completed session's
- * files and writes to /somnotrace/EDF/ — no shared state with the live
- * session writer.
- *
- * The task uses a 16KB PSRAM stack (allocated by stop_task) and self-deletes
- * when done. */
-typedef struct {
-    char     session_dir[MAX_SESSION_DIR_LEN];
-    char     session_id[32];
-    int64_t  start_epoch_ms;
-    int64_t  end_epoch_ms;
-    int64_t  clock_drift_ms;
-    int64_t  stop_boot_us;  /* esp_timer_get_time() at session stop */
-} edf_task_args_t;
-
-/* Cleanup pointers for the previous edf_task's PSRAM stack and TCB.
- * edf_task cannot free its own stack (it's running on it), so we save
- * the pointers here and free them the next time stop_task runs. */
-static StackType_t *s_prev_edf_stack = NULL;
-static StaticTask_t *s_prev_edf_tcb = NULL;
-
-/* Report remaining stack for the EDF tasks.  These run the deepest call
- * chain in the firmware (edf_gen_generate → generate_str_edf →
- * build_current_day_record) and previously overflowed a 10 KB stack.
- * Logging the high-water mark turns a future regression into a visible
- * warning instead of a panic. */
-#define EDF_STACK_WARN_BYTES  2048
-
-static void log_edf_stack_headroom(const char *who)
-{
-    /* uxTaskGetStackHighWaterMark returns the minimum free stack in words. */
-    UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
-    if (free_bytes < EDF_STACK_WARN_BYTES) {
-        ESP_LOGW(TAG, "%s: LOW STACK — only %u bytes free at peak "
-                 "(increase edf_stack_size)", who, (unsigned)free_bytes);
-    } else {
-        ESP_LOGI(TAG, "%s: peak stack headroom %u bytes", who, (unsigned)free_bytes);
-    }
-}
-
-static void edf_task(void *arg)
-{
-    ESP_LOGI(TAG, "edf_task: started on core %d", xPortGetCoreID());
-    edf_task_args_t *a = (edf_task_args_t *)arg;
-    if (a) {
-        esp_err_t ret = edf_gen_generate(a->session_dir, a->session_id,
-                         a->start_epoch_ms, a->end_epoch_ms,
-                         a->clock_drift_ms);
-        if (ret == ESP_OK) {
-            /* EDF generation complete — trigger upload.
-             * Compute the noon-based day folder from session start time. */
-            char day_folder[32];
-            time_t t = (time_t)(a->start_epoch_ms / 1000);
-            struct tm tm;
-            localtime_r(&t, &tm);
-            if (tm.tm_hour < 12) {
-                t -= 86400;
-                localtime_r(&t, &tm);
-            }
-            snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
-                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-            uploader_on_day_ready(day_folder);
-        } else {
-            ESP_LOGW(TAG, "edf_task: generation failed, not triggering upload");
-        }
-        free(a);
-    } else {
-        ESP_LOGE(TAG, "edf_task: NULL args");
-    }
-    log_edf_stack_headroom("edf_task");
-    ESP_LOGI(TAG, "edf_task: done");
-    vTaskDelete(NULL);
-}
-
-/* spool_refresh_task: retries pulling the Summary spool until fresh, then
- * runs EDF generation.  Runs on core 0 at priority 5 (below notif_proc_task
- * at priority 10) so BLE notifications always preempt it.
- *
- * The retry loop (post_therapy_wait_spool_current) yields via vTaskDelay
- * and semaphore waits, allowing notif_proc_task to process BLE responses
- * for each spool pull.  EDF generation is mostly SD I/O which also yields.
- *
- * Uses the PSRAM stack allocated by stop_task. */
-static void spool_refresh_task(void *arg)
-{
-    edf_task_args_t *a = (edf_task_args_t *)arg;
-    if (!a) {
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "spool_refresh_task: waiting for spool to become current");
-    bool fresh = post_therapy_wait_spool_current(a->end_epoch_ms, a->clock_drift_ms);
-    int64_t elapsed_ms = (esp_timer_get_time() - a->stop_boot_us) / 1000;
-    ESP_LOGI(TAG, "spool_refresh_task: spool %s after %lld ms from session stop",
-             fresh ? "CURRENT" : "STALE (timeout)", (long long)elapsed_ms);
-
-    /* Launch EDF generation on core 1. */
-    ESP_LOGI(TAG, "spool_refresh_task: launching EDF generation");
-    esp_err_t ret = edf_gen_generate(a->session_dir, a->session_id,
-                     a->start_epoch_ms, a->end_epoch_ms,
-                     a->clock_drift_ms);
-    if (ret == ESP_OK) {
-        char day_folder[32];
-        time_t t = (time_t)(a->start_epoch_ms / 1000);
-        struct tm tm;
-        localtime_r(&t, &tm);
-        if (tm.tm_hour < 12) {
-            t -= 86400;
-            localtime_r(&t, &tm);
-        }
-        snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
-                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-        uploader_on_day_ready(day_folder);
-    } else {
-        ESP_LOGW(TAG, "spool_refresh_task: EDF generation failed, not triggering upload");
-    }
-    free(a);
-
-    log_edf_stack_headroom("spool_refresh_task");
-    ESP_LOGI(TAG, "spool_refresh_task: done");
-    vTaskDelete(NULL);
-}
-
-/* Session stop runs in a dedicated task so that notif_proc_task is free to
- * process the GetDateTime RPC response while session_writer_stop blocks.
- *
- * After session_writer_stop() finalises the stream .snt files, this task
- * runs the post-therapy data collection pipeline:
- *
- *   1. session_writer_stop()  — final flush, close .snt files, write session.json
- *   2. post_therapy_collect() — pull Summary + TherapyEvents spools + Get RPC
- *                               → save to post-therapy/ subfolder
- *                               → checks if Summary spool is current for today
- *   3a. If spool is current: edf_gen_generate() launched as a SEPARATE task
- *       on core 1 (see edf_task above).
- *   3b. If spool is stale: spool_refresh_task launched on core 0 retries
- *       the pull every 3s for up to 2 min. When fresh (or timeout), it
- *       launches edf_gen_generate() on core 1.
- *
- * Steps 1 and 2 run in stop_task (needs BLE for spool pulls).
- * Step 3 is dispatched and stop_task exits immediately, freeing the
- * high-priority slot for notif_proc_task. */
-static void stop_task(void *arg)
-{
-    session_writer_t *s = (session_writer_t *)arg;
-    if (!s) {
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /* Capture session metadata before session_writer_stop() frees s.
-     * NOTE: clock_drift_ms is set INSIDE session_writer_stop() (from the
-     * GetDateTime RPC), so we capture it AFTER the call.  session_writer_stop()
-     * does not free s — we do it here after reading the drift. */
-    char session_dir[MAX_SESSION_DIR_LEN];
-    char session_id[32];
-
-    strlcpy(session_dir, s->dir, sizeof(session_dir));
-    strlcpy(session_id, s->session_id, sizeof(session_id));  /* file prefix */
-
-    /* Step 1: Finalise stream data (flush, close files, write session.json).
-     * This also queries AS11 clock and sets s->clock_drift_ms. */
-    session_writer_stop(s);
-
-    /* Now capture the values that session_writer_stop() set */
-    int64_t start_epoch_ms = s->start_epoch_ms;
-    int64_t end_epoch_ms = s->end_epoch_ms;
-    int64_t clock_drift_ms = s->clock_drift_ms;
-    int64_t stop_boot_us = s->end_time_us;
-
-    /* Free the session writer struct — we have everything we need */
-    free(s);
-
-    /* Step 2: Post-therapy data collection (spool pulls + Get RPC).
-     * This pulls Summary and TherapyEvents spools from the AS11 and
-     * queries device identification/settings via Get RPC.  All data
-     * is saved to the post-therapy/ subfolder inside the session directory.
-     * This step blocks on BLE RPC responses (semaphores), allowing
-     * notif_proc_task to run between RPCs.  May take 10-30 seconds.
-     * Also checks whether the current day's Summary spool is fresh. */
-    bool spool_current = false;
-    ESP_LOGI(TAG, "stop_task: starting post-therapy collection");
-    post_therapy_collect(session_dir, session_id, start_epoch_ms, clock_drift_ms,
-                         end_epoch_ms, &spool_current);
-
-    /* Step 3: Launch EDF generation.
-     *
-     * If the spool is current, launch edf_gen_generate() immediately on
-     * core 1 (async, non-blocking).
-     *
-     * If the spool is stale, launch spool_refresh_task on core 0 which
-     * retries the pull every 3s for up to 2 min. When the spool becomes
-     * current (or timeout), it launches edf_gen_generate() on core 1.
-     * This keeps stop_task non-blocking — notif_proc_task is free to
-     * process new therapy notifications. */
-    edf_task_args_t *edf_args = malloc(sizeof(edf_task_args_t));
-    if (edf_args) {
-        strlcpy(edf_args->session_dir, session_dir, sizeof(edf_args->session_dir));
-        strlcpy(edf_args->session_id, session_id, sizeof(edf_args->session_id));
-        edf_args->start_epoch_ms = start_epoch_ms;
-        edf_args->end_epoch_ms = end_epoch_ms;
-        edf_args->clock_drift_ms = clock_drift_ms;
-        edf_args->stop_boot_us = stop_boot_us;
-
-        /* Free the previous edf_task's PSRAM stack and TCB.
-         * The previous task has completed and self-deleted by now
-         * (it ran during the previous session's stop, which was
-         * at least seconds ago).  We can't free our own stack, but
-         * we can free the previous one. */
-        if (s_prev_edf_stack) {
-            free(s_prev_edf_stack);
-            s_prev_edf_stack = NULL;
-        }
-        if (s_prev_edf_tcb) {
-            free(s_prev_edf_tcb);
-            s_prev_edf_tcb = NULL;
-        }
-
-        /* Allocate task stack from PSRAM (8MB) instead of internal SRAM (~270KB).
-         * Internal SRAM is shared with Wi-Fi/BLE DMA buffers and gets fragmented
-         * over time, causing xTaskCreatePinnedToCore to fail even with 8MB total
-         * free heap.  PSRAM stacks are supported on ESP32-S3 with
-         * CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y.
-         *
-         * The StaticTask_t (TCB) must be in internal RAM (FreeRTOS requirement).
-         * The stack and TCB are freed by the NEXT stop_task invocation. */
-        const uint32_t edf_stack_size = 16384;
-        StackType_t *edf_stack = heap_caps_malloc(edf_stack_size, MALLOC_CAP_SPIRAM);
-        StaticTask_t *edf_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-
-        if (edf_stack && edf_tcb) {
-            s_prev_edf_stack = edf_stack;
-            s_prev_edf_tcb = edf_tcb;
-
-            if (spool_current) {
-                /* Spool is fresh — launch EDF generation immediately. */
-                TaskHandle_t edf_handle = xTaskCreateStaticPinnedToCore(
-                    edf_task, "edf_gen", edf_stack_size, edf_args, 5,
-                    edf_stack, edf_tcb, 1);
-                if (edf_handle) {
-                    ESP_LOGI(TAG, "stop_task: EDF generation launched on core 1 "
-                             "(spool current, stack=%u PSRAM)",
-                             (unsigned)edf_stack_size);
-                } else {
-                    ESP_LOGE(TAG, "stop_task: xTaskCreateStaticPinnedToCore failed");
-                    free(edf_stack); free(edf_tcb);
-                    s_prev_edf_stack = NULL; s_prev_edf_tcb = NULL;
-                    free(edf_args);
-                }
+        if (any_found) {
+            if (b->n_pld < PLD_CAP) {
+                for (int k = 0; k < 12; k++)
+                    b->pld[b->n_pld][k] = pld_found[k] ? pld_vals[k] : -1;
+                b->n_pld++;
+                for (int k = 0; k < 12; k++)
+                    s->last_pld[k] = b->pld[b->n_pld - 1][k];
+                s->last_pld_valid = true;
             } else {
-                /* Spool is stale — launch refresh task on core 0 that
-                 * retries the pull every 3s for up to 2 min, then
-                 * generates EDF when ready (or timeout). */
-                TaskHandle_t refresh_handle = xTaskCreateStaticPinnedToCore(
-                    spool_refresh_task, "spool_refresh", edf_stack_size, edf_args, 5,
-                    edf_stack, edf_tcb, 0);
-                if (refresh_handle) {
-                    ESP_LOGI(TAG, "stop_task: spool refresh task launched on core 0 "
-                             "(spool stale, stack=%u PSRAM)",
-                             (unsigned)edf_stack_size);
-                } else {
-                    ESP_LOGE(TAG, "stop_task: xTaskCreateStaticPinnedToCore failed");
-                    free(edf_stack); free(edf_tcb);
-                    s_prev_edf_stack = NULL; s_prev_edf_tcb = NULL;
-                    free(edf_args);
-                }
+                s->pld_dropped++;
             }
-        } else {
-            ESP_LOGE(TAG, "stop_task: malloc failed for edf stack/tcb "
-                     "(PSRAM free=%u, internal free=%u)",
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-            free(edf_stack); free(edf_tcb); free(edf_args);
         }
-    } else {
-        ESP_LOGE(TAG, "stop_task: failed to allocate edf_task args, EDF skipped");
     }
 
-    /* stop_task exits — notif_proc_task is now free to process any
-     * new therapy notifications without competition from this task. */
-    vTaskDelete(NULL);
+    /* Hand off to the storage worker before anything can be clipped.  No
+     * file I/O happens here — only a pointer swap. */
+    if (b->n_brp >= BRP_COMMIT_THRESHOLD ||
+        b->n_sa2 >= SA2_CAP - 5 ||
+        b->n_pld >= PLD_CAP - 20) {
+        swap_and_enqueue_locked(s);
+    }
+
+    xSemaphoreGive(s->fill_mutex);
 }
+
+/* ── Notification dispatch ────────────────────────────────────────── */
 
 void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
 {
@@ -1541,34 +1927,15 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
 
     cJSON *method = cJSON_GetObjectItem(msg, "method");
     const char *method_str = method ? method->valuestring : NULL;
-
     if (!method_str) return;
 
     ESP_LOGD(TAG, "notification: %s", method_str);
 
-    /* Handle EventNotification: check for TherapyStart/TherapyStop.
-     *
-     * Session lifecycle (confirmed from AS11 logs 2026-07-11):
-     *   - TherapyStop and TherapyStart are separate EventNotifications,
-     *     typically 1-5 minutes apart for short mask-off breaks.
-     *   - Each creates a separate .snt session and separate EDF files.
-     *   - The AS11 sends MaskOn ~7s after TherapyStart; .snt recording
-     *     starts at TherapyStart, so BRP/PLD/SA2 EDF files use skip_samples
-     *     to align to MaskOn (see edf_gen.c).
-     *
-     * Race condition note: session_writer_stop() now clears s_active BEFORE
-     * the GetDateTime RPC, so a TherapyStart arriving during that ~50ms
-     * window will correctly create a new session instead of writing to the
-     * closing session's files (which was the primary "session gluing" cause
-     * for short inter-session breaks). */
     if (strcmp(method_str, "EventNotification") == 0) {
         bool start = false, stop = false;
-        check_event_notification(msg, &start, &stop);
+        const char *report = NULL;
+        check_event_notification(msg, &start, &stop, &report);
 
-        /* Handle stop first so that a single message containing both
-         * TherapyStart + TherapyStop (quick start/stop) doesn't leave
-         * the display stuck in graph mode.  After stop, s is set to NULL
-         * so the start handler below will create a fresh session. */
         if (stop) {
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
             s_therapy_stopped = true;
@@ -1576,12 +1943,8 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             therapy_alert_on_therapy_stop();
             if (s && s->active) {
                 write_event(s, msg);
-                /* Run stop in a separate task so notif_proc_task can process
-                 * the GetDateTime RPC response while session_writer_stop blocks.
-                 * Stack 8KB: stop_task does session finalisation + post-therapy
-                 * spool pulls (BLE I/O, not CPU-heavy).  EDF generation runs
-                 * in a separate task on core 1 (see edf_task). */
-                psram_task_create(stop_task, "session_stop", 8192, s, 15, tskNO_AFFINITY, NULL, NULL);
+                sw_request_finalize(s, "completed",
+                                    (int64_t)time(NULL) * 1000, true);
                 s = NULL;
             }
         }
@@ -1589,10 +1952,34 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             ESP_LOGI(TAG, ">>> THERAPY START detected");
             s_therapy_stopped = false;
             therapy_alert_on_therapy_start();
-            /* Always activate the live graph — the display should show the
-             * waveform regardless of whether SD recording succeeds.  Flow
-             * data from push_flow() is discarded when s_mode != GRAPH. */
             bsp_display_set_therapy_active(true);
+
+            int64_t now_us = esp_timer_get_time();
+            bool duplicate = false;
+            if (report && report[0] && strcmp(report, s_last_start_report) == 0) {
+                duplicate = true;
+            } else if (s && s->active &&
+                       (now_us - s->start_time_us) / 1000 < SW_START_DEBOUNCE_MS) {
+                duplicate = true;
+            }
+            if (report && report[0])
+                strlcpy(s_last_start_report, report, sizeof(s_last_start_report));
+
+            if (s && s->active && !duplicate) {
+                /* A genuine TherapyStart while a session is still open means
+                 * the TherapyStop was missed (BLE dropout across the end of
+                 * therapy).  Rotate: without this the sessions glue together,
+                 * and an inactivity watchdog never fires because the new
+                 * therapy's StreamData keeps resetting it. */
+                ESP_LOGW(TAG, "TherapyStart while session active — "
+                         "missed TherapyStop, rotating session");
+                sw_request_finalize(s, "rotated",
+                                    (int64_t)time(NULL) * 1000, true);
+                s = NULL;
+            } else if (duplicate && s && s->active) {
+                ESP_LOGI(TAG, "duplicate TherapyStart ignored (echo)");
+            }
+
             if (!s || !s->active) {
                 s = session_writer_start();
             }
@@ -1605,9 +1992,6 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         }
         if (start || stop) return;
 
-        /* Check for _SNC ValueChange (Summary spool update notification).
-         * Format: {"method":"EventNotification","params":{"dataId":"_SNC",
-         * "events":[{"event":"ValueChange","value":247}]}} */
         cJSON *params = cJSON_GetObjectItem(msg, "params");
         if (params) {
             cJSON *data_id = cJSON_GetObjectItem(params, "dataId");
@@ -1626,16 +2010,14 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                         }
                     }
                 }
-                return;  /* _SNC notifications are not written to events.snt */
+                return;
             }
-            /* _ZLE ValueChange — write to events.snt with injected NTP
-             * timestamp.  The AS11 does not include reportTime in
-             * ValueChange notifications (same as _SNC), so we capture
-             * the NTP time at receipt and inject it as "ntpTimeMs".
-             * The EDF generator uses this to align BRP/PLD/SA2 start
-             * to the AS11's _ZLE gating signal instead of MaskOn.
-             * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
-            if (strcmp(data_id->valuestring, "_ZLE") == 0) {
+            /* _ZLE ValueChange — the AS11 omits reportTime here, so capture
+             * the NTP time at receipt and inject it.  The pair (AS11 event +
+             * ntpTimeMs) is also what lets crash recovery derive a
+             * session-local drift instead of trusting a stale estimate. */
+            if (data_id && cJSON_IsString(data_id) &&
+                strcmp(data_id->valuestring, "_ZLE") == 0) {
                 int zle_val = -1;
                 cJSON *events = cJSON_GetObjectItem(params, "events");
                 if (events && cJSON_IsArray(events)) {
@@ -1649,24 +2031,19 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                 if (s && s->active) {
                     cJSON *zle_copy = cJSON_Duplicate(msg, 1);
                     if (zle_copy) {
-                        cJSON *zle_params = cJSON_GetObjectItem(zle_copy, "params");
-                        if (zle_params) {
-                            cJSON *zle_events = cJSON_GetObjectItem(zle_params, "events");
-                            if (zle_events && cJSON_IsArray(zle_events)) {
-                                cJSON *zle_ev = cJSON_GetArrayItem(zle_events, 0);
-                                if (zle_ev) {
+                        cJSON *zp = cJSON_GetObjectItem(zle_copy, "params");
+                        if (zp) {
+                            cJSON *ze = cJSON_GetObjectItem(zp, "events");
+                            if (ze && cJSON_IsArray(ze)) {
+                                cJSON *zev = cJSON_GetArrayItem(ze, 0);
+                                if (zev) {
                                     int64_t ntp_ms = (int64_t)time(NULL) * 1000;
-                                    cJSON_AddNumberToObject(zle_ev, "ntpTimeMs",
+                                    cJSON_AddNumberToObject(zev, "ntpTimeMs",
                                                             (double)ntp_ms);
                                 }
                             }
                         }
-                        char *json_str = cJSON_PrintUnformatted(zle_copy);
-                        if (json_str) {
-                            fputs(json_str, s->f_events);
-                            fputc('\n', s->f_events);
-                            free(json_str);
-                        }
+                        queue_event_json(s, cJSON_PrintUnformatted(zle_copy));
                         cJSON_Delete(zle_copy);
                     }
                 }
@@ -1676,30 +2053,213 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             }
         }
 
-        /* Other events (MaskOn, MaskOff, etc.) — write if session active */
         if (s && s->active) write_event(s, msg);
         return;
     }
 
-    /* StreamData is handled by the fast-path (session_writer_on_stream_data_raw)
-     * in as11_ble.c before cJSON parse. If we reach here, it's a non-StreamData
-     * notification — write as event if session active. */
-    if (s && s->active) {
-        write_event(s, msg);
-    }
+    if (s && s->active) write_event(s, msg);
 }
 
-/* ── _SNC tracking ───────────────────────────────────────────────── */
+/* ════════════════════════════════════════════════════════════════════
+ *  Crash recovery
+ *
+ *  Physical records are authoritative, not the header count: the
+ *  buffer-full path used to write records without updating the header, so
+ *  a crash can leave a stale-LOW header with complete, readable records
+ *  beyond it.  Taking min(header, physical) would deliberately discard
+ *  them — and because both convert_snt_to_edf() and the "no therapy"
+ *  suppression read the header count, a stale-low header does not just
+ *  under-report: it truncates the export or drops the session entirely.
+ * ════════════════════════════════════════════════════════════════════ */
 
-bool session_writer_snc_changed(int64_t *out_value)
+typedef struct {
+    uint32_t records;
+    int64_t  start_epoch_ms;
+    bool     valid;
+    bool     repaired;
+} snt_scan_t;
+
+/* Validate geometry, count complete records from the file size, and repair
+ * the header in both directions. */
+static snt_scan_t scan_and_repair_snt(const char *path, uint8_t want_ch,
+                                      uint16_t want_hz)
 {
-    if (!s_snc_changed) return false;
-    s_snc_changed = false;
-    if (out_value) *out_value = s_snc_value;
-    return true;
+    snt_scan_t r = {0};
+    FILE *f = fopen(path, "r+b");
+    if (!f) return r;
+
+    snt_header_t hdr;
+    if (fread(&hdr, 1, SNT_HEADER_SIZE, f) != SNT_HEADER_SIZE ||
+        hdr.magic != SNT_MAGIC) {
+        fclose(f);
+        return r;
+    }
+    /* Reject implausible geometry rather than computing nonsense from it. */
+    if (hdr.version == 0 || hdr.version > SNT_VERSION ||
+        hdr.n_channels == 0 || hdr.n_channels > 16 ||
+        hdr.sample_bytes != 2 || hdr.sample_hz_x10 == 0) {
+        ESP_LOGW(TAG, "recover: %s has implausible geometry "
+                 "(v=%u ch=%u sb=%u hz10=%u)", path,
+                 hdr.version, hdr.n_channels, hdr.sample_bytes,
+                 hdr.sample_hz_x10);
+        fclose(f);
+        return r;
+    }
+    if (want_ch && hdr.n_channels != want_ch) {
+        ESP_LOGW(TAG, "recover: %s channel mismatch (%u != %u)",
+                 path, hdr.n_channels, want_ch);
+    }
+    if (want_hz && hdr.sample_hz_x10 != want_hz) {
+        ESP_LOGW(TAG, "recover: %s rate mismatch (%u != %u)",
+                 path, hdr.sample_hz_x10, want_hz);
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return r; }
+    long size = ftell(f);
+    if (size < (long)SNT_HEADER_SIZE) { fclose(f); return r; }
+
+    uint32_t rec_bytes = snt_record_bytes(&hdr);
+    uint64_t payload = (uint64_t)size - SNT_HEADER_SIZE;
+    uint32_t physical = (uint32_t)(payload / rec_bytes);
+    uint64_t partial = payload % rec_bytes;
+    if (partial) {
+        ESP_LOGW(TAG, "recover: %s has a %llu-byte partial trailing record "
+                 "(ignored)", path, (unsigned long long)partial);
+    }
+
+    r.records = physical;
+    r.start_epoch_ms = hdr.start_epoch_ms;
+    r.valid = true;
+
+    if (hdr.sample_count != physical) {
+        ESP_LOGW(TAG, "recover: %s header says %u records, %u are present — "
+                 "repairing header", path,
+                 (unsigned)hdr.sample_count, (unsigned)physical);
+        if (fseek(f, offsetof(snt_header_t, sample_count), SEEK_SET) == 0 &&
+            fwrite(&physical, sizeof(uint32_t), 1, f) == 1 &&
+            fflush(f) == 0) {
+            fsync(fileno(f));
+            r.repaired = true;
+        } else {
+            ESP_LOGE(TAG, "recover: header repair failed for %s", path);
+        }
+    }
+
+    fclose(f);
+    return r;
 }
 
-/* ── Crash recovery ───────────────────────────────────────────────── */
+/* Parse "YYYY-MM-DDTHH:MM:SS[.mmm]Z" to epoch ms.
+ *
+ * reportTime is UTC in the AS11 clock domain, so it must NOT go through
+ * mktime() (which would apply the local timezone offset and put the derived
+ * drift hours out).  Uses the same civil-from-days algorithm as
+ * edf_gen.c:parse_iso8601_utc_ms() so both agree exactly. */
+static int64_t parse_iso8601_utc_ms(const char *iso_str)
+{
+    if (!iso_str) return -1;
+    int year = 0, mon = 0, mday = 0, hour = 0, min = 0, sec = 0, ms = 0;
+    int n = sscanf(iso_str, "%d-%d-%dT%d:%d:%d.%dZ",
+                   &year, &mon, &mday, &hour, &min, &sec, &ms);
+    if (n < 6) {
+        n = sscanf(iso_str, "%d-%d-%dT%d:%d:%dZ",
+                   &year, &mon, &mday, &hour, &min, &sec);
+        if (n < 6) return -1;
+        ms = 0;
+    }
+    /* Howard Hinnant's days-from-civil algorithm (public domain). */
+    int y = year;
+    int m = mon;
+    int d = mday;
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = (int64_t)era * 146097 + (int)doe - 719468;
+    int64_t secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    return secs * 1000 + ms;
+}
+
+/* Derive a session-local drift from a durable event carrying both the AS11
+ * reportTime and the NTP time captured at receipt.  Preferred over any
+ * persisted estimate because it belongs to *this* session. */
+static bool drift_from_events(const char *events_path, int64_t *out_drift,
+                              int64_t *out_at)
+{
+    FILE *f = fopen(events_path, "r");
+    if (!f) return false;
+
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, "ntpTimeMs")) continue;
+        cJSON *root = cJSON_Parse(line);
+        if (!root) continue;
+        cJSON *params = cJSON_GetObjectItem(root, "params");
+        cJSON *events = params ? cJSON_GetObjectItem(params, "events") : NULL;
+        cJSON *ev = (events && cJSON_IsArray(events)) ?
+                     cJSON_GetArrayItem(events, 0) : NULL;
+        cJSON *ntp = ev ? cJSON_GetObjectItem(ev, "ntpTimeMs") : NULL;
+        cJSON *rt = ev ? cJSON_GetObjectItem(ev, "reportTime") : NULL;
+        if (ntp && cJSON_IsNumber(ntp) && rt && cJSON_IsString(rt)) {
+            int64_t as11_ms = parse_iso8601_utc_ms(rt->valuestring);
+            if (as11_ms > 0) {
+                int64_t ntp_ms = (int64_t)ntp->valuedouble;
+                int64_t drift = ntp_ms - as11_ms;
+                /* Sanity: a plausible AS11 drift is minutes, not days.  A
+                 * wild value means the pair is not trustworthy, so fall
+                 * through to the persisted estimate instead. */
+                if (drift > -86400000LL && drift < 86400000LL) {
+                    *out_drift = drift;
+                    *out_at = ntp_ms;
+                    found = true;
+                }
+            }
+        }
+        cJSON_Delete(root);
+        if (found) break;
+    }
+    fclose(f);
+    return found;
+}
+
+/* Read an existing manifest and decide whether the session is already
+ * final.  Presence alone must not suppress recovery: a crash can leave a
+ * truncated or half-written file. */
+static bool manifest_is_final(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > 16384) { fclose(f); return false; }
+
+    char *buf = malloc(size + 1);
+    if (!buf) { fclose(f); return false; }
+    size_t rd = fread(buf, 1, size, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        ESP_LOGW(TAG, "recover: %s is not valid JSON — treating as unfinished",
+                 path);
+        return false;
+    }
+    cJSON *state = cJSON_GetObjectItem(root, "state");
+    bool final = false;
+    if (state && cJSON_IsString(state)) {
+        const char *v = state->valuestring;
+        final = (strcmp(v, "completed") == 0 || strcmp(v, "interrupted") == 0 ||
+                 strcmp(v, "timed_out") == 0 || strcmp(v, "rotated") == 0 ||
+                 strcmp(v, "split") == 0 || strcmp(v, "storage_failed") == 0);
+    }
+    cJSON_Delete(root);
+    return final;
+}
 
 void session_writer_recover(void)
 {
@@ -1711,7 +2271,6 @@ void session_writer_recover(void)
     struct dirent *ent;
     int recovered = 0;
 
-    /* Scan noon-day folders under .somnotrace/sessions/streams/ */
     while ((ent = readdir(dir)) != NULL) {
         if (ent->d_name[0] == '.') continue;
         if (strlen(ent->d_name) != 8) continue;  /* YYYYMMDD */
@@ -1726,160 +2285,208 @@ void session_writer_recover(void)
         while ((day_ent = readdir(day_dir)) != NULL) {
             if (day_ent->d_name[0] == '.') continue;
 
-            /* Detect sessions: v2 uses _flow.snt, v1 (backwards compat) uses
-             * _brp.snt.  Check v2 first, then fall back to v1. */
             const char *flow_suffix = strstr(day_ent->d_name, "_flow.snt");
             const char *brp_suffix  = strstr(day_ent->d_name, "_brp.snt");
             const char *suffix = flow_suffix ? flow_suffix : brp_suffix;
             if (!suffix) continue;
             bool is_v2 = (flow_suffix != NULL);
 
-            /* Extract the session prefix (everything before _flow.snt / _brp.snt) */
             size_t prefix_len = suffix - day_ent->d_name;
-            if (prefix_len >= 32) continue;
-            char prefix[32];
+            if (prefix_len >= 40) continue;
+            char prefix[40];
             memcpy(prefix, day_ent->d_name, prefix_len);
             prefix[prefix_len] = '\0';
 
-            /* Check if session.json already exists (session was finalised) */
-            char json_path[400];
-            snprintf(json_path, sizeof(json_path), "%s/%s_session.json", day_path, prefix);
-            struct stat st;
-            if (stat(json_path, &st) == 0) continue;
+            /* Leftover temp manifest from a crash mid-rename. */
+            char tmp_path[420];
+            snprintf(tmp_path, sizeof(tmp_path), "%s/%s_session.json.tmp",
+                     day_path, prefix);
+            if (unlink(tmp_path) == 0) {
+                ESP_LOGW(TAG, "recover: removed stale temp manifest for %s", prefix);
+            }
 
-            ESP_LOGW(TAG, "found interrupted session: %s/%s — writing metadata",
+            char json_path[420];
+            snprintf(json_path, sizeof(json_path), "%s/%s_session.json",
+                     day_path, prefix);
+            if (manifest_is_final(json_path)) continue;
+
+            ESP_LOGW(TAG, "found interrupted session: %s/%s — recovering",
                      ent->d_name, prefix);
 
-            /* Read sample counts and start_epoch_ms from .snt headers.
-             * v2: read flow.snt + press.snt + flow_mm.snt
-             * v1: read brp.snt + brp_mm.snt (backwards compat) */
-            char path[400];
-            uint32_t brp_samples = 0, sa2_samples = 0, pld_samples = 0, brp_mm_samples = 0;
-            uint32_t press_samples = 0;
+            char path[420];
             int64_t start_epoch_ms = 0;
-            snt_header_t hdr;
-            bool got_valid_header = false;
+            snt_scan_t flow_s = {0}, press_s = {0}, mm_s = {0},
+                       sa2_s = {0}, pld_s = {0};
 
             if (is_v2) {
                 snprintf(path, sizeof(path), "%s/%s_flow.snt", day_path, prefix);
+                flow_s = scan_and_repair_snt(path, 1, 250);
+                snprintf(path, sizeof(path), "%s/%s_press.snt", day_path, prefix);
+                press_s = scan_and_repair_snt(path, 1, 250);
+                snprintf(path, sizeof(path), "%s/%s_flow_mm.snt", day_path, prefix);
+                mm_s = scan_and_repair_snt(path, 2, 10);
             } else {
                 snprintf(path, sizeof(path), "%s/%s_brp.snt", day_path, prefix);
+                flow_s = scan_and_repair_snt(path, 0, 0);
+                snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", day_path, prefix);
+                mm_s = scan_and_repair_snt(path, 0, 0);
             }
-            FILE *f = fopen(path, "rb");
-            if (f) {
-                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC) {
-                    brp_samples = hdr.sample_count;
-                    start_epoch_ms = hdr.start_epoch_ms;
-                    got_valid_header = true;
+            snprintf(path, sizeof(path), "%s/%s_sa2.snt", day_path, prefix);
+            sa2_s = scan_and_repair_snt(path, 2, 10);
+            snprintf(path, sizeof(path), "%s/%s_pld.snt", day_path, prefix);
+            pld_s = scan_and_repair_snt(path, 12, 5);
+
+            if (flow_s.valid) start_epoch_ms = flow_s.start_epoch_ms;
+
+            /* v2 pair: the exported lockstep length is the shorter of the
+             * two, and a mismatch is worth saying out loud. */
+            uint32_t brp_records = flow_s.records;
+            if (is_v2 && press_s.valid) {
+                if (press_s.records != flow_s.records) {
+                    ESP_LOGW(TAG, "recover: flow/press count mismatch "
+                             "(%u vs %u) — using the smaller",
+                             (unsigned)flow_s.records, (unsigned)press_s.records);
                 }
-                fclose(f);
+                brp_records = flow_s.records < press_s.records
+                            ? flow_s.records : press_s.records;
             }
 
-            /* No readable .snt header (0-byte directory entry from a crash
-             * before the FAT metadata was committed).  Rather than discarding
-             * the session outright — which is how 4h39m of therapy was lost
-             * to an INT_WDT reset — reconstruct start_epoch_ms from the
-             * session id (YYYYMMDD_HHMMSS) so the metadata is still written
-             * and the day-bucketing stays correct instead of defaulting to 0
-             * and producing an invalid 19691231 EDF folder. */
-            if (!got_valid_header) {
+            /* Checkpoint: newest valid slot. */
+            snt_ckpt_t ck;
+            bool have_ckpt = false;
+            snprintf(path, sizeof(path), "%s/%s.ckpt", day_path, prefix);
+            memset(&ck, 0, sizeof(ck));
+            have_ckpt = ckpt_read_best(path, &ck);
+            if (have_ckpt && start_epoch_ms <= 0)
+                start_epoch_ms = ck.start_epoch_ms;
+
+            /* Last resort: reconstruct the start from the session id so the
+             * day bucketing stays correct instead of defaulting to epoch 0
+             * and producing a 19691231 folder. */
+            if (start_epoch_ms <= 0) {
                 struct tm tm_id = {0};
                 int y, mo, d, h, mi, sec;
                 if (sscanf(prefix, "%4d%2d%2d_%2d%2d%2d",
                            &y, &mo, &d, &h, &mi, &sec) == 6) {
-                    tm_id.tm_year = y - 1900;
-                    tm_id.tm_mon  = mo - 1;
-                    tm_id.tm_mday = d;
-                    tm_id.tm_hour = h;
-                    tm_id.tm_min  = mi;
-                    tm_id.tm_sec  = sec;
+                    tm_id.tm_year = y - 1900; tm_id.tm_mon = mo - 1;
+                    tm_id.tm_mday = d; tm_id.tm_hour = h;
+                    tm_id.tm_min = mi; tm_id.tm_sec = sec;
                     tm_id.tm_isdst = -1;
                     time_t t_id = mktime(&tm_id);
                     if (t_id > 0) start_epoch_ms = (int64_t)t_id * 1000;
                 }
                 if (start_epoch_ms <= 0) {
-                    ESP_LOGW(TAG, "skipping interrupted session %s/%s — no valid .snt header "
-                                  "and unparseable session id",
-                             ent->d_name, prefix);
+                    ESP_LOGW(TAG, "skipping %s/%s — no valid header, no "
+                             "checkpoint, unparseable id", ent->d_name, prefix);
                     continue;
                 }
-                ESP_LOGW(TAG, "interrupted session %s/%s — no valid .snt header "
-                              "(crash before FAT sync?); start time reconstructed from id",
-                         ent->d_name, prefix);
+                ESP_LOGW(TAG, "recover: start time reconstructed from id for %s",
+                         prefix);
             }
 
-            if (is_v2) {
-                snprintf(path, sizeof(path), "%s/%s_flow_mm.snt", day_path, prefix);
+            /* End time, with provenance. */
+            int64_t end_epoch_ms = 0;
+            const char *end_source = "none";
+            if (have_ckpt && ck.elapsed_us > 0) {
+                end_epoch_ms = start_epoch_ms + ck.elapsed_us / 1000;
+                end_source = "checkpoint";
+                if (brp_records > ck.flow_count) {
+                    /* Records exist beyond the checkpoint: recover them and
+                     * extend the estimate by their duration rather than
+                     * discarding the tail or pretending it was observed. */
+                    uint32_t extra = brp_records - ck.flow_count;
+                    end_epoch_ms += (int64_t)extra * 1000 / 25;
+                    end_source = "checkpoint_extrapolated";
+                    ESP_LOGW(TAG, "recover: %u records past checkpoint — "
+                             "end extrapolated", (unsigned)extra);
+                }
+            } else if (brp_records > 0) {
+                end_epoch_ms = start_epoch_ms + (int64_t)brp_records * 1000 / 25;
+                end_source = "sample_estimate";
+            }
+
+            /* Drift: session-local first, persisted snapshot as fallback. */
+            int64_t drift_ms = 0, drift_at = 0;
+            const char *drift_source = "none";
+            bool drift_usable = false;
+            snprintf(path, sizeof(path), "%s/%s_events.snt", day_path, prefix);
+            if (drift_from_events(path, &drift_ms, &drift_at)) {
+                drift_source = "session_events";
+                drift_usable = true;
+                ESP_LOGI(TAG, "recover: drift %lld ms from session events",
+                         (long long)drift_ms);
             } else {
-                snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", day_path, prefix);
-            }
-            f = fopen(path, "rb");
-            if (f) {
-                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
-                    brp_mm_samples = hdr.sample_count;
-                fclose(f);
-            }
-
-            /* v2: also read press.snt for press_samples */
-            if (is_v2) {
-                snprintf(path, sizeof(path), "%s/%s_press.snt", day_path, prefix);
-                f = fopen(path, "rb");
-                if (f) {
-                    if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
-                        press_samples = hdr.sample_count;
-                    fclose(f);
+                time_drift_snapshot_t snap;
+                if (time_sync_get_drift_snapshot(&snap) && snap.available) {
+                    drift_ms = snap.drift_ms;
+                    drift_at = snap.measured_at_ms;
+                    drift_source = snap.source;
+                    drift_usable = true;
+                    ESP_LOGW(TAG, "recover: drift %lld ms estimated from %s",
+                             (long long)drift_ms, drift_source);
                 }
             }
 
-            snprintf(path, sizeof(path), "%s/%s_sa2.snt", day_path, prefix);
-            f = fopen(path, "rb");
-            if (f) {
-                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
-                    sa2_samples = hdr.sample_count;
-                fclose(f);
+            /* Write the manifest atomically. */
+            char tmp[440];
+            snprintf(tmp, sizeof(tmp), "%s.tmp", json_path);
+            FILE *f = fopen(tmp, "w");
+            if (!f) {
+                ESP_LOGE(TAG, "recover: cannot create %s", tmp);
+                continue;
             }
 
-            snprintf(path, sizeof(path), "%s/%s_pld.snt", day_path, prefix);
-            f = fopen(path, "rb");
-            if (f) {
-                if (fread(&hdr, 1, SNT_HEADER_SIZE, f) == SNT_HEADER_SIZE && hdr.magic == SNT_MAGIC)
-                    pld_samples = hdr.sample_count;
-                fclose(f);
+            char iso_start[32] = {0};
+            {
+                time_t st = (time_t)(start_epoch_ms / 1000);
+                struct tm tm;
+                localtime_r(&st, &tm);
+                strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
             }
 
-            /* Write session.json manually (no cJSON — stack-limited task).
-             * v2 sessions include fmt=2 and press_samples; v1 sessions omit them. */
-            f = fopen(json_path, "w");
-            if (f) {
-                fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
-                           "\"start_epoch_ms\":%lld,"
-                           "\"clock_drift_ms\":0,\"clock_drift_valid\":false,"
-                           "\"brp_samples\":%u,\"brp_mm_samples\":%u,"
-                           "\"sa2_samples\":%u,\"pld_samples\":%u",
-                        prefix,
-                        (long long)start_epoch_ms,
-                        (unsigned)brp_samples, (unsigned)brp_mm_samples,
-                        (unsigned)sa2_samples, (unsigned)pld_samples);
-                if (is_v2) {
-                    fprintf(f, ",\"fmt\":2,\"press_samples\":%u", (unsigned)press_samples);
-                }
+            fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
+                       "\"start_epoch_ms\":%lld",
+                    prefix, (long long)start_epoch_ms);
+            if (end_epoch_ms > 0)
+                fprintf(f, ",\"end_epoch_ms\":%lld", (long long)end_epoch_ms);
+            fprintf(f, ",\"end_source\":\"%s\"", end_source);
+            fprintf(f, ",\"clock_drift_ms\":%lld,\"clock_drift_valid\":false",
+                    (long long)drift_ms);
+            fprintf(f, ",\"clock_drift_source\":\"%s\"", drift_source);
+            fprintf(f, ",\"clock_drift_usable\":%s", drift_usable ? "true" : "false");
+            if (drift_at > 0)
+                fprintf(f, ",\"clock_drift_measured_at_ms\":%lld", (long long)drift_at);
+            fprintf(f, ",\"brp_samples\":%u,\"brp_mm_samples\":%u,"
+                       "\"sa2_samples\":%u,\"pld_samples\":%u",
+                    (unsigned)brp_records, (unsigned)mm_s.records,
+                    (unsigned)sa2_s.records, (unsigned)pld_s.records);
+            if (is_v2)
+                fprintf(f, ",\"fmt\":2,\"press_samples\":%u",
+                        (unsigned)press_s.records);
+            if (have_ckpt)
+                fprintf(f, ",\"checkpoint_seq\":%u", (unsigned)ck.seq);
+            if (iso_start[0])
+                fprintf(f, ",\"start_iso\":\"%s\"", iso_start);
+            if (s_device_addr[0])
+                fprintf(f, ",\"as11_device\":\"%s\"", s_device_addr);
+            if (s_client_id[0])
+                fprintf(f, ",\"as11_client_id\":\"%s\"", s_client_id);
+            fprintf(f, "}\n");
 
-                if (start_epoch_ms > 0) {
-                    time_t start = (time_t)(start_epoch_ms / 1000);
-                    struct tm tm;
-                    localtime_r(&start, &tm);
-                    char iso_start[32];
-                    strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
-                    fprintf(f, ",\"start_iso\":\"%s\"", iso_start);
-                }
-
-                if (s_device_addr[0]) fprintf(f, ",\"as11_device\":\"%s\"", s_device_addr);
-                if (s_client_id[0]) fprintf(f, ",\"as11_client_id\":\"%s\"", s_client_id);
-                fprintf(f, "}\n");
-                fclose(f);
-                ESP_LOGI(TAG, "wrote %s (state=interrupted)", json_path);
+            bool ok = (fflush(f) == 0) && (fsync(fileno(f)) == 0);
+            if (fclose(f) != 0) ok = false;
+            if (ok) {
+                unlink(json_path);
+                ok = (rename(tmp, json_path) == 0);
+            }
+            if (!ok) {
+                unlink(tmp);
+                ESP_LOGE(TAG, "recover: failed to write %s", json_path);
+                continue;
             }
 
+            ESP_LOGI(TAG, "recovered %s: brp=%u end_source=%s drift=%s",
+                     prefix, (unsigned)brp_records, end_source, drift_source);
             recovered++;
         }
         closedir(day_dir);
@@ -1888,5 +2495,6 @@ void session_writer_recover(void)
     closedir(dir);
     if (recovered > 0) {
         ESP_LOGI(TAG, "recovered %d interrupted session(s)", recovered);
+        ESP_LOGI(TAG, "use the Web UI 'rebuild day' action to export them");
     }
 }

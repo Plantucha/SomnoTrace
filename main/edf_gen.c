@@ -23,6 +23,7 @@
 
 #include "edf_gen.h"
 #include "sd_storage.h"
+#include "as11_time.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1207,6 +1208,11 @@ static void noon_day_folder(int64_t epoch_ms, char *out, size_t out_len);
  * Sub-field 2 = 50th percentile, 3 = 95th (or 70th for Leak), 4 = 100th (or 95th).
  * The exact mapping depends on the field — see _SUMMARY_SUBFIELDS in as11_spool.py. */
 
+/* MaskOn/MaskOff declare phys_max 1440 (one day of minutes).  Anything
+ * beyond that is rejected by consumers as a corrupt card, so it is treated
+ * as an internal error rather than written out. */
+#define STR_MASK_MINUTES_MAX  1440
+
 /* STR.edf signal count — full 134-signal superset:
  * 133 data signals + 1 Crc16 = 134 total.
  * Includes VAuto/Spont/ST/Timed/ASV/ASVAuto settings and
@@ -1841,35 +1847,43 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
      * NTP-based EDF headers, filenames, and event annotations (OSCAR matches
      * sessions to STR mask events within a ~1 minute window).
      *
-     * The noon-day *bucket*, however, must be decided from the RAW AS11 clock.
-     * The AS11 sets PeriodStart to exactly noon in its own clock; applying the
-     * NTP drift first (typically -8 min) lands it at 11:5x, which tripped the
-     * "before noon" test below and rolled every record back a full day —
-     * producing Date-1 and MaskOn/MaskOff +1440.  Values above 1440 exceed the
-     * signal's declared physical maximum, and OSCAR discards any mask on/off
-     * pair over 24*60 as card corruption, losing all STR session times.
-     * Rationale: same as str_day_record_t.period_start_as11 below. */
-    time_t day_t = (time_t)(period_start_ms / 1000);
-    struct tm day_tm;
-    localtime_r(&day_t, &day_tm);
-    if (day_tm.tm_hour < 12) day_t -= 86400;
-    localtime_r(&day_t, &day_tm);
+     * Two different clocks are involved and both matter:
+     *
+     *  - The noon-day *bucket* belongs to the AS11.  The device defines its
+     *    reporting day noon-to-noon in ITS OWN timezone and stamps
+     *    PeriodStart at exactly its local noon.  Applying ESP local time to
+     *    that instant is wrong whenever the zones differ: with the AS11 one
+     *    hour east, its noon reads as 11:00 ESP-local, trips the "before
+     *    noon" test and rolls every record back a whole day — producing
+     *    Date-1 and MaskOn/MaskOff +1440.  Values above 1440 exceed the
+     *    signal's declared maximum and OSCAR discards such pairs as card
+     *    corruption, losing every STR session time (issue #75).
+     *    as11_time_noon_day_for_period_start() resolves the bucket using the
+     *    AS11's own offset, derived from the noon stamp itself.
+     *
+     *  - The mask minutes are measured from ESP-LOCAL noon of that bucket,
+     *    because consumers reconstruct absolute times as (local noon of the
+     *    record's Date) + minutes and compare them with DATALOG filenames,
+     *    which are written in ESP local time. */
+    char day_label[16];
+    as11_time_noon_day_for_period_start(period_start_ms, day_label,
+                                        sizeof(day_label));
 
-    /* [0] Date: days from Unix epoch (noon-based day of PeriodStart).
-     * Snap to exactly local noon so MaskOn/MaskOff are true minutes from noon
-     * rather than minutes from a drift-shifted instant. */
-    day_tm.tm_hour = 12;
-    day_tm.tm_min = 0;
-    day_tm.tm_sec = 0;
-    day_tm.tm_isdst = -1;
-    time_t noon_t = mktime(&day_tm);
+    int64_t noon_secs = as11_time_local_noon_epoch(day_label);
+    int day_number = as11_time_day_number(day_label);
+    if (noon_secs == 0 || day_number < 0) {
+        /* Should not happen — fall back to the raw instant so we still emit
+         * something rather than a zeroed record. */
+        ESP_LOGW(TAG, "STR.edf: unusable day label '%s' for PeriodStart %lld",
+                 day_label, (long long)period_start_ms);
+        noon_secs = period_start_ms / 1000;
+        day_number = (int)(noon_secs / 86400);
+    }
 
-    struct tm epoch_tm = { .tm_year = 70, .tm_mon = 0, .tm_mday = 1,
-                           .tm_hour = 0, .tm_min = 0, .tm_sec = 0 };
-    time_t epoch_t = mktime(&epoch_tm);
-    str_values[0] = (int16_t)((noon_t - epoch_t) / 86400);
+    /* [0] Date: days from the Unix epoch for the noon-day. */
+    str_values[0] = (int16_t)day_number;
 
-    int64_t noon_epoch_ms = (int64_t)noon_t * 1000;
+    int64_t noon_epoch_ms = noon_secs * 1000;
 
     /* [1-3] MaskOn/MaskOff/MaskEvents from session entries.
      * Each session entry has: ts = MaskOn timestamp, duration_min = session
@@ -1881,6 +1895,23 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
     for (int i = 0; i < ctx->n_session_entries && mask_on_count < 20; i++) {
         int64_t event_ntp_ms = ctx->session_entries[i].ts + clock_drift_ms;
         int min_from_noon = (int)((event_ntp_ms - noon_epoch_ms) / 60000);
+
+        /* Both ends must fall inside the day window this record declares.
+         * A pair outside 0..1440 is exactly what OSCAR reports as "Mask times
+         * are out of range. Possible SDcard corruption" before discarding it,
+         * taking the whole day's session times with it.  If we ever compute
+         * one the bucket is wrong: drop the entry and say so, rather than
+         * emit a value the consumer will read as a corrupt card. */
+        {
+            int dur_chk = (int)ctx->session_entries[i].duration_min;
+            if (min_from_noon < 0 ||
+                min_from_noon + dur_chk > STR_MASK_MINUTES_MAX) {
+                ESP_LOGW(TAG, "STR.edf: %s session %d window %d..%d min is "
+                         "outside the day — entry skipped", day_label, i,
+                         min_from_noon, min_from_noon + dur_chk);
+                continue;
+            }
+        }
 
         if (mask_on_count == 0)
             str_values[1] = (int16_t)min_from_noon;
@@ -1903,14 +1934,18 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
     if (mask_on_count == 0 && ctx->has_scalar[SUM_F_PERIOD_START]) {
         int64_t ps_ntp = ctx->scalars[SUM_F_PERIOD_START] + clock_drift_ms;
         int min_from_noon = (int)((ps_ntp - noon_epoch_ms) / 60000);
-        str_values[1] = (int16_t)min_from_noon;
-        mask_on_count = 1;
+        if (min_from_noon >= 0 && min_from_noon <= STR_MASK_MINUTES_MAX) {
+            str_values[1] = (int16_t)min_from_noon;
+            mask_on_count = 1;
+        }
     }
     if (mask_off_count == 0 && ctx->has_scalar[SUM_F_PERIOD_END]) {
         int64_t pe_ntp = ctx->scalars[SUM_F_PERIOD_END] + clock_drift_ms;
         int min_from_noon = (int)((pe_ntp - noon_epoch_ms) / 60000);
-        str_values[2] = (int16_t)min_from_noon;
-        mask_off_count = 1;
+        if (min_from_noon >= 0 && min_from_noon <= STR_MASK_MINUTES_MAX) {
+            str_values[2] = (int16_t)min_from_noon;
+            mask_off_count = 1;
+        }
     }
 
     int n_pairs = mask_on_count > mask_off_count ? mask_on_count : mask_off_count;
@@ -1934,9 +1969,126 @@ typedef struct {
                                  * while all data timestamps remain NTP-corrected. */
 } str_day_record_t;
 
-/* Build a STR record for the current day from session data (events.snt,
- * start/end times, settings).  Used when the Summary spool doesn't yet
- * contain the current (incomplete) day.
+/* One mask on/off pair, in minutes from the record's local noon. */
+typedef struct {
+    int on_min;
+    int off_min;
+} mask_pair_t;
+
+/* Parse one session's events.snt and append its mask window(s).
+ *
+ * Event reportTime is UTC in the AS11 clock domain, so it is converted with
+ * parse_iso8601_utc_ms() and shifted by that session's own measured drift.
+ * MaskOn/MaskOff are preferred; TherapyStart/TherapyStop are the fallback for
+ * very short sessions where the AS11 emits no mask events. */
+static int collect_session_mask_pairs(const char *session_dir,
+                                     const char *session_id,
+                                     int64_t noon_epoch_ms,
+                                     int64_t session_drift_ms,
+                                     int64_t start_epoch_ms,
+                                     int64_t end_epoch_ms,
+                                     mask_pair_t *out, int max_out)
+{
+    if (max_out <= 0) return 0;
+
+    char events_path[400];
+    snprintf(events_path, sizeof(events_path), "%s/%s_events.snt",
+             session_dir, session_id);
+
+    int n_on = 0, n_off = 0;
+    int on_min[20], off_min[20];
+    int ts_start_min = -1, ts_stop_min = -1;
+
+    FILE *ef = fopen(events_path, "r");
+    if (ef) {
+        char line[640];
+        while (fgets(line, sizeof(line), ef)) {
+            cJSON *msg = cJSON_Parse(line);
+            if (!msg) continue;
+            cJSON *params = cJSON_GetObjectItem(msg, "params");
+            cJSON *events = params ? cJSON_GetObjectItem(params, "events") : NULL;
+            if (events && cJSON_IsArray(events)) {
+                int n = cJSON_GetArraySize(events);
+                for (int i = 0; i < n; i++) {
+                    cJSON *ev = cJSON_GetArrayItem(events, i);
+                    if (!ev) continue;
+                    cJSON *label = cJSON_GetObjectItem(ev, "event");
+                    cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
+                    if (!label || !cJSON_IsString(label)) continue;
+                    if (!rt || !cJSON_IsString(rt)) continue;
+
+                    int64_t as11_ms = parse_iso8601_utc_ms(rt->valuestring);
+                    if (as11_ms <= 0) continue;
+                    int64_t ntp_ms = as11_ms + session_drift_ms;
+                    int min_from_noon = (int)((ntp_ms - noon_epoch_ms) / 60000);
+
+                    const char *l = label->valuestring;
+                    if (strcmp(l, "MaskOn") == 0) {
+                        if (n_on < 20) on_min[n_on++] = min_from_noon;
+                    } else if (strcmp(l, "MaskOff") == 0) {
+                        if (n_off < 20) off_min[n_off++] = min_from_noon;
+                    } else if (strcmp(l, "TherapyStart") == 0) {
+                        if (ts_start_min < 0) ts_start_min = min_from_noon;
+                    } else if (strcmp(l, "TherapyStop") == 0) {
+                        ts_stop_min = min_from_noon;
+                    }
+                }
+            }
+            cJSON_Delete(msg);
+        }
+        fclose(ef);
+    }
+
+    /* Fall back to therapy events, then to the session's own span, so a
+     * session always contributes a window rather than disappearing. */
+    if (n_on == 0) {
+        if (ts_start_min >= 0) {
+            on_min[n_on++] = ts_start_min;
+        } else {
+            on_min[n_on++] = (int)((start_epoch_ms - noon_epoch_ms) / 60000);
+        }
+    }
+    if (n_off == 0) {
+        if (ts_stop_min >= 0) {
+            off_min[n_off++] = ts_stop_min;
+        } else if (end_epoch_ms > start_epoch_ms) {
+            off_min[n_off++] = (int)((end_epoch_ms - noon_epoch_ms) / 60000);
+        } else {
+            off_min[n_off++] = on_min[0];
+        }
+    }
+
+    /* Pair them up positionally; the AS11 writes MaskOff == MaskOn for a
+     * zero-length session rather than omitting it. */
+    int pairs = n_on > n_off ? n_on : n_off;
+    int written = 0;
+    for (int i = 0; i < pairs && written < max_out; i++) {
+        int on = (i < n_on) ? on_min[i] : on_min[n_on - 1];
+        int off = (i < n_off) ? off_min[i] : on;
+        if (off < on) off = on;
+
+        /* Never emit a window outside the day this record declares — see
+         * STR_MASK_MINUTES_MAX. */
+        if (on < 0 || off > STR_MASK_MINUTES_MAX) {
+            ESP_LOGW(TAG, "STR.edf: %s window %d..%d min is outside the day "
+                     "— entry skipped", session_id, on, off);
+            continue;
+        }
+        out[written].on_min = on;
+        out[written].off_min = off;
+        written++;
+    }
+    return written;
+}
+
+/* Build a STR record for a noon-day directly from session data (events.snt,
+ * start/end times, settings).  Used when the AS11's Summary spool does not
+ * yet cover that day — normally only the current, still-incomplete day.
+ *
+ * Every session belonging to the day is included, not just the one being
+ * exported: a day with several sessions previously reported only the last
+ * one, so MaskEvents and the mask windows under-reported the night.
+ *
  * Fills rec->values, mask_on_extra, mask_off_extra, period_start. */
 static void build_current_day_record(str_day_record_t *rec,
                                      const char *session_dir,
@@ -1950,145 +2102,12 @@ static void build_current_day_record(str_day_record_t *rec,
     memset(rec->mask_on_extra, 0xFF, sizeof(rec->mask_on_extra));
     memset(rec->mask_off_extra, 0xFF, sizeof(rec->mask_off_extra));
     rec->period_start = start_epoch_ms;
-    /* Reverse NTP correction for day labelling (see struct comment). */
     rec->period_start_as11 = start_epoch_ms - clock_drift_ms;
 
-    /* [0] Date: days from Unix epoch (noon-based day of session start) */
-    time_t start_t = (time_t)(start_epoch_ms / 1000);
-    struct tm tm_start;
-    localtime_r(&start_t, &tm_start);
-    time_t noon_t = start_t;
-    if (tm_start.tm_hour < 12) noon_t -= 86400;
-    struct tm epoch_tm = { .tm_year=70, .tm_mon=0, .tm_mday=1,
-                           .tm_hour=0, .tm_min=0, .tm_sec=0 };
-    time_t epoch_t = mktime(&epoch_tm);
-    rec->values[0] = (int16_t)((noon_t - epoch_t) / 86400);
-
-    int64_t noon_epoch_ms = (int64_t)noon_t * 1000;
-
-    /* [1-3] MaskOn/MaskOff/MaskEvents from events.snt.
-     * events.snt contains JSON lines with EventNotification messages.
-     * Each event has "reportTime" (ISO 8601 UTC string) and "event" label.
-     * Prefer MaskOn/MaskOff; fall back to TherapyStart/TherapyStop only if
-     * MaskOn/MaskOff are not present (e.g. very short sessions). */
-    int mask_on_count = 0;
-    int mask_off_count = 0;
-    int16_t ts_start_min = -1;  /* TherapyStart as fallback for MaskOn */
-    int16_t ts_stop_min = -1;   /* TherapyStop as fallback for MaskOff */
-
-    char events_path[350];
-    snprintf(events_path, sizeof(events_path), "%s/%s_events.snt", session_dir, session_id);
-    FILE *ef = fopen(events_path, "r");
-    if (ef) {
-        char line[512];
-        while (fgets(line, sizeof(line), ef) && (mask_on_count < 20 || mask_off_count < 20)) {
-            cJSON *msg = cJSON_Parse(line);
-            if (!msg) continue;
-            cJSON *params = cJSON_GetObjectItem(msg, "params");
-            if (params) {
-                cJSON *events = cJSON_GetObjectItem(params, "events");
-                if (events && cJSON_IsArray(events)) {
-                    int n = cJSON_GetArraySize(events);
-                    for (int i = 0; i < n; i++) {
-                        cJSON *ev = cJSON_GetArrayItem(events, i);
-                        if (!ev) continue;
-                        cJSON *label = cJSON_GetObjectItem(ev, "event");
-                        if (!label || !cJSON_IsString(label)) continue;
-                        cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
-                        if (!rt || !cJSON_IsString(rt)) continue;
-
-                        /* Parse ISO 8601 UTC: "2026-06-28T15:40:46.449Z" */
-                        struct tm ev_tm = {0};
-                        int ms = 0;
-                        sscanf(rt->valuestring, "%d-%d-%dT%d:%d:%d.%dZ",
-                               &ev_tm.tm_year, &ev_tm.tm_mon, &ev_tm.tm_mday,
-                               &ev_tm.tm_hour, &ev_tm.tm_min, &ev_tm.tm_sec, &ms);
-                        ev_tm.tm_year -= 1900;
-                        ev_tm.tm_mon -= 1;
-                        /* Convert UTC broken-down time to epoch directly.
-                         * Algorithm from Howard Hinnant's date library (public domain). */
-                        int y = ev_tm.tm_year + 1900;
-                        int m = ev_tm.tm_mon + 1;
-                        int d = ev_tm.tm_mday;
-                        y -= m <= 2;
-                        const int era = (y >= 0 ? y : y - 399) / 400;
-                        const unsigned yoe = (unsigned)(y - era * 400);
-                        const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-                        const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-                        int64_t days = (int64_t)era * 146097 + (int)doe - 719468;
-                        int64_t secs = days * 86400 + ev_tm.tm_hour * 3600 +
-                                       ev_tm.tm_min * 60 + ev_tm.tm_sec;
-                        int64_t event_ntp_ms = secs * 1000 + ms + clock_drift_ms;
-                        int min_from_noon = (int)((event_ntp_ms - noon_epoch_ms) / 60000);
-
-                        if (strcmp(label->valuestring, "MaskOn") == 0 &&
-                            mask_on_count < 20) {
-                            if (mask_on_count == 0)
-                                rec->values[1] = (int16_t)min_from_noon;
-                            else
-                                rec->mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
-                            mask_on_count++;
-                        } else if (strcmp(label->valuestring, "MaskOff") == 0 &&
-                                   mask_off_count < 20) {
-                            if (mask_off_count == 0)
-                                rec->values[2] = (int16_t)min_from_noon;
-                            else
-                                rec->mask_off_extra[mask_off_count - 1] = (int16_t)min_from_noon;
-                            mask_off_count++;
-                        } else if (strcmp(label->valuestring, "TherapyStart") == 0) {
-                            ts_start_min = (int16_t)min_from_noon;
-                        } else if (strcmp(label->valuestring, "TherapyStop") == 0) {
-                            ts_stop_min = (int16_t)min_from_noon;
-                        }
-                    }
-                }
-            }
-            cJSON_Delete(msg);
-        }
-        fclose(ef);
-    }
-
-    /* Fallback: use TherapyStart/TherapyStop if no MaskOn/MaskOff found,
-     * then fall back to session start/end times. */
-    if (mask_on_count == 0) {
-        if (ts_start_min >= 0) {
-            rec->values[1] = ts_start_min;
-            mask_on_count = 1;
-        } else {
-            int start_min = tm_start.tm_hour * 60 + tm_start.tm_min - 720;
-            if (start_min < 0) start_min += 1440;
-            rec->values[1] = (int16_t)start_min;
-            mask_on_count = 1;
-        }
-    }
-    if (mask_off_count == 0) {
-        if (ts_stop_min >= 0) {
-            rec->values[2] = ts_stop_min;
-            mask_off_count = 1;
-        } else {
-            time_t end_t = (time_t)(end_epoch_ms / 1000);
-            struct tm tm_end;
-            localtime_r(&end_t, &tm_end);
-            int end_min = tm_end.tm_hour * 60 + tm_end.tm_min - 720;
-            if (end_min < 0) end_min += 1440;
-            rec->values[2] = (int16_t)end_min;
-            mask_off_count = 1;
-        }
-    }
-    int n_pairs = mask_on_count > mask_off_count ? mask_on_count : mask_off_count;
-    rec->values[3] = (int16_t)(n_pairs * 2);  /* total mask events (on+off), not pair count */
-
-    /* [4] Duration: minutes from start to end */
-    if (end_epoch_ms > start_epoch_ms)
-        rec->values[4] = (int16_t)((end_epoch_ms - start_epoch_ms) / 60000);
-
-    /* [6-30] Settings from settings_json (same as build_str_data_values) */
-    /* Create a temporary ctx with no data so build_str_data_values just
-     * fills settings and leaves stats as -1.
-     *
-     * Heap-allocated: sizeof(summary_ctx_t) is ~5.6 KB, which on the stack
-     * pushed this frame to 6,688 bytes and overflowed the EDF task stack
-     * (generate_str_edf heap-allocates its own ctx for the same reason). */
+    /* Settings first.  build_str_data_values() writes Duration from its
+     * (here empty) Summary context, so it must not run after the values
+     * below or it silently overwrites Duration with 0 — which is what made
+     * the synthesised day report zero usage. */
     summary_ctx_t *empty_ctx = calloc(1, sizeof(summary_ctx_t));
     if (!empty_ctx) {
         ESP_LOGE(TAG, "STR.edf: calloc failed for current-day ctx");
@@ -2097,9 +2116,132 @@ static void build_current_day_record(str_day_record_t *rec,
     build_str_data_values(empty_ctx, rec->values, settings_json);
     free(empty_ctx);
 
-    ESP_LOGI(TAG, "STR.edf: synthesized current day record "
-             "(MaskOn=%d MaskOff=%d Duration=%d)",
-             mask_on_count, mask_off_count, rec->values[4]);
+    /* The day bucket follows the AS11's own noon boundary when its timezone
+     * is known, so this record lands on the same day as the spool records
+     * around it.  Mask minutes are then measured from ESP-LOCAL noon of that
+     * day, because consumers add them to local noon and compare the result
+     * with DATALOG filenames (written in ESP local time). */
+    char day_label[16];
+    as11_time_noon_day(start_epoch_ms - clock_drift_ms, day_label,
+                       sizeof(day_label));
+
+    int64_t noon_secs = as11_time_local_noon_epoch(day_label);
+    int day_number = as11_time_day_number(day_label);
+    if (noon_secs == 0 || day_number < 0) {
+        ESP_LOGW(TAG, "STR.edf: unusable day label '%s' for session %s",
+                 day_label, session_id);
+        return;
+    }
+    int64_t noon_epoch_ms = noon_secs * 1000;
+
+    /* [0] Date */
+    rec->values[0] = (int16_t)day_number;
+
+    /* [1-3] Mask windows, aggregated over every session of this noon-day. */
+    mask_pair_t pairs[21];
+    int n_pairs = 0;
+    int64_t usage_ms = 0;
+
+    DIR *d = opendir(session_dir);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && n_pairs < 20) {
+            const char *suffix = "_session.json";
+            size_t slen = strlen(suffix), flen = strlen(ent->d_name);
+            if (flen <= slen || strcmp(ent->d_name + flen - slen, suffix) != 0)
+                continue;
+
+            char sid[48];
+            size_t plen = flen - slen;
+            if (plen == 0 || plen >= sizeof(sid)) continue;
+            memcpy(sid, ent->d_name, plen);
+            sid[plen] = '\0';
+
+            char json_path[420];
+            snprintf(json_path, sizeof(json_path), "%s/%s", session_dir, ent->d_name);
+            cJSON *j = read_json_file(json_path);
+            if (!j) continue;
+
+            cJSON *js = cJSON_GetObjectItem(j, "start_epoch_ms");
+            cJSON *je = cJSON_GetObjectItem(j, "end_epoch_ms");
+            cJSON *jd = cJSON_GetObjectItem(j, "clock_drift_ms");
+            int64_t s_start = (js && cJSON_IsNumber(js)) ? (int64_t)js->valuedouble : 0;
+            int64_t s_end = (je && cJSON_IsNumber(je)) ? (int64_t)je->valuedouble : 0;
+            int64_t s_drift = (jd && cJSON_IsNumber(jd)) ? (int64_t)jd->valuedouble
+                                                         : clock_drift_ms;
+            cJSON_Delete(j);
+            if (s_start <= 0) continue;
+
+            /* Only sessions belonging to this noon-day. */
+            char sess_day[16];
+            as11_time_noon_day(s_start - s_drift, sess_day, sizeof(sess_day));
+            if (strcmp(sess_day, day_label) != 0) continue;
+
+            int got = collect_session_mask_pairs(session_dir, sid, noon_epoch_ms,
+                                                 s_drift, s_start, s_end,
+                                                 &pairs[n_pairs], 20 - n_pairs);
+            n_pairs += got;
+            if (s_end > s_start) usage_ms += (s_end - s_start);
+        }
+        closedir(d);
+    }
+
+    /* The exported session must be represented even if its manifest is not on
+     * the card yet (it is written after this runs on the very first export). */
+    bool have_self = false;
+    {
+        char self_day[16];
+        as11_time_noon_day(start_epoch_ms - clock_drift_ms, self_day, sizeof(self_day));
+        if (strcmp(self_day, day_label) == 0) {
+            char self_json[420];
+            snprintf(self_json, sizeof(self_json), "%s/%s_session.json",
+                     session_dir, session_id);
+            struct stat st;
+            have_self = (stat(self_json, &st) == 0);
+        } else {
+            have_self = true;   /* not part of this day at all */
+        }
+    }
+    if (!have_self && n_pairs < 20) {
+        int got = collect_session_mask_pairs(session_dir, session_id, noon_epoch_ms,
+                                             clock_drift_ms, start_epoch_ms,
+                                             end_epoch_ms, &pairs[n_pairs],
+                                             20 - n_pairs);
+        n_pairs += got;
+        if (end_epoch_ms > start_epoch_ms) usage_ms += (end_epoch_ms - start_epoch_ms);
+    }
+
+    /* Chronological order, as the AS11 writes them. */
+    for (int i = 1; i < n_pairs; i++) {
+        mask_pair_t tmp = pairs[i];
+        int k = i - 1;
+        while (k >= 0 && pairs[k].on_min > tmp.on_min) {
+            pairs[k + 1] = pairs[k];
+            k--;
+        }
+        pairs[k + 1] = tmp;
+    }
+
+    for (int i = 0; i < n_pairs; i++) {
+        if (i == 0) {
+            rec->values[1] = (int16_t)pairs[i].on_min;
+            rec->values[2] = (int16_t)pairs[i].off_min;
+        } else {
+            rec->mask_on_extra[i - 1] = (int16_t)pairs[i].on_min;
+            rec->mask_off_extra[i - 1] = (int16_t)pairs[i].off_min;
+        }
+    }
+    rec->values[3] = (int16_t)(n_pairs * 2);   /* on + off events */
+
+    /* [4] Duration: total therapy minutes for the day. */
+    int64_t usage_min = usage_ms / 60000;
+    if (usage_min > STR_MASK_MINUTES_MAX) usage_min = STR_MASK_MINUTES_MAX;
+    rec->values[4] = (int16_t)usage_min;
+
+    ESP_LOGI(TAG, "STR.edf: synthesized record for %s "
+             "(%d session(s), MaskOn=%d MaskOff=%d Duration=%d min)",
+             day_label, n_pairs, (int)rec->values[1], (int)rec->values[2],
+             (int)rec->values[4]);
 }
 
 /* Resolve the drift for one AS11 Summary noon-day.  Session metadata stores
@@ -2166,8 +2308,10 @@ static session_drift_entry_t *build_session_drift_index(int *out_count)
                 int64_t drift_ms = (int64_t)drift_j->valuedouble;
                 entries[n].start_as11_ms = start_ntp_ms - drift_ms;
                 entries[n].drift_ms = drift_ms;
-                noon_day_folder(entries[n].start_as11_ms, entries[n].as11_day,
-                                sizeof(entries[n].as11_day));
+                /* Same AS11 noon boundary the spool records are keyed on, so
+                 * a day's drift lookup cannot miss by one day. */
+                as11_time_noon_day(entries[n].start_as11_ms, entries[n].as11_day,
+                                   sizeof(entries[n].as11_day));
                 n++;
             }
             cJSON_Delete(session);
@@ -2357,8 +2501,15 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         }
     }
 
-    /* Keep only the newest 30 (trim from the front) */
-    int start_idx = n_spool > 30 ? n_spool - 30 : 0;
+    /* Walk newest → oldest and stop once 30 *distinct* days have been
+     * collected, rather than simply taking the newest 30 filenames.
+     *
+     * Spool files written before the day-labelling fix carry a name that is
+     * one day off, so the same night can be present under two names.  Taking
+     * the newest 30 names would let those duplicates crowd out genuinely
+     * older days; selecting by distinct period keeps the window honest while
+     * the stale names age out. */
+    #define STR_MAX_DAYS  30
 
     str_day_record_t *records = calloc(31, sizeof(str_day_record_t));
     summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
@@ -2375,9 +2526,10 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     session_drift_entry_t *drift_index = build_session_drift_index(&n_drift_entries);
     ESP_LOGI(TAG, "STR.edf: drift index: %d session entries", n_drift_entries);
 
-    /* Second pass: parse the selected spool files */
+    /* Second pass: parse spool files, newest first, until STR_MAX_DAYS
+     * distinct days are held.  Records are sorted chronologically below. */
     int n_records = 0;
-    for (int si = start_idx; si < n_spool; si++) {
+    for (int si = n_spool - 1; si >= 0 && n_records < STR_MAX_DAYS; si--) {
         const char *nm = spool_names[si];
 
         /* Read the spool file */
@@ -2416,8 +2568,27 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         memset(rec->mask_on_extra, 0xFF, sizeof(rec->mask_on_extra));
         memset(rec->mask_off_extra, 0xFF, sizeof(rec->mask_off_extra));
 
+        /* Label from the AS11's own noon boundary, not the ESP's (issue #75).
+         * The filename is not authoritative: files written before this fix
+         * carry the shifted name, so the day is always re-derived from the
+         * PeriodStart inside the record. */
         char as11_day_label[16];
-        noon_day_folder(period_start, as11_day_label, sizeof(as11_day_label));
+        as11_time_noon_day_for_period_start(period_start, as11_day_label,
+                                            sizeof(as11_day_label));
+
+        /* A legacy filename and a correctly-named one can describe the same
+         * period.  Keep the first and skip the duplicate, so the same night
+         * cannot appear twice in STR.edf. */
+        bool dup = false;
+        for (int k = 0; k < n_records; k++) {
+            if (records[k].period_start_as11 == period_start) { dup = true; break; }
+        }
+        if (dup) {
+            ESP_LOGI(TAG, "STR.edf: %s duplicates an already-parsed period "
+                     "(day %s) — skipping", nm, as11_day_label);
+            continue;
+        }
+
         int64_t record_drift_ms = lookup_drift(drift_index, n_drift_entries,
                                                 as11_day_label,
                                                 period_start,
@@ -2436,23 +2607,24 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     free(spool_names);
     free(drift_index);
 
-    /* Check if the current day is already covered by a spool record.
-     * If not, synthesize a record from the current session's data.
+    /* Check whether the exported session's day is already covered by a spool
+     * record; if not, synthesise one from session data.
      *
-     * Day labelling uses the raw AS11 PeriodStart (period_start_as11)
-     * deliberately — see the period_start_as11 comment in str_day_record_t.
-     * The current session day label is derived from its AS11-domain noon-day
-     * (start_epoch_ms - clock_drift_ms) to stay in the same label domain. */
+     * Both sides of the comparison use the AS11's own noon boundary, so a
+     * timezone difference between device and ESP can no longer make the day
+     * look uncovered and force a synthesised record every single time
+     * (issue #75). */
     char current_day_label[16];
-    noon_day_folder(start_epoch_ms - clock_drift_ms, current_day_label,
-                    sizeof(current_day_label));
+    as11_time_noon_day(start_epoch_ms - clock_drift_ms, current_day_label,
+                       sizeof(current_day_label));
     ESP_LOGI(TAG, "STR.edf: current day label=%s (start_epoch_ms=%lld)",
              current_day_label, (long long)start_epoch_ms);
     bool current_day_found = false;
     for (int i = 0; i < n_records; i++) {
         char rec_day[16];
-        noon_day_folder(records[i].period_start_as11, rec_day, sizeof(rec_day));
-        ESP_LOGI(TAG, "STR.edf: record[%d] day=%s (period_start=%lld)",
+        as11_time_noon_day_for_period_start(records[i].period_start_as11,
+                                            rec_day, sizeof(rec_day));
+        ESP_LOGD(TAG, "STR.edf: record[%d] day=%s (period_start=%lld)",
                  i, rec_day, (long long)records[i].period_start);
         if (strcmp(rec_day, current_day_label) == 0) {
             current_day_found = true;
@@ -2661,22 +2833,27 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
      * sorting), not the current session — otherwise SleepHQ misaligns every
      * record by the offset between the header date and the actual first day.
      *
-     * We use period_start_as11 (raw AS11 clock) for the header date to keep
-     * the day label consistent with spool-day names — see §5.9 comment in
-     * str_day_record_t. */
+     * The header date must name the same day as the first record's Date
+     * signal, so it is derived from the identical AS11 noon-day label rather
+     * than re-deriving it from the timestamp with different rules. */
     const char *str_start_time = "12.00.00";
-    char str_date[32];
-    {
-        time_t t = (time_t)(records[0].period_start_as11 / 1000);
-        struct tm tm;
-        localtime_r(&t, &tm);
-        if (tm.tm_hour < 12) {
-            t -= 86400;
-            localtime_r(&t, &tm);
-        }
-        snprintf(str_date, sizeof(str_date), "%02d.%02d.%02d",
-                 tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
+    char first_day_label[16];
+    if (records[0].period_start_as11 > 0) {
+        as11_time_noon_day_for_period_start(records[0].period_start_as11,
+                                            first_day_label,
+                                            sizeof(first_day_label));
+    } else {
+        as11_time_noon_day(records[0].period_start, first_day_label,
+                           sizeof(first_day_label));
     }
+    int fd_y = 0, fd_m = 0, fd_d = 0;
+    if (sscanf(first_day_label, "%4d%2d%2d", &fd_y, &fd_m, &fd_d) != 3) {
+        fd_y = 2000; fd_m = 1; fd_d = 1;
+    }
+
+    char str_date[32];
+    snprintf(str_date, sizeof(str_date), "%02d.%02d.%02d",
+             fd_d, fd_m, fd_y % 100);
     ESP_LOGI(TAG, "STR.edf: header date=%s (from oldest record PeriodStart=%lld)",
              str_date, (long long)records[0].period_start);
 
@@ -2685,14 +2862,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
      * format is "Startdate DD-MMM-YYYY X X X SRN=...". */
     char fixed_recording_id[128];
     {
-        /* Use AS11-domain period_start to match the header date label above. */
-        time_t t = (time_t)(records[0].period_start_as11 / 1000);
-        struct tm tm;
-        localtime_r(&t, &tm);
-        if (tm.tm_hour < 12) {
-            t -= 86400;
-            localtime_r(&t, &tm);
-        }
+        /* Same day label as the header date above. */
         static const char *mon_names[] = {
             "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
             "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
@@ -2706,8 +2876,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         }
         snprintf(fixed_recording_id, sizeof(fixed_recording_id),
                  "Startdate %02d-%s-%04d%s",
-                 tm.tm_mday, mon_names[tm.tm_mon % 12],
-                 tm.tm_year + 1900, tail);
+                 fd_d, mon_names[(fd_m - 1) % 12], fd_y, tail);
     }
 
     int header_bytes = edf_write_header(edf, patient_id, fixed_recording_id,
@@ -3351,16 +3520,35 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                            int64_t start_epoch_ms, int64_t end_epoch_ms,
                            int64_t clock_drift_ms)
 {
-    if (!session_dir || !session_id) return ESP_ERR_INVALID_ARG;
+    return edf_gen_generate_ex(SD_SDCARD_DIR, session_dir, session_id,
+                               start_epoch_ms, end_epoch_ms, clock_drift_ms,
+                               EDF_GEN_ALL);
+}
+
+esp_err_t edf_gen_generate_ex(const char *out_root,
+                              const char *session_dir, const char *session_id,
+                              int64_t start_epoch_ms, int64_t end_epoch_ms,
+                              int64_t clock_drift_ms, uint32_t flags)
+{
+    if (!session_dir || !session_id || !out_root) return ESP_ERR_INVALID_ARG;
     if (!sd_storage_is_ready()) {
         ESP_LOGW(TAG, "SD not ready, skipping EDF generation");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Serialise against other exports, day rebuilds and destructive actions.
+     * Recursive, so a rebuild that already holds the lease can call in here. */
+    bool have_lease = sd_storage_lease_acquire(SD_LEASE_EXPORT, 120000);
+    if (!have_lease) {
+        ESP_LOGW(TAG, "export lease unavailable, skipping EDF generation");
+        return ESP_ERR_TIMEOUT;
     }
     /* Reject sessions with invalid timestamps — these result from crash
      * recovery on 0-byte .snt files and would produce bogus 19691231 folders. */
     if (start_epoch_ms < 946684800000LL) {  /* < 2000-01-01T00:00:00Z */
         ESP_LOGW(TAG, "invalid start_epoch_ms=%lld, skipping EDF generation for %s",
                  (long long)start_epoch_ms, session_id);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -3375,9 +3563,15 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * STR.edf goes to /somnotrace/SDCARD/STR.edf (root level)
      * Identification.json goes to /somnotrace/SDCARD/
      * This is the ResMed-compatible SD card image, fully derived from .somnotrace/sessions/ */
-    mkdir(SD_SDCARD_DIR, 0775);
-    mkdir(SD_SDCARD_DATALOG, 0775);
-    mkdir(SD_SDCARD_SETTINGS, 0775);
+    /* Output paths are derived from out_root so a day rebuild can generate
+     * into a staging tree and publish only on success. */
+    char root_datalog[200], root_settings[200];
+    snprintf(root_datalog, sizeof(root_datalog), "%s/DATALOG", out_root);
+    snprintf(root_settings, sizeof(root_settings), "%s/SETTINGS", out_root);
+
+    mkdir(out_root, 0775);
+    mkdir(root_datalog, 0775);
+    mkdir(root_settings, 0775);
 
     /* The SDCARD export uses NTP-corrected time throughout: DATALOG days,
      * filenames, EDF headers, STR session boundaries, and annotations must
@@ -3388,8 +3582,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     char day_folder[16];
     noon_day_folder(start_epoch_ms, day_folder, sizeof(day_folder));
 
-    char day_dir[220];
-    snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_SDCARD_DATALOG, day_folder);
+    char day_dir[240];
+    snprintf(day_dir, sizeof(day_dir), "%s/%s", root_datalog, day_folder);
     mkdir(day_dir, 0775);
 
     /* Session timestamp prefix for EVE/CSL EDF filenames (NTP TherapyStart). */
@@ -3632,7 +3826,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * v2 format: flow.snt + press.snt (separate 1-ch files).
      * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
      * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
-    if (!no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
         char snt_path[300], edf_path[350], press_path[300];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
         snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
@@ -3665,7 +3859,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     }
 
     /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
-    if (!no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
@@ -3707,7 +3901,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
      * limitation and cannot be fixed by firmware changes.
      * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
-    if (!no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
@@ -3767,7 +3961,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* ── Generate STR.edf from per-day summary spool files ──
      * STR.edf goes in the SDCARD root (not inside DATALOG/) — it is a
      * multi-day cumulative file with one record per day. */
-    if (generate_str_edf(SD_SDCARD_DIR, patient_id, str_recording_id,
+    if ((flags & EDF_GEN_SHARED) &&
+        generate_str_edf(out_root, patient_id, str_recording_id,
                          str_start_date, settings,
                          session_dir, session_id,
                          start_epoch_ms, end_epoch_ms, clock_drift_ms) != ESP_OK) {
@@ -3790,7 +3985,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * The previous "session too short" skip was based on the opposite, and
      * incorrect, assumption.  Sessions with no therapy at all are excluded
      * earlier via no_therapy, which drops the whole session. */
-    if (!no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
         char eve_path[350];
         snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
         if (generate_eve_edf(eve_path, events_snt_path,
@@ -3815,7 +4010,8 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     }
 
     /* ── Generate Identification.json + .crc ── */
-    if (generate_identification(SD_SDCARD_DIR, ident_path) != ESP_OK) {
+    if ((flags & EDF_GEN_SHARED) &&
+        generate_identification(out_root, ident_path) != ESP_OK) {
         errors++;
     }
 
@@ -3824,7 +4020,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
      * a "FlowGenerator" wrapper: {"FlowGenerator":{"SettingProfiles":{...}}}.
      * Use a reference wrapper so the original `settings` tree is freed once
      * below (cJSON_AddItemReferenceToObject does not transfer ownership). */
-    if (settings) {
+    if ((flags & EDF_GEN_SHARED) && settings) {
         cJSON *cs_root = cJSON_CreateObject();
         cJSON_AddItemReferenceToObject(cs_root, "FlowGenerator", settings);
         char *settings_str = cJSON_PrintUnformatted(cs_root);
@@ -3874,7 +4070,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
             size_t slen = strlen(settings_str);
             char cs_path[300];
             char cs_tmp[380];
-            snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", SD_SDCARD_SETTINGS);
+            snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", root_settings);
             FILE *csf = open_atomic_file(cs_path, cs_tmp, sizeof(cs_tmp));
             if (csf) {
                 if (!write_all(csf, settings_str, slen)) {
@@ -3889,7 +4085,7 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                 ESP_LOGE(TAG, "cannot create %s: %s", cs_path, strerror(errno));
             }
             /* Write CurrentSettings.crc (CRC-32 LE, same format as Identification.crc) */
-            snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.crc", SD_SDCARD_SETTINGS);
+            snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.crc", root_settings);
             csf = open_atomic_file(cs_path, cs_tmp, sizeof(cs_tmp));
             if (csf) {
                 uint32_t cs_crc = crc32_ieee((const uint8_t *)settings_str, slen);
@@ -3920,5 +4116,300 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
     /* events_data no longer used */
 
     ESP_LOGI(TAG, "=== EDF GENERATION DONE (%d errors) ===", errors);
+
+    sd_storage_lease_release(SD_LEASE_EXPORT);
     return errors > 0 ? ESP_FAIL : ESP_OK;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ *  Section 12: Transactional single-day rebuild
+ *
+ *  Rebuilding a day is not "call the generator once per session".  Each
+ *  call also rewrites the shared root artifacts, and STR.edf synthesises
+ *  its current-day record from whichever single session it was given — so
+ *  a naive loop leaves STR describing only the last session.  Nor is
+ *  per-file atomicity enough: finalize_atomic_file() unlinks the target
+ *  before renaming, so a mid-rebuild failure would leave the day's export
+ *  partially destroyed.
+ *
+ *  This builds the whole day into a staging tree, publishes it with a
+ *  directory swap only when every session succeeded, and then runs the
+ *  shared pass exactly once.
+ * ════════════════════════════════════════════════════════════════════ */
+
+#define REBUILD_MAX_SESSIONS  64
+#define REBUILD_STAGING_DIR   SD_MOUNT_POINT "/SDCARD/.rebuild"
+
+typedef struct {
+    char    session_id[40];
+    int64_t start_epoch_ms;
+    int64_t end_epoch_ms;
+    int64_t clock_drift_ms;
+} rebuild_session_t;
+
+/* Recursively delete a directory tree (staging cleanup / old day removal). */
+static void rebuild_rmtree(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) { unlink(path); return; }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        char child[400];
+        snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+        if (ent->d_type == DT_DIR) rebuild_rmtree(child);
+        else unlink(child);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+/* Move every regular file from src into dst (same volume).  Used as the
+ * publish step: rename() of a directory is not reliable across all FATFS
+ * builds, so the contents are moved individually and verified. */
+static esp_err_t rebuild_move_dir(const char *src, const char *dst)
+{
+    DIR *d = opendir(src);
+    if (!d) return ESP_FAIL;
+    mkdir(dst, 0775);
+
+    esp_err_t ret = ESP_OK;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_type != DT_REG) continue;
+        char from[400], to[400];
+        snprintf(from, sizeof(from), "%s/%s", src, ent->d_name);
+        snprintf(to, sizeof(to), "%s/%s", dst, ent->d_name);
+        unlink(to);
+        if (rename(from, to) != 0) {
+            ESP_LOGE(TAG, "rebuild: publish failed for %s: %s",
+                     ent->d_name, strerror(errno));
+            ret = ESP_FAIL;
+            break;
+        }
+    }
+    closedir(d);
+    return ret;
+}
+
+/* Read one session manifest into a rebuild descriptor. */
+static bool rebuild_read_manifest(const char *day_path, const char *fname,
+                                  rebuild_session_t *out)
+{
+    const char *suffix = "_session.json";
+    size_t slen = strlen(suffix), flen = strlen(fname);
+    if (flen <= slen || strcmp(fname + flen - slen, suffix) != 0) return false;
+
+    size_t prefix_len = flen - slen;
+    if (prefix_len == 0 || prefix_len >= sizeof(out->session_id)) return false;
+
+    char json_path[420];
+    snprintf(json_path, sizeof(json_path), "%s/%s", day_path, fname);
+    FILE *f = fopen(json_path, "r");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > 16384) { fclose(f); return false; }
+    char *buf = malloc(size + 1);
+    if (!buf) { fclose(f); return false; }
+    size_t rd = fread(buf, 1, size, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    cJSON *j = cJSON_Parse(buf);
+    free(buf);
+    if (!j) {
+        ESP_LOGW(TAG, "rebuild: %s is not valid JSON, skipping", fname);
+        return false;
+    }
+
+    bool ok = false;
+    cJSON *js = cJSON_GetObjectItem(j, "start_epoch_ms");
+    if (js && cJSON_IsNumber(js)) {
+        int64_t start = (int64_t)js->valuedouble;
+        if (start >= 946684800000LL) {          /* >= 2000-01-01 */
+            memcpy(out->session_id, fname, prefix_len);
+            out->session_id[prefix_len] = '\0';
+            out->start_epoch_ms = start;
+            cJSON *je = cJSON_GetObjectItem(j, "end_epoch_ms");
+            cJSON *jd = cJSON_GetObjectItem(j, "clock_drift_ms");
+            out->end_epoch_ms = (je && cJSON_IsNumber(je)) ? (int64_t)je->valuedouble : 0;
+            out->clock_drift_ms = (jd && cJSON_IsNumber(jd)) ? (int64_t)jd->valuedouble : 0;
+
+            /* An unusable drift estimate is still better than 0 (which would
+             * put every spool-sourced timestamp ~7-8 min out), but say so. */
+            cJSON *ju = cJSON_GetObjectItem(j, "clock_drift_usable");
+            cJSON *jv = cJSON_GetObjectItem(j, "clock_drift_valid");
+            bool measured = jv && cJSON_IsTrue(jv);
+            bool usable = ju ? cJSON_IsTrue(ju) : measured;
+            if (!measured) {
+                ESP_LOGW(TAG, "rebuild: %s drift is an estimate (usable=%d)",
+                         out->session_id, (int)usable);
+            }
+            ok = true;
+        } else {
+            ESP_LOGW(TAG, "rebuild: skipping %s (invalid start_epoch_ms=%lld)",
+                     fname, (long long)start);
+        }
+    }
+    cJSON_Delete(j);
+    return ok;
+}
+
+esp_err_t edf_gen_rebuild_day(const char *day_folder)
+{
+    if (!day_folder || strlen(day_folder) != 8) return ESP_ERR_INVALID_ARG;
+    if (!sd_storage_is_ready()) return ESP_ERR_INVALID_STATE;
+
+    /* Hold the lease for the entire transaction: no other export, no upload
+     * of this day, and no destructive action may interleave. */
+    if (!sd_storage_lease_acquire(SD_LEASE_EXPORT, 120000)) {
+        ESP_LOGE(TAG, "rebuild %s: storage busy", day_folder);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ESP_LOGI(TAG, "=== REBUILD DAY %s ===", day_folder);
+
+    char day_path[300];
+    snprintf(day_path, sizeof(day_path), "%s/%s", SD_STREAMS_DIR, day_folder);
+
+    rebuild_session_t *sessions = calloc(REBUILD_MAX_SESSIONS,
+                                         sizeof(rebuild_session_t));
+    if (!sessions) {
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int n = 0;
+    bool truncated = false;
+    DIR *d = opendir(day_path);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_type != DT_REG) continue;
+            if (n >= REBUILD_MAX_SESSIONS) { truncated = true; break; }
+            if (rebuild_read_manifest(day_path, ent->d_name, &sessions[n])) n++;
+        }
+        closedir(d);
+    }
+
+    if (truncated) {
+        /* Silently dropping sessions would produce a day that looks complete
+         * but is not, so this is a hard error. */
+        ESP_LOGE(TAG, "rebuild %s: more than %d sessions — refusing to "
+                 "publish a partial day", day_folder, REBUILD_MAX_SESSIONS);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (n == 0) {
+        ESP_LOGW(TAG, "rebuild %s: no usable sessions found", day_folder);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* Chronological order (insertion sort — n is small). */
+    for (int i = 1; i < n; i++) {
+        rebuild_session_t tmp = sessions[i];
+        int j = i - 1;
+        while (j >= 0 && sessions[j].start_epoch_ms > tmp.start_epoch_ms) {
+            sessions[j + 1] = sessions[j];
+            j--;
+        }
+        sessions[j + 1] = tmp;
+    }
+
+    ESP_LOGI(TAG, "rebuild %s: %d session(s)", day_folder, n);
+
+    /* ── Pass 1: per-session artifacts into staging ── */
+    rebuild_rmtree(REBUILD_STAGING_DIR);
+    mkdir(REBUILD_STAGING_DIR, 0775);
+
+    esp_err_t ret = ESP_OK;
+    for (int i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "rebuild %s: session %d/%d: %s",
+                 day_folder, i + 1, n, sessions[i].session_id);
+        esp_err_t r = edf_gen_generate_ex(REBUILD_STAGING_DIR, day_path,
+                                         sessions[i].session_id,
+                                         sessions[i].start_epoch_ms,
+                                         sessions[i].end_epoch_ms,
+                                         sessions[i].clock_drift_ms,
+                                         EDF_GEN_PER_SESSION);
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "rebuild %s: session %s failed (%s) — aborting, "
+                     "existing export left untouched", day_folder,
+                     sessions[i].session_id, esp_err_to_name(r));
+            ret = r;
+            break;
+        }
+    }
+
+    if (ret != ESP_OK) {
+        rebuild_rmtree(REBUILD_STAGING_DIR);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ret;
+    }
+
+    /* ── Publish: swap the staged day into place ──
+     * Only now is the previous export replaced.  Up to this point a failure
+     * costs nothing. */
+    char staged_day[400], live_day[400];
+    snprintf(staged_day, sizeof(staged_day), "%s/DATALOG/%s",
+             REBUILD_STAGING_DIR, day_folder);
+    snprintf(live_day, sizeof(live_day), "%s/%s", SD_SDCARD_DATALOG, day_folder);
+
+    struct stat st;
+    if (stat(staged_day, &st) != 0) {
+        ESP_LOGE(TAG, "rebuild %s: staging produced no day folder", day_folder);
+        rebuild_rmtree(REBUILD_STAGING_DIR);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_FAIL;
+    }
+
+    mkdir(SD_SDCARD_DIR, 0775);
+    mkdir(SD_SDCARD_DATALOG, 0775);
+    rebuild_rmtree(live_day);
+    ret = rebuild_move_dir(staged_day, live_day);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "rebuild %s: publish failed — day may be incomplete, "
+                 "re-run the rebuild", day_folder);
+        rebuild_rmtree(REBUILD_STAGING_DIR);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ret;
+    }
+    rebuild_rmtree(REBUILD_STAGING_DIR);
+
+    /* ── Pass 2: shared artifacts, exactly once ──
+     * STR.edf is multi-day and cumulative, and its current-day record is
+     * synthesised from the session given here — so it must be the newest
+     * session of the day, not an arbitrary one.  Identification and
+     * CurrentSettings likewise come from the newest session's captured data. */
+    const rebuild_session_t *newest = &sessions[n - 1];
+    esp_err_t shared = edf_gen_generate_ex(SD_SDCARD_DIR, day_path,
+                                          newest->session_id,
+                                          newest->start_epoch_ms,
+                                          newest->end_epoch_ms,
+                                          newest->clock_drift_ms,
+                                          EDF_GEN_SHARED);
+    if (shared != ESP_OK) {
+        /* The day's per-session files are published and correct; only the
+         * cumulative/shared files are stale.  Report it without claiming the
+         * rebuild succeeded. */
+        ESP_LOGE(TAG, "rebuild %s: shared pass (STR/Identification) failed",
+                 day_folder);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return shared;
+    }
+
+    ESP_LOGI(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions) ===",
+             day_folder, n);
+    free(sessions);
+    sd_storage_lease_release(SD_LEASE_EXPORT);
+    return ESP_OK;
 }

@@ -33,11 +33,37 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#include "ff.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "bsp_display.h"
 
 static const char *TAG = "sd_storage";
 
 static bool s_mounted = false;
 static sdmmc_card_t *s_card = NULL;
+
+/* ── Space policy thresholds ──────────────────────────────────────────
+ * A night of raw stream data is ~3-4 MB, plus derived EDFs.  The reserve
+ * keeps enough room for the session about to start plus its recovery
+ * metadata; the floor is the point at which recording is refused. */
+#define SD_RESERVE_BYTES   (24ULL * 1024 * 1024)   /* warn below 24 MB  */
+#define SD_FLOOR_BYTES     (8ULL * 1024 * 1024)    /* refuse below 8 MB */
+
+/* ── Arbitration state ────────────────────────────────────────────── */
+static SemaphoreHandle_t s_lease_mutex = NULL;   /* guards the counters  */
+static SemaphoreHandle_t s_export_sem = NULL;    /* EXPORT/DESTRUCTIVE   */
+static volatile int s_recording = 0;
+static volatile int s_uploading = 0;
+
+static void lease_init_once(void)
+{
+    if (!s_lease_mutex) s_lease_mutex = xSemaphoreCreateMutex();
+    /* Recursive: a day rebuild holds the export lease across the whole
+     * transaction and calls the per-session generator inside it, which takes
+     * the same lease.  A plain mutex would self-deadlock. */
+    if (!s_export_sem) s_export_sem = xSemaphoreCreateRecursiveMutex();
+}
 
 esp_err_t sd_storage_init(void)
 {
@@ -82,6 +108,7 @@ esp_err_t sd_storage_init(void)
 
     s_mounted = true;
     s_card = card;
+    lease_init_once();
 
     sdmmc_card_print_info(stdout, card);
 
@@ -107,6 +134,166 @@ esp_err_t sd_storage_init(void)
 bool sd_storage_is_ready(void)
 {
     return s_mounted;
+}
+
+/* ── Free space ───────────────────────────────────────────────────── */
+
+esp_err_t sd_storage_get_free(uint64_t *free_bytes, uint64_t *total_bytes)
+{
+    if (!s_mounted) return ESP_ERR_INVALID_STATE;
+
+    FATFS *fs = NULL;
+    DWORD free_clst = 0;
+    /* Drive "0:" — the single mounted FATFS volume. */
+    if (f_getfree("0:", &free_clst, &fs) != FR_OK || !fs) {
+        return ESP_FAIL;
+    }
+    if (total_bytes)
+        *total_bytes = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
+    if (free_bytes)
+        *free_bytes = (uint64_t)free_clst * fs->csize * fs->ssize;
+    return ESP_OK;
+}
+
+/* Reclaim derived (regenerable) output so raw capture can proceed.
+ * Only SDCARD/ is eligible: it is fully rebuildable from
+ * .somnotrace/sessions/, which is the source of truth. */
+static uint64_t reclaim_derived_output(void)
+{
+    /* Deliberately conservative: report what could be reclaimed and let the
+     * user act.  Automatic deletion of derived data is only safe once the
+     * per-day export/upload state machine can prove a day is reproducible
+     * and already uploaded, so we do not delete here. */
+    uint64_t free_bytes = 0;
+    sd_storage_get_free(&free_bytes, NULL);
+    return free_bytes;
+}
+
+bool sd_storage_reserve_for_recording(void)
+{
+    if (!s_mounted) return false;
+
+    uint64_t free_bytes = 0, total = 0;
+    if (sd_storage_get_free(&free_bytes, &total) != ESP_OK) {
+        /* Cannot tell — do not block therapy recording on a failed query. */
+        ESP_LOGW(TAG, "free-space query failed; allowing recording");
+        return true;
+    }
+
+    if (free_bytes >= SD_RESERVE_BYTES) return true;
+
+    ESP_LOGW(TAG, "low free space: %llu KB free of %llu KB",
+             (unsigned long long)(free_bytes / 1024),
+             (unsigned long long)(total / 1024));
+
+    if (free_bytes < SD_FLOOR_BYTES) {
+        free_bytes = reclaim_derived_output();
+        if (free_bytes < SD_FLOOR_BYTES) {
+            ESP_LOGE(TAG, "below hard floor (%llu KB) — refusing to record",
+                     (unsigned long long)(free_bytes / 1024));
+            bsp_display_set_notice("SD full");
+            return false;
+        }
+    }
+
+    bsp_display_set_notice("SD nearly full");
+    return true;
+}
+
+/* ── Arbitration ──────────────────────────────────────────────────── */
+
+void sd_storage_recording_begin(void)
+{
+    lease_init_once();
+    if (!s_lease_mutex) { s_recording++; return; }
+    xSemaphoreTake(s_lease_mutex, portMAX_DELAY);
+    s_recording++;
+    xSemaphoreGive(s_lease_mutex);
+}
+
+void sd_storage_recording_end(void)
+{
+    if (!s_lease_mutex) { if (s_recording > 0) s_recording--; return; }
+    xSemaphoreTake(s_lease_mutex, portMAX_DELAY);
+    if (s_recording > 0) s_recording--;
+    xSemaphoreGive(s_lease_mutex);
+}
+
+bool sd_storage_recording_active(void)
+{
+    return s_recording > 0;
+}
+
+bool sd_storage_lease_acquire(sd_lease_t role, uint32_t timeout_ms)
+{
+    lease_init_once();
+    if (!s_export_sem || !s_lease_mutex) return true;   /* pre-init: allow */
+
+    TickType_t wait = pdMS_TO_TICKS(timeout_ms);
+
+    switch (role) {
+    case SD_LEASE_DESTRUCTIVE:
+        /* Never destroy data while it is being produced or consumed. */
+        if (s_recording > 0) {
+            ESP_LOGW(TAG, "destructive op refused: recording in progress");
+            return false;
+        }
+        if (s_uploading > 0) {
+            ESP_LOGW(TAG, "destructive op refused: upload in progress");
+            return false;
+        }
+        if (xSemaphoreTakeRecursive(s_export_sem, wait) != pdTRUE) {
+            ESP_LOGW(TAG, "destructive op refused: export in progress");
+            return false;
+        }
+        if (s_recording > 0) {   /* re-check after acquiring */
+            xSemaphoreGiveRecursive(s_export_sem);
+            ESP_LOGW(TAG, "destructive op refused: recording started");
+            return false;
+        }
+        return true;
+
+    case SD_LEASE_EXPORT:
+        /* Serialised against other exports and destructive work, but
+         * permitted during recording: the previous session still needs
+         * exporting while the next one records. */
+        if (xSemaphoreTakeRecursive(s_export_sem, wait) != pdTRUE) {
+            ESP_LOGW(TAG, "export lease busy");
+            return false;
+        }
+        return true;
+
+    case SD_LEASE_UPLOAD:
+        /* Held for the duration of the upload so a day can never be read
+         * while it is being replaced by a rebuild. */
+        if (xSemaphoreTakeRecursive(s_export_sem, wait) != pdTRUE) {
+            ESP_LOGW(TAG, "upload lease busy (export in progress)");
+            return false;
+        }
+        xSemaphoreTake(s_lease_mutex, portMAX_DELAY);
+        s_uploading++;
+        xSemaphoreGive(s_lease_mutex);
+        return true;
+    }
+    return false;
+}
+
+void sd_storage_lease_release(sd_lease_t role)
+{
+    if (!s_export_sem || !s_lease_mutex) return;
+
+    switch (role) {
+    case SD_LEASE_EXPORT:
+    case SD_LEASE_DESTRUCTIVE:
+        xSemaphoreGiveRecursive(s_export_sem);
+        break;
+    case SD_LEASE_UPLOAD:
+        xSemaphoreTake(s_lease_mutex, portMAX_DELAY);
+        if (s_uploading > 0) s_uploading--;
+        xSemaphoreGive(s_lease_mutex);
+        xSemaphoreGiveRecursive(s_export_sem);
+        break;
+    }
 }
 
 esp_err_t sd_storage_format(void)

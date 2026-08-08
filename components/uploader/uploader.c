@@ -144,6 +144,17 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
 /* Injected NVS-write executor (the app's internal-stack nvs_writer). */
 static uploader_nvs_exec_fn_t s_nvs_exec = NULL;
 
+/* Injected storage-lease hooks (the app's sd_storage arbitration). */
+static uploader_lease_acquire_fn_t s_lease_acquire = NULL;
+static uploader_lease_release_fn_t s_lease_release = NULL;
+
+void uploader_set_lease_fns(uploader_lease_acquire_fn_t acquire,
+                            uploader_lease_release_fn_t release)
+{
+    s_lease_acquire = acquire;
+    s_lease_release = release;
+}
+
 void uploader_set_nvs_executor(uploader_nvs_exec_fn_t exec)
 {
     s_nvs_exec = exec;
@@ -372,6 +383,14 @@ static void process_day(const char *day_folder)
 {
     ESP_LOGI(TAG, "processing day %s", day_folder);
 
+    /* Do not read a day that an export/rebuild may be replacing.  Leaving it
+     * pending is correct: check_retries() will pick it up again. */
+    if (s_lease_acquire && !s_lease_acquire(5000)) {
+        ESP_LOGW(TAG, "  storage busy (export in progress) — deferring day %s",
+                 day_folder);
+        return;
+    }
+
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     day_state_t *day = uploader_state_find_or_create(s_state, day_folder);
     if (day) {
@@ -440,6 +459,8 @@ static void process_day(const char *day_folder)
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     uploader_state_save(s_state);
     xSemaphoreGive(s_state_mutex);
+
+    if (s_lease_release) s_lease_release();
 }
 
 static void check_retries(void)

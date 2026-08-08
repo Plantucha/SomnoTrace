@@ -81,6 +81,25 @@ int64_t time_source_drift_age_ms(void);
  * degraded mode or reboot. */
 bool time_sync_has_drift(void);
 
+/* Persisted-drift snapshot.
+ *
+ * Returns the value, when it was measured, and where it came from together,
+ * so a consumer can judge whether an *estimate* is fit for its purpose
+ * instead of silently treating it like a measurement.  Note that age must
+ * be judged against the session or checkpoint being recovered: crash
+ * recovery runs before wall time is usable, so "now - measured_at" is
+ * meaningless there. */
+typedef struct {
+    bool        available;
+    int64_t     drift_ms;         /* NTP_epoch_ms - AS11_epoch_ms          */
+    int64_t     measured_at_ms;   /* NTP epoch ms when it was measured     */
+    const char *source;           /* "nvs" | "sd" | "none"                 */
+} time_drift_snapshot_t;
+
+/* Fills *out with the best available persisted drift.  Loads from NVS (or
+ * the SD upgrade fallback) if not already resident.  Returns out->available. */
+bool time_sync_get_drift_snapshot(time_drift_snapshot_t *out);
+
 /* Persist the most recent valid clock drift to NVS for use by the
  * degraded-mode fallback.  Called at session stop when clock_drift_valid.
  * drift_ms: NTP_epoch_ms - AS11_epoch_ms (positive = AS11 is behind).

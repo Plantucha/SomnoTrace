@@ -1552,6 +1552,31 @@ static esp_err_t audio_test_beep_handler(httpd_req_t *req)
 
 /* ── Actions: Reset State, Delete EDFs, Reset All, Recreate EDFs ───── */
 
+/* 409 Conflict for actions refused by storage arbitration.  ESP-IDF's
+ * httpd_err_code_t has no 409, so the status is set explicitly and the
+ * reason returned as JSON for the Web UI. */
+static esp_err_t send_busy(httpd_req_t *req, const char *reason)
+{
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    char body[160];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", reason);
+    httpd_resp_sendstr(req, body);
+    return ESP_FAIL;
+}
+
+/* Storage-lease adapters injected into the uploader component (which cannot
+ * depend on the app's sd_storage). */
+static bool uploader_lease_acquire(uint32_t timeout_ms)
+{
+    return sd_storage_lease_acquire(SD_LEASE_UPLOAD, timeout_ms);
+}
+
+static void uploader_lease_release(void)
+{
+    sd_storage_lease_release(SD_LEASE_UPLOAD);
+}
+
 /* Recursively delete a directory and all its contents. */
 static void recursive_delete(const char *path)
 {
@@ -1740,6 +1765,26 @@ static void recreate_edfs_task(void *arg)
     ESP_LOGI(TAG, "recreate_edfs_task: done (%d sessions, %d unique days queued)",
              n_sessions, n_queued_days);
     free(sessions);
+    vTaskDelete(NULL);
+}
+
+/* Scoped single-day rebuild.  Unlike recreate_edfs_task() this deletes
+ * nothing up front: edf_gen_rebuild_day() stages the day and publishes it
+ * only on full success, and the day is queued for upload only then. */
+static void rebuild_day_task(void *arg)
+{
+    char *day = (char *)arg;
+    if (!day) { vTaskDelete(NULL); return; }
+
+    esp_err_t ret = edf_gen_rebuild_day(day);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "rebuild_day_task: %s rebuilt, queueing for upload", day);
+        uploader_on_day_ready(day);
+    } else {
+        ESP_LOGE(TAG, "rebuild_day_task: %s failed: %s — not queueing upload",
+                 day, esp_err_to_name(ret));
+    }
+    free(day);
     vTaskDelete(NULL);
 }
 
@@ -2195,20 +2240,63 @@ static esp_err_t actions_handler(httpd_req_t *req)
         uploader_reset_state();
         scan_and_queue_uploads();
     } else if (strcmp(action, "delete-edfs") == 0) {
+        /* Destructive: refused while recording, exporting or uploading. */
+        if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+            cJSON_Delete(root);
+            return send_busy(req, "recording, export or upload in progress");
+        }
         ESP_LOGI(TAG, "action: delete all EDF files");
         recursive_delete(SD_SDCARD_DIR);
+        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
     } else if (strcmp(action, "reset-all") == 0) {
+        if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+            cJSON_Delete(root);
+            return send_busy(req, "recording, export or upload in progress");
+        }
         ESP_LOGI(TAG, "action: reset all (state + SDCARD + .somnotrace)");
         uploader_reset_state();
         recursive_delete(SD_SDCARD_DIR);
         recursive_delete(SD_SESSIONS_DIR);
+        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
     } else if (strcmp(action, "recreate-edfs") == 0) {
-        ESP_LOGI(TAG, "action: recreate EDFs");
+        /* Explicitly destructive maintenance: deletes the whole export before
+         * rebuilding.  Prefer "rebuild-day" for recovering a single night. */
+        if (sd_storage_recording_active()) {
+            cJSON_Delete(root);
+            return send_busy(req, "therapy recording in progress");
+        }
+        ESP_LOGW(TAG, "action: recreate ALL EDFs (destructive)");
         TaskHandle_t h = psram_task_create(recreate_edfs_task, "recreate_edfs", 16384, NULL, 5, 1, NULL, NULL);
         if (!h) {
             err = ESP_ERR_NO_MEM;
         }
+    } else if (strcmp(action, "rebuild-day") == 0) {
+        /* Scoped, success-gated recovery: rebuilds one noon-day as a
+         * transaction and queues it for upload only if it fully succeeded. */
+        cJSON *day = cJSON_GetObjectItem(root, "day");
+        if (!day || !cJSON_IsString(day) || strlen(day->valuestring) != 8) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "missing or invalid 'day' (YYYYMMDD)");
+            return ESP_FAIL;
+        }
+        char *day_arg = strdup(day->valuestring);
+        if (!day_arg) {
+            err = ESP_ERR_NO_MEM;
+        } else {
+            ESP_LOGI(TAG, "action: rebuild day %s", day_arg);
+            TaskHandle_t h = psram_task_create(rebuild_day_task, "rebuild_day",
+                                               16384, day_arg, 5, 1, NULL, NULL);
+            if (!h) {
+                free(day_arg);
+                err = ESP_ERR_NO_MEM;
+            }
+        }
     } else if (strcmp(action, "format-sd") == 0) {
+        if (sd_storage_recording_active()) {
+            cJSON_Delete(root);
+            return send_busy(req, "therapy recording in progress");
+        }
         ESP_LOGI(TAG, "action: format SD card (destructive)");
         TaskHandle_t h = psram_task_create(format_sd_task, "format_sd", 16384, NULL, 5, 1, NULL, NULL);
         if (!h) {
@@ -2247,6 +2335,9 @@ static esp_err_t start_webserver(void)
     nvs_writer_init();
     uploader_set_nvs_executor((uploader_nvs_exec_fn_t)nvs_writer_run);
     therapy_alert_set_nvs_executor((alert_nvs_exec_fn_t)nvs_writer_run);
+    /* Let the uploader participate in storage arbitration so it never reads a
+     * day folder while a rebuild is replacing it. */
+    uploader_set_lease_fns(uploader_lease_acquire, uploader_lease_release);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;

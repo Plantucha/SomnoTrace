@@ -169,6 +169,11 @@ typedef struct {
     int      len;
 } notif_item_t;
 static QueueHandle_t s_notif_queue = NULL;
+/* Backlog metrics — see BLE_GAP_EVENT_NOTIFY_RX. */
+static UBaseType_t s_notif_hwm = 0;
+static uint32_t    s_notif_dropped = 0;
+static uint32_t    s_notif_dropped_bytes = 0;
+static uint32_t    s_notif_alloc_fail = 0;
 static TaskHandle_t  s_notif_task  = NULL;
 
 /* ── Spool fragment collector ────────────────────────────────────────
@@ -983,6 +988,20 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         uint16_t notif_len = OS_MBUF_PKTLEN(event->notify_rx.om);
         ESP_LOGD(TAG, "Notification RX: handle=%d len=%d", event->notify_rx.attr_handle, notif_len);
         if (notif_len > 0 && s_notif_queue) {
+            /* Queue-depth metrics.  Each element owns a separately malloc'd
+             * payload, so depth translates into a real worst-case backlog —
+             * the right way to size NOTIF_QUEUE_LEN is from the observed
+             * high-water mark and dropped bytes under a slow card, not from
+             * a guessed item count. */
+            UBaseType_t depth = uxQueueMessagesWaiting(s_notif_queue);
+            if (depth > s_notif_hwm) {
+                s_notif_hwm = depth;
+                if (depth >= (NOTIF_QUEUE_LEN * 3) / 4) {
+                    ESP_LOGW(TAG, "notif queue high-water %u/%u",
+                             (unsigned)depth, (unsigned)NOTIF_QUEUE_LEN);
+                }
+            }
+
             uint8_t *notif_data = malloc(notif_len);
             if (notif_data) {
                 int rc = os_mbuf_copydata(event->notify_rx.om, 0, notif_len, notif_data);
@@ -992,10 +1011,15 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                         /* Queue full — drop oldest, then enqueue */
                         notif_item_t dropped;
                         xQueueReceive(s_notif_queue, &dropped, 0);
+                        s_notif_dropped++;
+                        s_notif_dropped_bytes += (uint32_t)dropped.len;
                         free(dropped.data);
                         xQueueSend(s_notif_queue, &item, 0);
                         notif_data = NULL;  /* owned by queue now */
-                        ESP_LOGW(TAG, "notif queue full, dropped 1 item");
+                        ESP_LOGW(TAG, "notif queue full, dropped 1 item "
+                                 "(total %u items / %u bytes)",
+                                 (unsigned)s_notif_dropped,
+                                 (unsigned)s_notif_dropped_bytes);
                     } else {
                         notif_data = NULL;  /* owned by queue now */
                     }
@@ -1004,7 +1028,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                 }
                 if (notif_data) free(notif_data);
             } else {
-                ESP_LOGE(TAG, "failed to allocate notif_data");
+                s_notif_alloc_fail++;
+                ESP_LOGE(TAG, "failed to allocate notif_data (%u bytes, "
+                         "%u alloc failures)", (unsigned)notif_len,
+                         (unsigned)s_notif_alloc_fail);
             }
         }
         return 0;
