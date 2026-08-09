@@ -77,13 +77,15 @@ static TaskHandle_t s_flush_task;
 static bool s_sd_ready;              /* SD card is mounted and log dir created */
 
 /* ── WebSocket Live Tail ──────────────────────────────────────────── */
-/* Single active viewer model (matches the old SSE guard).  The forwarder
- * task drains the ring buffer continuously and pushes raw text frames via
- * httpd_ws_send_frame_async — the officially supported API for sending WS
- * frames from outside a request-handler context, so this never touches
- * the shared httpd worker task. */
-static httpd_handle_t   s_ws_hd = NULL;
-static int              s_ws_fd = -1;
+#define MAX_WS_CLIENTS 4
+
+typedef struct {
+    httpd_handle_t hd;
+    int fd;
+} ws_client_t;
+
+static ws_client_t       s_ws_clients[MAX_WS_CLIENTS];
+static int               s_ws_client_count = 0;
 static SemaphoreHandle_t s_ws_mutex;
 static TaskHandle_t     s_ws_fwd_task;
 
@@ -342,16 +344,68 @@ void log_stream_request_ble_push(void)
     s_push_ble_now = true;
 }
 
+static void ws_remove_client_locked(int fd)
+{
+    for (int i = 0; i < s_ws_client_count; i++) {
+        if (s_ws_clients[i].fd == fd) {
+            for (int j = i; j < s_ws_client_count - 1; j++) {
+                s_ws_clients[j] = s_ws_clients[j + 1];
+            }
+            s_ws_client_count--;
+            break;
+        }
+    }
+}
+
+static void ws_add_client_locked(httpd_handle_t hd, int fd)
+{
+    for (int i = 0; i < s_ws_client_count; i++) {
+        if (s_ws_clients[i].fd == fd) return;
+    }
+    if (s_ws_client_count >= MAX_WS_CLIENTS) {
+        httpd_handle_t old_hd = s_ws_clients[0].hd;
+        int old_fd = s_ws_clients[0].fd;
+        ESP_LOGI(TAG, "ws: evicting oldest client (fd=%d) for new client (fd=%d)", old_fd, fd);
+
+        const char *evict_msg = "{\"type\":\"evicted\",\"reason\":\"max_clients_exceeded\"}";
+        httpd_ws_frame_t evict_pkt = {
+            .final = true,
+            .type = HTTPD_WS_TYPE_TEXT,
+            .payload = (uint8_t *)evict_msg,
+            .len = strlen(evict_msg),
+        };
+        httpd_ws_send_frame_async(old_hd, old_fd, &evict_pkt);
+
+        httpd_ws_frame_t close_pkt = {
+            .final = true,
+            .type = HTTPD_WS_TYPE_CLOSE,
+        };
+        httpd_ws_send_frame_async(old_hd, old_fd, &close_pkt);
+
+        for (int i = 0; i < s_ws_client_count - 1; i++) {
+            s_ws_clients[i] = s_ws_clients[i + 1];
+        }
+        s_ws_client_count--;
+    }
+    s_ws_clients[s_ws_client_count].hd = hd;
+    s_ws_clients[s_ws_client_count].fd = fd;
+    s_ws_client_count++;
+    ESP_LOGI(TAG, "ws: client connected (fd=%d, total=%d)", fd, s_ws_client_count);
+}
+
 static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
 {
-    httpd_handle_t hd = NULL;
-    int fd = -1;
+    ws_client_t clients[MAX_WS_CLIENTS];
+    int count = 0;
+
     if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        hd = s_ws_hd;
-        fd = s_ws_fd;
+        count = s_ws_client_count;
+        if (count > 0) {
+            memcpy(clients, s_ws_clients, sizeof(ws_client_t) * count);
+        }
         xSemaphoreGive(s_ws_mutex);
     }
-    if (!hd || fd < 0) return ESP_OK;
+    if (count <= 0) return ESP_OK;
 
     httpd_ws_frame_t ws_pkt = {
         .final = true,
@@ -359,23 +413,21 @@ static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
         .payload = (uint8_t *)payload_str,
         .len = len,
     };
-    esp_err_t err = httpd_ws_send_frame_async(hd, fd, &ws_pkt);
-    if (err != ESP_OK) {
-        /* Distinguish transient send failures (buffer full, timeout) from
-         * real socket errors (peer closed, RST).  Only tear down on the
-         * latter — transient failures resolve on the next attempt. */
-        bool transient = (err == ESP_ERR_TIMEOUT || err == ESP_ERR_NO_MEM);
-        if (transient) {
-            ESP_LOGD(TAG, "ws: transient send failure (err=0x%x), keeping fd=%d", err, fd);
-        } else {
-            ESP_LOGW(TAG, "ws: send failed (err=0x%x), closing fd=%d", err, fd);
-            if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
-                if (s_ws_fd == fd) { s_ws_hd = NULL; s_ws_fd = -1; }
-                xSemaphoreGive(s_ws_mutex);
+
+    for (int i = 0; i < count; i++) {
+        esp_err_t err = httpd_ws_send_frame_async(clients[i].hd, clients[i].fd, &ws_pkt);
+        if (err != ESP_OK) {
+            bool transient = (err == ESP_ERR_TIMEOUT || err == ESP_ERR_NO_MEM);
+            if (!transient) {
+                ESP_LOGW(TAG, "ws: send failed (err=0x%x), removing fd=%d", err, clients[i].fd);
+                if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
+                    ws_remove_client_locked(clients[i].fd);
+                    xSemaphoreGive(s_ws_mutex);
+                }
             }
         }
     }
-    return err;
+    return ESP_OK;
 }
 
 esp_err_t log_stream_ws_send_json(const char *type, cJSON *data_obj)
@@ -435,15 +487,13 @@ static void ws_forwarder_task(void *arg)
     TickType_t last_upload_tick = xTaskGetTickCount();
 
     while (true) {
-        httpd_handle_t hd = NULL;
-        int fd = -1;
+        int client_count = 0;
         if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            hd = s_ws_hd;
-            fd = s_ws_fd;
+            client_count = s_ws_client_count;
             xSemaphoreGive(s_ws_mutex);
         }
 
-        if (!hd || fd < 0) {
+        if (client_count <= 0) {
             vTaskDelay(pdMS_TO_TICKS(200));
             frame_pos = 0;
             last_status_tick = xTaskGetTickCount();
@@ -533,26 +583,10 @@ static void ws_forwarder_task(void *arg)
 static esp_err_t logs_ws_handler(httpd_req_t *req)
 {
     if (req->method == HTTP_GET) {
-        /* Single-viewer model: reject if a client is already connected. */
-        bool accepted = false;
         if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-            if (s_ws_fd < 0) {
-                s_ws_hd = req->handle;
-                s_ws_fd = httpd_req_to_sockfd(req);
-                s_ws_paused = false;
-                accepted = true;
-                ESP_LOGI(TAG, "ws: client connected (fd=%d)", s_ws_fd);
-            }
+            ws_add_client_locked(req->handle, httpd_req_to_sockfd(req));
+            s_ws_paused = false;
             xSemaphoreGive(s_ws_mutex);
-        }
-        if (!accepted) {
-            ESP_LOGI(TAG, "ws: rejecting additional client (single-viewer)");
-            httpd_ws_frame_t close_pkt = {
-                .final = true,
-                .type  = HTTPD_WS_TYPE_CLOSE,
-            };
-            httpd_ws_send_frame(req, &close_pkt);
-            return ESP_OK;
         }
 
         if (!s_ws_fwd_task) {
@@ -572,6 +606,8 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    int req_fd = httpd_req_to_sockfd(req);
+
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT && ws_pkt.len > 0) {
         buf[ws_pkt.len] = '\0';
         if (strncmp((char *)buf, "pause", 5) == 0) {
@@ -583,13 +619,11 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
         }
     } else if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
         if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
-            s_ws_hd = NULL;
-            s_ws_fd = -1;
+            ws_remove_client_locked(req_fd);
             xSemaphoreGive(s_ws_mutex);
-            ESP_LOGI(TAG, "ws: client disconnected");
         }
+        ESP_LOGI(TAG, "ws: client closed connection (fd=%d)", req_fd);
     }
-
     return ESP_OK;
 }
 

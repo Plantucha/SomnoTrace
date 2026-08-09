@@ -2323,8 +2323,11 @@ function handleLogData(text) {
   if (logsSec && logsSec.classList.contains('active')) renderLogTerminal();
 }
 
+var wsEvicted = false;
+
 function connectWs() {
   if (appWs) return;
+  wsEvicted = false;
   setLogConnStatus('connecting');
 
   /* Load initial log history on first connect if empty */
@@ -2349,7 +2352,11 @@ function connectWs() {
   appWs.onmessage = function(ev) {
     try {
       var msg = JSON.parse(ev.data);
-      if (msg.type === 'log') {
+      if (msg.type === 'evicted') {
+        wsEvicted = true;
+        setLogConnStatus('evicted');
+        dashSetStatus('Disconnected (opened on another device)');
+      } else if (msg.type === 'log') {
         handleLogData(msg.data || '');
       } else if (msg.type === 'status') {
         loadStatusTab(msg.data);
@@ -2365,6 +2372,10 @@ function connectWs() {
 
   appWs.onclose = function() {
     appWs = null;
+    if (wsEvicted) {
+      setLogConnStatus('disconnected');
+      return;
+    }
     setLogConnStatus('error');
     if (!wsReconnectTimer) {
       wsReconnectTimer = setTimeout(function() {
