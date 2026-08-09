@@ -30,31 +30,28 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 <style>
 /* ── Design Tokens ─────────────────────────────────────────────── */
 :root{
---bg:#0b0f19;--card-bg:#111827;--card-border:#1e293b;--text:#f3f4f6;--text-muted:#94a3b8;
---primary:#0d9488;--primary-hover:#0f766e;--primary-glow:rgba(13,148,136,0.15);
---border-color:#334155;--input-bg:#1e293b;--input-focus:#0d9488;
+--bg:#0f172a;--card-bg:#1e293b;--card-border:#334155;--text:#f8fafc;--text-muted:#94a3b8;
+--primary:#38bdf8;--primary-hover:#0ea5e9;--primary-glow:rgba(56,189,248,0.15);--btn-primary-text:#0f172a;
+--border-color:#334155;--input-bg:#0f172a;--input-focus:#38bdf8;
 --danger:#f87171;--danger-hover:#ef4444;--success:#34d399;--warning:#fbbf24;
---color-airflow:#22d3ee;--color-pressure:#fb923c;--color-leak:#c084fc;
+--color-airflow:#38bdf8;--color-pressure:#fb923c;--color-leak:#c084fc;
 --color-spo2:#60a5fa;--color-pulse:#f87171;
 --color-flowlim:#f472b6;--color-snore:#34d399;
---accent-wifi:#0d9488;--accent-smb:#fb923c;--accent-shq:#60a5fa;--accent-ble:#34d399;
 --space-xs:4px;--space-sm:8px;--space-md:14px;--space-lg:20px;--space-xl:28px;
 --text-xs:.72rem;--text-sm:.8rem;--text-base:.85rem;--text-md:.9rem;--text-lg:.95rem;--text-xl:1rem;
 }
 [data-theme="day"]{
---bg:#f1f5f9;--card-bg:#ffffff;--card-border:#e2e8f0;--text:#0f172a;--text-muted:#64748b;
---primary:#0f766e;--primary-hover:#115e59;--primary-glow:rgba(15,118,110,0.12);
---border-color:#cbd5e1;--input-bg:#f8fafc;--input-focus:#0f766e;
+--bg:#f8fafc;--card-bg:#ffffff;--card-border:#e2e8f0;--text:#0f172a;--text-muted:#64748b;
+--primary:#0284c7;--primary-hover:#0369a1;--primary-glow:rgba(2,132,199,0.12);--btn-primary-text:#ffffff;
+--border-color:#cbd5e1;--input-bg:#f1f5f9;--input-focus:#0284c7;
 --danger:#dc2626;--danger-hover:#b91c1c;--success:#10b981;--warning:#f59e0b;
---color-airflow:#0891b2;--color-pressure:#ea580c;--color-leak:#7c3aed;
+--color-airflow:#0284c7;--color-pressure:#ea580c;--color-leak:#7c3aed;
 --color-spo2:#2563eb;--color-pulse:#dc2626;
 --color-flowlim:#db2777;--color-snore:#059669;
---accent-wifi:#0f766e;--accent-smb:#ea580c;--accent-shq:#2563eb;--accent-ble:#10b981;
 }
 .mt-xs{margin-top:var(--space-xs)}.mt-sm{margin-top:var(--space-sm)}.mt-md{margin-top:var(--space-md)}.mt-lg{margin-top:var(--space-lg)}
 .mb-xs{margin-bottom:var(--space-xs)}.mb-sm{margin-bottom:var(--space-sm)}.mb-md{margin-bottom:var(--space-md)}
 .card-disabled-placeholder{opacity:.5;display:flex;flex-direction:column;justify-content:space-between}
-.card-primary-border{border-left-color:var(--primary)}
 .action-item-row{display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px}
 .action-item-danger{display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--danger);border-radius:8px;background:rgba(248,113,113,.05)}
 
@@ -74,7 +71,7 @@ header{background:var(--card-bg);border-bottom:1px solid var(--card-border);padd
 .theme-selector{display:flex;background:var(--input-bg);border:1px solid var(--border-color);border-radius:8px;padding:2px;gap:2px}
 .theme-btn{background:none;border:none;color:var(--text-muted);padding:5px 10px;height:30px;border-radius:6px;cursor:pointer;display:flex;align-items:center;gap:5px;font-size:.8rem;font-weight:500;transition:all .2s}
 .theme-btn svg{width:14px;height:14px;fill:currentColor}
-.theme-btn.active{background:var(--primary);color:#fff}
+.theme-btn.active{background:var(--primary);color:var(--btn-primary-text)}
 
 /* ── Main Layout ───────────────────────────────────────────────── */
 main{flex:1;padding:16px;max-width:1440px;width:100%;margin:0 auto;display:flex;flex-direction:column;gap:16px}
@@ -83,11 +80,9 @@ main{flex:1;padding:16px;max-width:1440px;width:100%;margin:0 auto;display:flex;
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 
 /* ── Cards ─────────────────────────────────────────────────────── */
-.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:20px;border-left:3px solid transparent}
-.card-wifi{border-left-color:var(--accent-wifi)}
-.card-smb{border-left-color:var(--accent-smb)}
-.card-shq{border-left-color:var(--accent-shq)}
-.card-ble{border-left-color:var(--accent-ble)}
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:20px;border-left:3px solid var(--primary)}
+.card-warning{border-left-color:var(--warning)}
+.card-danger{border-left-color:var(--danger)}
 .card-title{font-size:1rem;font-weight:600;margin-bottom:14px;color:var(--text);display:flex;align-items:center;gap:8px}
 .card-title svg{width:18px;height:18px;fill:var(--primary)}
 
@@ -116,7 +111,7 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .btn svg{width:16px;height:16px;fill:currentColor;flex-shrink:0}
 .btn-block{width:100%}
 
-.btn-primary{background:var(--primary);color:#fff}
+.btn-primary{background:var(--primary);color:var(--btn-primary-text)}
 .btn-primary:hover:not(:disabled){background:var(--primary-hover);box-shadow:0 2px 8px var(--primary-glow)}
 
 .btn-outline{background:transparent;border:1px solid var(--border-color);color:var(--text)}
@@ -131,7 +126,7 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .btn-sm{padding:7px 12px;font-size:.8rem;border-radius:6px}
 .btn-icon{width:32px;height:32px;padding:0;border-radius:50%;background:rgba(148,163,184,0.15);border:1px solid rgba(148,163,184,0.25);color:var(--text);font-size:1.1rem;line-height:1;backdrop-filter:blur(2px)}
 .btn-icon:hover:not(:disabled){background:rgba(59,130,246,0.2);border-color:var(--primary);color:var(--primary)}
-.btn-icon.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn-icon.active{background:var(--primary);color:var(--btn-primary-text);border-color:var(--primary)}
 
 /* ── Password Wrapper ──────────────────────────────────────────── */
 .pw-wrap{position:relative;display:flex;align-items:center}
@@ -183,7 +178,7 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .panel-ctrls{position:absolute;top:-3px;right:0;z-index:20;display:flex;gap:4px;align-items:center}
 .panel-ctrls .btn-icon{width:30px;height:30px;font-size:1rem;background:var(--input-bg);border:1px solid var(--card-border);color:var(--text-muted);opacity:.9;backdrop-filter:none}
 .panel-ctrls .btn-icon:hover{opacity:1;color:var(--text);background:var(--card-bg)}
-.panel-ctrls .btn-icon.active{background:var(--primary);border-color:var(--primary);color:#fff;opacity:1}
+.panel-ctrls .btn-icon.active{background:var(--primary);border-color:var(--primary);color:var(--btn-primary-text);opacity:1}
 @media(max-width:600px){.panel-ctrls .btn-icon{width:34px;height:34px}.dash-signal-label{padding-right:164px}}
 /* Zoom drag-select highlight — override uPlot's near-invisible default so the
  * selection reads clearly on both light and dark themes (used by mouse drag
@@ -201,9 +196,9 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .dash-cal-day.has-data{color:var(--text);cursor:pointer;font-weight:600}
 .dash-cal-day.has-data:hover{background:rgba(59,130,246,0.15)}
 .dash-cal-day.today{outline:1px solid var(--primary);outline-offset:-1px}
-.dash-cal-day.selected{background:var(--primary);color:#fff}
+.dash-cal-day.selected{background:var(--primary);color:var(--btn-primary-text)}
 .dash-cal-day .dot{position:absolute;left:50%;bottom:4px;transform:translateX(-50%);width:5px;height:5px;border-radius:50%;background:var(--primary)}
-.dash-cal-day.selected .dot{background:#fff}
+.dash-cal-day.selected .dot{background:var(--btn-primary-text)}
 /* Loading progress bar */
 .dash-progress-wrap{margin:12px 0;display:none}
 .dash-progress-track{height:6px;background:var(--input-bg);border-radius:3px;overflow:hidden;position:relative}
@@ -372,7 +367,7 @@ SomnoTrace
 <div class="settings-section-header">
 <span class="step-num">1</span> Wi-Fi Network &amp; Timezone
 </div>
-<div class="card card-wifi">
+<div class="card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M1 9l2 2a12.73 12.73 0 0 1 18 0l2-2A15.57 15.57 0 0 0 1 9zm4 4l2 2a8.5 8.5 0 0 1 10 0l2-2A11.36 11.36 0 0 0 5 13zm4 4l3 3 3-3a4.24 4.24 0 0 0-6 0z"/></svg>
 Wi-Fi Configuration
@@ -410,7 +405,7 @@ Wi-Fi Configuration
 </div>
 <div class="settings-grid-2col sta-only">
 <!-- ResMed AirSense 11 -->
-<div class="card card-ble" style="display:flex;flex-direction:column;justify-content:space-between">
+<div class="card" style="display:flex;flex-direction:column;justify-content:space-between">
 <div>
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/></svg>
@@ -464,7 +459,7 @@ Wellue/Viatom O2 Ring S Pulse Oximeter
 </div>
 <div class="settings-grid-2col sta-only" id="upload-cards-grid">
 <!-- Network Folder (SMB) -->
-<div class="card card-smb" id="smb-card">
+<div class="card" id="smb-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
 Network Folder (SMB Share)
@@ -507,7 +502,7 @@ Network Folder (SMB Share)
 </div>
 
 <!-- SleepHQ Cloud -->
-<div class="card card-shq" id="shq-card">
+<div class="card" id="shq-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h.71A5.5 5.5 0 0 1 12 6c2.76 0 5 2.24 5 5v1h2c1.65 0 3 1.35 3 3s-1.35 3-3 3z"/></svg>
 SleepHQ Cloud Upload
@@ -535,7 +530,7 @@ SleepHQ Cloud Upload
 </div>
 
 <!-- Section 4: Remote File Access (FTP) -->
-<div class="card sta-only" style="border-left-color:var(--primary)">
+<div class="card sta-only mt-md">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M11 7h2v2h-2V7zm0 4h2v6h-2v-6zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
 Upload Window
@@ -550,7 +545,7 @@ Upload Window
 <div class="settings-section-header sta-only">
 <span class="step-num">4</span> Remote File Access (FTP Server)
 </div>
-<div class="card sta-only" id="ftp-card" style="border-left-color:var(--accent-ble)">
+<div class="card sta-only" id="ftp-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
 SD Card File Access (FTP)
@@ -585,19 +580,19 @@ SD Card File Access (FTP)
 </div>
 </div>
 
-<!-- Display (real-time, no reboot needed) -->
+<!-- Display & Alerts Grid -->
 <div class="settings-section-header sta-only">
-<span class="step-num">5</span> Display & Sound
+<span class="step-num">5</span> Display, Sound &amp; Alerts
 </div>
-<div class="card advanced-section sta-only" style="border-left-color:var(--accent-ble)">
+<div class="settings-grid-2col sta-only">
+<!-- Display & Sound -->
+<div class="card" id="display-sound-card">
 <div class="card-title">
-<svg viewBox="0 0 24 24" style="fill:var(--accent-ble)"><path d="M21 2H3a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7v2H8v2h8v-2h-2v-2h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zm0 14H3V4h18v12z"/></svg>
-Display & Sound
+<svg viewBox="0 0 24 24"><path d="M21 2H3a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7v2H8v2h8v-2h-2v-2h7a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zm0 14H3V4h18v12z"/></svg>
+Display &amp; Sound
 </div>
 <p class="card-desc">These settings are applied immediately and do not require a reboot.</p>
-<details id="display-sound-details">
-<summary>LCD & Speaker</summary>
-<div class="settings-grid-2col" style="margin-top:12px">
+<div style="display:flex;flex-direction:column;gap:12px;margin-top:12px">
 <div class="form-group">
 <label>LCD Brightness <span id="brightness-val" style="font-weight:normal;color:var(--text-muted)">10</span><span id="brightness-status" class="setting-status"></span></label>
 <input type="range" id="lcd-brightness" class="form-control" min="0" max="7" step="1" value="6" style="padding:0" oninput="onBrightnessInput(this.value)">
@@ -610,31 +605,28 @@ Display & Sound
 <option value="2">Backlight always off (battery)</option>
 </select>
 </div>
-</div>
-<div class="form-group" style="margin-top:12px">
+<div class="form-group">
 <label>Alert Speaker Volume <span id="alert-vol-val" style="font-weight:normal;color:var(--text-muted)">4</span><span id="alert-vol-status" class="setting-status"></span></label>
 <div style="display:flex;align-items:center;gap:8px">
 <input type="range" id="alert-volume" class="form-control" min="1" max="11" step="1" value="4" style="padding:0;flex:1" oninput="onAlertVolumeInput(this.value)">
 <button type="button" class="btn btn-sm" style="white-space:nowrap" onclick="testAlertVolume()">Test</button>
 </div>
 </div>
-</details>
+</div>
 </div>
 
 <!-- Therapy Alert Config -->
-<div class="card advanced-section sta-only" id="alert-card" style="border-left-color:var(--accent-wifi)">
+<div class="card" id="alert-card">
 <div class="card-title">
-<svg viewBox="0 0 24 24" style="fill:var(--accent-wifi)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
 Therapy Interruption Alerts
 </div>
-<p class="card-desc">Get notified when therapy stops during a configured time window. Push notifications via ntfy.sh, with optional buzzer escalation. Acknowledge with a single press of the PLUS button.</p>
-<details id="alert-settings-details">
-<summary>Alert settings</summary>
-<div style="margin-top:12px">
-<div class="form-group">
-<label><input type="checkbox" id="alert-enabled" onchange="autoSaveAlert()"> Enable therapy interruption alerts <span id="alert-save-status" class="setting-status"></span></label>
+<div class="toggle-row">
+<label for="alert-enabled">Enable Therapy Interruption Alerts <span id="alert-save-status" class="setting-status"></span></label>
+<label class="toggle"><input type="checkbox" id="alert-enabled" onchange="autoSaveAlert();toggleCardDisabled('alert-card','alert-enabled')"><span class="toggle-slider"></span></label>
 </div>
-<div class="settings-grid-2col">
+<p class="card-desc">Get notified when therapy stops during a configured time window. Push notifications via ntfy.sh, with optional buzzer escalation.</p>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px">
 <div class="form-group">
 <label>Window start</label>
 <select id="alert-win-start" class="form-control" onchange="autoSaveAlert()">
@@ -684,7 +676,7 @@ Therapy Interruption Alerts
 </select>
 </div>
 </div>
-<div class="form-group">
+<div class="form-group" style="margin-top:10px">
 <label>Delay after therapy stop (minutes) <span id="alert-delay1-val" style="font-weight:normal;color:var(--text-muted)">5</span></label>
 <input type="range" id="alert-delay1" class="form-control" min="1" max="20" step="1" value="5" style="padding:0" oninput="document.getElementById('alert-delay1-val').textContent=this.value" onchange="autoSaveAlert()">
 </div>
@@ -706,7 +698,7 @@ Therapy Interruption Alerts
 <input type="text" id="alert-ntfy-srv" class="form-control" value="https://ntfy.sh" placeholder="https://ntfy.sh" onchange="autoSaveAlert()">
 </div>
 <div class="form-group">
-<label>ntfy topic <span style="font-size:.78rem;color:var(--text-muted)">(shared secret — anyone with the topic can read notifications)</span></label>
+<label>ntfy topic <span style="font-size:.78rem;color:var(--text-muted)">(shared secret)</span></label>
 <div style="display:flex;gap:8px">
 <input type="text" id="alert-ntfy-topic" class="form-control" placeholder="somnotrace-xxxxxxxxxxxxxxxx" onchange="autoSaveAlert()">
 <button type="button" class="btn btn-sm" onclick="generateAlertTopic();autoSaveAlert()" style="white-space:nowrap">Generate</button>
@@ -725,7 +717,9 @@ Therapy Interruption Alerts
 <span id="alert-status" class="status-msg" style="margin-left:8px"></span>
 </div>
 </div>
+</div>
 </details>
+</div>
 </div>
 
 <!-- Sticky Floating Save & Reboot Bar -->
@@ -791,7 +785,7 @@ Save &amp; Reboot
 <!-- ═══════════════ STATUS TAB ═══════════════ -->
 <section id="tab-status" class="tab-content sta-only">
 <!-- Top Card: Upload Progress -->
-<div class="card card-primary-border">
+<div class="card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
 Upload Progress
@@ -854,7 +848,7 @@ Upload Progress
 
 <!-- ═══════════════ ACTIONS TAB ═══════════════ -->
 <section id="actions" class="tab-content sta-only">
-<div class="card card-primary-border">
+<div class="card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
 Firmware Update (OTA)
@@ -879,7 +873,12 @@ Firmware Update (OTA)
 <div style="display:flex;flex-direction:column;gap:8px">
 <label style="font-size:.85rem;font-weight:600;color:var(--text)">Upload from File</label>
 <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-<input type="file" id="ota-file-input" accept=".bin" style="font-size:.85rem;flex:1;min-width:200px">
+<input type="file" id="ota-file-input" accept=".bin" style="display:none">
+<button class="btn btn-outline" type="button" id="ota-choose-file-btn" onclick="document.getElementById('ota-file-input').click()">
+<svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+Choose File
+</button>
+<span id="ota-file-name" style="font-size:.85rem;color:var(--text-muted);flex:1;min-width:140px;word-break:break-all">No file chosen</span>
 <button class="btn btn-primary" id="ota-upload-btn" onclick="otaUpload()" disabled>Upload &amp; Flash</button>
 </div>
 </div>
@@ -895,12 +894,11 @@ Firmware Update (OTA)
 </div>
 </div>
 
-<div class="card advanced-section mt-md" style="border-left-color:var(--warning)">
-<details>
-<summary class="card-title" style="cursor:pointer">
+<div class="card card-warning advanced-section mt-md">
+<div class="card-title">
 <svg viewBox="0 0 24 24" style="fill:var(--warning)"><path d="M12 2L1 21h22L12 2zm0 3.83L19.53 19H4.47L12 5.83zM11 10v6h2v-6h-2zm0 8v2h2v-2h-2z"/></svg>
 Maintenance Actions
-</summary>
+</div>
 <p class="card-desc mt-sm">These actions modify files on the SD card and upload state. Each action requires confirmation before proceeding.</p>
 
 <div style="display:flex;flex-direction:column;gap:12px" class="mt-md">
@@ -947,7 +945,6 @@ Maintenance Actions
 
 </div>
 <div id="action-status" class="status-msg" style="margin-top:14px"></div>
-</details>
 </div>
 </section>
 
@@ -966,6 +963,7 @@ var PW_SENTINEL_UPLOAD = '***';
 
 /* ── Theme ─────────────────────────────────────────────────────── */
 var settingsLoaded = false;
+var dashThemeDirty = false;
 
 function switchTab(tabId) {
   document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
@@ -976,6 +974,16 @@ function switchTab(tabId) {
   if (btn) { btn.classList.add('active'); btn.setAttribute('aria-selected', 'true'); }
   var sec = document.getElementById(tabId);
   if (sec) sec.classList.add('active');
+
+  if (tabId === 'dashboard') {
+    if (dashThemeDirty) {
+      dashThemeDirty = false;
+      if (typeof dashCharts !== 'undefined' && dashCharts.length) renderDashboardCharts();
+    } else {
+      setTimeout(resizeDashboardChart, 0);
+    }
+  }
+
   /* Set fixed body height for terminal in logs tab */
   if (tabId === 'logs') {
     document.body.classList.add('fixed-height');
@@ -987,8 +995,8 @@ function switchTab(tabId) {
   /* Lazy-load Settings tab data on first visit. */
   if (tabId === 'settings' && !settingsLoaded) {
     settingsLoaded = true;
-    setLoading('display-sound-details', true);
-    setLoading('alert-settings-details', true);
+    setLoading('display-sound-card', true);
+    setLoading('alert-card', true);
     if (!PORTAL_MODE) {
       setLoading('upload-cards-grid', true);
       setLoading('ftp-card', true);
@@ -1009,8 +1017,8 @@ function switchTab(tabId) {
       loadAlertConfig();
       loadStatus();
     }).then(function() {
-      setLoading('display-sound-details', false);
-      setLoading('alert-settings-details', false);
+      setLoading('display-sound-card', false);
+      setLoading('alert-card', false);
       setLoading('upload-cards-grid', false);
       setLoading('ftp-card', false);
       setLoading('upload-progress', false);
@@ -1032,7 +1040,12 @@ function setTheme(theme) {
   if (btn) btn.classList.add('active');
   localStorage.setItem('somnotrace_theme', theme);
   /* Re-render dashboard charts so axis/grid/stroke colors pick up new theme vars. */
-  if (typeof dashCharts !== 'undefined' && dashCharts.length) renderDashboardCharts();
+  var dashSec = document.getElementById('dashboard');
+  if (dashSec && dashSec.classList.contains('active')) {
+    if (typeof dashCharts !== 'undefined' && dashCharts.length) renderDashboardCharts();
+  } else {
+    dashThemeDirty = true;
+  }
 }
 function getSystemTheme() {
   if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'night';
@@ -1858,31 +1871,35 @@ function autoSaveAlert() {
     });
   }, 300);
 }
+function renderAlertConfig(d) {
+  var setVal = function(id, v) { var el = document.getElementById(id); if (el) el.value = v; };
+  var setTxt = function(id, v) { var el = document.getElementById(id); if (el) el.textContent = v; };
+  var setChk = function(id, v) { var el = document.getElementById(id); if (el) el.checked = !!v; };
+  setChk('alert-enabled', d.enabled);
+  toggleCardDisabled('alert-card', 'alert-enabled');
+  setVal('alert-win-start', String(d.win_start || 1380));
+  setVal('alert-win-end', String(d.win_end || 360));
+  setVal('alert-delay1', d.delay1 || 5);
+  setTxt('alert-delay1-val', d.delay1 || 5);
+  setVal('alert-ntfy-srv', d.ntfy_srv || 'https://ntfy.sh');
+  setVal('alert-ntfy-topic', d.ntfy_topic || '');
+  setVal('alert-ntfy-prio', String(d.ntfy_prio || 5));
+  setVal('alert-delay2', d.delay2 || 5);
+  setTxt('alert-delay2-val', d.delay2 || 5);
+  var modeSel = document.getElementById('alert-mode');
+  if (modeSel) {
+    if (d.push_en && d.buzz_en) modeSel.value = 'both';
+    else if (d.push_en) modeSel.value = 'push';
+    else modeSel.value = 'sound';
+    onAlertModeChange(modeSel);
+  }
+}
 function loadAlertConfig() {
   fetch('/api/alert/config').then(function(r){ return r.json(); }).then(function(d) {
-    var setVal = function(id, v) { var el = document.getElementById(id); if (el) el.value = v; };
-    var setTxt = function(id, v) { var el = document.getElementById(id); if (el) el.textContent = v; };
-    var setChk = function(id, v) { var el = document.getElementById(id); if (el) el.checked = !!v; };
-    setChk('alert-enabled', d.enabled);
-    setVal('alert-win-start', String(d.win_start || 1380));
-    setVal('alert-win-end', String(d.win_end || 360));
-    setVal('alert-delay1', d.delay1 || 5);
-    setTxt('alert-delay1-val', d.delay1 || 5);
-    setVal('alert-ntfy-srv', d.ntfy_srv || 'https://ntfy.sh');
-    setVal('alert-ntfy-topic', d.ntfy_topic || '');
-    setVal('alert-ntfy-prio', String(d.ntfy_prio || 5));
-    setVal('alert-delay2', d.delay2 || 5);
-    setTxt('alert-delay2-val', d.delay2 || 5);
-    var modeSel = document.getElementById('alert-mode');
-    if (modeSel) {
-      if (d.push_en && d.buzz_en) modeSel.value = 'both';
-      else if (d.push_en) modeSel.value = 'push';
-      else modeSel.value = 'sound';
-      onAlertModeChange(modeSel);
-    }
-    setLoading('alert-settings-details', false);
+    renderAlertConfig(d);
+    setLoading('alert-card', false);
   }).catch(function() {
-    setLoading('alert-settings-details', false);
+    setLoading('alert-card', false);
   });
 }
 function generateAlertTopic() {
@@ -2095,7 +2112,10 @@ function execAction(action, confirmMsg) {
 /* ── OTA Firmware Upload ───────────────────────────────────────── */
 document.getElementById('ota-file-input').addEventListener('change', function() {
   var btn = document.getElementById('ota-upload-btn');
-  btn.disabled = !this.files || !this.files.length;
+  var nameEl = document.getElementById('ota-file-name');
+  var hasFile = this.files && this.files.length > 0;
+  btn.disabled = !hasFile;
+  if (nameEl) nameEl.textContent = hasFile ? this.files[0].name : 'No file chosen';
 });
 
 /* Shared OTA UI helpers — both URL and file paths use the same progress/status elements. */
@@ -2115,14 +2135,16 @@ function otaShowStatus(msg, cls) {
 function otaSetBusy(busy) {
   var urlBtn = document.getElementById('ota-url-btn');
   var uploadBtn = document.getElementById('ota-upload-btn');
+  var chooseBtn = document.getElementById('ota-choose-file-btn');
   var fileInput = document.getElementById('ota-file-input');
   var urlInput = document.getElementById('ota-url-input');
   var advBtn = document.getElementById('ota-adventurous-btn');
   urlBtn.disabled = busy;
   uploadBtn.disabled = busy || !fileInput.files || !fileInput.files.length;
+  if (chooseBtn) chooseBtn.disabled = busy;
   fileInput.disabled = busy;
   urlInput.disabled = busy;
-  advBtn.disabled = busy;
+  if (advBtn) advBtn.disabled = busy;
 }
 
 /* ── OTA: Download from URL ──────────────────────────────────────
@@ -3924,9 +3946,17 @@ function renderDashboardCharts() {
   requestAnimationFrame(function() { if (dashCharts.length) updateDashView(); });
 }
 
-/* Shared floating value tooltip helpers (mouse + touch). The dashed vertical
- * crosshair is drawn by uPlot's synced cursor across all panels; these add the
- * value label for the active panel. Hidden over session/data gaps. */
+var chartTooltip = null;
+function ensureTooltip() {
+  if (!chartTooltip) {
+    chartTooltip = document.createElement('div');
+    chartTooltip.className = 'chart-tooltip';
+    chartTooltip.style.cssText = 'position:absolute;display:none;padding:6px 10px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:6px;font-size:0.78rem;color:var(--text);pointer-events:none;z-index:1000;box-shadow:0 4px 12px rgba(0,0,0,0.3);line-height:1.3';
+    document.body.appendChild(chartTooltip);
+  }
+  return chartTooltip;
+}
+
 function dashHideTip() { if (chartTooltip) chartTooltip.style.display = 'none'; }
 function dashShowTip(chart, over, sig, clientX, clientY) {
   var tip = ensureTooltip();
@@ -4211,11 +4241,15 @@ function applyPortalMode() {
 
 function resizeDashboardChart() {
   if (!dashCharts.length) return;
+  var dashSec = document.getElementById('dashboard');
+  if (dashSec && !dashSec.classList.contains('active')) return;
   for (var i = 0; i < dashCharts.length; i++) {
     var chart = dashCharts[i];
     if (!chart) continue;
     var el = document.getElementById('chart-' + DASH_SIGNALS[i].key);
-    if (el) chart.setSize({ width: dashChartWidth(el), height: DASH_SIGNALS[i].height });
+    if (el && el.clientWidth > 0) {
+      chart.setSize({ width: dashChartWidth(el), height: DASH_SIGNALS[i].height });
+    }
   }
   updateDashView();
 }
