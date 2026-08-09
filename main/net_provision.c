@@ -737,7 +737,7 @@ static void status_cache_refresh_nvs(void)
     s_status_cache.tz_tick = xTaskGetTickCount();
 }
 
-static esp_err_t status_get_handler(httpd_req_t *req)
+cJSON *netprov_build_status_json(void)
 {
     TickType_t now = xTaskGetTickCount();
     uint32_t ms = portTICK_PERIOD_MS;
@@ -755,6 +755,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     }
 
     cJSON *resp = cJSON_CreateObject();
+    if (!resp) return NULL;
+
     cJSON_AddStringToObject(resp, "mode", s_portal_mode ? "setup" : "connected");
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
@@ -850,9 +852,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         }
     }
 
-    /* Upload summary (only in connected mode).
-     * Deliberately tiny: the dashboard polls this every few seconds, so the
-     * detail lives behind /api/uploads/progress instead. */
+    /* Upload summary (only in connected mode) */
     if (!s_portal_mode) {
         int pending = 0;
         const char *worst = "idle";
@@ -869,10 +869,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON *alert = cJSON_AddObjectToObject(resp, "alert");
     cJSON_AddStringToObject(alert, "state", therapy_alert_state_str(therapy_alert_get_state()));
 
-    /* Days recovered from an interrupted session that are still waiting to be
-     * exported.  A recovered night used to be visible only as a boot log line
-     * that scrolled away; surfacing it here is the difference between "silently
-     * lost" and "the device is working on it / needs attention". */
     {
         char *pending = NULL;
         if (session_writer_pending_export_json(&pending) == ESP_OK && pending) {
@@ -896,8 +892,22 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(resp, "sd_free", (double)s_status_cache.sd_free);
     }
 
+    return resp;
+}
+
+static esp_err_t status_get_handler(httpd_req_t *req)
+{
+    cJSON *resp = netprov_build_status_json();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status failed");
+        return ESP_FAIL;
+    }
     char *json_str = cJSON_PrintUnformatted(resp);
     cJSON_Delete(resp);
+    if (!json_str) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status serialization failed");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
     cJSON_free(json_str);
@@ -1558,6 +1568,50 @@ static esp_err_t device_settings_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free(json);
+    return ESP_OK;
+}
+
+static esp_err_t settings_all_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char *up_json = NULL;
+    if (uploader_get_config_json(&up_json) == ESP_OK && up_json) {
+        cJSON *parsed = cJSON_Parse(up_json);
+        if (parsed) cJSON_AddItemToObject(root, "uploads", parsed);
+        free(up_json);
+    }
+
+    char *dev_json = NULL;
+    if (device_settings_get_json(&dev_json) == ESP_OK && dev_json) {
+        cJSON *parsed = cJSON_Parse(dev_json);
+        if (parsed) cJSON_AddItemToObject(root, "device", parsed);
+        free(dev_json);
+    }
+
+    char *alert_json = NULL;
+    if (therapy_alert_get_config_json(&alert_json) == ESP_OK && alert_json) {
+        cJSON *parsed = cJSON_Parse(alert_json);
+        if (parsed) cJSON_AddItemToObject(root, "alert", parsed);
+        free(alert_json);
+    }
+
+    cJSON *st = netprov_build_status_json();
+    if (st) cJSON_AddItemToObject(root, "status", st);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json_str) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(json_str);
     return ESP_OK;
 }
 
@@ -2391,7 +2445,7 @@ static esp_err_t start_webserver(void)
     config.lru_purge_enable = true;
     config.max_uri_handlers = 45;
     config.stack_size = 8192;
-    config.max_open_sockets = 24;
+    config.max_open_sockets = 16;
     config.recv_wait_timeout = 2;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
     config.keep_alive_enable = true;    /* detect dead connections via TCP probes */
@@ -2472,6 +2526,8 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &up_state_get);
 
     /* Device settings endpoints (brightness, LCD therapy mode) */
+    httpd_uri_t settings_all = { .uri = "/api/settings/all", .method = HTTP_GET, .handler = settings_all_get_handler };
+    httpd_register_uri_handler(s_httpd, &settings_all);
     httpd_uri_t dev_get = { .uri = "/api/device/settings", .method = HTTP_GET, .handler = device_settings_get_handler };
     httpd_uri_t dev_post = { .uri = "/api/device/settings", .method = HTTP_POST, .handler = device_settings_post_handler };
     httpd_register_uri_handler(s_httpd, &dev_get);

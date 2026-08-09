@@ -121,6 +121,17 @@ static void set_status(const char *fmt, ...)
     va_end(ap);
 }
 
+/* Single choke point for backend state changes so the UI can be pushed an
+ * update the moment anything transitions, rather than up to one poll period
+ * later.  Only real transitions notify — re-assigning the same state is
+ * common in the scan loop and must not generate traffic. */
+static void set_be_state(backend_rt_t *r, sb_state_t st)
+{
+    if (r->state == st) return;
+    r->state = st;
+    uploader_notify_progress_changed();
+}
+
 static backend_rt_t *rt_for(const upload_backend_t *be)
 {
     for (int i = 0; i < s_n_rt; i++) {
@@ -140,13 +151,13 @@ static void cooldown_enter(backend_rt_t *r, const char *why, bool permanent)
     int mins = COOLDOWN_MIN[r->cooldown_idx];
     if (r->cooldown_idx < N_COOLDOWN - 1) r->cooldown_idx++;
     r->retry_at_us = now_us() + (int64_t)mins * 60 * 1000000LL;
-    r->state = SB_COOLDOWN;
     r->last_err_permanent = permanent;
     if (why) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         strlcpy(r->err, why, sizeof(r->err));
         xSemaphoreGive(s_lock);
     }
+    set_be_state(r, SB_COOLDOWN);
     ESP_LOGW(TAG, "%s: cooldown %d min (%s)", r->be->id, mins,
              why ? why : "error");
 }
@@ -195,13 +206,13 @@ static bool run_backend(backend_rt_t *r, int max_days)
                           (upload_index_bundle_ok_fp(r->slot) != bundle.fp);
 
     if (n_days == 0 && !bundle_changed) {
-        r->state = SB_IDLE;
+        set_be_state(r, SB_IDLE);
         r->cur_day[0] = '\0';
         return false;
     }
     if (!have_bundle) {
         /* No STR.edf yet: uploading session files alone would be useless. */
-        r->state = SB_IDLE;
+        set_be_state(r, SB_IDLE);
         return false;
     }
 
@@ -213,7 +224,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         if (!be->bundle_only_ok) {
             ESP_LOGI(TAG, "%s: only root files changed — deferring to the "
                      "next session upload", be->id);
-            r->state = SB_IDLE;
+            set_be_state(r, SB_IDLE);
             return false;
         }
 
@@ -233,7 +244,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         if (attach == 0) {
             ESP_LOGI(TAG, "%s: root files changed but no exported day to attach "
                      "them to — nothing to do", be->id);
-            r->state = SB_IDLE;
+            set_be_state(r, SB_IDLE);
             return false;
         }
         days[n_days++] = attach;
@@ -245,7 +256,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         return false;
     }
 
-    r->state = SB_UPLOADING;
+    set_be_state(r, SB_UPLOADING);
     r->n_units = n_units;
     r->cur_unit = 0;
 
@@ -408,7 +419,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         cooldown_enter(r, "nothing to send (state out of sync)", false);
     } else {
         cooldown_reset(r);
-        r->state = SB_IDLE;
+        set_be_state(r, SB_IDLE);
         ESP_LOGI(TAG, "%s: up to date%s", be->id,
                  bundle_committed && !any_ok ? " (root files)" : "");
     }
@@ -433,7 +444,7 @@ static void run_pass(void)
         if (!r || r->slot < 0) continue;
 
         if (!bes[i]->is_configured || !bes[i]->is_configured()) {
-            r->state = SB_DISABLED;
+            set_be_state(r, SB_DISABLED);
             continue;
         }
         if (r->state == SB_COOLDOWN && now_us() < r->retry_at_us) continue;
@@ -528,7 +539,7 @@ static void sched_task(void *arg)
                 upload_index_clear();
                 for (int i = 0; i < s_n_rt; i++) {
                     cooldown_reset(&s_rt[i]);
-                    s_rt[i].state = SB_IDLE;
+                    set_be_state(&s_rt[i], SB_IDLE);
                     s_rt[i].last_ok_s = 0;
                 }
                 do_scan();
@@ -616,8 +627,15 @@ esp_err_t upload_sched_progress_json(char **out_json)
 {
     if (!out_json) return ESP_ERR_INVALID_ARG;
 
+    /* s_task is this module's "fully constructed" sentinel: it is assigned
+     * last, after the mutex, the queue and the runtime slots.  Guarding on
+     * s_lock instead would still expose s_rt/s_n_rt while rt_for() is
+     * populating them. */
+    if (!s_task) return ESP_ERR_INVALID_STATE;
+
     int max_days = uploader_max_days();
     cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     cJSON_AddStringToObject(root, "status", s_status);

@@ -62,6 +62,7 @@
 #include "nvs.h"
 #include "psram_task.h"
 #include "nvs_writer.h"
+#include "log_stream.h"
 
 #include "mbedtls/sha256.h"
 #include "mbedtls/bignum.h"
@@ -271,6 +272,7 @@ static void set_state(const char *st)
     s_state = st;
     xSemaphoreGive(s_state_mtx);
     bsp_display_set_as11_paired(strcmp(st, AS11_STATUS_PAIRED) == 0);
+    log_stream_request_ble_push();
 }
 
 static void set_error(const char *msg)
@@ -281,6 +283,7 @@ static void set_error(const char *msg)
     xSemaphoreGive(s_state_mtx);
     bsp_display_set_as11_paired(false);
     ESP_LOGE(TAG, "error: %s", msg ? msg : "");
+    log_stream_request_ble_push();
 }
 
 static void bytes_to_hex(const uint8_t *in, size_t n, char *out_upper)

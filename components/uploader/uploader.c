@@ -136,11 +136,27 @@ static uploader_nvs_exec_fn_t s_nvs_exec = NULL;
 static uploader_lease_acquire_fn_t s_lease_acquire = NULL;
 static uploader_lease_release_fn_t s_lease_release = NULL;
 
+/* Injected "progress changed" notifier (the app's WebSocket push). */
+static uploader_progress_notify_fn_t s_progress_notify = NULL;
+
 void uploader_set_lease_fns(uploader_lease_acquire_fn_t acquire,
                             uploader_lease_release_fn_t release)
 {
     s_lease_acquire = acquire;
     s_lease_release = release;
+}
+
+void uploader_set_progress_notify_fn(uploader_progress_notify_fn_t fn)
+{
+    s_progress_notify = fn;
+}
+
+/* Called by the scheduler on every backend state transition.  Must stay
+ * cheap and allocation-free: it runs on the scheduler task and the hook is
+ * expected only to set a flag for another task to act on. */
+void uploader_notify_progress_changed(void)
+{
+    if (s_progress_notify) s_progress_notify();
 }
 
 void uploader_set_nvs_executor(uploader_nvs_exec_fn_t exec)
@@ -344,13 +360,25 @@ esp_err_t uploader_save_config_json(const char *json_str)
 
 /* ── Progress / status for the web UI ───────────────────────────────── */
 
+/* Both of these are reachable from the httpd worker and from the WebSocket
+ * forwarder task, either of which can run before uploader_init() has
+ * finished — the forwarder starts as soon as a browser attaches, which at
+ * boot is well before the uploader's index load completes.  Reading the
+ * scheduler's state in that window previously took an uninitialised mutex
+ * and aborted, so both entry points are gated on full initialisation. */
 esp_err_t uploader_get_progress_json(char **out_json)
 {
+    if (!s_initialised) return ESP_ERR_INVALID_STATE;
     return upload_sched_progress_json(out_json);
 }
 
 void uploader_get_summary(int *out_pending, const char **out_worst)
 {
+    if (!s_initialised) {
+        if (out_pending) *out_pending = 0;
+        if (out_worst) *out_worst = "idle";
+        return;
+    }
     upload_sched_summary(out_pending, out_worst);
 }
 

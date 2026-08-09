@@ -59,6 +59,10 @@ int  uploader_enabled_backends(const upload_backend_t **out, int max_out);
 bool uploader_lease_take(uint32_t timeout_ms);
 void uploader_lease_give(void);
 
+/* Fan out a backend state transition to the app's injected notifier (if any)
+ * so the web UI can be updated immediately.  Cheap and non-blocking. */
+void uploader_notify_progress_changed(void);
+
 /* Create the task and queue.  Backends must already be registered. */
 esp_err_t upload_sched_init(void);
 

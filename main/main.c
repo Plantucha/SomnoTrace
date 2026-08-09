@@ -382,6 +382,7 @@ void app_main(void)
                 }
             }
             uploader_init();
+            uploader_set_progress_notify_fn(log_stream_request_upload_push);
 
             char ip_line[32];
             snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
@@ -468,6 +469,7 @@ void app_main(void)
                         }
                     }
                     uploader_init();
+                    uploader_set_progress_notify_fn(log_stream_request_upload_push);
                     post_connect_init_done = true;
 
                     /* Try NTP now that we have a network. */

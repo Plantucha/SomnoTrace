@@ -30,6 +30,8 @@
 extern "C" {
 #endif
 
+#include "cJSON.h"
+
 /**
  * Initialise the log stream subsystem.
  *
@@ -40,9 +42,9 @@ extern "C" {
 void log_stream_init(void);
 
 /**
- * Register the log-related HTTP endpoints on the given server:
+ * Register the system WebSocket & log HTTP endpoints on the given server:
  *
- *   GET  /api/logs/ws        — WebSocket real-time log push (text frames)
+ *   GET  /api/ws            — Unified WebSocket real-time channel (JSON envelopes)
  *   GET  /api/logs/recent    — polling fallback for live log lines (JSON)
  *   GET  /api/logs/download  — plain-text download of buffered logs
  *   GET  /api/logs/history   — plain-text history from SD card files
@@ -50,6 +52,37 @@ void log_stream_init(void);
  *   POST /api/logs/level     — change runtime log level (JSON body)
  */
 void log_stream_register_handlers(httpd_handle_t server);
+
+/**
+ * Push a typed JSON envelope frame down the active WebSocket connection.
+ * Format: {"type": "<type>", "data": <data_obj>}
+ *
+ * Ownership: data_obj is transferred to this function.  It will be
+ * embedded in the envelope and freed (via cJSON_Delete) before returning,
+ * regardless of success or failure.  The caller must not reference
+ * data_obj after the call returns.
+ */
+esp_err_t log_stream_ws_send_json(const char *type, cJSON *data_obj);
+
+/**
+ * Push a typed raw JSON string frame down the active WebSocket connection.
+ * Format: {"type": "<type>", "data": <data_json_str>}
+ */
+esp_err_t log_stream_ws_send_json_raw(const char *type, const char *data_json_str);
+
+/**
+ * Request an immediate upload-progress push on the next forwarder cycle.
+ * Called from the upload scheduler on backend state transitions.
+ * Non-blocking — just sets a flag.
+ */
+void log_stream_request_upload_push(void);
+
+/**
+ * Request an immediate BLE-state push on the next forwarder cycle.
+ * Called from the BLE state machine on pairing state changes.
+ * Non-blocking — just sets a flag.
+ */
+void log_stream_request_ble_push(void);
 
 #ifdef __cplusplus
 }

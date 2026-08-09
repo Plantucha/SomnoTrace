@@ -42,6 +42,9 @@
 #include "cJSON.h"
 #include "sd_storage.h"
 #include "psram_task.h"
+#include "net_provision.h"
+#include "uploader.h"
+#include "as11_ble.h"
 
 static const char *TAG = "log_stream";
 
@@ -317,18 +320,107 @@ void log_stream_init(void)
     s_ws_mutex = xSemaphoreCreateMutex();
 }
 
-/* ── WebSocket Live Tail: GET /api/logs/ws ────────────────────────── */
-/* The handler runs only for the WS handshake and incoming control frames;
- * it returns immediately so the httpd worker task is never blocked.  A
- * separate forwarder task drains the ring buffer and pushes text frames
- * via httpd_ws_send_frame_async — the officially supported API for
- * sending WS frames outside a handler context. */
+static volatile bool s_ws_paused = false;
+
+/* Push-now flags — set by external event sources, consumed by the forwarder
+ * task.  Volatile because they are written from other tasks/contexts. */
+static volatile bool s_push_status_now = false;
+static volatile bool s_push_upload_now = false;
+static volatile bool s_push_ble_now    = false;
+
+/* Request an immediate upload-progress push on the next forwarder cycle
+ * (e.g. on a backend state transition).  Safe to call from any task. */
+void log_stream_request_upload_push(void)
+{
+    s_push_upload_now = true;
+}
+
+/* Request an immediate BLE-state push on the next forwarder cycle
+ * (e.g. on a pairing state change).  Safe to call from any task. */
+void log_stream_request_ble_push(void)
+{
+    s_push_ble_now = true;
+}
+
+static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
+{
+    httpd_handle_t hd = NULL;
+    int fd = -1;
+    if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        hd = s_ws_hd;
+        fd = s_ws_fd;
+        xSemaphoreGive(s_ws_mutex);
+    }
+    if (!hd || fd < 0) return ESP_OK;
+
+    httpd_ws_frame_t ws_pkt = {
+        .final = true,
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)payload_str,
+        .len = len,
+    };
+    esp_err_t err = httpd_ws_send_frame_async(hd, fd, &ws_pkt);
+    if (err != ESP_OK) {
+        /* Distinguish transient send failures (buffer full, timeout) from
+         * real socket errors (peer closed, RST).  Only tear down on the
+         * latter — transient failures resolve on the next attempt. */
+        bool transient = (err == ESP_ERR_TIMEOUT || err == ESP_ERR_NO_MEM);
+        if (transient) {
+            ESP_LOGD(TAG, "ws: transient send failure (err=0x%x), keeping fd=%d", err, fd);
+        } else {
+            ESP_LOGW(TAG, "ws: send failed (err=0x%x), closing fd=%d", err, fd);
+            if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
+                if (s_ws_fd == fd) { s_ws_hd = NULL; s_ws_fd = -1; }
+                xSemaphoreGive(s_ws_mutex);
+            }
+        }
+    }
+    return err;
+}
+
+esp_err_t log_stream_ws_send_json(const char *type, cJSON *data_obj)
+{
+    if (s_ws_paused && strcmp(type, "log") != 0) {
+        if (data_obj) cJSON_Delete(data_obj);
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        if (data_obj) cJSON_Delete(data_obj);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "type", type);
+    if (data_obj) {
+        cJSON_AddItemToObject(root, "data", data_obj);
+    }
+    char *str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!str) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = ws_send_frame_internal(str, strlen(str));
+    free(str);
+    return err;
+}
+
+esp_err_t log_stream_ws_send_json_raw(const char *type, const char *data_json_str)
+{
+    if (s_ws_paused && strcmp(type, "log") != 0) return ESP_OK;
+    size_t type_len = strlen(type);
+    size_t data_len = data_json_str ? strlen(data_json_str) : 4;
+    size_t total = type_len + data_len + 32;
+    char *buf = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc(total);
+    if (!buf) return ESP_ERR_NO_MEM;
+
+    int len = snprintf(buf, total, "{\"type\":\"%s\",\"data\":%s}", type, data_json_str ? data_json_str : "null");
+    esp_err_t err = ws_send_frame_internal(buf, len);
+    free(buf);
+    return err;
+}
 
 static void ws_forwarder_task(void *arg)
 {
     (void)arg;
-    /* Accumulate lines into a single frame buffer to reduce the number
-     * of socket writes.  Send when we hit a threshold or after a timeout. */
     char *frame_buf = heap_caps_malloc(LOG_LINE_MAX * 16, MALLOC_CAP_SPIRAM);
     if (!frame_buf) {
         ESP_LOGE(TAG, "ws_fwd: failed to allocate frame buffer");
@@ -337,9 +429,12 @@ static void ws_forwarder_task(void *arg)
     }
     size_t frame_cap = LOG_LINE_MAX * 16;
     size_t frame_pos = 0;
+    const TickType_t status_interval = pdMS_TO_TICKS(3000);
+    const TickType_t upload_interval = pdMS_TO_TICKS(5000);
+    TickType_t last_status_tick = xTaskGetTickCount();
+    TickType_t last_upload_tick = xTaskGetTickCount();
 
     while (true) {
-        /* Snapshot the current WS connection under the mutex. */
         httpd_handle_t hd = NULL;
         int fd = -1;
         if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -349,17 +444,62 @@ static void ws_forwarder_task(void *arg)
         }
 
         if (!hd || fd < 0) {
-            /* No active viewer — sleep and re-check. */
             vTaskDelay(pdMS_TO_TICKS(200));
             frame_pos = 0;
+            last_status_tick = xTaskGetTickCount();
+            last_upload_tick = xTaskGetTickCount();
+            s_push_status_now = false;
+            s_push_upload_now = false;
+            s_push_ble_now    = false;
             continue;
+        }
+
+        /* Status push: periodic (~3 s) or on-demand (resume). */
+        TickType_t now = xTaskGetTickCount();
+        if (!s_ws_paused &&
+            ((now - last_status_tick) >= status_interval || s_push_status_now)) {
+            last_status_tick = now;
+            s_push_status_now = false;
+            cJSON *st = netprov_build_status_json();
+            if (st) {
+                log_stream_ws_send_json("status", st);
+            }
+        }
+
+        /* Upload progress push: periodic (~5 s) or on-demand (transition). */
+        if (!s_ws_paused &&
+            ((now - last_upload_tick) >= upload_interval || s_push_upload_now)) {
+            last_upload_tick = now;
+            s_push_upload_now = false;
+            char *up_json = NULL;
+            if (uploader_get_progress_json(&up_json) == ESP_OK && up_json) {
+                log_stream_ws_send_json_raw("upload", up_json);
+                free(up_json);
+            }
+        }
+
+        /* BLE state push: event-driven only (no periodic polling). */
+        if (!s_ws_paused && s_push_ble_now) {
+            s_push_ble_now = false;
+            cJSON *ble = cJSON_CreateObject();
+            if (ble) {
+                cJSON_AddStringToObject(ble, "state", as11_ble_get_status());
+                cJSON_AddStringToObject(ble, "error", as11_ble_get_error());
+                cJSON_AddBoolToObject(ble, "paired", as11_ble_is_paired());
+                if (as11_ble_is_paired()) {
+                    cJSON *info = as11_ble_get_paired_info();
+                    if (info) {
+                        cJSON_AddItemToObject(ble, "device", info);
+                    }
+                }
+                log_stream_ws_send_json("ble", ble);
+            }
         }
 
         /* Try to drain available ring-buffer data (non-blocking). */
         size_t item_sz = 0;
         void *item = xRingbufferReceiveUpTo(s_ringbuf, &item_sz, 0, LOG_LINE_MAX);
         if (item) {
-            /* Append to frame buffer; flush if near capacity. */
             size_t copy_len = item_sz;
             if (frame_pos + copy_len > frame_cap - 1) {
                 copy_len = frame_cap - 1 - frame_pos;
@@ -368,37 +508,23 @@ static void ws_forwarder_task(void *arg)
             frame_pos += copy_len;
             vRingbufferReturnItem(s_ringbuf, item);
 
-            /* Send immediately if we have a decent batch. */
             if (frame_pos >= 256) {
-                httpd_ws_frame_t ws_pkt = {
-                    .final = true,
-                    .type = HTTPD_WS_TYPE_TEXT,
-                    .payload = (uint8_t *)frame_buf,
-                    .len = frame_pos,
-                };
-                esp_err_t err = httpd_ws_send_frame_async(hd, fd, &ws_pkt);
-                if (err != ESP_OK) {
-                    /* Client likely disconnected — clear the slot. */
-                    if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
-                        if (s_ws_fd == fd) { s_ws_hd = NULL; s_ws_fd = -1; }
-                        xSemaphoreGive(s_ws_mutex);
-                    }
+                frame_buf[frame_pos] = '\0';
+                cJSON *cjs = cJSON_CreateString(frame_buf);
+                if (cjs) {
+                    log_stream_ws_send_json("log", cjs);
                 }
                 frame_pos = 0;
             }
         } else {
-            /* No data available — send any pending fragment, then wait. */
             if (frame_pos > 0) {
-                httpd_ws_frame_t ws_pkt = {
-                    .final = true,
-                    .type = HTTPD_WS_TYPE_TEXT,
-                    .payload = (uint8_t *)frame_buf,
-                    .len = frame_pos,
-                };
-                httpd_ws_send_frame_async(hd, fd, &ws_pkt);
+                frame_buf[frame_pos] = '\0';
+                cJSON *cjs = cJSON_CreateString(frame_buf);
+                if (cjs) {
+                    log_stream_ws_send_json("log", cjs);
+                }
                 frame_pos = 0;
             }
-            /* Brief sleep so we don't busy-spin on an empty ring buffer. */
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
@@ -406,20 +532,29 @@ static void ws_forwarder_task(void *arg)
 
 static esp_err_t logs_ws_handler(httpd_req_t *req)
 {
-    /* Handle WS handshake — the httpd framework does the actual upgrade
-     * automatically when .is_websocket = true.  We only get called for
-     * the initial request and for incoming WS control frames. */
     if (req->method == HTTP_GET) {
-        /* WS handshake: store the handle + fd for the forwarder task. */
+        /* Single-viewer model: reject if a client is already connected. */
+        bool accepted = false;
         if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-            /* If a previous viewer was connected, let it go. */
-            s_ws_hd = req->handle;
-            s_ws_fd = httpd_req_to_sockfd(req);
+            if (s_ws_fd < 0) {
+                s_ws_hd = req->handle;
+                s_ws_fd = httpd_req_to_sockfd(req);
+                s_ws_paused = false;
+                accepted = true;
+                ESP_LOGI(TAG, "ws: client connected (fd=%d)", s_ws_fd);
+            }
             xSemaphoreGive(s_ws_mutex);
-            ESP_LOGI(TAG, "ws: client connected (fd=%d)", s_ws_fd);
+        }
+        if (!accepted) {
+            ESP_LOGI(TAG, "ws: rejecting additional client (single-viewer)");
+            httpd_ws_frame_t close_pkt = {
+                .final = true,
+                .type  = HTTPD_WS_TYPE_CLOSE,
+            };
+            httpd_ws_send_frame(req, &close_pkt);
+            return ESP_OK;
         }
 
-        /* Start the forwarder task if not already running. */
         if (!s_ws_fwd_task) {
             s_ws_fwd_task = psram_task_create(ws_forwarder_task, "ws_fwd", 4096,
                                                NULL, 3, 0, NULL, NULL);
@@ -427,19 +562,26 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* For incoming WS frames (client may send close/ping). */
     httpd_ws_frame_t ws_pkt;
     uint8_t buf[32] = {0};
     memset(&ws_pkt, 0, sizeof(ws_pkt));
     ws_pkt.payload = buf;
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
-    if (httpd_ws_recv_frame(req, &ws_pkt, sizeof(buf)) != ESP_OK) {
+    if (httpd_ws_recv_frame(req, &ws_pkt, sizeof(buf) - 1) != ESP_OK) {
         return ESP_FAIL;
     }
 
-    /* If the client sent a close frame, clear the slot. */
-    if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT && ws_pkt.len > 0) {
+        buf[ws_pkt.len] = '\0';
+        if (strncmp((char *)buf, "pause", 5) == 0) {
+            s_ws_paused = true;
+        } else if (strncmp((char *)buf, "resume", 6) == 0) {
+            s_ws_paused = false;
+            /* Defer the status push to the forwarder task (single-writer model). */
+            s_push_status_now = true;
+        }
+    } else if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
         if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
             s_ws_hd = NULL;
             s_ws_fd = -1;
@@ -814,12 +956,12 @@ void log_stream_register_handlers(httpd_handle_t server)
     httpd_register_uri_handler(server, &history);
 
     httpd_uri_t ws = {
-        .uri        = "/api/logs/ws",
+        .uri        = "/api/ws",
         .method     = HTTP_GET,
         .handler    = logs_ws_handler,
         .is_websocket = true,
     };
     httpd_register_uri_handler(server, &ws);
 
-    ESP_LOGI(TAG, "registered /api/logs/{recent,ws,download,history,level}");
+    ESP_LOGI(TAG, "registered /api/ws and /api/logs/{recent,download,history,level}");
 }

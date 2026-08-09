@@ -191,6 +191,17 @@ typedef void (*uploader_lease_release_fn_t)(void);
 void uploader_set_lease_fns(uploader_lease_acquire_fn_t acquire,
                             uploader_lease_release_fn_t release);
 
+/* Optional "upload progress changed" hook (injected for the same reason as
+ * the lease and NVS hooks: this component does not depend on the app).
+ *
+ * Invoked on every backend state transition (idle/uploading/cooldown/
+ * disabled) so the web UI can be pushed an update immediately instead of
+ * waiting for the next periodic poll.  It is called from the scheduler
+ * task, so the implementation must be cheap and non-blocking — set a flag
+ * and let another task do the work. */
+typedef void (*uploader_progress_notify_fn_t)(void);
+void uploader_set_progress_notify_fn(uploader_progress_notify_fn_t fn);
+
 /* Check if specific backends are configured and enabled. */
 bool uploader_is_smb_configured(void);
 bool uploader_is_sleephq_configured(void);
@@ -203,6 +214,7 @@ bool uploader_is_ftp_enabled(void);
 /* Compact upload progress for the web UI: one entry per backend with its
  * state, days done/total and, while uploading, the current day and unit.
  * Bounded in size regardless of how much history exists.
+ * Returns ESP_ERR_INVALID_STATE before uploader_init() has completed.
  * Caller must free() the returned string. */
 esp_err_t uploader_get_progress_json(char **out_json);
 

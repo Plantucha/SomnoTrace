@@ -25,8 +25,13 @@ struct netprov_config {
     struct netprov_wifi_cred wifi[NETPROV_MAX_SSID_SLOTS];
 };
 
+#include "cJSON.h"
+
 /* Initialise NVS, netif, event loop and Wi-Fi driver. Call once at boot. */
 esp_err_t netprov_init(void);
+
+/* Build full system status JSON object (used by /api/status and /api/ws). */
+cJSON *netprov_build_status_json(void);
 
 /* Live station link state, maintained from Wi-Fi/IP events.
  *

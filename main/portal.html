@@ -38,6 +38,8 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 --color-spo2:#60a5fa;--color-pulse:#f87171;
 --color-flowlim:#f472b6;--color-snore:#34d399;
 --accent-wifi:#0d9488;--accent-smb:#fb923c;--accent-shq:#60a5fa;--accent-ble:#34d399;
+--space-xs:4px;--space-sm:8px;--space-md:14px;--space-lg:20px;--space-xl:28px;
+--text-xs:.72rem;--text-sm:.8rem;--text-base:.85rem;--text-md:.9rem;--text-lg:.95rem;--text-xl:1rem;
 }
 [data-theme="day"]{
 --bg:#f1f5f9;--card-bg:#ffffff;--card-border:#e2e8f0;--text:#0f172a;--text-muted:#64748b;
@@ -49,6 +51,12 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 --color-flowlim:#db2777;--color-snore:#059669;
 --accent-wifi:#0f766e;--accent-smb:#ea580c;--accent-shq:#2563eb;--accent-ble:#10b981;
 }
+.mt-xs{margin-top:var(--space-xs)}.mt-sm{margin-top:var(--space-sm)}.mt-md{margin-top:var(--space-md)}.mt-lg{margin-top:var(--space-lg)}
+.mb-xs{margin-bottom:var(--space-xs)}.mb-sm{margin-bottom:var(--space-sm)}.mb-md{margin-bottom:var(--space-md)}
+.card-disabled-placeholder{opacity:.5;display:flex;flex-direction:column;justify-content:space-between}
+.card-primary-border{border-left-color:var(--primary)}
+.action-item-row{display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px}
+.action-item-danger{display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--danger);border-radius:8px;background:rgba(248,113,113,.05)}
 
 /* ── Reset & Base ──────────────────────────────────────────────── */
 *{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
@@ -767,6 +775,20 @@ Save &amp; Reboot
 
 <!-- ═══════════════ STATUS TAB ═══════════════ -->
 <section id="tab-status" class="tab-content sta-only">
+<!-- Top Card: Upload Progress -->
+<div class="card card-primary-border">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+Upload Progress
+</div>
+<p class="card-desc">Each destination is tracked independently, per session. Only new sessions are uploaded.</p>
+<div id="upload-progress" class="mt-xs"></div>
+<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--card-border);margin-top:12px;padding-top:10px;font-size:.82rem">
+<span style="color:var(--text-muted)">Status</span>
+<span id="upload-status-line" style="color:var(--text)">&mdash;</span>
+</div>
+</div>
+
 <div class="status-grid">
 <div class="card info-list">
 <div class="card-title">System Status</div>
@@ -781,7 +803,7 @@ Save &amp; Reboot
 <div class="info-row"><span class="info-label">Paired data source</span><span class="info-value" id="status-ble">--</span></div>
 <div class="info-row"><span class="info-label">WiFi RSSI</span><span class="info-value" id="status-rssi">--</span></div>
 </div>
-<div class="card" style="display:flex;flex-direction:column">
+<div class="card info-list">
 <div class="card-title">Device Telemetry</div>
 <div class="info-row"><span class="info-label">Int. Free</span><span class="info-value" id="stat-ih-free">--</span></div>
 <div class="info-row"><span class="info-label">Int. Min</span><span class="info-value" id="stat-ih-min">--</span></div>
@@ -790,24 +812,6 @@ Save &amp; Reboot
 <div class="info-row"><span class="info-label">PSRAM Min</span><span class="info-value" id="stat-ps-min">--</span></div>
 <div class="info-row"><span class="info-label">PSRAM LFB</span><span class="info-value" id="stat-ps-lfb">--</span></div>
 <div class="info-row"><span class="info-label">Tasks</span><span class="info-value" id="stat-tasks">--</span></div>
-<div style="margin-top:8px"><div style="font-size:.75rem;color:var(--text-muted);margin-bottom:2px">Internal Heap</div><div id="chart-heap" style="min-height:120px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.8rem">Loading…</div></div>
-<div style="margin-top:8px"><div style="font-size:.75rem;color:var(--text-muted);margin-bottom:2px">PSRAM</div><div id="chart-psram" style="min-height:120px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.8rem">Loading…</div></div>
-</div>
-</div>
-<!-- Recent Upload Activity & Sync History -->
-<div class="card" style="margin-top:16px">
-<div class="card-title" style="justify-content:space-between">
-<div style="display:flex;align-items:center;gap:8px">
-<svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
-Upload Progress
-</div>
-<button class="btn btn-outline btn-sm" type="button" onclick="loadUploadStatus()">Refresh</button>
-</div>
-<p class="card-desc">Each destination is tracked independently, per session. Only new sessions are uploaded.</p>
-<div id="upload-progress" style="margin-top:4px"></div>
-<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--card-border);margin-top:12px;padding-top:10px;font-size:.82rem">
-<span style="color:var(--text-muted)">Status</span>
-<span id="upload-status-line" style="color:var(--text)">&mdash;</span>
 </div>
 </div>
 </section>
@@ -835,65 +839,12 @@ Upload Progress
 
 <!-- ═══════════════ ACTIONS TAB ═══════════════ -->
 <section id="actions" class="tab-content sta-only">
-<div class="card" style="border-left-color:var(--warning)">
-<div class="card-title">
-<svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.83L19.53 19H4.47L12 5.83zM11 10v6h2v-6h-2zm0 8v2h2v-2h-2z"/></svg>
-Maintenance Actions
-</div>
-<p style="color:var(--text-muted);font-size:.85rem;margin-bottom:16px">These actions modify files on the SD card and upload state. Each action requires confirmation before proceeding.</p>
-
-<div style="display:flex;flex-direction:column;gap:12px">
-
-<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px">
-<div>
-<div style="font-weight:600;font-size:.9rem">Reset Upload State</div>
-<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Clears upload tracking so all days re-upload from the beginning</div>
-</div>
-<button class="btn btn-primary" onclick="execAction('reset-state','Clear upload state? This will reset the upload tracking for all sessions. All EDF files on the SD card will be re-uploaded to configured backends. Continue?')">Reset State</button>
-</div>
-
-<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px">
-<div>
-<div style="font-weight:600;font-size:.9rem">Delete All EDF Files</div>
-<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Removes all EDF and related files from SDCARD/ (session data preserved)</div>
-</div>
-<button class="btn btn-primary" onclick="execAction('delete-edfs','Delete all EDF files? This will remove all EDF files and related data (SETTINGS, STR.edf, Identification.json) from the SDCARD folder. Session data in .somnotrace/sessions/ is preserved. Continue?')">Delete All EDFs</button>
-</div>
-
-<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--card-border);border-radius:8px">
-<div>
-<div style="font-weight:600;font-size:.9rem">Recreate EDFs from Sessions</div>
-<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes all EDFs and re-exports them from .session files in chronological order</div>
-</div>
-<button class="btn btn-primary" onclick="execAction('recreate-edfs','Recreate all EDF files? This will delete all existing EDF files and re-export them from session data. This may take several minutes. Continue?')">Recreate EDFs</button>
-</div>
-
-<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--danger);border-radius:8px;background:rgba(248,113,113,.05)">
-<div>
-<div style="font-weight:600;font-size:.9rem;color:var(--danger)">Reset ALL (Destructive)</div>
-<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes everything under /somnotrace/ (SDCARD + .somnotrace) and clears upload state</div>
-</div>
-<button class="btn btn-danger" onclick="execAction('reset-all','RESET EVERYTHING? This will permanently delete ALL data on the SD card: EDF files, session data, upload state — everything under /somnotrace/. This cannot be undone. Continue?')">Reset ALL</button>
-</div>
-
-<div style="display:flex;justify-content:space-between;align-items:center;padding:14px;border:1px solid var(--danger);border-radius:8px;background:rgba(248,113,113,.05)">
-<div>
-<div style="font-weight:600;font-size:.9rem;color:var(--danger)">Format SD Card (Destructive)</div>
-<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Formats the SD card to FAT32. ALL data is permanently erased — no recovery possible</div>
-</div>
-<button class="btn btn-danger" onclick="execAction('format-sd','FORMAT SD CARD? This will erase EVERYTHING on the card by reformatting it to FAT32. All session data, EDF files, logs, and upload state will be permanently lost — not even data recovery tools can restore a formatted card. The device will need to record new data from scratch. This action cannot be undone.\\n\\nAre you absolutely sure you want to continue?')">Format SD</button>
-</div>
-
-</div>
-<div id="action-status" class="status-msg" style="margin-top:14px"></div>
-</div>
-
-<div class="card" style="border-left-color:var(--primary);margin-top:16px">
+<div class="card card-primary-border">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
 Firmware Update (OTA)
 </div>
-<p style="color:var(--text-muted);font-size:.85rem;margin-bottom:16px">Update the device firmware by downloading from a URL or uploading a .bin file. The device reboots automatically after a successful update.</p>
+<p class="card-desc">Update the device firmware by downloading from a URL or uploading a .bin file. The device reboots automatically after a successful update.</p>
 
 <div style="display:flex;flex-direction:column;gap:16px">
 <!-- ── URL download ── -->
@@ -928,6 +879,61 @@ Firmware Update (OTA)
 <div id="ota-status" class="status-msg" style="margin-top:4px"></div>
 </div>
 </div>
+
+<div class="card advanced-section mt-md" style="border-left-color:var(--warning)">
+<details>
+<summary class="card-title" style="cursor:pointer">
+<svg viewBox="0 0 24 24" style="fill:var(--warning)"><path d="M12 2L1 21h22L12 2zm0 3.83L19.53 19H4.47L12 5.83zM11 10v6h2v-6h-2zm0 8v2h2v-2h-2z"/></svg>
+Maintenance Actions
+</summary>
+<p class="card-desc mt-sm">These actions modify files on the SD card and upload state. Each action requires confirmation before proceeding.</p>
+
+<div style="display:flex;flex-direction:column;gap:12px" class="mt-md">
+
+<div class="action-item-row">
+<div>
+<div style="font-weight:600;font-size:.9rem">Reset Upload State</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Clears upload tracking so all days re-upload from the beginning</div>
+</div>
+<button class="btn btn-primary" onclick="execAction('reset-state','Clear upload state? This will reset the upload tracking for all sessions. All EDF files on the SD card will be re-uploaded to configured backends. Continue?')">Reset State</button>
+</div>
+
+<div class="action-item-row">
+<div>
+<div style="font-weight:600;font-size:.9rem">Delete All EDF Files</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Removes all EDF and related files from SDCARD/ (session data preserved)</div>
+</div>
+<button class="btn btn-primary" onclick="execAction('delete-edfs','Delete all EDF files? This will remove all EDF files and related data (SETTINGS, STR.edf, Identification.json) from the SDCARD folder. Session data in .somnotrace/sessions/ is preserved. Continue?')">Delete All EDFs</button>
+</div>
+
+<div class="action-item-row">
+<div>
+<div style="font-weight:600;font-size:.9rem">Recreate EDFs from Sessions</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes all EDFs and re-exports them from .session files in chronological order</div>
+</div>
+<button class="btn btn-primary" onclick="execAction('recreate-edfs','Recreate all EDF files? This will delete all existing EDF files and re-export them from session data. This may take several minutes. Continue?')">Recreate EDFs</button>
+</div>
+
+<div class="action-item-danger">
+<div>
+<div style="font-weight:600;font-size:.9rem;color:var(--danger)">Reset ALL (Destructive)</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Deletes everything under /somnotrace/ (SDCARD + .somnotrace) and clears upload state</div>
+</div>
+<button class="btn btn-danger" onclick="execAction('reset-all','RESET EVERYTHING? This will permanently delete ALL data on the SD card: EDF files, session data, upload state — everything under /somnotrace/. This cannot be undone. Continue?')">Reset ALL</button>
+</div>
+
+<div class="action-item-danger">
+<div>
+<div style="font-weight:600;font-size:.9rem;color:var(--danger)">Format SD Card (Destructive)</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Formats the SD card to FAT32. ALL data is permanently erased — no recovery possible</div>
+</div>
+<button class="btn btn-danger" onclick="execAction('format-sd','FORMAT SD CARD? This will erase EVERYTHING on the card by reformatting it to FAT32. All session data, EDF files, logs, and upload state will be permanently lost — not even data recovery tools can restore a formatted card. The device will need to record new data from scratch. This action cannot be undone.\\n\\nAre you absolutely sure you want to continue?')">Format SD</button>
+</div>
+
+</div>
+<div id="action-status" class="status-msg" style="margin-top:14px"></div>
+</details>
+</div>
 </section>
 
 </main>
@@ -955,31 +961,45 @@ function switchTab(tabId) {
   if (btn) btn.classList.add('active');
   var sec = document.getElementById(tabId);
   if (sec) sec.classList.add('active');
-  /* Connect/disconnect log stream based on tab visibility. */
+  /* Set fixed body height for terminal in logs tab */
   if (tabId === 'logs') {
     document.body.classList.add('fixed-height');
-    connectLogStream();
     loadLogLevel();
+    renderLogTerminal(true);
   } else {
     document.body.classList.remove('fixed-height');
-    disconnectLogStream();
   }
   /* Lazy-load Settings tab data on first visit. */
   if (tabId === 'settings' && !settingsLoaded) {
     settingsLoaded = true;
-    /* Show loading indicators on sections that will be populated */
     setLoading('display-sound-details', true);
     setLoading('alert-settings-details', true);
     if (!PORTAL_MODE) {
       setLoading('upload-cards-grid', true);
       setLoading('ftp-card', true);
       setLoading('upload-progress', true);
-      bleRefresh();
-      loadUploadConfig();
-      loadUploadStatus();
     }
-    loadDeviceSettings();
-    loadAlertConfig();
+    fetch('/api/settings/all').then(function(r) { return r.json(); }).then(function(d) {
+      if (d.uploads) renderUploadConfig(d.uploads);
+      if (d.device) renderDeviceSettings(d.device);
+      if (d.alert) renderAlertConfig(d.alert);
+      if (d.status) loadStatus(d.status);
+    }).catch(function() {
+      if (!PORTAL_MODE) {
+        bleRefresh();
+        loadUploadConfig();
+        loadUploadStatus();
+      }
+      loadDeviceSettings();
+      loadAlertConfig();
+      loadStatus();
+    }).then(function() {
+      setLoading('display-sound-details', false);
+      setLoading('alert-settings-details', false);
+      setLoading('upload-cards-grid', false);
+      setLoading('ftp-card', false);
+      setLoading('upload-progress', false);
+    });
     scanWifi();
   }
 }
@@ -999,7 +1019,11 @@ function setTheme(theme) {
   /* Re-render dashboard charts so axis/grid/stroke colors pick up new theme vars. */
   if (typeof dashCharts !== 'undefined' && dashCharts.length) renderDashboardCharts();
 }
-function getSystemTheme() { var h = new Date().getHours(); return (h >= 8 && h < 20) ? 'day' : 'night'; }
+function getSystemTheme() {
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'night';
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) return 'day';
+  var h = new Date().getHours(); return (h >= 8 && h < 20) ? 'day' : 'night';
+}
 
 /* ── Password Toggle ───────────────────────────────────────────── */
 function togglePw(id) {
@@ -1311,9 +1335,10 @@ function scanWifi() {
   pollScan();
 }
 
-/* ── Load Status (boot) ────────────────────────────────────────── */
-function loadStatus() {
-  fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
+/* ── Load Status (boot or pushed) ────────────────────────────── */
+function loadStatus(data) {
+  var apply = function(d) {
+    if (!d) return;
     if (d.mode === 'setup') {
       PORTAL_MODE = true;
       applyPortalMode();
@@ -1323,27 +1348,21 @@ function loadStatus() {
         var nav = document.getElementById('nav-tabs'); if (nav) nav.style.display = '';
         var badge = document.getElementById('setup-badge'); if (badge) badge.style.display = 'none';
         document.querySelectorAll('.sta-only').forEach(function(el) { el.style.display = ''; });
-        settingsLoaded = false; /* allow lazy-load on first Settings visit */
+        settingsLoaded = false;
       }
       loadStatusTab(d);
-      pushStats(d);
     }
 
     loadTimezones(d.tz_name || '');
 
-    /* Populate NTP server field */
     var ntpInput = document.getElementById('ntp-server');
     if (ntpInput) {
       ntpInput.value = d.ntp_server || '';
       ntpInput.setAttribute('data-dirty', 'false');
     }
 
-    /* Background-load full timezone list after page is interactive.
-     * The dropdown already shows the current TZ from /api/status. */
     setTimeout(function() { loadTimezoneList(d.tz_name || ''); }, 2000);
 
-    // WiFi profiles: use manual (text input) mode for pre-populated networks
-    // so the SSID is visible even before a scan is done.
     if (d.ssids && d.ssids.length > 0) {
       activeBlocks = d.ssids.length;
       for (var i = 1; i <= d.ssids.length; i++) {
@@ -1352,7 +1371,6 @@ function loadStatus() {
     }
     renderWifiBlocks();
 
-    // Populate saved SSIDs and password states
     if (d.ssids && d.ssids.length > 0) {
       for (var i = 1; i <= d.ssids.length; i++) {
         var el = document.getElementById('ssid-' + i);
@@ -1367,11 +1385,15 @@ function loadStatus() {
         }
       }
     }
+  };
 
-    // WiFi scan is deferred to Settings tab switch
-  }).catch(function() {
-    renderWifiBlocks();
-  });
+  if (data) {
+    apply(data);
+  } else {
+    fetch('/api/status').then(function(r){ return r.json(); }).then(apply).catch(function() {
+      renderWifiBlocks();
+    });
+  }
 }
 
 function formatUptime(s) {
@@ -1625,37 +1647,43 @@ function bleForget() {
 }
 function blePoll() {
   if (blePollTimer) clearInterval(blePollTimer);
-  blePollTimer = setInterval(bleRefresh, 500);
+  /* 5 s fallback poll — only used when the WebSocket is not open.
+   * When WS is open, BLE state changes are pushed event-driven. */
+  blePollTimer = setInterval(function() {
+    if (!appWs || appWs.readyState !== WebSocket.OPEN) bleRefresh();
+  }, 5000);
   bleRefresh();
+}
+function updateBleUI(ble) {
+  if (!ble) return;
+  var paired = document.getElementById('ble-paired');
+  var unp = document.getElementById('ble-unpaired');
+  var fgt = document.getElementById('btn-ble-forget');
+  var pg = document.getElementById('ble-passkey-group');
+
+  if (ble.state === 'waiting_passkey') { pg.style.display = 'block'; bleStatusMsg('Enter the code shown on your CPAP screen'); return; }
+  if (ble.state === 'connecting') { bleStatusMsg('Connecting to device…'); return; }
+  if (ble.state === 'confirming') { bleStatusMsg('Verifying code…'); return; }
+  if (ble.state === 'error') { if (blePollTimer) clearInterval(blePollTimer); if (pg) pg.style.display = 'none'; bleStatusMsg('Error: ' + (ble.error || 'pairing failed')); return; }
+
+  if (ble.paired) {
+    if (blePollTimer) clearInterval(blePollTimer);
+    if (paired) paired.style.display = 'block';
+    if (unp) unp.style.display = 'none';
+    if (fgt) fgt.style.display = '';
+    if (pg) pg.style.display = 'none';
+    var dn = document.getElementById('ble-dev-name');
+    if (dn) dn.textContent = (ble.device && ble.device.name) || 'AirSense 11';
+    bleStatusMsg(ble.state === 'paired' ? 'Paired successfully' : '');
+  } else {
+    if (paired) paired.style.display = 'none';
+    if (unp) unp.style.display = 'block';
+    if (fgt) fgt.style.display = 'none';
+  }
 }
 function bleRefresh() {
   fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
-    var ble = d.ble;
-    if (!ble) return;
-    var paired = document.getElementById('ble-paired');
-    var unp = document.getElementById('ble-unpaired');
-    var fgt = document.getElementById('btn-ble-forget');
-    var pg = document.getElementById('ble-passkey-group');
-
-    if (ble.state === 'waiting_passkey') { pg.style.display = 'block'; bleStatusMsg('Enter the code shown on your CPAP screen'); return; }
-    if (ble.state === 'connecting') { bleStatusMsg('Connecting to device…'); return; }
-    if (ble.state === 'confirming') { bleStatusMsg('Verifying code…'); return; }
-    if (ble.state === 'error') { if (blePollTimer) clearInterval(blePollTimer); if (pg) pg.style.display = 'none'; bleStatusMsg('Error: ' + (ble.error || 'pairing failed')); return; }
-
-    if (ble.paired) {
-      if (blePollTimer) clearInterval(blePollTimer);
-      if (paired) paired.style.display = 'block';
-      if (unp) unp.style.display = 'none';
-      if (fgt) fgt.style.display = '';
-      if (pg) pg.style.display = 'none';
-      var dn = document.getElementById('ble-dev-name');
-      if (dn) dn.textContent = (ble.device && ble.device.name) || 'AirSense 11';
-      bleStatusMsg(ble.state === 'paired' ? 'Paired successfully' : '');
-    } else {
-      if (paired) paired.style.display = 'none';
-      if (unp) unp.style.display = 'block';
-      if (fgt) fgt.style.display = 'none';
-    }
+    updateBleUI(d.ble);
   }).catch(function() {});
 }
 
@@ -1978,28 +2006,30 @@ function renderBackendRow(b) {
   return h;
 }
 
+function renderUploadProgress(d) {
+  var el = document.getElementById('upload-progress');
+  var line = document.getElementById('upload-status-line');
+  if (!el) { setLoading('upload-progress', false); return; }
+
+  var bes = (d && d.backends) || [];
+  if (!bes.length) {
+    el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload destination configured.</div>';
+  } else {
+    el.innerHTML = bes.map(renderBackendRow).join('');
+  }
+
+  if (line) {
+    var txt = (d && d.status) || '\u2014';
+    if (d && d.next_scan_s > 0 && !d.scanning) {
+      txt += ' \u00b7 next check ' + fmtLeft(d.next_scan_s);
+    }
+    line.textContent = txt;
+  }
+  setLoading('upload-progress', false);
+}
+
 function loadUploadStatus() {
-  fetch('/api/uploads/progress').then(function(r){ return r.json(); }).then(function(d) {
-    var el = document.getElementById('upload-progress');
-    var line = document.getElementById('upload-status-line');
-    if (!el) { setLoading('upload-progress', false); return; }
-
-    var bes = (d && d.backends) || [];
-    if (!bes.length) {
-      el.innerHTML = '<div style="padding:8px;color:var(--text-muted);font-style:italic">No upload destination configured.</div>';
-    } else {
-      el.innerHTML = bes.map(renderBackendRow).join('');
-    }
-
-    if (line) {
-      var txt = (d && d.status) || '\u2014';
-      if (d && d.next_scan_s > 0 && !d.scanning) {
-        txt += ' \u00b7 next check ' + fmtLeft(d.next_scan_s);
-      }
-      line.textContent = txt;
-    }
-    setLoading('upload-progress', false);
-  }).catch(function() {
+  fetch('/api/uploads/progress').then(function(r){ return r.json(); }).then(renderUploadProgress).catch(function() {
     setLoading('upload-progress', false);
   });
 }
@@ -2243,9 +2273,11 @@ function otaUpload() {
   xhr.send(file);
 }
 
-/* ── Logs ──────────────────────────────────────────────────────── */
-var logWs = null;
-var logWsReconnectTimer = null;
+/* ── Unified App WebSocket ─────────────────────────────────────── */
+var appWs = null;
+var wsReconnectTimer = null;
+var wsReconnectDelay = 1000;
+var WS_MAX_DELAY = 30000;
 var logLines = [];                /* master list of all received lines */
 var LOG_MAX_LINES = 512;         /* cap to prevent DOM explosion */
 var logFilterQuery = '';
@@ -2254,60 +2286,84 @@ function setLogConnStatus(state) {
   var el = document.getElementById('log-conn-status');
   if (!el) return;
   if (state === 'connected')   { el.textContent = '● Connected';    el.style.color = 'var(--success)'; }
-  else if (state === 'connecting') { el.textContent = '● Loading history…'; el.style.color = 'var(--warning)'; }
+  else if (state === 'connecting') { el.textContent = '● Connecting…'; el.style.color = 'var(--warning)'; }
   else if (state === 'error')  { el.textContent = '● Reconnecting…'; el.style.color = 'var(--warning)'; }
   else                         { el.textContent = '● Disconnected';  el.style.color = 'var(--text-muted)'; }
 }
 
-function connectLogStream() {
-  if (logWs) return;
-  logLines = [];
-  setLogConnStatus('connecting');
-  fetch('/api/logs/history').then(function(r) { return r.text(); }).then(function(text) {
-    var lines = text.split('\n');
-    for (var i = 0; i < lines.length; i++) {
-      if (lines[i].length > 0) logLines.push(lines[i]);
-    }
-    if (logLines.length > LOG_MAX_LINES) logLines = logLines.slice(-LOG_MAX_LINES);
-    renderLogTerminal(true);
-    setLogConnStatus('connected');
-  }).catch(function() {}).then(function() {
-    /* Open WebSocket for real-time log push. */
-    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    logWs = new WebSocket(proto + '//' + location.host + '/api/logs/ws');
-    logWs.onopen = function() {
-      setLogConnStatus('connected');
-    };
-    logWs.onmessage = function(ev) {
-      var lines = ev.data.split('\n');
-      for (var i = 0; i < lines.length; i++) {
-        if (lines[i].length > 0) logLines.push(lines[i]);
-      }
-      if (logLines.length > LOG_MAX_LINES) logLines = logLines.slice(-LOG_MAX_LINES);
-      renderLogTerminal();
-    };
-    logWs.onclose = function() {
-      logWs = null;
-      setLogConnStatus('error');
-      /* Auto-reconnect after 2 seconds. */
-      if (!logWsReconnectTimer) {
-        logWsReconnectTimer = setTimeout(function() {
-          logWsReconnectTimer = null;
-          connectLogStream();
-        }, 2000);
-      }
-    };
-    logWs.onerror = function() {
-      /* onclose will fire after this. */
-    };
-  });
+function handleLogData(text) {
+  var lines = text.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].length > 0) logLines.push(lines[i]);
+  }
+  if (logLines.length > LOG_MAX_LINES) logLines = logLines.slice(-LOG_MAX_LINES);
+  var logsSec = document.getElementById('logs');
+  if (logsSec && logsSec.classList.contains('active')) renderLogTerminal();
 }
 
-function disconnectLogStream() {
-  if (logWsReconnectTimer) { clearTimeout(logWsReconnectTimer); logWsReconnectTimer = null; }
-  if (logWs) { logWs.onclose = null; logWs.close(); logWs = null; }
-  setLogConnStatus('disconnected');
+function connectWs() {
+  if (appWs) return;
+  setLogConnStatus('connecting');
+
+  /* Load initial log history on first connect if empty */
+  if (!logLines.length) {
+    fetch('/api/logs/history').then(function(r) { return r.text(); }).then(function(text) {
+      handleLogData(text);
+      renderLogTerminal(true);
+    }).catch(function() {});
+  }
+
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  appWs = new WebSocket(proto + '//' + location.host + '/api/ws');
+
+  appWs.onopen = function() {
+    setLogConnStatus('connected');
+    wsReconnectDelay = 1000;
+    if (document.hidden) {
+      try { appWs.send('pause'); } catch(e) {}
+    }
+  };
+
+  appWs.onmessage = function(ev) {
+    try {
+      var msg = JSON.parse(ev.data);
+      if (msg.type === 'log') {
+        handleLogData(msg.data || '');
+      } else if (msg.type === 'status') {
+        loadStatusTab(msg.data);
+      } else if (msg.type === 'upload') {
+        renderUploadProgress(msg.data);
+      } else if (msg.type === 'ble') {
+        updateBleUI(msg.data);
+      }
+    } catch(e) {
+      handleLogData(ev.data);
+    }
+  };
+
+  appWs.onclose = function() {
+    appWs = null;
+    setLogConnStatus('error');
+    if (!wsReconnectTimer) {
+      wsReconnectTimer = setTimeout(function() {
+        wsReconnectTimer = null;
+        connectWs();
+      }, wsReconnectDelay);
+      wsReconnectDelay = Math.min(wsReconnectDelay * 1.5, WS_MAX_DELAY);
+    }
+  };
+
+  appWs.onerror = function() {};
 }
+
+document.addEventListener('visibilitychange', function() {
+  if (!appWs || appWs.readyState !== WebSocket.OPEN) return;
+  if (document.hidden) {
+    try { appWs.send('pause'); } catch(e) {}
+  } else {
+    try { appWs.send('resume'); } catch(e) {}
+  }
+});
 
 function renderLogTerminal(forceScroll) {
   var term = document.getElementById('log-terminal');
@@ -4102,111 +4158,6 @@ function applyPortalMode() {
   switchTab('settings');
 }
 
-/* ── Telemetry polling + uPlot charts ──────────────────────────── */
-var statusTimer = null;
-var statsData = { heap: { t: [], free: [], lfb: [] }, psram: { t: [], free: [], lfb: [] } };
-var heapChart = null, psramChart = null;
-var STATS_MAX_AGE = 120; /* seconds — data older than this is trimmed */
-
-function makeChartOpts(width) {
-  var now = Math.floor(Date.now() / 1000);
-  return {
-    width: width,
-    height: 120,
-    padding: [8, 8, 0, 0],
-    series: [
-      { value: function(u, v) { return v == null ? '' : new Date(v * 1000).toLocaleTimeString(); } },
-      { label: 'Free', stroke: '#10b981', width: 1.5, value: function(u, v) { return v != null ? fmtBytes(v) : '--'; } },
-      { label: 'LFB',  stroke: '#3b82f6', width: 1.5, value: function(u, v) { return v != null ? fmtBytes(v) : '--'; } }
-    ],
-    scales: { x: { time: true, min: now - STATS_MAX_AGE, max: now }, y: { auto: true } },
-    axes: [
-      { grid: { stroke: 'rgba(148,163,184,0.15)', width: 1, dash: [2,3] }, ticks: { stroke: 'rgba(148,163,184,0.3)' }, stroke: '#94a3b8', font: '10px sans-serif', size: 26 },
-      { grid: { stroke: 'rgba(148,163,184,0.15)', width: 1, dash: [2,3] }, ticks: { stroke: 'rgba(148,163,184,0.3)' }, stroke: '#94a3b8', font: '10px sans-serif', size: 52,
-        values: function(u, vals) { return vals.map(function(v) { return fmtBytes(v); }); } }
-    ],
-    cursor: {
-      points: { size: 4 }
-    },
-    legend: { show: true, live: true }
-  };
-}
-
-function chartWidth(el) {
-  var w = el.clientWidth;
-  return (w && w > 0) ? w : 320;
-}
-
-/* Custom floating tooltip — works with mouse and touch. */
-var chartTooltip = null;
-function ensureTooltip() {
-  if (chartTooltip) return chartTooltip;
-  chartTooltip = document.createElement('div');
-  chartTooltip.style.cssText = 'position:absolute;display:none;pointer-events:none;' +
-    'background:rgba(15,23,42,0.95);color:#e2e8f0;padding:6px 10px;border-radius:6px;' +
-    'font-size:.75rem;z-index:1000;border:1px solid rgba(148,163,184,0.2);white-space:nowrap;line-height:1.4';
-  document.body.appendChild(chartTooltip);
-  return chartTooltip;
-}
-
-function attachChartTooltip(chart, el) {
-  var tip = ensureTooltip();
-  var over = el.querySelector('.u-over') || el;
-  function showTip(e) {
-    var rect = over.getBoundingClientRect();
-    var cx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
-    var cy = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
-    var idx = chart.posToIdx(cx, cy);
-    if (idx == null) { tip.style.display = 'none'; return; }
-    var ts = chart.data[0][idx];
-    var lines = [];
-    for (var i = 1; i < chart.series.length; i++) {
-      var val = chart.data[i][idx];
-      var label = chart.series[i].label;
-      var swatch = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + chart.series[i].stroke + ';margin-right:4px"></span>';
-      lines.push(swatch + label + ': ' + (val != null ? fmtBytes(val) : '--'));
-    }
-    tip.innerHTML = lines.join('<br>') +
-      '<div style="opacity:.6;margin-top:2px">' +
-      (ts != null ? new Date(ts * 1000).toLocaleTimeString() : '') + '</div>';
-    tip.style.display = 'block';
-    tip.style.left = (rect.left + window.pageXOffset + cx + 12) + 'px';
-    tip.style.top = (rect.top + window.pageYOffset + cy - 40) + 'px';
-  }
-  function hideTip() { tip.style.display = 'none'; }
-  over.addEventListener('mousemove', showTip);
-  over.addEventListener('mouseleave', hideTip);
-  over.addEventListener('touchstart', showTip, { passive: true });
-  over.addEventListener('touchmove', showTip, { passive: true });
-  over.addEventListener('touchend', hideTip);
-}
-
-function initStatsCharts() {
-  if (heapChart) return;
-  if (typeof uPlot === 'undefined') { console.error('uPlot library not loaded'); return; }
-  var hEl = document.getElementById('chart-heap');
-  var pEl = document.getElementById('chart-psram');
-  if (!hEl || !pEl) return;
-  /* Clear loading placeholder text before uPlot takes over the element. */
-  hEl.textContent = ''; hEl.style.display = '';
-  pEl.textContent = ''; pEl.style.display = '';
-  try {
-    heapChart = new uPlot(makeChartOpts(chartWidth(hEl)),
-      [statsData.heap.t, statsData.heap.free, statsData.heap.lfb], hEl);
-    psramChart = new uPlot(makeChartOpts(chartWidth(pEl)),
-      [statsData.psram.t, statsData.psram.free, statsData.psram.lfb], pEl);
-    attachChartTooltip(heapChart, hEl);
-    attachChartTooltip(psramChart, pEl);
-  } catch (e) {
-    console.error('uPlot init failed', e);
-    heapChart = null; psramChart = null;
-  }
-}
-
-function resizeStatsCharts() {
-  if (heapChart) { var h = document.getElementById('chart-heap'); if (h) heapChart.setSize({ width: chartWidth(h), height: 120 }); }
-  if (psramChart) { var p = document.getElementById('chart-psram'); if (p) psramChart.setSize({ width: chartWidth(p), height: 120 }); }
-}
 function resizeDashboardChart() {
   if (!dashCharts.length) return;
   for (var i = 0; i < dashCharts.length; i++) {
@@ -4215,69 +4166,17 @@ function resizeDashboardChart() {
     var el = document.getElementById('chart-' + DASH_SIGNALS[i].key);
     if (el) chart.setSize({ width: dashChartWidth(el), height: DASH_SIGNALS[i].height });
   }
-  /* Point budget scales with width — rebuild data so the envelope stays at
-   * ~1 pair per pixel column after a resize. */
   updateDashView();
 }
-window.addEventListener('resize', function() { resizeStatsCharts(); resizeDashboardChart(); });
-
-function pushStats(d) {
-  var now = (d.time && typeof d.time === 'string') ? Math.floor(new Date(d.time).getTime() / 1000) : Math.floor(Date.now() / 1000);
-  function push(arr, val) { arr.push(val); }
-  push(statsData.heap.t, now);
-  push(statsData.heap.free, d.ih_free || 0);
-  push(statsData.heap.lfb, d.ih_lfb || 0);
-  push(statsData.psram.t, now);
-  push(statsData.psram.free, d.ps_free || 0);
-  push(statsData.psram.lfb, d.ps_lfb || 0);
-  /* Trim data older than STATS_MAX_AGE seconds. */
-  var cutoff = now - STATS_MAX_AGE;
-  function trim(t, a, b) {
-    while (t.length > 1 && t[0] < cutoff) { t.shift(); a.shift(); b.shift(); }
-  }
-  trim(statsData.heap.t, statsData.heap.free, statsData.heap.lfb);
-  trim(statsData.psram.t, statsData.psram.free, statsData.psram.lfb);
-  /* Create charts lazily once we have data + a laid-out container. */
-  if (!heapChart) initStatsCharts();
-  if (heapChart) {
-    heapChart.setData([statsData.heap.t, statsData.heap.free, statsData.heap.lfb]);
-    heapChart.setScale('x', {min: now - STATS_MAX_AGE, max: now});
-  }
-  if (psramChart) {
-    psramChart.setData([statsData.psram.t, statsData.psram.free, statsData.psram.lfb]);
-    psramChart.setScale('x', {min: now - STATS_MAX_AGE, max: now});
-  }
-}
-
-function pollStatus() {
-  /* Skip status polling while dashboard files are downloading — the
-   * ESP32-S3 shares one radio between BLE (AS11 stream) and Wi-Fi, so
-   * concurrent TCP connections compete for scarce airtime and stall
-   * each other.  Pausing the poll eliminates that competition. */
-  if (dashIsLoading) return;
-  fetch('/api/status').then(function(r) { return r.json(); }).then(function(d) {
-    loadStatusTab(d);
-    pushStats(d);
-  }).catch(function() {});
-}
-
-/* Polling is always-on: one interval, started on boot, never stopped.
- * One /api/status request every 3s is negligible on the ESP32 and avoids
- * the fragile start/stop lifecycle tied to tab switching. */
+window.addEventListener('resize', resizeDashboardChart);
 
 /* ── Boot ──────────────────────────────────────────────────────── */
 window.onload = function() {
   setTheme(localStorage.getItem('somnotrace_theme') || 'night');
   applyPortalMode();
+  connectWs();
   loadStatus();
-  if (!PORTAL_MODE) {
-    /* Init charts immediately (grid/axes render before first data point).
-       loadStatus() will feed the first data point via pushStats().
-       Periodic polling starts after a 3s gap — no duplicate fetch. */
-    initStatsCharts();
-    statusTimer = setInterval(pollStatus, 3000);
-  }
-  // Dashboard: open it by default (STA mode) and load the latest day with data.
+
   var picker = document.getElementById('session-date');
   var today = new Date();
   var todayIso = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
@@ -4290,7 +4189,6 @@ window.onload = function() {
         updateDateDisplayLabel(latestIso);
         loadSessionData();
       } else {
-        /* No data yet — show today with an empty state. */
         if (picker) picker.value = todayIso;
         updateDateDisplayLabel(todayIso);
         dashSetStatus('No sessions recorded yet');
@@ -4300,7 +4198,6 @@ window.onload = function() {
     picker.value = todayIso;
     updateDateDisplayLabel(todayIso);
   }
-  /* Defer service worker registration to avoid competing for HTTP sockets during boot. */
   if ('serviceWorker' in navigator) setTimeout(function() { navigator.serviceWorker.register('/sw.js'); }, 3000);
 };
 </script>
