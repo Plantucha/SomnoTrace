@@ -25,11 +25,16 @@
 #include "crash_diag.h"
 
 #include <inttypes.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "esp_rom_crc.h"
 
 /* Core dump APIs are only available when core dump is enabled in sdkconfig.
  * Guard with CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH so this file compiles even
@@ -39,6 +44,110 @@
 #endif
 
 static const char *TAG = "crash_diag";
+
+/* ── Crash breadcrumb in RTC memory ─────────────────────────────────────
+ *
+ * RTC_NOINIT_ATTR data is not cleared by the startup code, so it survives
+ * panic, INT_WDT and TASK_WDT resets; on power-on it holds whatever the RAM
+ * happened to contain.  A magic value plus a CRC over the payload therefore
+ * has to gate every read, otherwise random RAM would be reported as a real
+ * breadcrumb.
+ *
+ * Writes are deliberately trivial — no allocation, no locks, no I/O — so
+ * they are safe to call from any task and cannot themselves become the
+ * reason a crash goes unreported. */
+
+#define BREADCRUMB_MAGIC 0x536F6D31u   /* "Som1" */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t crc;               /* CRC32 over everything after this field */
+    uint32_t boot_count;
+    int64_t  activity_us;       /* esp_timer time of the last activity note */
+    char     session_id[40];
+    char     activity[24];
+} crash_breadcrumb_t;
+
+static RTC_NOINIT_ATTR crash_breadcrumb_t s_bc;
+
+/* Snapshot taken before the live breadcrumb is re-armed for this boot. */
+static crash_breadcrumb_t s_bc_prev;
+static bool s_bc_prev_valid = false;
+
+static uint32_t breadcrumb_crc(const crash_breadcrumb_t *bc)
+{
+    const uint8_t *p = (const uint8_t *)&bc->boot_count;
+    size_t len = sizeof(*bc) - offsetof(crash_breadcrumb_t, boot_count);
+    return esp_rom_crc32_le(0, p, len);
+}
+
+static bool breadcrumb_valid(const crash_breadcrumb_t *bc)
+{
+    return bc->magic == BREADCRUMB_MAGIC && bc->crc == breadcrumb_crc(bc);
+}
+
+static void breadcrumb_reseal(void)
+{
+    s_bc.magic = BREADCRUMB_MAGIC;
+    s_bc.crc = breadcrumb_crc(&s_bc);
+}
+
+void crash_diag_note_session(const char *session_id)
+{
+    if (session_id) {
+        strlcpy(s_bc.session_id, session_id, sizeof(s_bc.session_id));
+    } else {
+        s_bc.session_id[0] = '\0';
+    }
+    breadcrumb_reseal();
+}
+
+void crash_diag_note_activity(const char *tag)
+{
+    if (tag) {
+        strlcpy(s_bc.activity, tag, sizeof(s_bc.activity));
+    } else {
+        s_bc.activity[0] = '\0';
+    }
+    s_bc.activity_us = esp_timer_get_time();
+    breadcrumb_reseal();
+}
+
+/* Capture the previous boot's breadcrumb, then re-arm it for this boot.
+ * Called once, before anything can overwrite the live copy. */
+static void breadcrumb_rotate(bool poweron)
+{
+    if (!poweron && breadcrumb_valid(&s_bc)) {
+        s_bc_prev = s_bc;
+        s_bc_prev_valid = true;
+    }
+
+    uint32_t boots = s_bc_prev_valid ? s_bc_prev.boot_count + 1 : 1;
+    memset(&s_bc, 0, sizeof(s_bc));
+    s_bc.boot_count = boots;
+    breadcrumb_reseal();
+}
+
+/* Report the previous boot's breadcrumb.  Only meaningful after a crash:
+ * on a clean restart the same data would describe an orderly shutdown. */
+static void log_breadcrumb(void)
+{
+    if (!s_bc_prev_valid) {
+        ESP_LOGW(TAG, "no crash breadcrumb from the previous boot "
+                      "(power-on, or firmware predates breadcrumbs)");
+        return;
+    }
+
+    ESP_LOGW(TAG, "=== CRASH CONTEXT (breadcrumb from previous boot) ===");
+    ESP_LOGW(TAG, "  Boot count   : %u", (unsigned)s_bc_prev.boot_count);
+    ESP_LOGW(TAG, "  Session      : %s",
+             s_bc_prev.session_id[0] ? s_bc_prev.session_id : "(none active)");
+    ESP_LOGW(TAG, "  Last activity: %s",
+             s_bc_prev.activity[0] ? s_bc_prev.activity : "(none recorded)");
+    ESP_LOGW(TAG, "  Uptime at it : %lld ms",
+             (long long)(s_bc_prev.activity_us / 1000));
+    ESP_LOGW(TAG, "=== END CRASH CONTEXT ===");
+}
 
 /* Human-readable names for esp_reset_reason_t values.  Indices match the
  * enum defined in esp_system.h. */
@@ -76,24 +185,37 @@ static const char *reset_reason_str(esp_reset_reason_t r)
 static void log_coredump_summary(void)
 {
     /* Check whether a valid core dump image exists on flash. */
-    if (esp_core_dump_image_check() != ESP_OK) {
-        ESP_LOGW(TAG, "core dump image check failed — partition may be empty, "
-                      "corrupt, or erased by bootloader (CHECK_BOOT)");
+    esp_err_t chk = esp_core_dump_image_check();
+    if (chk != ESP_OK) {
+        /* Be specific: the common cause is that no dump was ever written,
+         * because the panic handler faulted while writing one.  Blaming
+         * CHECK_BOOT (which this build disables) sent the last investigation
+         * down the wrong path. */
+        ESP_LOGW(TAG, "no valid core dump on flash (image check: %s)",
+                 esp_err_to_name(chk));
+        ESP_LOGW(TAG, "  most likely the panic handler faulted while writing "
+                      "it — check the console for 'Re-entered core dump!'; a "
+                      "damaged task stack makes the dump unwritable");
+        ESP_LOGW(TAG, "  the breadcrumb above is the primary evidence in that "
+                      "case");
         return;
     }
 
     esp_core_dump_summary_t *summary = malloc(sizeof(esp_core_dump_summary_t));
     if (!summary) {
-        ESP_LOGW(TAG, "core dump exists but malloc failed for summary struct");
-        esp_core_dump_image_erase();
+        /* Keep the image: it is the only copy of this crash.  It can be read
+         * off the device with espcoredump.py and will be retried next boot. */
+        ESP_LOGW(TAG, "core dump present but summary allocation failed — "
+                      "image RETAINED for offline extraction");
         return;
     }
 
     esp_err_t err = esp_core_dump_get_summary(summary);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "core dump exists but get_summary failed: 0x%x", (unsigned)err);
+        ESP_LOGW(TAG, "core dump present but get_summary failed: %s — "
+                      "image RETAINED for offline extraction",
+                 esp_err_to_name(err));
         free(summary);
-        esp_core_dump_image_erase();
         return;
     }
 
@@ -148,6 +270,12 @@ void crash_diag_check(void)
                      reason == ESP_RST_TASK_WDT ||
                      reason == ESP_RST_WDT);
 
+    /* Take the previous boot's breadcrumb and re-arm for this one.  Must
+     * happen before any subsystem writes a new note.  A power-on reset
+     * leaves indeterminate RTC contents, so the previous copy is discarded
+     * rather than trusted. */
+    breadcrumb_rotate(reason == ESP_RST_POWERON);
+
     if (is_crash) {
         ESP_LOGW(TAG, "reset reason: %s (%d)", reset_reason_str(reason), (int)reason);
     } else {
@@ -174,9 +302,10 @@ void crash_diag_check(void)
     ESP_LOGI(TAG, "watchdogs: TASK_WDT disabled");
 #endif
     if (reason == ESP_RST_INT_WDT) {
-        ESP_LOGW(TAG, "INT_WDT: interrupts were disabled > %d ms — suspect a "
-                 "long driver critical section (SDMMC is the usual candidate); "
-                 "check the storage latency report below",
+        ESP_LOGW(TAG, "INT_WDT: interrupts were disabled > %d ms — most often a "
+                 "spin on a corrupted lock (a stack overflow into an adjacent "
+                 "heap object will do this) or a long driver critical section; "
+                 "check the backtrace and storage latency report below",
 #if defined(CONFIG_ESP_INT_WDT)
                  (int)CONFIG_ESP_INT_WDT_TIMEOUT_MS
 #else
@@ -189,6 +318,11 @@ void crash_diag_check(void)
     ESP_LOGI(TAG, "[heap] boot: internal free=%u, PSRAM free=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    /* ── What was in flight when it died ─────────────────────────────── */
+    if (is_crash) {
+        log_breadcrumb();
+    }
 
     /* ── Core dump analysis (only if the feature is enabled) ─────────── */
 #if defined(CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH)

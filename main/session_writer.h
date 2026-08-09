@@ -67,8 +67,22 @@ session_writer_t *session_writer_get_active(void);
 /* Set the AS11 device address and client ID for session metadata. */
 void session_writer_set_device_info(const char *addr, const char *client_id);
 
-/* Crash recovery: scan for interrupted sessions and finalise them. */
+/* Crash recovery: scan for interrupted sessions and finalise them.
+ *
+ * Repairs raw files, writes a final "interrupted" manifest, and durably
+ * queues each affected noon-day for an automatic export rebuild.  The
+ * rebuild itself is deliberately NOT run here: this executes before BLE
+ * starts, and a long rebuild would delay reconnect. */
 void session_writer_recover(void);
+
+/* Allow the idle post worker to start draining days queued by recovery.
+ * Call once at boot after BLE initialisation has been started, so a rebuild
+ * can never delay reconnect or the first StreamData of a live session. */
+void session_writer_enable_deferred_export(void);
+
+/* Days still awaiting an automatic export rebuild, as a JSON array of
+ * {day, attempts, needs_attention}.  Caller frees. */
+esp_err_t session_writer_pending_export_json(char **out_json);
 
 /* Check whether an _SNC ValueChange notification has been received since
  * the last call.  Returns true and stores the new value in *out_value

@@ -95,12 +95,23 @@ static TaskHandle_t     s_ws_fwd_task;
 
 static int log_vprintf_hook(const char *fmt, va_list args)
 {
-    /* Always forward to UART first. */
-    int ret = s_orig_vprintf(fmt, args);
+    /* Two consumers, two independent va_lists.
+     *
+     * A va_list is consumed by a vprintf-family call: after s_orig_vprintf()
+     * returns, `args` is indeterminate and reusing it for vsnprintf() is
+     * undefined behaviour, not merely unportable.  Each consumer therefore
+     * gets its own va_copy, and the caller's list is never touched here. */
+    va_list uart_args;
+    va_copy(uart_args, args);
+    int ret = s_orig_vprintf(fmt, uart_args);
+    va_end(uart_args);
 
     /* Render into a stack-local scratch buffer. */
     char buf[LOG_LINE_MAX];
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_list buf_args;
+    va_copy(buf_args, args);
+    int len = vsnprintf(buf, sizeof(buf), fmt, buf_args);
+    va_end(buf_args);
     if (len <= 0) {
         return ret;
     }

@@ -3525,6 +3525,43 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
                                EDF_GEN_ALL);
 }
 
+/* Find another session's metadata file (`suffix`) in the same day folder.
+ *
+ * Used only when the session being exported has none of its own, which in
+ * practice means it was reconstructed by crash recovery.  Picks the newest
+ * candidate: session ids are timestamps, so the lexicographically largest is
+ * the most recent, and therefore the closest description of the device state.
+ * Returns false when the day has no other session to borrow from. */
+static bool day_metadata_fallback(const char *session_dir, const char *session_id,
+                                  const char *suffix, char *out_path,
+                                  size_t out_len)
+{
+    if (!session_dir || !suffix || !out_path) return false;
+
+    DIR *d = opendir(session_dir);
+    if (!d) return false;
+
+    char best[64] = {0};
+    size_t suffix_len = strlen(suffix);
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len <= suffix_len || len >= sizeof(best)) continue;
+        if (strcmp(ent->d_name + len - suffix_len, suffix) != 0) continue;
+        /* Skip the session's own (missing) file if it somehow appears. */
+        if (session_id && strncmp(ent->d_name, session_id, strlen(session_id)) == 0)
+            continue;
+        if (!best[0] || strcmp(ent->d_name, best) > 0) {
+            strlcpy(best, ent->d_name, sizeof(best));
+        }
+    }
+    closedir(d);
+
+    if (!best[0]) return false;
+    snprintf(out_path, out_len, "%s/%s", session_dir, best);
+    return true;
+}
+
 esp_err_t edf_gen_generate_ex(const char *out_root,
                               const char *session_dir, const char *session_id,
                               int64_t start_epoch_ms, int64_t end_epoch_ms,
@@ -3593,15 +3630,38 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     /* ── Load post-therapy data from .somnotrace/sessions/streams/YYYYMMDD/ ──
      * Files use prefix-based naming: <session_id>_ident.json, etc. */
 
-    /* Read identification.json for EDF header fields */
+    /* Read identification.json for EDF header fields.
+     *
+     * A session recovered after a crash never ran post-therapy collection, so
+     * it has no _ident.json or _settings.json of its own.  These describe the
+     * device and its therapy settings — not the session's samples — so the
+     * same night's other sessions carry equivalent values.  Borrowing them is
+     * what makes an automatically exported recovered session usable instead of
+     * headerless.  The substitution is logged so it is never silently assumed. */
     char ident_path[330];
     snprintf(ident_path, sizeof(ident_path), "%s/%s_ident.json", session_dir, session_id);
     cJSON *ident = read_json_file(ident_path);
+    if (!ident && day_metadata_fallback(session_dir, session_id, "_ident.json",
+                                        ident_path, sizeof(ident_path))) {
+        ident = read_json_file(ident_path);
+        if (ident) {
+            ESP_LOGW(TAG, "session %s has no ident.json (recovered session?) — "
+                     "using %s from the same day", session_id, ident_path);
+        }
+    }
 
     /* Read settings.json for STR.edf settings fields */
     char settings_path[330];
     snprintf(settings_path, sizeof(settings_path), "%s/%s_settings.json", session_dir, session_id);
     cJSON *settings = read_json_file(settings_path);
+    if (!settings && day_metadata_fallback(session_dir, session_id, "_settings.json",
+                                           settings_path, sizeof(settings_path))) {
+        settings = read_json_file(settings_path);
+        if (settings) {
+            ESP_LOGW(TAG, "session %s has no settings.json (recovered session?) "
+                     "— using %s from the same day", session_id, settings_path);
+        }
+    }
     ESP_LOGI(TAG, "settings.json: path=%s %s", settings_path,
              settings ? "loaded OK" : "FAILED to load");
 
@@ -4150,6 +4210,20 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
 #define REBUILD_MAX_SESSIONS  64
 #define REBUILD_STAGING_DIR   SD_MOUNT_POINT "/SDCARD/.rebuild"
 
+/* Publish sentinel.
+ *
+ * Staging is failure-safe, but publication is not atomic: the live day is
+ * deleted and the staged files are moved in one by one, and the shared
+ * STR/Identification pass runs after that swap.  A reset in that window
+ * leaves a day that looks published but is incomplete.
+ *
+ * The sentinel names the day currently being published and is removed only
+ * after the whole rebuild succeeds.  A sentinel found at boot therefore means
+ * "this day's export was interrupted", and the day is re-queued for an
+ * automatic rebuild.  It is written outside the day folder because the day
+ * folder itself is deleted during publication. */
+#define REBUILD_SENTINEL      SD_SDCARD_DIR "/.rebuilding"
+
 typedef struct {
     char    session_id[40];
     int64_t start_epoch_ms;
@@ -4382,6 +4456,22 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
 
     mkdir(SD_SDCARD_DIR, 0775);
     mkdir(SD_SDCARD_DATALOG, 0775);
+
+    /* Mark the day as mid-publication before anything is destroyed, so an
+     * interruption from here on is detectable on the next boot. */
+    {
+        FILE *sf = fopen(REBUILD_SENTINEL, "w");
+        if (sf) {
+            fprintf(sf, "%s\n", day_folder);
+            fflush(sf);
+            fsync(fileno(sf));
+            fclose(sf);
+        } else {
+            ESP_LOGW(TAG, "rebuild %s: could not write publish sentinel — an "
+                     "interrupted publish will not self-heal", day_folder);
+        }
+    }
+
     rebuild_rmtree(live_day);
     ret = rebuild_move_dir(staged_day, live_day);
     if (ret != ESP_OK) {
@@ -4417,9 +4507,48 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
         return shared;
     }
 
+    /* Fully published, including the shared pass: the day is consistent, so
+     * retire the sentinel.  Every failure path above deliberately leaves it in
+     * place so the day is rebuilt again. */
+    unlink(REBUILD_SENTINEL);
+
     ESP_LOGI(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions) ===",
              day_folder, n);
     free(sessions);
     sd_storage_lease_release(SD_LEASE_EXPORT);
     return ESP_OK;
+}
+
+bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len)
+{
+    if (!out_day || out_len < 9) return false;
+
+    FILE *f = fopen(REBUILD_SENTINEL, "r");
+    if (!f) return false;
+
+    char buf[32] = {0};
+    size_t rd = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    /* Trim whitespace/newline. */
+    for (char *p = buf; *p; p++) {
+        if (*p == '\r' || *p == '\n' || *p == ' ') { *p = '\0'; break; }
+    }
+
+    bool valid = (strlen(buf) == 8);
+    for (int i = 0; valid && i < 8; i++) {
+        if (buf[i] < '0' || buf[i] > '9') valid = false;
+    }
+
+    /* Consume it either way: a malformed sentinel would otherwise be reported
+     * on every boot for ever. */
+    unlink(REBUILD_SENTINEL);
+    if (!valid) {
+        ESP_LOGW(TAG, "discarding malformed publish sentinel");
+        return false;
+    }
+
+    strlcpy(out_day, buf, out_len);
+    return true;
 }

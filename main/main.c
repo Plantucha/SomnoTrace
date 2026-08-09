@@ -188,6 +188,12 @@ void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 
+    /* 4c-bis. BLE startup has begun, so reconnect can now establish whether
+     * therapy is already running.  Only now is it safe to let the idle post
+     * worker export days that boot recovery queued: doing it earlier could
+     * run a multi-minute rebuild while a live session was trying to start. */
+    session_writer_enable_deferred_export();
+
     /* 4d. Init therapy alert subsystem (loads config from NVS). */
     therapy_alert_set_beep_fn(bsp_audio_beep);
     therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);

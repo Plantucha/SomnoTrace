@@ -66,6 +66,7 @@
 #include "uploader.h"
 #include "time_sync.h"
 #include "therapy_alert.h"
+#include "crash_diag.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1134,16 +1135,313 @@ static void sw_storage_task(void *arg)
     }
 }
 
+/* ── Deferred export of recovered days ─────────────────────────────────
+ *
+ * Boot recovery repairs the raw files of an interrupted session and writes a
+ * final manifest, but the derived output (per-session EDFs, the day's shared
+ * artifacts, the upload) is a separate concern with a separate lifetime.
+ * Before this existed, recovery printed advice to run a rebuild by hand, so a
+ * crashed night stayed on the card and never reached SDCARD/, SMB or SleepHQ.
+ *
+ * The publication state is therefore durable and independent of the manifest
+ * state: one marker file per noon-day under SD_PENDING_EXPORT_DIR.  Design
+ * points that matter:
+ *
+ *  - Marker first.  The marker is created before the recovered manifest is
+ *    renamed into place.  Writing the manifest first would leave a window
+ *    where a reset makes recovery skip the session (its manifest is final)
+ *    while no marker exists to schedule the export — exactly the silent loss
+ *    being fixed.  A marker without a repaired manifest is harmless.
+ *  - Per day, not per session.  A day rebuild enumerates every manifest in
+ *    the folder, so several interruptions in one night collapse to one
+ *    rebuild.
+ *  - Drained by the existing post worker when it is otherwise idle, never
+ *    inline during boot recovery: recovery runs before BLE starts, and a
+ *    multi-minute rebuild there would delay reconnect and risk losing live
+ *    therapy data.
+ *  - Cleared only after the rebuild succeeds and the uploader has been told
+ *    the day changed.  Any failure, or a reset mid-rebuild, leaves the marker
+ *    for the next attempt.
+ *
+ * Sessions are never stitched or resumed: each uninterrupted span keeps its
+ * own manifest and its own per-session EDFs, and the gap between them stays
+ * visible. */
+
+#define SD_PENDING_EXPORT_DIR  SD_APP_DIR "/pending_export"
+
+/* Retry budget for transient failures (storage busy, out of memory, I/O).
+ * Permanent failures are not retried at all — see pending_error_is_permanent. */
+#define PENDING_MAX_ATTEMPTS   12
+
+/* How long the post worker waits for real work before servicing the queue of
+ * recovered days. */
+#define SW_POST_IDLE_MS        30000
+
+/* Internal heap floor.  A rebuild allocates EDF buffers and can run while
+ * BLE, Wi-Fi and TLS are all up; better to wait than to fail and burn an
+ * attempt. */
+#define PENDING_MIN_FREE_HEAP  (48 * 1024)
+
+static volatile bool s_deferred_export_enabled = false;
+
+static void pending_path(const char *day, char *out, size_t out_len)
+{
+    snprintf(out, out_len, "%s/%s.json", SD_PENDING_EXPORT_DIR, day);
+}
+
+/* Record that `day` needs its export rebuilt.  Idempotent: an existing
+ * marker (possibly carrying an attempt count) is left alone. */
+static void pending_export_mark(const char *day)
+{
+    if (!day || strlen(day) != 8) return;
+
+    mkdir(SD_APP_DIR, 0775);
+    mkdir(SD_PENDING_EXPORT_DIR, 0775);
+
+    char path[300];
+    pending_path(day, path, sizeof(path));
+
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        ESP_LOGI(TAG, "export already pending for day %s", day);
+        return;
+    }
+
+    char tmp[320];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) {
+        ESP_LOGE(TAG, "cannot create pending-export marker for %s", day);
+        return;
+    }
+    fprintf(f, "{\"day\":\"%s\",\"attempts\":0,\"reason\":\"recovered\","
+               "\"first_seen_epoch_ms\":%lld}\n",
+            day, (long long)((int64_t)time(NULL) * 1000));
+    bool ok = (fflush(f) == 0) && (fsync(fileno(f)) == 0);
+    if (fclose(f) != 0) ok = false;
+    if (ok) ok = (rename(tmp, path) == 0);
+    if (!ok) {
+        unlink(tmp);
+        ESP_LOGE(TAG, "failed to persist pending-export marker for %s", day);
+        return;
+    }
+    ESP_LOGW(TAG, "day %s queued for automatic export rebuild", day);
+}
+
+/* Read the attempt count and whether the day was already given up on. */
+static void pending_read(const char *path, int *out_attempts, bool *out_stalled)
+{
+    if (out_attempts) *out_attempts = 0;
+    if (out_stalled) *out_stalled = false;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char buf[512];
+    size_t rd = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return;
+    cJSON *a = cJSON_GetObjectItem(root, "attempts");
+    if (a && cJSON_IsNumber(a) && out_attempts) *out_attempts = (int)a->valuedouble;
+    cJSON *s = cJSON_GetObjectItem(root, "stalled");
+    if (s && cJSON_IsTrue(s) && out_stalled) *out_stalled = true;
+    cJSON_Delete(root);
+}
+
+/* Update a marker after a failed attempt.  `stalled` means "do not retry
+ * automatically" — the day stays visible in the status API so a persistent
+ * problem is actionable instead of looping for ever. */
+static void pending_update(const char *day, int attempts, bool stalled,
+                           esp_err_t err)
+{
+    char path[300], tmp[320];
+    pending_path(day, path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "{\"day\":\"%s\",\"attempts\":%d,\"stalled\":%s,"
+               "\"last_error\":\"%s\",\"last_try_epoch_ms\":%lld}\n",
+            day, attempts, stalled ? "true" : "false", esp_err_to_name(err),
+            (long long)((int64_t)time(NULL) * 1000));
+    bool ok = (fflush(f) == 0) && (fsync(fileno(f)) == 0);
+    if (fclose(f) != 0) ok = false;
+    if (ok) {
+        unlink(path);
+        ok = (rename(tmp, path) == 0);
+    }
+    if (!ok) unlink(tmp);
+}
+
+/* Failures a retry cannot fix.  Retrying these would spin for ever and hide
+ * the real problem behind an ever-growing attempt count. */
+static bool pending_error_is_permanent(esp_err_t err)
+{
+    return err == ESP_ERR_INVALID_ARG ||    /* malformed day */
+           err == ESP_ERR_INVALID_SIZE ||   /* > REBUILD_MAX_SESSIONS */
+           err == ESP_ERR_NOT_FOUND;        /* no usable manifest in the day */
+}
+
+/* Service at most one pending day, then return so the worker stays responsive
+ * to real post-stop jobs. */
+static void pending_export_service(void)
+{
+    if (!s_deferred_export_enabled) return;
+    if (!sd_storage_is_ready()) return;
+
+    /* Raw capture always outranks derived output. */
+    if (sd_storage_recording_active() || s_active) return;
+
+    /* The shared STR/Identification pass is written in the current clock
+     * domain, so an unset clock would bake epoch-era values into the day. */
+    if ((int64_t)time(NULL) < 1700000000LL) return;
+
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < PENDING_MIN_FREE_HEAP) return;
+
+    DIR *dir = opendir(SD_PENDING_EXPORT_DIR);
+    if (!dir) return;
+
+    char day[16] = {0};
+    char path[300] = {0};
+    int attempts = 0;
+    bool stalled = false;
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        size_t len = strlen(ent->d_name);
+        if (len != 13 || strcmp(ent->d_name + 8, ".json") != 0) continue;
+
+        char cand[16];
+        memcpy(cand, ent->d_name, 8);
+        cand[8] = '\0';
+
+        char cand_path[300];
+        snprintf(cand_path, sizeof(cand_path), "%s/%s",
+                 SD_PENDING_EXPORT_DIR, ent->d_name);
+
+        int cand_attempts = 0;
+        bool cand_stalled = false;
+        pending_read(cand_path, &cand_attempts, &cand_stalled);
+        if (cand_stalled || cand_attempts >= PENDING_MAX_ATTEMPTS) continue;
+
+        strlcpy(day, cand, sizeof(day));
+        strlcpy(path, cand_path, sizeof(path));
+        attempts = cand_attempts;
+        stalled = cand_stalled;
+        break;
+    }
+    closedir(dir);
+    (void)stalled;
+
+    if (!day[0]) return;
+
+    /* Reconcile: the raw day may have been deleted or the card swapped since
+     * the marker was written. */
+    char day_streams[300];
+    snprintf(day_streams, sizeof(day_streams), "%s/%s", SD_STREAMS_DIR, day);
+    struct stat st;
+    if (stat(day_streams, &st) != 0) {
+        ESP_LOGW(TAG, "pending export: day %s no longer on the card — "
+                 "dropping marker", day);
+        unlink(path);
+        return;
+    }
+
+    ESP_LOGW(TAG, "pending export: rebuilding day %s (attempt %d)",
+             day, attempts + 1);
+    crash_diag_note_activity("rebuild_day");
+
+    esp_err_t ret = edf_gen_rebuild_day(day);
+    if (ret == ESP_OK) {
+        /* The day's files were replaced, so whatever the backends hold for it
+         * is stale.  Re-offer it, then retire the marker. */
+        uploader_on_day_invalidated(day);
+        unlink(path);
+        ESP_LOGW(TAG, "pending export: day %s rebuilt and queued for upload",
+                 day);
+    } else if (pending_error_is_permanent(ret)) {
+        ESP_LOGE(TAG, "pending export: day %s failed permanently (%s) — "
+                 "needs attention, not retrying", day, esp_err_to_name(ret));
+        pending_update(day, attempts + 1, true, ret);
+    } else {
+        int next = attempts + 1;
+        bool give_up = (next >= PENDING_MAX_ATTEMPTS);
+        ESP_LOGE(TAG, "pending export: day %s failed (%s), attempt %d/%d%s",
+                 day, esp_err_to_name(ret), next, PENDING_MAX_ATTEMPTS,
+                 give_up ? " — giving up, needs attention" : "");
+        pending_update(day, next, give_up, ret);
+    }
+    crash_diag_note_activity("idle");
+}
+
+void session_writer_enable_deferred_export(void)
+{
+    if (s_deferred_export_enabled) return;
+    s_deferred_export_enabled = true;
+    ESP_LOGI(TAG, "deferred export of recovered days enabled");
+}
+
+esp_err_t session_writer_pending_export_json(char **out_json)
+{
+    if (!out_json) return ESP_ERR_INVALID_ARG;
+
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return ESP_ERR_NO_MEM;
+
+    DIR *dir = opendir(SD_PENDING_EXPORT_DIR);
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            size_t len = strlen(ent->d_name);
+            if (len != 13 || strcmp(ent->d_name + 8, ".json") != 0) continue;
+
+            char cand_path[300];
+            snprintf(cand_path, sizeof(cand_path), "%s/%s",
+                     SD_PENDING_EXPORT_DIR, ent->d_name);
+            int attempts = 0;
+            bool stalled = false;
+            pending_read(cand_path, &attempts, &stalled);
+
+            cJSON *o = cJSON_CreateObject();
+            char day[16];
+            memcpy(day, ent->d_name, 8);
+            day[8] = '\0';
+            cJSON_AddStringToObject(o, "day", day);
+            cJSON_AddNumberToObject(o, "attempts", attempts);
+            cJSON_AddBoolToObject(o, "needs_attention",
+                                  stalled || attempts >= PENDING_MAX_ATTEMPTS);
+            cJSON_AddItemToArray(arr, o);
+        }
+        closedir(dir);
+    }
+
+    *out_json = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    return *out_json ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 /* ── Post-stop pipeline task ──────────────────────────────────────── */
 
 static void sw_post_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "post worker started on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "post worker started on core %d (idle; waiting for jobs)",
+             xPortGetCoreID());
 
     while (1) {
         sw_post_job_t job;
-        if (xQueueReceive(s_post_q, &job, portMAX_DELAY) != pdTRUE) continue;
+        /* A timed wait rather than portMAX_DELAY: when there is no session to
+         * finalise, the idle worker is where recovered days get exported.
+         * Real post-stop jobs always take priority — they arrive on the
+         * queue and are handled before the next idle pass. */
+        if (xQueueReceive(s_post_q, &job, pdMS_TO_TICKS(SW_POST_IDLE_MS)) != pdTRUE) {
+            pending_export_service();
+            continue;
+        }
         session_writer_t *s = job.s;
         if (!s) continue;
 
@@ -1359,6 +1657,12 @@ session_writer_t *session_writer_start(void)
     s->last_stream_us = s->start_time_us;
 
     make_session_id(s->session_id, sizeof(s->session_id));
+    /* Leave a breadcrumb in RTC memory: if the firmware dies mid-session, the
+     * next boot can name the session that was recording even when no core
+     * dump could be written. */
+    crash_diag_note_session(s->session_id);
+    crash_diag_note_activity("session_open");
+
     char noon_day[16];
     noon_day_folder_local(time(NULL), noon_day, sizeof(noon_day));
     snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_STREAMS_DIR, noon_day);
@@ -1410,6 +1714,9 @@ static void sw_request_finalize(session_writer_t *s, const char *state,
     if (s_active == s) s_active = NULL;
     xSemaphoreGive(s_active_mutex);
     if (was_active) sd_storage_recording_end();
+
+    crash_diag_note_activity(state ? state : "finalize");
+    crash_diag_note_session(NULL);
 
     /* Hand off whatever the producer still holds, before FINALIZE is queued;
      * the queue is FIFO, so the batch is written first. */
@@ -1938,6 +2245,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
 
         if (stop) {
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
+            crash_diag_note_activity("therapy_stop");
             s_therapy_stopped = true;
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
@@ -1950,6 +2258,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         }
         if (start) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
+            crash_diag_note_activity("therapy_start");
             s_therapy_stopped = false;
             therapy_alert_on_therapy_start();
             bsp_display_set_therapy_active(true);
@@ -2265,6 +2574,17 @@ void session_writer_recover(void)
 {
     if (!sd_storage_is_ready()) return;
 
+    /* A day rebuild that was interrupted while publishing left the export tree
+     * for that day incomplete.  Re-queue it before touching anything else. */
+    {
+        char day[16];
+        if (edf_gen_take_interrupted_rebuild(day, sizeof(day))) {
+            ESP_LOGW(TAG, "day %s was mid-publish when the device restarted — "
+                     "re-queueing its export", day);
+            pending_export_mark(day);
+        }
+    }
+
     DIR *dir = opendir(SD_STREAMS_DIR);
     if (!dir) return;
 
@@ -2427,6 +2747,12 @@ void session_writer_recover(void)
                 }
             }
 
+            /* Mark the day for automatic export BEFORE the manifest becomes
+             * final.  If the order were reversed, a reset in between would
+             * leave a session that recovery skips (final manifest) and that
+             * nothing schedules for export — the silent loss this fixes. */
+            pending_export_mark(ent->d_name);
+
             /* Write the manifest atomically. */
             char tmp[440];
             snprintf(tmp, sizeof(tmp), "%s.tmp", json_path);
@@ -2495,6 +2821,7 @@ void session_writer_recover(void)
     closedir(dir);
     if (recovered > 0) {
         ESP_LOGI(TAG, "recovered %d interrupted session(s)", recovered);
-        ESP_LOGI(TAG, "use the Web UI 'rebuild day' action to export them");
+        ESP_LOGI(TAG, "their day(s) are queued for automatic export; the "
+                 "rebuild runs once recording is idle");
     }
 }

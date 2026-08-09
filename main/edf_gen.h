@@ -23,6 +23,9 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #include "esp_err.h"
 
 /* ── EDF file generation ──────────────────────────────────────────────
@@ -125,3 +128,12 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
  * was fully rebuilt and published — the caller may then queue it for
  * upload. */
 esp_err_t edf_gen_rebuild_day(const char *day_folder);
+
+/* Boot check: was a day rebuild interrupted while publishing?
+ *
+ * Publication deletes the live day and moves the staged files into place, so
+ * a reset in that window leaves the day incomplete.  Returns true and fills
+ * out_day (8 chars + NUL) when such a day is found, consuming the marker so
+ * the caller owns the retry.  Call once at boot, before anything reads the
+ * export tree. */
+bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len);

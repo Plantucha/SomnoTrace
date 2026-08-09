@@ -15,6 +15,7 @@
 #include "log_stream.h"
 #include "device_settings.h"
 #include "session_graph.h"
+#include "session_writer.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -867,6 +868,21 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     /* Therapy alert state */
     cJSON *alert = cJSON_AddObjectToObject(resp, "alert");
     cJSON_AddStringToObject(alert, "state", therapy_alert_state_str(therapy_alert_get_state()));
+
+    /* Days recovered from an interrupted session that are still waiting to be
+     * exported.  A recovered night used to be visible only as a boot log line
+     * that scrolled away; surfacing it here is the difference between "silently
+     * lost" and "the device is working on it / needs attention". */
+    {
+        char *pending = NULL;
+        if (session_writer_pending_export_json(&pending) == ESP_OK && pending) {
+            cJSON *parsed = cJSON_Parse(pending);
+            if (parsed) {
+                cJSON_AddItemToObject(resp, "pending_export", parsed);
+            }
+            free(pending);
+        }
+    }
     cJSON_AddNumberToObject(resp, "ih_min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(resp, "ih_lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(resp, "ps_free", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));

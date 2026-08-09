@@ -24,15 +24,40 @@
 
 #pragma once
 
+#include <stdint.h>
+
 /**
- * Check the reset reason and, if a crash occurred, extract the core dump
- * summary (task name, exception PC, backtrace) and log it.
+ * Check the reset reason and, if a crash occurred, report what is known:
+ * the RTC breadcrumb written before the crash, and the core dump summary
+ * (task name, exception PC, backtrace) when one was successfully written.
  *
  * Should be called once, early in app_main() — after log_stream_init()
  * so the output is captured in the ring buffer, but before any other
  * subsystem that might itself crash.
  *
- * The core dump is erased after its summary is logged, so the information
- * appears only once in the first boot after the crash.
+ * A core dump is erased only after its summary has been logged
+ * successfully.  If the summary cannot be read (allocation failure, parse
+ * failure) the image is left on flash so it can still be pulled off the
+ * device for offline decoding, and retried on a later boot.
  */
 void crash_diag_check(void);
+
+/* ── Crash breadcrumb (RTC memory, survives panic/WDT resets) ────────────
+ *
+ * A core dump cannot be captured when the crashing task's stack is
+ * unusable: the panic handler faults while spilling register windows onto
+ * that stack, re-enters, and writes nothing.  That is exactly what happened
+ * on 2026-08-09, leaving a reset reason and no context.
+ *
+ * These breadcrumbs are written during normal operation into RTC memory,
+ * which is preserved across software/panic/watchdog resets and only
+ * randomised on power-on.  They need no allocation, no locks and no
+ * filesystem, so they remain valid however the firmware dies, and are
+ * reported by crash_diag_check() on the next boot. */
+
+/* Record the session currently being recorded ("" when idle). */
+void crash_diag_note_session(const char *session_id);
+
+/* Record the latest therapy/alert transition or operation tag.
+ * Keep tags short and stable — they are truncated to 23 characters. */
+void crash_diag_note_activity(const char *tag);
