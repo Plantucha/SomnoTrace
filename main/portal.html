@@ -4239,8 +4239,6 @@ window.onload = function() {
         var latestIso = dayToIso(latestDay);
         if (picker) picker.value = latestIso;
         updateDateDisplayLabel(latestIso);
-        /* Speculatively preload events JSON in parallel */
-        fetch('/api/events?day=' + latestDay).catch(function(){});
         loadSessionData();
       } else {
         if (picker) picker.value = todayIso;
