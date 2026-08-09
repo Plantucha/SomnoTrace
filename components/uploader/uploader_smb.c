@@ -362,7 +362,7 @@ static upload_result_t smb_day_end(const char *day, bool any_uploaded)
 
 const upload_backend_t smb_backend = {
     .id = "smb",
-    .label = "NAS (SMB)",
+    .label = "SMB Network Share",
     .bundle_only_ok = true,     /* plain file copy, no side effects */
     .is_configured = smb_is_configured,
     .session_begin = smb_session_begin,

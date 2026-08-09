@@ -462,8 +462,8 @@ static void run_pass(void)
         if (s_rt[i].state == SB_COOLDOWN) cooling = true;
     }
     if (pending == 0) set_status("All uploaded");
-    else if (cooling)  set_status("%d pending — waiting to retry", pending);
-    else               set_status("%d pending", pending);
+    else if (cooling)  set_status("%d file groups pending — waiting to retry", pending);
+    else               set_status("%d file groups pending", pending);
 }
 
 /* ── Task ─────────────────────────────────────────────────────────── */

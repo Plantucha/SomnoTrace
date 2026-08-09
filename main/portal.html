@@ -274,14 +274,28 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .setting-status.ok{color:var(--success)}
 .setting-status.err{color:var(--danger)}
 
+/* ── Dashboard Shimmer & Loading Polish ───────────────────────── */
+.dash-panel-loading{position:relative;overflow:hidden;background:var(--input-bg);border-radius:8px;min-height:160px}
+.dash-panel-loading::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,0.06),transparent);animation:shimmer 1.5s infinite}
+@keyframes shimmer{100%{transform:translateX(100%)}}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(1.2)}}
+
 /* ── Responsive ────────────────────────────────────────────────── */
+@media(min-height:900px){
+.dashboard-charts-panel .uplot{height:240px !important}
+}
 @media(max-width:768px){
 .status-grid,.settings-grid-2col{grid-template-columns:1fr}
 }
 @media(max-width:600px){
 header{flex-direction:column;height:auto;padding:10px 12px;gap:6px}
-.nav-tabs{width:100%;gap:2px;padding:0}
-.nav-tabs .tab-btn{flex:1;justify-content:center;padding:8px 2px;font-size:.82rem}
+.nav-tabs{width:100%;gap:4px;padding:2px 0;overflow-x:auto;white-space:nowrap;scroll-behavior:smooth;-webkit-overflow-scrolling:touch}
+.nav-tabs::-webkit-scrollbar{display:none}
+.nav-tabs .tab-btn{flex:0 0 auto;padding:8px 12px;font-size:.85rem}
+.action-item-row,.action-item-danger{flex-direction:column;align-items:stretch;gap:10px}
+.action-item-row .btn,.action-item-danger .btn{width:100%}
+.upload-status-footer{flex-direction:column;align-items:flex-start;gap:4px}
+.upload-status-footer #upload-status-line{text-align:left}
 .theme-selector{align-self:flex-end}
 main{padding:8px}
 .card{padding:14px}
@@ -324,13 +338,14 @@ body.fixed-height .logs-container {
 <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 9.9 9.9 0 0 0-.2-2 7 7 0 1 1-8.3-8.3A10.1 10.1 0 0 0 12 3z"/></svg>
 SomnoTrace
 <span class="setup-badge" id="setup-badge">Setup Mode</span>
+<span id="dash-loading-dot" style="display:none;width:8px;height:8px;border-radius:50%;background:var(--primary);margin-left:6px;animation:pulse 1s infinite" title="Loading session data…"></span>
 </a>
-<div class="nav-tabs" id="nav-tabs">
-<button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
-<button class="tab-btn" onclick="switchTab('tab-status')">Status</button>
-<button class="tab-btn" onclick="switchTab('logs')">Logs</button>
-<button class="tab-btn" onclick="switchTab('actions')">Actions</button>
-<button class="tab-btn" onclick="switchTab('settings')">Settings</button>
+<div class="nav-tabs" id="nav-tabs" role="tablist">
+<button class="tab-btn active" role="tab" id="tab-btn-dashboard" aria-selected="true" onclick="switchTab('dashboard')">Dashboard</button>
+<button class="tab-btn" role="tab" id="tab-btn-status" aria-selected="false" onclick="switchTab('tab-status')">Status</button>
+<button class="tab-btn" role="tab" id="tab-btn-logs" aria-selected="false" onclick="switchTab('logs')">Logs</button>
+<button class="tab-btn" role="tab" id="tab-btn-actions" aria-selected="false" onclick="switchTab('actions')">Actions</button>
+<button class="tab-btn" role="tab" id="tab-btn-settings" aria-selected="false" onclick="switchTab('settings')">Settings</button>
 </div>
 <div class="theme-selector">
 <button class="theme-btn" id="theme-day-btn" onclick="setTheme('day')" title="Day Mode">
@@ -783,9 +798,9 @@ Upload Progress
 </div>
 <p class="card-desc">Each destination is tracked independently, per session. Only new sessions are uploaded.</p>
 <div id="upload-progress" class="mt-xs"></div>
-<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--card-border);margin-top:12px;padding-top:10px;font-size:.82rem">
+<div class="upload-status-footer" style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--card-border);margin-top:12px;padding-top:10px;font-size:.82rem">
 <span style="color:var(--text-muted)">Status</span>
-<span id="upload-status-line" style="color:var(--text)">&mdash;</span>
+<span id="upload-status-line" style="color:var(--text);text-align:right">&mdash;</span>
 </div>
 </div>
 
@@ -953,12 +968,12 @@ var PW_SENTINEL_UPLOAD = '***';
 var settingsLoaded = false;
 
 function switchTab(tabId) {
-  document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
+  document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
   document.querySelectorAll('.tab-content').forEach(function(c){ c.classList.remove('active'); });
   var labels = {dashboard:'Dashboard','tab-status':'Status',logs:'Logs',actions:'Actions',settings:'Settings'};
   var lbl = labels[tabId] || tabId;
   var btn = Array.from(document.querySelectorAll('.tab-btn')).find(function(b){ return b.textContent.trim() === lbl; });
-  if (btn) btn.classList.add('active');
+  if (btn) { btn.classList.add('active'); btn.setAttribute('aria-selected', 'true'); }
   var sec = document.getElementById(tabId);
   if (sec) sec.classList.add('active');
   /* Set fixed body height for terminal in logs tab */
@@ -1023,6 +1038,13 @@ function getSystemTheme() {
   if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'night';
   if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) return 'day';
   var h = new Date().getHours(); return (h >= 8 && h < 20) ? 'day' : 'night';
+}
+if (window.matchMedia) {
+  try {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function() {
+      if (localStorage.getItem('somnotrace_theme') === 'auto') setTheme('auto');
+    });
+  } catch(e) {}
 }
 
 /* ── Password Toggle ───────────────────────────────────────────── */
@@ -1976,7 +1998,7 @@ function renderBackendRow(b) {
   h += '<div style="display:flex;justify-content:space-between;align-items:baseline">';
   h += '<span style="font-weight:600;color:' + colour + '">' + b.label + '</span>';
   if (b.configured) {
-    h += '<span style="font-variant-numeric:tabular-nums">' + done + ' / ' + total +
+    h += '<span style="font-variant-numeric:tabular-nums">' + done + ' / ' + total + ' days' +
          ' <span style="color:' + gcol + '">' + glyph + '</span></span>';
   } else {
     h += '<span style="color:var(--text-muted);font-size:.8rem">Not configured</span>';
@@ -2735,7 +2757,12 @@ function isToday(s) {
 }
 function noonDayStr(s) { return s ? s.replace(/-/g, '') : ''; }
 function dashChartWidth(el) { var w = el.clientWidth; return (w && w > 0) ? w : 320; }
-function dashSetStatus(m) { var e = document.getElementById('dash-status'); if (e) e.textContent = m; }
+function dashSetStatus(m) {
+  var e = document.getElementById('dash-status');
+  if (e) e.textContent = m;
+  var dot = document.getElementById('dash-loading-dot');
+  if (dot) dot.style.display = (m && m.toLowerCase().indexOf('loading') >= 0) ? 'inline-block' : 'none';
+}
 
 /* ── Loading progress bar ────────────────────────────────────────
  * Visible between the stat cards and the summary card.  Shows a
@@ -3733,6 +3760,14 @@ function updateDashView() {
     if (!chart) continue;
     var sig = DASH_SIGNALS[i];
     var src = buildSignalData(sig, cur, dashChartCols(chart));
+    var chartEl = document.getElementById('chart-' + sig.key);
+    if (chartEl) {
+      if (src && src.t && src.t.length > 0) {
+        chartEl.classList.remove('dash-panel-loading');
+      } else {
+        chartEl.classList.add('dash-panel-loading');
+      }
+    }
     if (sig.overlay) {
       var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
       var ovSrc = buildSignalData(ovSig, cur, dashChartCols(chart));
@@ -3748,6 +3783,11 @@ function updateDashView() {
 /* Build a single uPlot panel for one signal into container `el`. */
 function makeDashPanel(sig, el, cur) {
   var src = buildSignalData(sig, cur, dashChartCols(null, el));
+  if (!src || !src.t || !src.t.length) {
+    if (el) el.classList.add('dash-panel-loading');
+  } else if (el) {
+    el.classList.remove('dash-panel-loading');
+  }
   var ovSrc = null;
   if (sig.overlay) {
     var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
@@ -4184,9 +4224,12 @@ window.onload = function() {
     switchTab('dashboard');
     fetchDays().then(function(days) {
       if (days.length) {
-        var latestIso = dayToIso(days[days.length - 1].day);
+        var latestDay = days[days.length - 1].day;
+        var latestIso = dayToIso(latestDay);
         if (picker) picker.value = latestIso;
         updateDateDisplayLabel(latestIso);
+        /* Speculatively preload events JSON in parallel */
+        fetch('/api/events?day=' + latestDay).catch(function(){});
         loadSessionData();
       } else {
         if (picker) picker.value = todayIso;

@@ -166,16 +166,17 @@ static void link_mark_down(void)
  * (which is not necessarily slot 1 — candidates are ranked by RSSI). */
 static void link_mark_up(const char *ip)
 {
-    wifi_ap_record_t ap;
-    bool have_ap = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+    wifi_ap_record_t *ap = malloc(sizeof(wifi_ap_record_t));
+    bool have_ap = ap && (esp_wifi_sta_get_ap_info(ap) == ESP_OK);
 
     if (s_link_mutex) xSemaphoreTake(s_link_mutex, portMAX_DELAY);
     s_connected = true;
     strlcpy(s_connected_ip, ip, sizeof(s_connected_ip));
-    if (have_ap) {
-        strlcpy(s_link_ssid, (const char *)ap.ssid, sizeof(s_link_ssid));
+    if (have_ap && ap) {
+        strlcpy(s_link_ssid, (const char *)ap->ssid, sizeof(s_link_ssid));
     }
     if (s_link_mutex) xSemaphoreGive(s_link_mutex);
+    if (ap) free(ap);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,

@@ -11,6 +11,9 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # Main task stack: recovery + cJSON need more than default 3584
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# System event task (sys_evt) stack: default 2304 is too small for Wi-Fi/IP event handlers
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
 # PSRAM: ESP32-S3R8 has 8 MB octal SPI RAM. The app runs Wi-Fi + BLE + SD/FATFS
 # + HTTP + a 240x240 LCD framebuffer concurrently, which exhausts the ~290 KB
 # internal RAM. Push as much as possible to PSRAM, keeping only small
