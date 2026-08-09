@@ -495,6 +495,33 @@ static esp_err_t snt_read_header(FILE *f, snt_header_t *hdr)
     return ESP_OK;
 }
 
+/* How many whole samples per channel the file actually contains.
+ *
+ * The header's sample_count states how many samples were *accounted for*, but
+ * a session killed mid-write can have fewer bytes than that on disk: the final
+ * batch was torn off.  Trusting the header then makes the converter ask for
+ * data that does not exist, which used to abort the whole export.  Measuring
+ * the file is the only honest source for "what can actually be read".
+ *
+ * Returns UINT32_MAX if the size cannot be determined, so callers clamp to the
+ * header value and behaviour is unchanged.  The stream position is preserved:
+ * callers rely on being positioned just past the header. */
+static uint32_t snt_available_samples(FILE *f, int channels_in_file)
+{
+    if (!f || channels_in_file <= 0) return UINT32_MAX;
+
+    long cur = ftell(f);
+    if (cur < 0) return UINT32_MAX;
+    if (fseek(f, 0, SEEK_END) != 0) return UINT32_MAX;
+    long end = ftell(f);
+    if (fseek(f, cur, SEEK_SET) != 0 || end < 0) return UINT32_MAX;
+
+    if (end <= (long)sizeof(snt_header_t)) return 0;
+    long data_bytes = end - (long)sizeof(snt_header_t);
+    long frame = (long)channels_in_file * (long)sizeof(int16_t);
+    return (uint32_t)(data_bytes / frame);
+}
+
 /* ════════════════════════════════════════════════════════════════════
  *  Section 5: .snt → EDF conversion for BRP, SA2, PLD
  * ════════════════════════════════════════════════════════════════════
@@ -851,6 +878,36 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
      * last record is dropped, matching AS11 behaviour (AS11 does not
      * zero-pad trailing partial records). */
     uint32_t total_samples = hdr.sample_count;
+
+    /* Never promise more samples than the files hold.
+     *
+     * A crash-interrupted session commonly has a torn final batch: the header
+     * counts samples the writer had accounted for, but the tail never reached
+     * the card.  The EDF header (including its CRCs) is written before the data
+     * and states the record count, so the count has to be right up front —
+     * discovering the shortfall mid-write is unrecoverable without rewriting a
+     * CRC-protected header.  Clamping here keeps the floor-division invariant
+     * ("the last record is always complete") true for damaged files too, so
+     * an interrupted session exports the data it does have instead of failing
+     * and taking the whole day's rebuild down with it.
+     *
+     * For an intact file the measured length is >= sample_count, so this is a
+     * no-op and healthy sessions are byte-for-byte unaffected. */
+    {
+        /* v2 stores one channel per file; v1 interleaves snt_channels. */
+        uint32_t avail = snt_available_samples(snt, snt2 ? 1 : snt_channels);
+        if (snt2) {
+            uint32_t avail2 = snt_available_samples(snt2, 1);
+            if (avail2 < avail) avail = avail2;
+        }
+        if (avail < total_samples) {
+            ESP_LOGW(TAG, "%s: header claims %u samples but only %u are on disk "
+                     "(torn tail from an interrupted session) — exporting %u",
+                     snt_path, total_samples, avail, avail);
+            total_samples = avail;
+        }
+    }
+
     if (skip_samples > total_samples) {
         ESP_LOGW(TAG, "%s: skip_samples (%u) > sample_count (%u), clamping",
                  snt_path, skip_samples, total_samples);
@@ -908,10 +965,19 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
      * as [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...], so each sample frame is
      * snt_channels × sizeof(int16_t) bytes.
      * v2: each file is 1-ch, so skip_bytes = skip_samples × sizeof(int16_t)
-     *     per file.  snt_channels is already set to 2 (virtual), so the
-     *     math below works for both v1 and v2 when we seek in both files. */
+     *     in BOTH files — snt_channels is the virtual (2-ch) stream width and
+     *     must not be applied to a single-channel file. */
     if (skip_samples > 0) {
-        long skip_bytes = (long)skip_samples * snt_channels * sizeof(int16_t);
+        /* Frame size is per FILE, not per virtual stream.
+         *
+         * For v2, snt_channels was forced to 2 to describe the virtual
+         * flow+press stream, but each file on disk holds ONE channel.  Scaling
+         * the primary file's skip by snt_channels therefore seeked twice as far
+         * as intended: the flow channel was silently shifted skip_samples
+         * earlier than pressure, and the extra offset ran the last record past
+         * end-of-file whenever no MaskOff end-trim was there to absorb it. */
+        int primary_channels = snt2 ? 1 : snt_channels;
+        long skip_bytes = (long)skip_samples * primary_channels * sizeof(int16_t);
         if (fseek(snt, sizeof(snt_header_t) + skip_bytes, SEEK_SET) != 0) {
             ESP_LOGW(TAG, "%s: fseek skip failed, starting from beginning", snt_path);
             fseek(snt, sizeof(snt_header_t), SEEK_SET);
@@ -4229,6 +4295,7 @@ typedef struct {
     int64_t start_epoch_ms;
     int64_t end_epoch_ms;
     int64_t clock_drift_ms;
+    bool    interrupted;    /* reconstructed by crash recovery */
 } rebuild_session_t;
 
 /* Recursively delete a directory tree (staging cleanup / old day removal). */
@@ -4323,6 +4390,12 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
 
             /* An unusable drift estimate is still better than 0 (which would
              * put every spool-sourced timestamp ~7-8 min out), but say so. */
+            /* Sessions rebuilt from a crash have partially damaged raw data by
+             * definition; the day rebuild treats their failures differently. */
+            cJSON *jst = cJSON_GetObjectItem(j, "state");
+            out->interrupted = (jst && cJSON_IsString(jst) &&
+                                strcmp(jst->valuestring, "interrupted") == 0);
+
             cJSON *ju = cJSON_GetObjectItem(j, "clock_drift_usable");
             cJSON *jv = cJSON_GetObjectItem(j, "clock_drift_valid");
             bool measured = jv && cJSON_IsTrue(jv);
@@ -4412,6 +4485,7 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     mkdir(REBUILD_STAGING_DIR, 0775);
 
     esp_err_t ret = ESP_OK;
+    int degraded = 0;
     for (int i = 0; i < n; i++) {
         ESP_LOGI(TAG, "rebuild %s: session %d/%d: %s",
                  day_folder, i + 1, n, sessions[i].session_id);
@@ -4422,6 +4496,20 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
                                          sessions[i].clock_drift_ms,
                                          EDF_GEN_PER_SESSION);
         if (r != ESP_OK) {
+            if (sessions[i].interrupted) {
+                /* A crash-recovered fragment can be damaged in ways no amount
+                 * of retrying will fix.  Letting it veto the rebuild would
+                 * lose the whole night — every healthy session included — which
+                 * is a far worse outcome than exporting the night without this
+                 * one fragment.  Loud, not silent: the skipped session is named
+                 * here and counted in the completion line. */
+                ESP_LOGE(TAG, "rebuild %s: interrupted session %s could not be "
+                         "exported (%s) — SKIPPING it and continuing with the "
+                         "rest of the day", day_folder,
+                         sessions[i].session_id, esp_err_to_name(r));
+                degraded++;
+                continue;
+            }
             ESP_LOGE(TAG, "rebuild %s: session %s failed (%s) — aborting, "
                      "existing export left untouched", day_folder,
                      sessions[i].session_id, esp_err_to_name(r));
@@ -4512,8 +4600,13 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
      * place so the day is rebuilt again. */
     unlink(REBUILD_SENTINEL);
 
-    ESP_LOGI(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions) ===",
-             day_folder, n);
+    if (degraded > 0) {
+        ESP_LOGW(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions, %d skipped as "
+                 "unexportable) ===", day_folder, n - degraded, degraded);
+    } else {
+        ESP_LOGI(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions) ===",
+                 day_folder, n);
+    }
     free(sessions);
     sd_storage_lease_release(SD_LEASE_EXPORT);
     return ESP_OK;

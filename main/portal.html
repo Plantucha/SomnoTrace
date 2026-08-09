@@ -3217,7 +3217,20 @@ function renderSummary() {
     }).join('');
   }
   var sc = document.getElementById('dash-summary-sessions');
-  if (sc) sc.textContent = sum.sessions ? '(' + sum.sessions + ' session' + (sum.sessions > 1 ? 's' : '') + ')' : '';
+  if (sc) {
+    /* Sessions that ended abnormally (crash recovery, stream timeout, day
+     * split) are shown like any other, but say so: their end time is an
+     * estimate and there is a real gap in the data at that point. */
+    var nPartial = 0;
+    for (var pi = 0; pi < dashSessions.length; pi++) {
+      if (dashSessions[pi] && dashSessions[pi].partial) nPartial++;
+    }
+    var txt = sum.sessions ? '(' + sum.sessions + ' session' + (sum.sessions > 1 ? 's' : '') + ')' : '';
+    if (nPartial > 0) {
+      txt += (txt ? ' ' : '') + '· ' + nPartial + ' incomplete';
+    }
+    sc.textContent = txt;
+  }
 
   /* Stats table */
   var tb = document.getElementById('dash-stats-body');

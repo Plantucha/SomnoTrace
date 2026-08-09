@@ -196,10 +196,12 @@ static inline float pld_leak_phys(int16_t dig, int16_t missing)
 }
 
 /* GET /api/sessions?date=YYYYMMDD
- * Returns JSON array of completed sessions for the given noon-day folder,
+ * Returns JSON array of terminal sessions for the given noon-day folder,
  * sorted by start_epoch_ms, with metadata including clock drift and file sizes. */
 typedef struct {
     char id[32];
+    char state[16];             /* manifest state, reported as-is            */
+    bool partial;               /* ended abnormally: data is real but short  */
     int64_t start_epoch_ms;
     int64_t end_epoch_ms;
     int64_t clock_drift_ms;
@@ -308,9 +310,31 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         if (!j_st || !cJSON_IsNumber(j_st)) { cJSON_Delete(j); continue; }
         if ((int64_t)j_st->valuedouble < 946684800000LL) { cJSON_Delete(j); continue; }
 
-        /* Exclude non-completed sessions (active, interrupted, incomplete) */
-        const char *state = j_state ? j_state->valuestring : "unknown";
-        if (strcmp(state, "completed") != 0) { cJSON_Delete(j); continue; }
+        /* Which sessions the Web UI may show.
+         *
+         * This used to accept only "completed", which meant a night that ended
+         * in a crash was exported to EDF (and uploaded to SleepHQ/SMB) while
+         * being invisible in our own UI — the graphs showed less than the files
+         * we published.  The states below are all *terminal* and have real
+         * captured data, so they are shown and flagged as partial:
+         *
+         *   interrupted  reconstructed by crash recovery
+         *   timed_out    stream went silent, session closed by the watchdog
+         *   rotated      superseded by a new session
+         *   split        closed at a day boundary
+         *
+         * Still excluded: a session that is currently recording (its manifest
+         * is not final, and its .snt files are being appended to while the
+         * graph would be reading them), and "storage_failed", where the raw
+         * data itself is not trustworthy. */
+        const char *state = (j_state && cJSON_IsString(j_state))
+                          ? j_state->valuestring : "unknown";
+        bool completed   = (strcmp(state, "completed") == 0);
+        bool partial     = (strcmp(state, "interrupted") == 0 ||
+                            strcmp(state, "timed_out") == 0 ||
+                            strcmp(state, "rotated") == 0 ||
+                            strcmp(state, "split") == 0);
+        if (!completed && !partial) { cJSON_Delete(j); continue; }
 
         if (count >= cap) {
             cap *= 2;
@@ -322,6 +346,8 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         session_manifest_t *s = &sessions[count];
         memset(s, 0, sizeof(*s));
         strlcpy(s->id, session_id, sizeof(s->id));
+        strlcpy(s->state, state, sizeof(s->state));
+        s->partial = partial;
         s->start_epoch_ms = (int64_t)j_st->valuedouble;
         s->end_epoch_ms = j_en ? (int64_t)j_en->valuedouble : 0;
         s->brp_samples = j_brp ? (uint32_t)j_brp->valuedouble : 0;
@@ -376,13 +402,13 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         }
         if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
         pos += snprintf(json + pos, json_cap - pos,
-            "{\"id\":\"%s\",\"state\":\"completed\","
+            "{\"id\":\"%s\",\"state\":\"%s\",\"partial\":%s,"
             "\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,"
             "\"clock_drift_ms\":%lld,\"clock_drift_valid\":%s,"
             "\"brp_samples\":%u,\"brp_mm_samples\":%u,\"pld_samples\":%u,"
             "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld,"
             "\"fmt\":%d,\"stream_notifications\":%u,\"gap_events\":%u,\"gap_missing\":%u}",
-            s->id,
+            s->id, s->state, s->partial ? "true" : "false",
             (long long)s->start_epoch_ms, (long long)s->end_epoch_ms,
             (long long)s->clock_drift_ms, s->clock_drift_valid ? "true" : "false",
             (unsigned)s->brp_samples, (unsigned)s->brp_mm_samples, (unsigned)s->pld_samples,
