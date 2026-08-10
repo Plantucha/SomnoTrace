@@ -1058,6 +1058,7 @@ function switchTab(tabId) {
     setLoading('alert-card', true);
     if (!PORTAL_MODE) {
       setLoading('upload-cards-grid', true);
+      setLoading('upload-window-card', true);
       setLoading('ftp-card', true);
       setLoading('upload-progress', true);
     }
@@ -1079,6 +1080,7 @@ function switchTab(tabId) {
       setLoading('display-sound-card', false);
       setLoading('alert-card', false);
       setLoading('upload-cards-grid', false);
+      setLoading('upload-window-card', false);
       setLoading('ftp-card', false);
       setLoading('upload-progress', false);
     });
@@ -2060,9 +2062,11 @@ function loadUploadConfig() {
     }
     updateSmbPreview();
     setLoading('upload-cards-grid', false);
+    setLoading('upload-window-card', false);
     setLoading('ftp-card', false);
   }).catch(function() {
     setLoading('upload-cards-grid', false);
+    setLoading('upload-window-card', false);
     setLoading('ftp-card', false);
   });
 }
