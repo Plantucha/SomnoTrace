@@ -3260,7 +3260,6 @@ function clearSummary() {
     var e = document.getElementById(id); if (e) e.textContent = '--';
   });
   var s = document.getElementById('dash-summary'); if (s) s.style.display = 'none';
-  var sq = document.getElementById('dash-stream-quality'); if (sq) sq.style.display = 'none';
 }
 var dashSummary = null;   /* last /api/summary response for the current day */
 function loadSummary(noonDay, loadId) {
@@ -3655,9 +3654,11 @@ function loadDashboardData() {
   /* Reset per-day state before any async fetches complete to prevent
    * stale data from a previous day being used by renderSummary() when
    * the spool fetch resolves before the sessions fetch. */
+  dashSessions = [];
   dashSessionData = [];
   dashEvents = [];
   dashEventsLoaded = false;
+  renderStreamQuality();
   loadSummary(noonDay, dashLoadId + 1);   /* loadId matches the increment below */
 
   /* Cancel any in-flight load */
@@ -3697,6 +3698,7 @@ function loadDashboardData() {
       dashSetStatus('No sessions');
       dashProgHide();
       renderDashboardCharts();
+      renderStreamQuality();
       dashIsLoading = false;
       return;
     }
