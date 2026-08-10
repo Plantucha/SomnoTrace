@@ -38,6 +38,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
+#include "psram_task.h"
 
 static const char *TAG = "session_graph";
 
@@ -1068,7 +1069,7 @@ void session_graph_init(void)
     } else {
         ESP_LOGW(TAG, "snt worker PSRAM stack alloc failed, using internal stack");
         free(stack); free(tcb); stack = NULL; tcb = NULL;
-        xTaskCreate(snt_download_worker, "snt_download", SNT_WORKER_STACK, NULL, 4, &h);
+        h = psram_task_create(snt_download_worker, "snt_download", SNT_WORKER_STACK, NULL, 4, tskNO_AFFINITY, NULL, NULL);
     }
     if (!h) ESP_LOGE(TAG, "failed to create snt_download worker");
     else ESP_LOGI(TAG, "snt_download worker started (PSRAM stack=%s)", stack ? "yes" : "no");

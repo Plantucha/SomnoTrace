@@ -58,6 +58,9 @@
 #include "esp_timer.h"
 #include "esp_rom_crc.h"
 #include "esp_heap_caps.h"
+#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
+#include "esp_coexist.h"
+#endif
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "psram_task.h"
@@ -2133,6 +2136,9 @@ static void reconnect_task(void *arg)
     free(rpc);
 
     set_state(AS11_STATUS_PAIRED);
+    #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
+    esp_coex_status_bit_set(ESP_COEX_BLE_ST_MESH_TRAFFIC, true);
+    #endif
     ESP_LOGI(TAG, "reconnect: connected to %s, session established, streams started", addr_str);
 
     vTaskDelete(NULL);
@@ -2340,8 +2346,7 @@ esp_err_t as11_ble_confirm_pair(const char *passkey)
 {
     if (!passkey || !*passkey) return ESP_ERR_INVALID_ARG;
     strlcpy(s_passkey, passkey, sizeof(s_passkey));
-    TaskHandle_t h = NULL;
-    xTaskCreate(confirm_task, "as11_confirm", 8192, NULL, 5, &h);
+    TaskHandle_t h = psram_task_create(confirm_task, "as11_confirm", 8192, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     if (!h) {
         return ESP_ERR_NO_MEM;
     }

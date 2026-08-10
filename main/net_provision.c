@@ -910,6 +910,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
     cJSON_free(json_str);
     return ESP_OK;
@@ -1403,6 +1404,7 @@ static esp_err_t upload_progress_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_sendstr(req, json);
     free(json);
     return ESP_OK;
@@ -1427,6 +1429,7 @@ static esp_err_t upload_state_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_sendstr(req, json);
     free(json);
     return ESP_OK;
@@ -1440,6 +1443,7 @@ static esp_err_t upload_config_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free(json);
     return ESP_OK;
@@ -1489,6 +1493,7 @@ static esp_err_t alert_config_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free(json);
     return ESP_OK;
@@ -1567,6 +1572,7 @@ static esp_err_t device_settings_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free(json);
     return ESP_OK;
@@ -1611,6 +1617,7 @@ static esp_err_t settings_all_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
     cJSON_free(json_str);
     return ESP_OK;
@@ -2447,12 +2454,12 @@ static esp_err_t start_webserver(void)
     config.max_uri_handlers = 45;
     config.stack_size = 8192;
     config.max_open_sockets = 16;
-    config.recv_wait_timeout = 2;       /* close idle keep-alive sockets fast */
+    config.recv_wait_timeout = 1;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
     config.keep_alive_enable = true;    /* detect dead connections via TCP probes */
-    config.keep_alive_idle = 5;         /* start probing after 5s idle */
-    config.keep_alive_interval = 5;     /* probe every 5s */
-    config.keep_alive_count = 3;        /* 3 failed probes = dead */
+    config.keep_alive_idle = 2;         /* start probing after 2s idle */
+    config.keep_alive_interval = 2;     /* probe every 2s */
+    config.keep_alive_count = 2;        /* 2 failed probes = dead */
     /* Allocate the httpd worker task's stack from PSRAM to free internal RAM.
      * Safe because no handler performs a flash write on this task (see above). */
     config.task_caps = MALLOC_CAP_SPIRAM;
