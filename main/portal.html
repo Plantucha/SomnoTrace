@@ -168,7 +168,8 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .date-display{font-size:.95rem;font-weight:600;padding:0 14px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);user-select:none;border-left:1px solid var(--card-border);border-right:1px solid var(--card-border)}
 .date-picker-hidden{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
-.stat-card{display:flex;flex-direction:column;gap:4px}
+.stat-card{position:relative;overflow:hidden;display:flex;flex-direction:column;gap:4px;padding:14px 16px}
+.stat-card-icon{position:absolute;right:10px;bottom:8px;opacity:.12;width:48px;height:48px;pointer-events:none;z-index:0}
 .dash-signal-row{position:relative;margin-top:12px}
 .dash-signal-label{font-size:.72rem;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.02em;min-height:24px;display:flex;align-items:center;padding-right:148px}
 /* Per-panel zoom/pan/reset cluster. Sits on the heading line's right end and
@@ -225,11 +226,13 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
  * it stays in view while scrolling the tall panel stack. Mobile: fixed
  * bottom-right for thumb reach (won't scroll away). */
 .dashboard-charts-panel{padding:16px}
-.stat-val{font-size:1.8rem;font-weight:700}
-.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600;text-transform:uppercase;margin-top:4px;width:fit-content}
+.stat-val{font-size:1.75rem;font-weight:700;line-height:1.2;z-index:1;position:relative;display:flex;align-items:baseline;flex-wrap:wrap;gap:2px}
+.stat-val .unit{font-size:.85rem;font-weight:500;color:var(--text-muted);margin-left:2px}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600;text-transform:uppercase;margin-top:4px;width:fit-content;z-index:1;position:relative}
 .badge-green{background:rgba(16,185,129,.15);color:var(--success)}
 .badge-orange{background:rgba(245,158,11,.15);color:var(--warning)}
 .badge-red{background:rgba(239,68,68,.15);color:var(--danger)}
+.badge-gray{background:rgba(148,163,184,.15);color:var(--text-muted)}
 .chart-placeholder{min-height:300px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.9rem;text-align:center;padding:40px}
 
 /* ── Status Tab ────────────────────────────────────────────────── */
@@ -812,10 +815,30 @@ Save &amp; Reboot
 </div>
 </div>
 <div class="stats-grid">
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">AHI</div><div class="stat-val" id="stat-ahi">--</div><span class="badge badge-green" id="stat-ahi-badge">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Usage Time</div><div class="stat-val" id="stat-usage">--</div><span class="badge badge-green" id="stat-usage-badge">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Avg Leak Rate</div><div class="stat-val" id="stat-leak">--</div><span class="badge badge-green" id="stat-leak-badge">--</span></div>
-<div class="card stat-card"><div style="font-size:.8rem;color:var(--text-muted)">Average Pressure</div><div class="stat-val" id="stat-press">--</div><span class="badge badge-orange" id="stat-press-badge">--</span></div>
+<div class="card stat-card">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">AHI</div>
+  <div class="stat-val" id="stat-ahi">--</div>
+  <span class="badge badge-gray" id="stat-ahi-badge">--</span>
+</div>
+<div class="card stat-card">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">Usage Time</div>
+  <div class="stat-val" id="stat-usage">--</div>
+  <span class="badge badge-gray" id="stat-usage-badge">--</span>
+</div>
+<div class="card stat-card">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#06b6d4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.7 7.7a2.5 2.5 0 1 1 1.8 4.3H2"/><path d="M9.6 4.6A2 2 0 1 1 11 8H2"/><path d="M12.6 19.4A2 2 0 1 0 14 16H2"/></svg>
+  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">Avg Leak Rate</div>
+  <div class="stat-val" id="stat-leak">--</div>
+  <span class="badge badge-gray" id="stat-leak-badge">--</span>
+</div>
+<div class="card stat-card">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">Average Pressure</div>
+  <div class="stat-val" id="stat-press">--</div>
+  <span class="badge badge-gray" id="stat-press-badge">--</span>
+</div>
 </div>
 <div id="dash-progress" class="dash-progress-wrap">
 <div class="dash-progress-track"><div class="dash-progress-fill" id="dash-progress-fill"></div></div>
@@ -3247,17 +3270,39 @@ function fmtUsage(min) {
   var h = Math.floor(min / 60), m = Math.round(min % 60);
   return h > 0 ? (h + 'h ' + m + 'm') : (m + 'm');
 }
+function fmtUsageHtml(min) {
+  if (min == null || isNaN(min)) return '--';
+  var h = Math.floor(min / 60), m = Math.round(min % 60);
+  return h > 0 ? (h + '<span class="unit">h</span> ' + m + '<span class="unit">m</span>') : (m + '<span class="unit">m</span>');
+}
 /* AHI severity → badge class (matches the app's badge palette). */
 function ahiBadge(ahi) {
-  if (ahi == null || isNaN(ahi)) return { cls: 'badge-green', txt: '--' };
+  if (ahi == null || isNaN(ahi)) return { cls: 'badge-gray', txt: '--' };
   if (ahi < 5)  return { cls: 'badge-green',  txt: 'Normal' };
   if (ahi < 15) return { cls: 'badge-orange', txt: 'Mild' };
   if (ahi < 30) return { cls: 'badge-orange', txt: 'Moderate' };
   return { cls: 'badge-red', txt: 'Severe' };
 }
+function usageBadge(min) {
+  if (min == null || isNaN(min)) return { cls: 'badge-gray', txt: '--' };
+  if (min >= 240) return { cls: 'badge-green', txt: '≥ 4h Compliant' };
+  return { cls: 'badge-orange', txt: '< 4h Short' };
+}
+function leakBadge(leak) {
+  if (!leak || leak.mean == null || isNaN(leak.mean)) return { cls: 'badge-gray', txt: '--' };
+  if (leak.mean < 24) return { cls: 'badge-green', txt: '< 24 L/min Good' };
+  return { cls: 'badge-orange', txt: '≥ 24 L/min High' };
+}
+function pressBadge(press) {
+  if (!press || press.p95 == null || isNaN(press.p95)) return { cls: 'badge-gray', txt: '--' };
+  return { cls: 'badge-orange', txt: '95% ' + press.p95.toFixed(1) + '<span class="unit" style="font-weight:400;text-transform:none"> cmH₂O</span>' };
+}
 function clearSummary() {
   ['stat-ahi','stat-usage','stat-leak','stat-press'].forEach(function(id){
-    var e = document.getElementById(id); if (e) e.textContent = '--';
+    var e = document.getElementById(id); if (e) e.innerHTML = '--';
+  });
+  ['stat-ahi-badge','stat-usage-badge','stat-leak-badge','stat-press-badge'].forEach(function(id){
+    setBadge(id, 'badge-gray', '--');
   });
   var s = document.getElementById('dash-summary'); if (s) s.style.display = 'none';
 }
@@ -3273,10 +3318,10 @@ function loadSummary(noonDay, loadId) {
     renderSummary();
   }).catch(function(){ if (loadId === dashLoadId) { dashSummary = null; clearSummary(); } });
 }
-function setStat(id, txt) { var e = document.getElementById(id); if (e) e.textContent = txt; }
+function setStat(id, txt) { var e = document.getElementById(id); if (e) e.innerHTML = txt; }
 function setBadge(id, cls, txt) {
   var e = document.getElementById(id); if (!e) return;
-  e.className = 'badge ' + cls; e.textContent = txt;
+  e.className = 'badge ' + cls; e.innerHTML = txt;
 }
 function num(v, dec) { return (v == null || isNaN(v)) ? '--' : v.toFixed(dec == null ? 1 : dec); }
 
@@ -3409,11 +3454,15 @@ function renderSummary() {
   var ab = ahiBadge(ahi); setBadge('stat-ahi-badge', ab.cls, ab.txt);
   /* Usage from the session data spans (OSCAR's definition), not the spool. */
   var usageMin = computeUsageMin();
-  setStat('stat-usage', usageMin != null ? fmtUsage(usageMin) : '--');
+  setStat('stat-usage', usageMin != null ? fmtUsageHtml(usageMin) : '--');
+  var ub = usageBadge(usageMin); setBadge('stat-usage-badge', ub.cls, ub.txt);
   /* 2 decimals: leak averages are often well under 1 L/min, where 1 decimal
    * hides real differences (0.6248 shows as "0.6" instead of "0.62"). */
-  setStat('stat-leak', leak && leak.mean != null ? num(leak.mean, 2) + ' L/min' : '--');
-  setStat('stat-press', press && press.mean != null ? num(press.mean, 2) + ' cmH\u2082O' : '--');
+  setStat('stat-leak', leak && leak.mean != null ? num(leak.mean, 2) + ' <span class="unit">L/min</span>' : '--');
+  var lb = leakBadge(leak); setBadge('stat-leak-badge', lb.cls, lb.txt);
+
+  setStat('stat-press', press && press.mean != null ? num(press.mean, 2) + ' <span class="unit">cmH\u2082O</span>' : '--');
+  var pb = pressBadge(press); setBadge('stat-press-badge', pb.cls, pb.txt);
 
   /* Event breakdown (computed indices preferred over spool) */
   var brk = document.getElementById('dash-breakdown');
