@@ -530,7 +530,7 @@ SleepHQ Cloud Upload
 </div>
 
 <!-- Section 4: Remote File Access (FTP) -->
-<div class="card sta-only mt-md">
+<div class="card card-upload sta-only mt-md" id="upload-window-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M11 7h2v2h-2V7zm0 4h2v6h-2v-6zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
 Upload Window
@@ -629,53 +629,112 @@ Therapy Interruption Alerts
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px">
 <div class="form-group">
 <label>Window start</label>
-<select id="alert-win-start" class="form-control" onchange="autoSaveAlert()">
-<option value="1080">18:00</option>
-<option value="1140">19:00</option>
-<option value="1200">20:00</option>
-<option value="1260">21:00</option>
-<option value="1320">22:00</option>
-<option value="1380" selected>23:00</option>
+<select id="alert-win-start" class="form-control" onchange="updateAlertWindowSummary();autoSaveAlert()">
 <option value="0">00:00</option>
+<option value="30">00:30</option>
 <option value="60">01:00</option>
+<option value="90">01:30</option>
 <option value="120">02:00</option>
+<option value="150">02:30</option>
 <option value="180">03:00</option>
+<option value="210">03:30</option>
 <option value="240">04:00</option>
+<option value="270">04:30</option>
 <option value="300">05:00</option>
-<option value="360" selected>06:00</option>
+<option value="330">05:30</option>
+<option value="360">06:00</option>
+<option value="390">06:30</option>
 <option value="420">07:00</option>
+<option value="450">07:30</option>
 <option value="480">08:00</option>
+<option value="510">08:30</option>
 <option value="540">09:00</option>
+<option value="570">09:30</option>
 <option value="600">10:00</option>
+<option value="630">10:30</option>
 <option value="660">11:00</option>
+<option value="690">11:30</option>
 <option value="720">12:00</option>
+<option value="750">12:30</option>
+<option value="780">13:00</option>
+<option value="810">13:30</option>
+<option value="840">14:00</option>
+<option value="870">14:30</option>
+<option value="900">15:00</option>
+<option value="930">15:30</option>
+<option value="960">16:00</option>
+<option value="990">16:30</option>
+<option value="1020">17:00</option>
+<option value="1050">17:30</option>
+<option value="1080">18:00</option>
+<option value="1110">18:30</option>
+<option value="1140">19:00</option>
+<option value="1170">19:30</option>
+<option value="1200">20:00</option>
+<option value="1230">20:30</option>
+<option value="1260">21:00</option>
+<option value="1290">21:30</option>
+<option value="1320">22:00</option>
+<option value="1350">22:30</option>
+<option value="1380" selected>23:00</option>
+<option value="1410">23:30</option>
 </select>
 </div>
 <div class="form-group">
 <label>Window end</label>
-<select id="alert-win-end" class="form-control" onchange="autoSaveAlert()">
-<option value="1080">18:00</option>
-<option value="1140">19:00</option>
-<option value="1200">20:00</option>
-<option value="1260">21:00</option>
-<option value="1320">22:00</option>
-<option value="1380">23:00</option>
+<select id="alert-win-end" class="form-control" onchange="updateAlertWindowSummary();autoSaveAlert()">
 <option value="0">00:00</option>
+<option value="30">00:30</option>
 <option value="60">01:00</option>
+<option value="90">01:30</option>
 <option value="120">02:00</option>
+<option value="150">02:30</option>
 <option value="180">03:00</option>
+<option value="210">03:30</option>
 <option value="240">04:00</option>
+<option value="270">04:30</option>
 <option value="300">05:00</option>
+<option value="330">05:30</option>
 <option value="360" selected>06:00</option>
+<option value="390">06:30</option>
 <option value="420">07:00</option>
+<option value="450">07:30</option>
 <option value="480">08:00</option>
+<option value="510">08:30</option>
 <option value="540">09:00</option>
+<option value="570">09:30</option>
 <option value="600">10:00</option>
+<option value="630">10:30</option>
 <option value="660">11:00</option>
+<option value="690">11:30</option>
 <option value="720">12:00</option>
+<option value="750">12:30</option>
+<option value="780">13:00</option>
+<option value="810">13:30</option>
+<option value="840">14:00</option>
+<option value="870">14:30</option>
+<option value="900">15:00</option>
+<option value="930">15:30</option>
+<option value="960">16:00</option>
+<option value="990">16:30</option>
+<option value="1020">17:00</option>
+<option value="1050">17:30</option>
+<option value="1080">18:00</option>
+<option value="1110">18:30</option>
+<option value="1140">19:00</option>
+<option value="1170">19:30</option>
+<option value="1200">20:00</option>
+<option value="1230">20:30</option>
+<option value="1260">21:00</option>
+<option value="1290">21:30</option>
+<option value="1320">22:00</option>
+<option value="1350">22:30</option>
+<option value="1380">23:00</option>
+<option value="1410">23:30</option>
 </select>
 </div>
 </div>
+<div id="alert-win-summary" style="font-size:.8rem;color:var(--primary);font-weight:500;margin-top:2px"></div>
 <div class="form-group" style="margin-top:10px">
 <label>Delay after therapy stop (minutes) <span id="alert-delay1-val" style="font-weight:normal;color:var(--text-muted)">5</span></label>
 <input type="range" id="alert-delay1" class="form-control" min="1" max="20" step="1" value="5" style="padding:0" oninput="document.getElementById('alert-delay1-val').textContent=this.value" onchange="autoSaveAlert()">
@@ -1085,7 +1144,7 @@ function markDirty(el) {
     isDirty.tz = true;
   } else {
     var card = el ? el.closest('.card') : null;
-    if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq') || card.id === 'ftp-card')) {
+    if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq') || card.classList.contains('card-upload') || card.id === 'ftp-card' || (el && el.id === 'upload-max-days'))) {
       isDirty.upload = true;
     } else {
       isDirty.wifi = true;
@@ -1871,14 +1930,40 @@ function autoSaveAlert() {
     });
   }, 300);
 }
+function updateAlertWindowSummary() {
+  var sEl = document.getElementById('alert-win-start');
+  var eEl = document.getElementById('alert-win-end');
+  var sumEl = document.getElementById('alert-win-summary');
+  if (!sEl || !eEl || !sumEl) return;
+  var s = parseInt(sEl.value, 10);
+  var e = parseInt(eEl.value, 10);
+  if (isNaN(s) || isNaN(e)) return;
+
+  var pad = function(n) { return (n < 10 ? '0' : '') + n; };
+  var fmtTime = function(m) {
+    return pad(Math.floor(m / 60)) + ':' + pad(m % 60);
+  };
+
+  if (s === e) {
+    sumEl.textContent = '🔄 Monitored 24 hours a day (always active)';
+  } else if (s < e) {
+    var dur = ((e - s) / 60).toFixed(s % 60 || e % 60 ? 1 : 0);
+    sumEl.textContent = '☀️ Active daytime (' + fmtTime(s) + ' to ' + fmtTime(e) + ' — ' + dur + ' hrs total)';
+  } else {
+    var dur = ((1440 - s + e) / 60).toFixed(s % 60 || e % 60 ? 1 : 0);
+    sumEl.textContent = '🌙 Active overnight (' + fmtTime(s) + ' to ' + fmtTime(e) + ' next day — ' + dur + ' hrs total)';
+  }
+}
+
 function renderAlertConfig(d) {
   var setVal = function(id, v) { var el = document.getElementById(id); if (el) el.value = v; };
   var setTxt = function(id, v) { var el = document.getElementById(id); if (el) el.textContent = v; };
   var setChk = function(id, v) { var el = document.getElementById(id); if (el) el.checked = !!v; };
   setChk('alert-enabled', d.enabled);
   toggleCardDisabled('alert-card', 'alert-enabled');
-  setVal('alert-win-start', String(d.win_start || 1380));
-  setVal('alert-win-end', String(d.win_end || 360));
+  setVal('alert-win-start', String(d.win_start !== undefined ? d.win_start : 1380));
+  setVal('alert-win-end', String(d.win_end !== undefined ? d.win_end : 360));
+  updateAlertWindowSummary();
   setVal('alert-delay1', d.delay1 || 5);
   setTxt('alert-delay1-val', d.delay1 || 5);
   setVal('alert-ntfy-srv', d.ntfy_srv || 'https://ntfy.sh');
