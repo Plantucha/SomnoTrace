@@ -49,6 +49,21 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 --color-spo2:#2563eb;--color-pulse:#dc2626;
 --color-flowlim:#db2777;--color-snore:#059669;
 }
+[data-theme="day"] .badge-green{background:#ecfdf5;color:#047857;border:1px solid #10b981;box-shadow:0 1px 5px rgba(16,185,129,.25)}
+[data-theme="day"] .badge-blue{background:#eff6ff;color:#1d4ed8;border:1px solid #3b82f6;box-shadow:0 1px 5px rgba(59,130,246,.25)}
+[data-theme="day"] .badge-orange{background:#fffbeb;color:#b45309;border:1px solid #f59e0b;box-shadow:0 1px 5px rgba(245,158,11,.25)}
+[data-theme="day"] .badge-red{background:#fef2f2;color:#b91c1c;border:1px solid #ef4444;box-shadow:0 1px 5px rgba(239,68,68,.25)}
+[data-theme="day"] .badge-gray{background:#f1f5f9;color:#475569;border:1px solid #cbd5e1}
+[data-theme="day"] .stat-card-ahi{background:linear-gradient(135deg,rgba(59,130,246,.26),rgba(59,130,246,.08));border:1px solid rgba(59,130,246,.55);box-shadow:0 4px 18px -2px rgba(59,130,246,.30)}
+[data-theme="day"] .stat-card-usage{background:linear-gradient(135deg,rgba(16,185,129,.26),rgba(16,185,129,.08));border:1px solid rgba(16,185,129,.55);box-shadow:0 4px 18px -2px rgba(16,185,129,.30)}
+[data-theme="day"] .stat-card-leak{background:linear-gradient(135deg,rgba(245,158,11,.26),rgba(245,158,11,.08));border:1px solid rgba(245,158,11,.55);box-shadow:0 4px 18px -2px rgba(245,158,11,.30)}
+[data-theme="day"] .stat-card-press{background:linear-gradient(135deg,rgba(244,63,94,.26),rgba(244,63,94,.08));border:1px solid rgba(244,63,94,.55);box-shadow:0 4px 18px -2px rgba(244,63,94,.30)}
+[data-theme="day"] .stat-card-icon{opacity:.65}
+[data-theme="day"] .stat-card-ahi .stat-card-title{color:#1d4ed8}
+[data-theme="day"] .stat-card-usage .stat-card-title{color:#047857}
+[data-theme="day"] .stat-card-leak .stat-card-title{color:#b45309}
+[data-theme="day"] .stat-val{color:#0f172a}
+[data-theme="day"] .stat-val .unit{color:#64748b}
 .mt-xs{margin-top:var(--space-xs)}.mt-sm{margin-top:var(--space-sm)}.mt-md{margin-top:var(--space-md)}.mt-lg{margin-top:var(--space-lg)}
 .mb-xs{margin-bottom:var(--space-xs)}.mb-sm{margin-bottom:var(--space-sm)}.mb-md{margin-bottom:var(--space-md)}
 .card-disabled-placeholder{opacity:.5;display:flex;flex-direction:column;justify-content:space-between}
@@ -168,8 +183,19 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .date-display{font-size:.95rem;font-weight:600;padding:0 14px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);user-select:none;border-left:1px solid var(--card-border);border-right:1px solid var(--card-border)}
 .date-picker-hidden{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
-.stat-card{position:relative;overflow:hidden;display:flex;flex-direction:column;gap:4px;padding:14px 16px}
-.stat-card-icon{position:absolute;right:10px;bottom:8px;opacity:.12;width:48px;height:48px;pointer-events:none;z-index:0}
+.stat-card{position:relative;overflow:hidden;display:flex;flex-direction:column;gap:6px;padding:16px;border-radius:12px;transition:transform .2s ease,box-shadow .2s ease;backdrop-filter:blur(8px)}
+.stat-card:hover{transform:translateY(-2px)}
+.stat-card-ahi{background:linear-gradient(135deg,rgba(59,130,246,.18),rgba(59,130,246,.06));border:1px solid rgba(59,130,246,.40);box-shadow:0 3px 12px -2px rgba(59,130,246,.18)}
+.stat-card-usage{background:linear-gradient(135deg,rgba(16,185,129,.18),rgba(16,185,129,.06));border:1px solid rgba(16,185,129,.40);box-shadow:0 3px 12px -2px rgba(16,185,129,.18)}
+.stat-card-leak{background:linear-gradient(135deg,rgba(245,158,11,.18),rgba(245,158,11,.06));border:1px solid rgba(245,158,11,.40);box-shadow:0 3px 12px -2px rgba(245,158,11,.18)}
+.stat-card-press{background:linear-gradient(135deg,rgba(244,63,94,.18),rgba(244,63,94,.06));border:1px solid rgba(244,63,94,.40);box-shadow:0 3px 12px -2px rgba(244,63,94,.18)}
+.stat-card-icon{position:absolute;right:8px;bottom:6px;opacity:.42;width:56px;height:56px;pointer-events:none;z-index:0;transition:transform .3s ease,opacity .3s ease}
+.stat-card:hover .stat-card-icon{transform:scale(1.1);opacity:.60}
+.stat-card-title{font-size:.82rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;z-index:1;position:relative}
+.stat-card-ahi .stat-card-title{color:#60a5fa}
+.stat-card-usage .stat-card-title{color:#34d399}
+.stat-card-leak .stat-card-title{color:#fbbf24}
+.stat-card-press .stat-card-title{color:#fb7185}
 .dash-signal-row{position:relative;margin-top:12px}
 .dash-signal-label{font-size:.72rem;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.02em;min-height:24px;display:flex;align-items:center;padding-right:148px}
 /* Per-panel zoom/pan/reset cluster. Sits on the heading line's right end and
@@ -226,13 +252,14 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
  * it stays in view while scrolling the tall panel stack. Mobile: fixed
  * bottom-right for thumb reach (won't scroll away). */
 .dashboard-charts-panel{padding:16px}
-.stat-val{font-size:1.75rem;font-weight:700;line-height:1.2;z-index:1;position:relative;display:flex;align-items:baseline;flex-wrap:wrap;gap:2px}
-.stat-val .unit{font-size:.85rem;font-weight:500;color:var(--text-muted);margin-left:2px}
-.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600;text-transform:uppercase;margin-top:4px;width:fit-content;z-index:1;position:relative}
-.badge-green{background:rgba(16,185,129,.15);color:var(--success)}
-.badge-orange{background:rgba(245,158,11,.15);color:var(--warning)}
-.badge-red{background:rgba(239,68,68,.15);color:var(--danger)}
-.badge-gray{background:rgba(148,163,184,.15);color:var(--text-muted)}
+.stat-val{font-size:1.85rem;font-weight:700;line-height:1.2;z-index:1;position:relative;display:flex;align-items:baseline;flex-wrap:wrap;gap:2px;color:#cbd5e1}
+.stat-val .unit{font-size:.9rem;font-weight:500;color:#64748b;margin-left:2px}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:.72rem;font-weight:700;text-transform:uppercase;margin-top:4px;width:fit-content;z-index:1;position:relative;letter-spacing:.03em;transition:all .2s ease}
+.badge-green{background:#06231a;color:#34d399;border:1px solid rgba(16,185,129,.40);box-shadow:0 0 5px rgba(16,185,129,.20)}
+.badge-orange{background:#281b0a;color:#fbbf24;border:1px solid rgba(245,158,11,.40);box-shadow:0 0 5px rgba(245,158,11,.20)}
+.badge-red{background:#2a1215;color:#f87171;border:1px solid rgba(239,68,68,.40);box-shadow:0 0 5px rgba(239,68,68,.20)}
+.badge-blue{background:#0c1e38;color:#60a5fa;border:1px solid rgba(59,130,246,.40);box-shadow:0 0 5px rgba(59,130,246,.20)}
+.badge-gray{background:#1e293b;color:#94a3b8;border:1px solid #475569}
 .chart-placeholder{min-height:300px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:.9rem;text-align:center;padding:40px}
 
 /* ── Status Tab ────────────────────────────────────────────────── */
@@ -815,27 +842,27 @@ Save &amp; Reboot
 </div>
 </div>
 <div class="stats-grid">
-<div class="card stat-card">
-  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">AHI</div>
+<div class="card stat-card stat-card-ahi">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+  <div class="stat-card-title">AHI</div>
   <div class="stat-val" id="stat-ahi">--</div>
   <span class="badge badge-gray" id="stat-ahi-badge">--</span>
 </div>
-<div class="card stat-card">
-  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">Usage Time</div>
+<div class="card stat-card stat-card-usage">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+  <div class="stat-card-title">Usage Time</div>
   <div class="stat-val" id="stat-usage">--</div>
   <span class="badge badge-gray" id="stat-usage-badge">--</span>
 </div>
-<div class="card stat-card">
-  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#06b6d4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.7 7.7a2.5 2.5 0 1 1 1.8 4.3H2"/><path d="M9.6 4.6A2 2 0 1 1 11 8H2"/><path d="M12.6 19.4A2 2 0 1 0 14 16H2"/></svg>
-  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">Avg Leak Rate</div>
+<div class="card stat-card stat-card-leak">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.7 7.7a2.5 2.5 0 1 1 1.8 4.3H2"/><path d="M9.6 4.6A2 2 0 1 1 11 8H2"/><path d="M12.6 19.4A2 2 0 1 0 14 16H2"/></svg>
+  <div class="stat-card-title">Avg Leak Rate</div>
   <div class="stat-val" id="stat-leak">--</div>
   <span class="badge badge-gray" id="stat-leak-badge">--</span>
 </div>
-<div class="card stat-card">
-  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
-  <div style="font-size:.8rem;color:var(--text-muted);font-weight:500">Average Pressure</div>
+<div class="card stat-card stat-card-press">
+  <svg class="stat-card-icon" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z"/><path d="M12 12l4.5-4.5"/><circle cx="12" cy="12" r="2.5"/></svg>
+  <div class="stat-card-title">Average Pressure</div>
   <div class="stat-val" id="stat-press">--</div>
   <span class="badge badge-gray" id="stat-press-badge">--</span>
 </div>
@@ -3295,7 +3322,7 @@ function leakBadge(leak) {
 }
 function pressBadge(press) {
   if (!press || press.p95 == null || isNaN(press.p95)) return { cls: 'badge-gray', txt: '--' };
-  return { cls: 'badge-orange', txt: '95% ' + press.p95.toFixed(1) + '<span class="unit" style="font-weight:400;text-transform:none"> cmH₂O</span>' };
+  return { cls: 'badge-blue', txt: '95% ' + press.p95.toFixed(1) + '<span class="unit" style="font-weight:400;text-transform:none"> cmH₂O</span>' };
 }
 function clearSummary() {
   ['stat-ahi','stat-usage','stat-leak','stat-press'].forEach(function(id){
