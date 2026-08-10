@@ -2509,6 +2509,15 @@ document.addEventListener('visibilitychange', function() {
   }
 });
 
+var closeWsCleanly = function() {
+  if (appWs && appWs.readyState === WebSocket.OPEN) {
+    try { appWs.close(1000, "pagehide"); } catch(e) {}
+    appWs = null;
+  }
+};
+window.addEventListener('pagehide', closeWsCleanly);
+window.addEventListener('beforeunload', closeWsCleanly);
+
 function renderLogTerminal(forceScroll) {
   var term = document.getElementById('log-terminal');
   if (!term) return;

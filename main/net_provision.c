@@ -2453,7 +2453,7 @@ static esp_err_t start_webserver(void)
     config.lru_purge_enable = true;
     config.max_uri_handlers = 45;
     config.stack_size = 8192;
-    config.max_open_sockets = 16;
+    config.max_open_sockets = 20;
     config.recv_wait_timeout = 1;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
     config.keep_alive_enable = true;    /* detect dead connections via TCP probes */
@@ -2463,6 +2463,9 @@ static esp_err_t start_webserver(void)
     /* Allocate the httpd worker task's stack from PSRAM to free internal RAM.
      * Safe because no handler performs a flash write on this task (see above). */
     config.task_caps = MALLOC_CAP_SPIRAM;
+
+    /* Silence benign peer-reset (104 ECONNRESET) log noise on client disconnects. */
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
 
     ESP_LOGI(TAG, "starting httpd: stack=%d (PSRAM), handlers=%d, internal free=%u",
              config.stack_size, config.max_uri_handlers,
