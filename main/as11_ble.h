@@ -133,3 +133,10 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys);
  * Requires an active encrypted BLE session.
  * Returns ESP_OK on success. */
 esp_err_t as11_ble_stop_therapy(void);
+
+/* Generic BLE JSON-RPC passthrough interface.
+ * Transmits json_in over the encrypted BLE session, awaits the AS11 response,
+ * and returns the decrypted response string in *json_out (malloc'd, caller frees).
+ * Requires an active encrypted BLE session. */
+esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_t timeout_ms);
+

@@ -160,6 +160,7 @@ static SemaphoreHandle_t s_connect_sem;
 static volatile int s_connect_status;
 static SemaphoreHandle_t s_resp_sem;  /* JSON RPC response arrived */
 static cJSON *s_resp_json;            /* owned; freed by waiter */
+static SemaphoreHandle_t s_cmd_mtx;   /* serialization mutex for RPC requests */
 
 static uint8_t *s_rx_buf;          /* PSRAM-allocated, RX_BUF_MAX bytes */
 static int s_rx_len;
@@ -2214,11 +2215,12 @@ static void host_task(void *param)
 esp_err_t as11_ble_init(void)
 {
     s_state_mtx  = xSemaphoreCreateMutex();
+    s_cmd_mtx    = xSemaphoreCreateMutex();
     s_op_sem     = xSemaphoreCreateBinary();
     s_connect_sem = xSemaphoreCreateBinary();
     s_resp_sem   = xSemaphoreCreateBinary();
     s_scan_done  = xSemaphoreCreateBinary();
-    if (!s_state_mtx || !s_op_sem || !s_connect_sem || !s_resp_sem || !s_scan_done) {
+    if (!s_state_mtx || !s_cmd_mtx || !s_op_sem || !s_connect_sem || !s_resp_sem || !s_scan_done) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -2850,5 +2852,46 @@ esp_err_t as11_ble_stop_therapy(void)
 
     ESP_LOGI(TAG, "stop_therapy: EnterStandby accepted");
     cJSON_Delete(resp);
+    return ESP_OK;
+}
+
+esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_t timeout_ms)
+{
+    if (!json_in || !*json_in || !json_out) return ESP_ERR_INVALID_ARG;
+    *json_out = NULL;
+
+    if (!s_session_encrypted) {
+        ESP_LOGW(TAG, "passthrough_rpc: no active encrypted BLE session");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "passthrough_rpc: BLE command bus busy");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    clear_response();
+    if (send_rpc_encrypted(json_in) != ESP_OK) {
+        ESP_LOGE(TAG, "passthrough_rpc: send_rpc_encrypted failed");
+        xSemaphoreGive(s_cmd_mtx);
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = wait_response((int)timeout_ms);
+    if (!resp) {
+        ESP_LOGW(TAG, "passthrough_rpc: timeout waiting for AS11 response");
+        xSemaphoreGive(s_cmd_mtx);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    char *resp_str = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    xSemaphoreGive(s_cmd_mtx);
+
+    if (!resp_str) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    *json_out = resp_str;
     return ESP_OK;
 }

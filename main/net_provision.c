@@ -1103,6 +1103,52 @@ static esp_err_t ble_forget_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t ble_passthrough_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 2048) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body (1..2048 bytes)");
+        return ESP_FAIL;
+    }
+
+    char *body = heap_caps_malloc(total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    char *out_json = NULL;
+    esp_err_t err = as11_ble_passthrough_rpc(body, &out_json, 10000);
+    free(body);
+
+    if (err != ESP_OK || !out_json) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Connection", "close");
+        const char *errmsg = (err == ESP_ERR_INVALID_STATE) ? "BLE session not active/paired" :
+                             (err == ESP_ERR_TIMEOUT) ? "BLE response timeout" : "BLE RPC failed";
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "{\"ok\":false,\"error\":\"%s\"}", errmsg);
+        httpd_resp_sendstr(req, errbuf);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, out_json, HTTPD_RESP_USE_STRLEN);
+    free(out_json);
+    return ESP_OK;
+}
+
 static void reboot_task(void *arg)
 {
     (void)arg;
@@ -2515,10 +2561,12 @@ static esp_err_t start_webserver(void)
     httpd_uri_t ble_pair = { .uri = "/api/ble/pair", .method = HTTP_POST, .handler = ble_pair_handler };
     httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
     httpd_uri_t ble_forget = { .uri = "/api/ble/forget", .method = HTTP_POST, .handler = ble_forget_handler };
+    httpd_uri_t ble_pass = { .uri = "/api/ble/passthrough", .method = HTTP_POST, .handler = ble_passthrough_handler };
     httpd_register_uri_handler(s_httpd, &ble_scan);
     httpd_register_uri_handler(s_httpd, &ble_pair);
     httpd_register_uri_handler(s_httpd, &ble_conf);
     httpd_register_uri_handler(s_httpd, &ble_forget);
+    httpd_register_uri_handler(s_httpd, &ble_pass);
 
     /* EZShare-compatible file server endpoints */
     httpd_uri_t dir_hdl = { .uri = "/dir", .method = HTTP_GET, .handler = dir_get_handler };
