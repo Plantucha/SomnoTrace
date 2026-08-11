@@ -178,8 +178,10 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 /* ── Dashboard ─────────────────────────────────────────────────── */
 .dashboard-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
 .date-navigator{display:flex;align-items:center;background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;overflow:hidden}
-.date-btn{background:none;border:none;color:var(--text);width:40px;height:40px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .2s}
-.date-btn:hover{background:var(--input-bg)}
+.date-btn{background:none;border:none;color:var(--text);width:40px;height:40px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .2s;-webkit-tap-highlight-color:transparent}
+@media(hover:hover){.date-btn:hover{background:var(--input-bg)}}
+.date-btn:active{background:var(--input-bg)}
+.date-btn:focus,.date-btn:focus-visible{outline:none}
 .date-display{font-size:.95rem;font-weight:600;padding:0 14px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);user-select:none;border-left:1px solid var(--card-border);border-right:1px solid var(--card-border)}
 .date-picker-hidden{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
@@ -324,6 +326,12 @@ header{flex-direction:column;height:auto;padding:10px 12px;gap:6px}
 .theme-selector{align-self:flex-end}
 main{padding:8px}
 .card{padding:14px}
+.stats-grid{grid-template-columns:repeat(2,1fr);gap:8px}
+.stat-card{padding:10px 8px;gap:3px}
+.stat-card-title{font-size:.74rem}
+.stat-val{font-size:1.35rem}
+.stat-card-icon{width:36px;height:36px;right:4px;bottom:4px;opacity:.25}
+.stat-card .badge{font-size:.64rem;padding:2px 6px;margin-top:2px;letter-spacing:.01em}
 /* Charts go near-edge-to-edge on phones to reclaim horizontal space for the
  * plotting area (every pixel counts on a narrow screen). */
 .dashboard-charts-panel{padding:10px 4px}
@@ -489,7 +497,7 @@ Wellue/Viatom O2 Ring S Pulse Oximeter
 </div>
 <div class="settings-grid-2col sta-only" id="upload-cards-grid">
 <!-- Network Folder (SMB) -->
-<div class="card" id="smb-card">
+<div class="card card-smb" id="smb-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M20 6H12L10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
 Network Folder (SMB Share)
@@ -532,7 +540,7 @@ Network Folder (SMB Share)
 </div>
 
 <!-- SleepHQ Cloud -->
-<div class="card" id="shq-card">
+<div class="card card-shq" id="shq-card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4s1.79-4 4-4h.71A5.5 5.5 0 0 1 12 6c2.76 0 5 2.24 5 5v1h2c1.65 0 3 1.35 3 3s-1.35 3-3 3z"/></svg>
 SleepHQ Cloud Upload
@@ -1196,7 +1204,7 @@ function markDirty(el) {
     isDirty.tz = true;
   } else {
     var card = el ? el.closest('.card') : null;
-    if (card && (card.classList.contains('card-smb') || card.classList.contains('card-shq') || card.classList.contains('card-upload') || card.id === 'ftp-card' || (el && el.id === 'upload-max-days'))) {
+    if (card && (card.id === 'smb-card' || card.id === 'shq-card' || card.id === 'ftp-card' || card.id === 'upload-window-card' || card.classList.contains('card-smb') || card.classList.contains('card-shq') || card.classList.contains('card-upload') || (el && el.id === 'upload-max-days'))) {
       isDirty.upload = true;
     } else {
       isDirty.wifi = true;
@@ -2656,6 +2664,7 @@ function handleDateChange(val) { updateDateDisplayLabel(val); loadSessionData();
 
 /* Step to the previous/next noon-day that actually has data. */
 function stepDate(dir) {
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
   if (!dashDays.length) return;
   var cur = isoToDay(document.getElementById('session-date').value);
   var idx = -1;
@@ -2679,6 +2688,7 @@ function selectDay(iso) {
 }
 
 function toggleCalendar() {
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
   var el = document.getElementById('dash-calendar');
   if (!el) return;
   if (el.style.display === 'none' || !el.style.display) {
