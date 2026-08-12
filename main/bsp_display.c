@@ -81,6 +81,13 @@ static uint16_t *s_strip[LCD_STRIP_BUFS] = { NULL, NULL };
 static SemaphoreHandle_t s_flush_done = NULL;
 static TaskHandle_t s_display_task = NULL;
 
+/* Periodic panel refresh: re-send ST7789 initialisation commands to prevent
+ * the display controller from drifting into an undefined state during extended
+ * continuous rendering.  Value is in lcd_flush() calls (~25 Hz during graph
+ * mode → every ~30 minutes). */
+#define LCD_REFRESH_INTERVAL  45000
+static uint32_t s_flush_count = 0;
+
 /* ── Display state (single-owner render task model) ──────────────────
  *
  * Only the render task (display_task) ever touches the framebuffer s_fb
@@ -235,6 +242,19 @@ static bool IRAM_ATTR lcd_color_done_cb(esp_lcd_panel_io_handle_t io,
  * Wi-Fi and SDMMC have claimed internal RAM, silently dropping frames. By
  * copying each strip into a small, permanently-allocated internal DMA buffer
  * we guarantee the transfer always succeeds regardless of heap state. */
+/* Re-send the ST7789 initialisation sequence (without a hardware reset) to
+ * recover from any accumulated SPI/controller state drift.  Called from the
+ * display_task only, so no locking is needed for the panel handle. */
+static void lcd_panel_refresh(void)
+{
+    if (!s_panel) return;
+    esp_lcd_panel_init(s_panel);
+    esp_lcd_panel_invert_color(s_panel, LCD_INVERT_COLOR);
+    esp_lcd_panel_set_gap(s_panel, 0, 0);
+    esp_lcd_panel_disp_on_off(s_panel, true);
+    ESP_LOGI(TAG, "panel refresh (re-init)");
+}
+
 static void lcd_flush(void)
 {
     if (!s_panel || !s_fb) return;
@@ -1118,10 +1138,26 @@ static void display_task(void *arg)
         if (mode == DISP_MODE_GRAPH) {
             /* Redraw on new data or when first entering graph mode. */
             if (notified || mode_changed) {
+                if (mode_changed) s_flush_count = 0;
                 render_graph();
+                s_flush_count++;
+                /* Periodic panel refresh to prevent ST7789 state drift
+                 * during extended continuous rendering sessions. */
+                if (s_flush_count % LCD_REFRESH_INTERVAL == 0) {
+                    lcd_panel_refresh();
+                }
                 last_render = now;
             }
         } else {
+            /* On transition from GRAPH → STATUS, re-initialise the panel
+             * to recover from any state drift accumulated during the
+             * extended high-frequency rendering session. */
+            if (mode_changed) {
+                ESP_LOGI(TAG, "mode GRAPH -> STATUS (after %lu flushes)",
+                         (unsigned long)s_flush_count);
+                lcd_panel_refresh();
+                s_flush_count = 0;
+            }
             if (mode_changed || dirty ||
                 (now - last_render) >= pdMS_TO_TICKS(STATUS_FRAME_MS)) {
                 render_status();
