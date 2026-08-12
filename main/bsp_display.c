@@ -253,7 +253,10 @@ static void lcd_flush(void)
 
         /* Don't overwrite a buffer whose DMA is still running. */
         if (inflight >= LCD_STRIP_BUFS) {
-            xSemaphoreTake(s_flush_done, portMAX_DELAY);
+            if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100)) == pdFALSE) {
+                ESP_LOGW(TAG, "lcd_flush: DMA timeout waiting for strip completion");
+                break;
+            }
             inflight--;
         }
 
@@ -268,7 +271,10 @@ static void lcd_flush(void)
     }
     /* Drain remaining in-flight transfers. */
     while (inflight > 0) {
-        xSemaphoreTake(s_flush_done, portMAX_DELAY);
+        if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100)) == pdFALSE) {
+            ESP_LOGW(TAG, "lcd_flush: DMA timeout draining transfers");
+            break;
+        }
         inflight--;
     }
 }
