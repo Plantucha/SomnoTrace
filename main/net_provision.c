@@ -1777,25 +1777,20 @@ static void recreate_edfs_task(void *arg)
 {
     ESP_LOGI(TAG, "recreate_edfs_task: starting");
 
+    int max_days = uploader_max_days();
+    ESP_LOGI(TAG, "recreate_edfs_task: upload window = %d days (newest first)", max_days);
+
     /* 1. Delete everything in SDCARD/ recursively. */
     recursive_delete(SD_SDCARD_DIR);
     ESP_LOGI(TAG, "recreate_edfs_task: SDCARD/ deleted");
 
-    /* 2. Scan .somnotrace/sessions/streams/ for day folders, collect sessions.
-     * Allocate the sessions array on the heap (PSRAM) — 64 * ~312 bytes
-     * = ~20KB, which would overflow the 10KB task stack. */
-    recreate_session_t *sessions = calloc(64, sizeof(recreate_session_t));
-    if (!sessions) {
-        ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate sessions array");
-        vTaskDelete(NULL);
-        return;
-    }
-    int n_sessions = 0;
-
+    /* 2. First pass: count total _session.json files so we can allocate the
+     * exact-sized array (no arbitrary cap). */
+    int total_sessions = 0;
     DIR *d = opendir(SD_STREAMS_DIR);
     if (d) {
         struct dirent *ent;
-        while ((ent = readdir(d)) != NULL && n_sessions < 64) {
+        while ((ent = readdir(d)) != NULL) {
             if (ent->d_type != DT_DIR) continue;
             if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
                 continue;
@@ -1804,20 +1799,62 @@ static void recreate_edfs_task(void *arg)
             DIR *dd = opendir(day_dir);
             if (!dd) continue;
             struct dirent *fent;
-            while ((fent = readdir(dd)) != NULL && n_sessions < 64) {
+            while ((fent = readdir(dd)) != NULL) {
                 if (fent->d_type != DT_REG) continue;
                 const char *suffix = "_session.json";
                 int slen = strlen(suffix);
                 int flen = strlen(fent->d_name);
                 if (flen <= slen || strcmp(fent->d_name + flen - slen, suffix) != 0)
                     continue;
-                /* Extract session prefix */
+                total_sessions++;
+            }
+            closedir(dd);
+        }
+        closedir(d);
+    }
+
+    if (total_sessions == 0) {
+        ESP_LOGI(TAG, "recreate_edfs_task: no sessions found");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 3. Allocate sessions array in PSRAM (each entry is ~312 bytes;
+     * with many sessions this can exceed internal RAM free space). */
+    recreate_session_t *sessions = heap_caps_calloc(total_sessions,
+            sizeof(recreate_session_t), MALLOC_CAP_SPIRAM);
+    if (!sessions) {
+        ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate %d sessions", total_sessions);
+        vTaskDelete(NULL);
+        return;
+    }
+    int n_sessions = 0;
+
+    /* 4. Second pass: collect all sessions. */
+    d = opendir(SD_STREAMS_DIR);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_type != DT_DIR) continue;
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            char day_dir[300];
+            snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_STREAMS_DIR, ent->d_name);
+            DIR *dd = opendir(day_dir);
+            if (!dd) continue;
+            struct dirent *fent;
+            while ((fent = readdir(dd)) != NULL) {
+                if (fent->d_type != DT_REG) continue;
+                const char *suffix = "_session.json";
+                int slen = strlen(suffix);
+                int flen = strlen(fent->d_name);
+                if (flen <= slen || strcmp(fent->d_name + flen - slen, suffix) != 0)
+                    continue;
                 char session_id[32];
                 int prefix_len = flen - slen;
                 if (prefix_len <= 0 || prefix_len >= (int)sizeof(session_id)) continue;
                 memcpy(session_id, fent->d_name, prefix_len);
                 session_id[prefix_len] = '\0';
-                /* Read session.json */
                 char json_path[600];
                 snprintf(json_path, sizeof(json_path), "%s/%s", day_dir, fent->d_name);
                 FILE *f = fopen(json_path, "r");
@@ -1839,10 +1876,7 @@ static void recreate_edfs_task(void *arg)
                 cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
                 if (j_start && cJSON_IsNumber(j_start)) {
                     int64_t epoch = (int64_t)j_start->valuedouble;
-                    /* Skip sessions with invalid timestamps (epoch 0 or pre-2000).
-                     * These result from crash-recovery on 0-byte .snt files and
-                     * would generate bogus 19691231 EDF folders. */
-                    if (epoch < 946684800000LL) {  /* < 2000-01-01T00:00:00Z */
+                    if (epoch < 946684800000LL) {
                         ESP_LOGW(TAG, "recreate_edfs: skipping %s (invalid start_epoch_ms=%lld)",
                                  session_id, (long long)epoch);
                         cJSON_Delete(j);
@@ -1864,29 +1898,32 @@ static void recreate_edfs_task(void *arg)
 
     ESP_LOGI(TAG, "recreate_edfs_task: found %d sessions", n_sessions);
 
-    /* 3. Sort sessions by start_epoch_ms (simple insertion sort). */
+    /* 5. Sort sessions by start_epoch_ms descending (newest first). */
     for (int i = 1; i < n_sessions; i++) {
         recreate_session_t tmp = sessions[i];
         int j = i - 1;
-        while (j >= 0 && sessions[j].start_epoch_ms > tmp.start_epoch_ms) {
+        while (j >= 0 && sessions[j].start_epoch_ms < tmp.start_epoch_ms) {
             sessions[j + 1] = sessions[j];
             j--;
         }
         sessions[j + 1] = tmp;
     }
 
-    /* 4. Generate EDFs for each session in chronological order. */
-    for (int i = 0; i < n_sessions; i++) {
-        ESP_LOGI(TAG, "recreate_edfs_task: generating EDFs for session %d/%d: %s",
-                 i + 1, n_sessions, sessions[i].session_id);
-        edf_gen_generate(sessions[i].session_dir, sessions[i].session_id,
-                         sessions[i].start_epoch_ms, sessions[i].end_epoch_ms,
-                         sessions[i].clock_drift_ms);
+    /* 6. Walk newest-first, generating EDFs only for sessions within the
+     * first max_days unique day folders.  Sessions are sorted descending so
+     * once max_days distinct days have been seen, all remaining sessions are
+     * older and outside the upload window. */
+    char (*queued_days)[16] = heap_caps_calloc(max_days + 1,
+            sizeof(*queued_days), MALLOC_CAP_SPIRAM);
+    if (!queued_days) {
+        ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate queued_days");
+        free(sessions);
+        vTaskDelete(NULL);
+        return;
     }
-
-    /* 5. Queue unique day folders for upload (not per-session). */
-    char queued_days[64][16];
     int n_queued_days = 0;
+    int n_processed = 0;
+
     for (int i = 0; i < n_sessions; i++) {
         char day_folder[32];
         time_t t = (time_t)(sessions[i].start_epoch_ms / 1000);
@@ -1898,22 +1935,36 @@ static void recreate_edfs_task(void *arg)
         }
         snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-        /* Skip if already queued */
+
         bool dup = false;
         for (int j = 0; j < n_queued_days; j++) {
             if (strcmp(queued_days[j], day_folder) == 0) { dup = true; break; }
         }
-        if (!dup && n_queued_days < 64) {
+        if (!dup) {
+            if (n_queued_days >= max_days) {
+                /* Exceeded the upload window — all remaining sessions are
+                 * older; stop processing. */
+                break;
+            }
             strlcpy(queued_days[n_queued_days++], day_folder, sizeof(queued_days[0]));
-            /* Every file in this day was just regenerated, so whatever the
-             * backends hold is stale — drop the tracking state rather than
-             * only announcing the day. */
-            uploader_on_day_invalidated(day_folder);
         }
+
+        n_processed++;
+        ESP_LOGI(TAG, "recreate_edfs_task: generating EDFs for session %d: %s",
+                 n_processed, sessions[i].session_id);
+        edf_gen_generate(sessions[i].session_dir, sessions[i].session_id,
+                         sessions[i].start_epoch_ms, sessions[i].end_epoch_ms,
+                         sessions[i].clock_drift_ms);
     }
 
-    ESP_LOGI(TAG, "recreate_edfs_task: done (%d sessions, %d unique days queued)",
-             n_sessions, n_queued_days);
+    /* 7. Queue unique day folders for upload. */
+    for (int j = 0; j < n_queued_days; j++) {
+        uploader_on_day_invalidated(queued_days[j]);
+    }
+
+    ESP_LOGI(TAG, "recreate_edfs_task: done (%d/%d sessions processed, %d unique days queued)",
+             n_processed, n_sessions, n_queued_days);
+    free(queued_days);
     free(sessions);
     vTaskDelete(NULL);
 }
