@@ -194,8 +194,8 @@ static void epoch_ms_to_iso_utc(int64_t epoch_ms, char *out, size_t out_len)
     struct tm tm;
     gmtime_r(&t, &tm);
     snprintf(out, out_len, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
+             (tm.tm_year + 1900) % 10000, (tm.tm_mon + 1) % 100, tm.tm_mday % 100,
+             tm.tm_hour % 100, tm.tm_min % 100, tm.tm_sec % 100, ms % 1000);
 }
 
 /* ── Summary spool decode & per-day storage ─────────────────────────── */

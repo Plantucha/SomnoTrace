@@ -354,7 +354,7 @@ static void noon_day_folder_local(time_t t, char *out, size_t out_len)
         localtime_r(&t, &tm);
     }
     snprintf(out, out_len, "%04d%02d%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+             (tm.tm_year + 1900) % 10000, (tm.tm_mon + 1) % 100, tm.tm_mday % 100);
 }
 
 static void make_session_id(char *out, size_t out_len)

@@ -98,8 +98,10 @@ static uint32_t hhmmss_to_sec(const char *s)
 
 static void sec_to_hhmmss(uint32_t sec, char *out, size_t out_len)
 {
+    unsigned h = (unsigned)(sec / 3600);
+    if (h > 99) h = 99;
     snprintf(out, out_len, "%02u%02u%02u",
-             (unsigned)(sec / 3600), (unsigned)((sec / 60) % 60),
+             h, (unsigned)((sec / 60) % 60),
              (unsigned)(sec % 60));
 }
 

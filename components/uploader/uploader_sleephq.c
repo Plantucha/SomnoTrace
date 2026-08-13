@@ -61,11 +61,23 @@ static const char *TAG = "upload_shq";
 #define SHQ_READ_BUF    1024
 #define SHQ_RESP_CAP    4096
 
-/* Token cache */
-static char s_token[512] = {0};
+/* Token cache (token string in PSRAM; allocated on first auth). */
+#define SHQ_TOKEN_MAX  512
+static char *s_token;
 static int64_t s_token_time_s = 0;
 static int s_token_expires = 0;
 static char s_team_id[32] = {0};
+
+static bool shq_token_ready(void)
+{
+    if (s_token) return true;
+    s_token = heap_caps_calloc(1, SHQ_TOKEN_MAX, MALLOC_CAP_SPIRAM);
+    if (!s_token) {
+        ESP_LOGE(TAG, "token buffer alloc failed");
+        return false;
+    }
+    return true;
+}
 
 /* ── TLS socket layer ───────────────────────────────────────────────── */
 
@@ -302,7 +314,7 @@ static int shq_http_request(esp_tls_t *tls, const char *method,
 
 static esp_err_t shq_authenticate(esp_tls_t *tls, const uploader_config_t *cfg)
 {
-    if (s_token[0] && s_token_expires > 0) {
+    if (s_token && s_token[0] && s_token_expires > 0) {
         int64_t now_s = time(NULL);
         int elapsed = (int)(now_s - s_token_time_s);
         if (elapsed < s_token_expires - 60) {
@@ -345,7 +357,11 @@ static esp_err_t shq_authenticate(esp_tls_t *tls, const uploader_config_t *cfg)
         return ESP_FAIL;
     }
 
-    strlcpy(s_token, token->valuestring, sizeof(s_token));
+    if (!shq_token_ready()) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    strlcpy(s_token, token->valuestring, SHQ_TOKEN_MAX);
     s_token_expires = (expires && cJSON_IsNumber(expires)) ? expires->valueint : 7200;
     s_token_time_s = time(NULL);
 

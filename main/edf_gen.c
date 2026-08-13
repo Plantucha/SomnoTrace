@@ -2941,7 +2941,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
             while (*tail && *tail != ' ') tail++;
         }
         snprintf(fixed_recording_id, sizeof(fixed_recording_id),
-                 "Startdate %02d-%s-%04d%s",
+                 "Startdate %02d-%.3s-%04d%.100s",
                  fd_d, mon_names[(fd_m - 1) % 12], fd_y, tail);
     }
 
@@ -3508,7 +3508,7 @@ static void format_edf_datetime(int64_t epoch_ms,
     struct tm tm;
     localtime_r(&t, &tm);
     snprintf(date_out, date_len, "%02d.%02d.%02d",
-             tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
+             tm.tm_mday % 100, (tm.tm_mon + 1) % 100, (tm.tm_year % 100 + 100) % 100);
     snprintf(time_out, time_len, "%02d.%02d.%02d",
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
@@ -3568,7 +3568,7 @@ static void noon_day_folder(int64_t epoch_ms, char *out, size_t out_len)
         localtime_r(&t, &tm);
     }
     snprintf(out, out_len, "%04d%02d%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+             (tm.tm_year + 1900) % 10000, (tm.tm_mon + 1) % 100, tm.tm_mday % 100);
 }
 
 /* Format a session timestamp prefix: YYYYMMDD_HHMMSS */
@@ -4328,7 +4328,7 @@ static esp_err_t rebuild_move_dir(const char *src, const char *dst)
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_type != DT_REG) continue;
-        char from[400], to[400];
+        char from[656], to[656];
         snprintf(from, sizeof(from), "%s/%s", src, ent->d_name);
         snprintf(to, sizeof(to), "%s/%s", dst, ent->d_name);
         unlink(to);
@@ -4354,7 +4354,7 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
     size_t prefix_len = flen - slen;
     if (prefix_len == 0 || prefix_len >= sizeof(out->session_id)) return false;
 
-    char json_path[420];
+    char json_path[656];
     snprintf(json_path, sizeof(json_path), "%s/%s", day_path, fname);
     FILE *f = fopen(json_path, "r");
     if (!f) return false;

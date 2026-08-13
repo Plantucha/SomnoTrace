@@ -233,8 +233,10 @@ static struct {
 
 static char s_target_name[32];
 static ble_addr_t s_target_addr;
-static char s_server_pk[600];   /* serverPk from StartKeyExchange */
-static char s_salt[160];        /* salt from StartKeyExchange */
+#define SERVER_PK_MAX  600
+#define SALT_MAX       160
+static char *s_server_pk;       /* PSRAM; serverPk from StartKeyExchange */
+static char *s_salt;            /* PSRAM; salt from StartKeyExchange */
 static bool s_kex_ready;        /* serverPk + salt captured */
 static char s_passkey[16];
 
@@ -1071,9 +1073,22 @@ static int wait_op(int timeout_ms)
     return s_op_status;
 }
 
+static uint8_t *fig_tx_pkt(void)
+{
+    static uint8_t *pkt;
+    if (!pkt) {
+        pkt = heap_caps_malloc(16 + TX_PAYLOAD_MAX, MALLOC_CAP_SPIRAM);
+        if (!pkt) {
+            ESP_LOGE(TAG, "fig_tx_pkt: PSRAM alloc failed");
+        }
+    }
+    return pkt;
+}
+
 static esp_err_t send_fig(uint16_t vcid, const char *json)
 {
-    static uint8_t pkt[16 + TX_PAYLOAD_MAX];
+    uint8_t *pkt = fig_tx_pkt();
+    if (!pkt) return ESP_ERR_NO_MEM;
     uint16_t plen = (uint16_t)strlen(json);
     if (plen > TX_PAYLOAD_MAX) return ESP_ERR_INVALID_SIZE;
     int total = fig_encode(vcid, (const uint8_t *)json, plen, pkt);
@@ -1108,7 +1123,8 @@ static esp_err_t send_fig(uint16_t vcid, const char *json)
 /* Send a raw binary FIG packet (for encrypted payloads). */
 static esp_err_t send_fig_raw(uint16_t vcid, const uint8_t *data, int len)
 {
-    static uint8_t pkt[16 + TX_PAYLOAD_MAX];
+    uint8_t *pkt = fig_tx_pkt();
+    if (!pkt) return ESP_ERR_NO_MEM;
     if (len > TX_PAYLOAD_MAX) return ESP_ERR_INVALID_SIZE;
     int total = fig_encode(vcid, data, (uint16_t)len, pkt);
 
@@ -1635,7 +1651,7 @@ static void confirm_task(void *arg)
     for (int i = 0; i < 50 && !s_kex_ready; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    if (!s_kex_ready) {
+    if (!s_kex_ready || !s_server_pk || !s_salt) {
         set_error("no key-exchange state"); vTaskDelete(NULL); return;
     }
 
@@ -2232,6 +2248,12 @@ esp_err_t as11_ble_init(void)
     s_rx_buf = heap_caps_malloc(RX_BUF_MAX, MALLOC_CAP_SPIRAM);
     if (!s_rx_buf) {
         ESP_LOGE(TAG, "init: failed to allocate s_rx_buf in PSRAM");
+        return ESP_ERR_NO_MEM;
+    }
+    s_server_pk = heap_caps_calloc(1, SERVER_PK_MAX, MALLOC_CAP_SPIRAM);
+    s_salt = heap_caps_calloc(1, SALT_MAX, MALLOC_CAP_SPIRAM);
+    if (!s_server_pk || !s_salt) {
+        ESP_LOGE(TAG, "init: failed to allocate SRP buffers in PSRAM");
         return ESP_ERR_NO_MEM;
     }
 

@@ -133,10 +133,12 @@ static char s_notice[STATUS_LINE_LEN] = "";
 static int s_batt_percent = -1;   /* -1 = unknown/not set */
 static bool s_batt_charging = false;
 
-/* Live flow ring buffer for the therapy graph */
-static float s_flow_buf[FLOW_BUF_SIZE];
-static int   s_flow_head = 0;
-static int   s_flow_count = 0;
+/* Live flow ring buffer for the therapy graph (PSRAM). */
+static float *s_flow_buf;
+static float *s_flow_local;   /* render-task snapshot */
+static float *s_flow_yf;      /* render-task y coordinates */
+static int    s_flow_head = 0;
+static int    s_flow_count = 0;
 
 /* ── Public state-mutating API (never draws; render task handles drawing) ── */
 
@@ -203,7 +205,7 @@ void bsp_display_push_flow(float flow_lpm)
     if (!s_state_mutex) return;
     bool notify = false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    if (s_mode == DISP_MODE_GRAPH) {
+    if (s_mode == DISP_MODE_GRAPH && s_flow_buf) {
         s_flow_buf[s_flow_head] = flow_lpm * 60.0f;
         s_flow_head = (s_flow_head + 1) % FLOW_BUF_SIZE;
         if (s_flow_count < FLOW_BUF_SIZE) s_flow_count++;
@@ -551,6 +553,14 @@ esp_err_t bsp_display_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    s_flow_buf = heap_caps_calloc(FLOW_BUF_SIZE, sizeof(float), MALLOC_CAP_SPIRAM);
+    s_flow_local = heap_caps_malloc(FLOW_BUF_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    s_flow_yf = heap_caps_malloc(LCD_H_RES * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!s_flow_buf || !s_flow_local || !s_flow_yf) {
+        ESP_LOGE(TAG, "flow graph buffer alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* Permanently allocate the internal DMA-capable strip buffers up front,
      * while internal RAM is still free. */
     for (int i = 0; i < LCD_STRIP_BUFS; i++) {
@@ -849,12 +859,13 @@ static void render_graph(void)
     const uint16_t label_col = rgb565(122, 134, 158);
     const uint16_t unit_col  = rgb565(86, 96, 120);
 
-    static float local[FLOW_BUF_SIZE];
+    if (!s_flow_buf || !s_flow_local || !s_flow_yf) return;
+
     int n, head;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     n = s_flow_count;
     head = s_flow_head;
-    memcpy(local, s_flow_buf, sizeof(local));
+    memcpy(s_flow_local, s_flow_buf, FLOW_BUF_SIZE * sizeof(float));
     xSemaphoreGive(s_state_mutex);
 
     fb_clear(bg);
@@ -901,9 +912,9 @@ static void render_graph(void)
     int start = (head - m + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
     int xbase = LCD_H_RES - m;
 
-    static float yf[LCD_H_RES];
+    float *yf = s_flow_yf;
     for (int j = 0; j < m; j++) {
-        float val = local[(start + j) % FLOW_BUF_SIZE];
+        float val = s_flow_local[(start + j) % FLOW_BUF_SIZE];
         float y = mid_y - val * scale;  /* positive flow (inhale) → up */
         if (y < GRAPH_PLOT_TOP) y = GRAPH_PLOT_TOP;   /* static hard cut */
         if (y > GRAPH_PLOT_BOT) y = GRAPH_PLOT_BOT;
