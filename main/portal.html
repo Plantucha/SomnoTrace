@@ -1746,12 +1746,46 @@ function saveAll() {
   Promise.all(promises).then(function() {
     if (statusEl) { statusEl.textContent = 'Saved! Rebooting…'; statusEl.className = 'status-msg success'; }
     clearDirty();
+    /* Disable the save button so the user can't trigger a second reboot */
+    var btn = document.getElementById('btn-save');
+    if (btn) btn.disabled = true;
     /* Trigger actual reboot after a short delay to let the response reach the client */
     setTimeout(function() {
       fetch('/api/reboot', { method: 'POST' }).catch(function() {});
     }, 500);
+    /* Show countdown and poll for the device to come back online */
+    saveRebootCountdown(20);
   }).catch(function() {
     if (statusEl) { statusEl.textContent = 'Save failed — please try again'; statusEl.className = 'status-msg error'; }
+  });
+}
+
+function saveRebootCountdown(sec) {
+  var statusEl = document.getElementById('save-status');
+  if (sec > 0) {
+    if (statusEl) {
+      statusEl.textContent = 'Rebooting… page will reload in ' + sec + ' s';
+      statusEl.className = 'status-msg success';
+    }
+    setTimeout(function() { saveRebootCountdown(sec - 1); }, 1000);
+  } else {
+    if (statusEl) {
+      statusEl.textContent = 'Checking if device is back online…';
+      statusEl.className = 'status-msg success';
+    }
+    saveWaitForReboot();
+  }
+}
+
+function saveWaitForReboot() {
+  fetch('/api/device/settings', { cache: 'no-store' }).then(function(r) {
+    if (r.ok) {
+      var statusEl = document.getElementById('save-status');
+      if (statusEl) { statusEl.textContent = 'Device is back online! Reloading…'; }
+      setTimeout(function() { location.reload(); }, 1000);
+    } else { setTimeout(saveWaitForReboot, 2000); }
+  }).catch(function() {
+    setTimeout(saveWaitForReboot, 2000);
   });
 }
 
