@@ -1064,6 +1064,14 @@ Maintenance Actions
 <button class="btn btn-danger" onclick="execAction('format-sd','FORMAT SD CARD? This will erase EVERYTHING on the card by reformatting it to FAT32. All session data, EDF files, logs, and upload state will be permanently lost — not even data recovery tools can restore a formatted card. The device will need to record new data from scratch. This action cannot be undone.\\n\\nAre you absolutely sure you want to continue?')">Format SD</button>
 </div>
 
+<div class="action-item-row">
+<div>
+<div style="font-weight:600;font-size:.9rem">Soft Reboot</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Restarts the device without changing any settings</div>
+</div>
+<button class="btn btn-primary" onclick="softReboot()">Reboot</button>
+</div>
+
 </div>
 <div id="action-status" class="status-msg" style="margin-top:14px"></div>
 </div>
@@ -1758,39 +1766,47 @@ function saveAll() {
       fetch('/api/reboot', { method: 'POST' }).catch(function() {});
     }, 500);
     /* Show countdown and poll for the device to come back online */
-    saveRebootCountdown(20);
+    rebootCountdown(20, 'save-status');
   }).catch(function() {
     if (statusEl) { statusEl.textContent = 'Save failed — please try again'; statusEl.className = 'status-msg error'; }
   });
 }
 
-function saveRebootCountdown(sec) {
-  var statusEl = document.getElementById('save-status');
+function rebootCountdown(sec, statusId) {
+  var statusEl = document.getElementById(statusId);
   if (sec > 0) {
     if (statusEl) {
       statusEl.textContent = 'Rebooting… page will reload in ' + sec + ' s';
       statusEl.className = 'status-msg success';
     }
-    setTimeout(function() { saveRebootCountdown(sec - 1); }, 1000);
+    setTimeout(function() { rebootCountdown(sec - 1, statusId); }, 1000);
   } else {
     if (statusEl) {
       statusEl.textContent = 'Checking if device is back online…';
       statusEl.className = 'status-msg success';
     }
-    saveWaitForReboot();
+    waitForReboot(statusId);
   }
 }
 
-function saveWaitForReboot() {
+function waitForReboot(statusId) {
   fetch('/api/device/settings', { cache: 'no-store' }).then(function(r) {
     if (r.ok) {
-      var statusEl = document.getElementById('save-status');
+      var statusEl = document.getElementById(statusId);
       if (statusEl) { statusEl.textContent = 'Device is back online! Reloading…'; }
       setTimeout(function() { location.reload(); }, 1000);
-    } else { setTimeout(saveWaitForReboot, 2000); }
+    } else { setTimeout(function() { waitForReboot(statusId); }, 2000); }
   }).catch(function() {
-    setTimeout(saveWaitForReboot, 2000);
+    setTimeout(function() { waitForReboot(statusId); }, 2000);
   });
+}
+
+function softReboot() {
+  if (!confirm('Reboot the device now? The page will automatically reload when it comes back online.')) return;
+  var statusEl = document.getElementById('action-status');
+  if (statusEl) { statusEl.textContent = 'Rebooting…'; statusEl.className = 'status-msg success'; }
+  fetch('/api/reboot', { method: 'POST' }).catch(function() {});
+  rebootCountdown(20, 'action-status');
 }
 
 function valOf(id) { var el = document.getElementById(id); return el ? el.value : ''; }
