@@ -83,3 +83,8 @@ void netprov_request_rescan(void);
 /* Task entry for the captive DNS server (wildcard hijack). 
  * arg is ignored; starts automatically inside netprov_start_portal. */
 void netprov_dns_task(void *arg);
+
+/* mDNS custom name (stored in NVS, defaults to "somnotrace"). */
+void netprov_get_mdns_name(char *out, size_t out_len);
+esp_err_t netprov_set_mdns_name(const char *name);
+const char *netprov_mdns_name_cached(void);

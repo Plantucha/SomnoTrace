@@ -425,6 +425,14 @@ Wi-Fi Configuration
 <select id="tz-select" class="form-control" data-dirty="false" onchange="markDirty(this)"></select>
 <input type="hidden" id="tz-str">
 </div>
+<div class="form-group" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--card-border)">
+<label>Device Name (mDNS)</label>
+<p class="card-desc" style="margin:2px 0 8px 0">Custom hostname for accessing the web portal. The device will be reachable at <code>&lt;name&gt;.local</code>. Requires save and reboot.</p>
+<div style="display:flex;align-items:center;gap:8px">
+<input type="text" id="mdns-name" class="form-control" style="max-width:18ch;text-transform:lowercase" maxlength="10" pattern="[a-z0-9-]+" placeholder="somnotrace" data-dirty="false" oninput="markDirty(this)" spellcheck="false" autocapitalize="none">
+<span style="color:var(--text);white-space:nowrap;user-select:none">.local</span>
+</div>
+</div>
 <div class="advanced-section" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--card-border)">
 <details>
 <summary>Advanced settings</summary>
@@ -1212,7 +1220,7 @@ var isDirty = { wifi: false, upload: false, tz: false };
 function markDirty(el) {
   if (el) el.setAttribute('data-dirty', 'true');
   // Determine which section
-  if (el && (el.id === 'tz-select' || el.id === 'ntp-server')) {
+  if (el && (el.id === 'tz-select' || el.id === 'ntp-server' || el.id === 'mdns-name')) {
     isDirty.tz = true;
   } else {
     var card = el ? el.closest('.card') : null;
@@ -1527,6 +1535,12 @@ function loadStatus(data) {
       ntpInput.setAttribute('data-dirty', 'false');
     }
 
+    var mdnsInput = document.getElementById('mdns-name');
+    if (mdnsInput) {
+      mdnsInput.value = d.mdns_name || 'somnotrace';
+      mdnsInput.setAttribute('data-dirty', 'false');
+    }
+
     setTimeout(function() { loadTimezoneList(d.tz_name || ''); }, 2000);
 
     if (d.ssids && d.ssids.length > 0) {
@@ -1699,6 +1713,8 @@ function saveAll() {
     if (tzHidden && tzHidden.value) body += '&tz_str=' + encodeURIComponent(tzHidden.value);
     var ntpInput = document.getElementById('ntp-server');
     if (ntpInput) body += '&ntp_srv=' + encodeURIComponent(ntpInput.value.trim());
+    var mdnsInput = document.getElementById('mdns-name');
+    if (mdnsInput) body += '&mdns_name=' + encodeURIComponent(mdnsInput.value.trim().toLowerCase());
 
     promises.push(
       fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
@@ -1712,6 +1728,8 @@ function saveAll() {
     if (tzSel && tzSel.value) tzBody += '&tz_name=' + encodeURIComponent(tzSel.value);
     if (tzHidden && tzHidden.value) tzBody += '&tz_str=' + encodeURIComponent(tzHidden.value);
     if (ntpInput) tzBody += '&ntp_srv=' + encodeURIComponent(ntpInput.value.trim());
+    var mdnsInput = document.getElementById('mdns-name');
+    if (mdnsInput) tzBody += '&mdns_name=' + encodeURIComponent(mdnsInput.value.trim().toLowerCase());
     if (tzBody) {
       tzBody = 'tz_only=1' + tzBody;
       promises.push(

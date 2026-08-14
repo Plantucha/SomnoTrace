@@ -48,6 +48,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
+#include "mdns.h"
 
 static const char *TAG = "netprov";
 
@@ -55,6 +56,8 @@ static const char *TAG = "netprov";
 #define NVS_KEY_HOSTNAME    "hostname"
 #define NVS_KEY_SSID_FMT    "ssid%d"
 #define NVS_KEY_PASS_FMT    "pass%d"
+#define NVS_KEY_MDNS_NAME   "mdns_name"
+#define MDNS_NAME_MAX       11   /* 10 chars + NUL */
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
@@ -146,6 +149,52 @@ esp_err_t netprov_save_config(const struct netprov_config *cfg)
 {
     /* Delegate the flash write so callers on a PSRAM stack (httpd) are safe. */
     return nvs_writer_run(do_netprov_save, (void *)cfg);
+}
+
+/* ── mDNS custom name ──────────────────────────────────────────────── */
+static char s_mdns_name[MDNS_NAME_MAX] = "somnotrace";
+
+static esp_err_t do_save_mdns_name(void *arg)
+{
+    const char *name = (const char *)arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(h, NVS_KEY_MDNS_NAME, name);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+void netprov_get_mdns_name(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = out_len;
+        if (nvs_get_str(h, NVS_KEY_MDNS_NAME, out, &len) != ESP_OK || out[0] == '\0') {
+            strlcpy(out, "somnotrace", out_len);
+        }
+        nvs_close(h);
+    } else {
+        strlcpy(out, "somnotrace", out_len);
+    }
+    strlcpy(s_mdns_name, out, sizeof(s_mdns_name));
+}
+
+esp_err_t netprov_set_mdns_name(const char *name)
+{
+    if (!name || name[0] == '\0') return ESP_ERR_INVALID_ARG;
+    esp_err_t err = nvs_writer_run(do_save_mdns_name, (void *)name);
+    if (err == ESP_OK) {
+        strlcpy(s_mdns_name, name, sizeof(s_mdns_name));
+    }
+    return err;
+}
+
+const char *netprov_mdns_name_cached(void)
+{
+    return s_mdns_name;
 }
 
 /* ------------------------------------------------------------------ */
@@ -800,6 +849,7 @@ cJSON *netprov_build_status_json(void)
     /* Time / timezone / NTP (from cache) */
     cJSON_AddStringToObject(resp, "tz_name", s_status_cache.tz_name);
     cJSON_AddStringToObject(resp, "ntp_server", s_status_cache.ntp_srv);
+    cJSON_AddStringToObject(resp, "mdns_name", netprov_mdns_name_cached());
     cJSON_AddBoolToObject(resp, "ntp_synced", time_sync_is_synced());
     const char *src_str = "none";
     switch (time_source_get()) {
@@ -1161,7 +1211,7 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    psram_task_create(reboot_task, "reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -1253,11 +1303,20 @@ static esp_err_t save_post_handler(httpd_req_t *req)
                  ntp_srv_val[0] ? ntp_srv_val : "(auto)");
     }
 
+    /* Save mDNS name if present (requires reboot to take effect) */
+    char mdns_val[MDNS_NAME_MAX] = { 0 };
+    if (form_get(body, "mdns_name", mdns_val, sizeof(mdns_val))) {
+        if (mdns_val[0] != '\0') {
+            netprov_set_mdns_name(mdns_val);
+            ESP_LOGI(TAG, "saved mDNS name: %s", mdns_val);
+        }
+    }
+
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req,
         "<html><body style=\"font-family:sans-serif\">Saved. Rebooting to connect...</body></html>");
 
-    psram_task_create(reboot_task, "reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -2224,7 +2283,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     httpd_resp_sendstr(req, "{\"ok\":true}");
 
     /* Reboot after a short delay so the response is sent. */
-    psram_task_create(reboot_task, "ota_reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "ota_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -2318,7 +2377,7 @@ static void ota_url_task(void *arg)
     s_ota_progress.active = false;
     s_ota_progress.done = true;
     free(url);
-    psram_task_create(reboot_task, "ota_reboot", 2048, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "ota_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     vTaskDelete(NULL);
     return;
 
@@ -2859,6 +2918,17 @@ esp_err_t netprov_start_connected_server(const char *ip)
      * s_rescan_requested which is raised by the event handler after repeated
      * failed reconnects to the current SSID. */
     netprov_start_link_supervisor();
+
+    /* Start mDNS so the device is reachable as <name>.local */
+    char mdns_name[MDNS_NAME_MAX];
+    netprov_get_mdns_name(mdns_name, sizeof(mdns_name));
+    if (mdns_init() == ESP_OK) {
+        mdns_hostname_set(mdns_name);
+        mdns_service_add("SomnoTrace", "_http", "_tcp", 80, NULL, 0);
+        ESP_LOGI(TAG, "mDNS started: %s.local", mdns_name);
+    } else {
+        ESP_LOGW(TAG, "mDNS init failed");
+    }
 
     return start_webserver();
 }

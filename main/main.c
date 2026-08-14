@@ -384,13 +384,15 @@ void app_main(void)
             uploader_init();
             uploader_set_progress_notify_fn(log_stream_request_upload_push);
 
-            char ip_line[32];
-            snprintf(ip_line, sizeof(ip_line), "IP: %s", ip);
+            char mdns_name[12];
+            netprov_get_mdns_name(mdns_name, sizeof(mdns_name));
+            char url_line[32];
+            snprintf(url_line, sizeof(url_line), "http://%s.local", mdns_name);
             netprov_link_t link;
             netprov_get_link(&link);
             const char *lines[] = {
                 link.ssid[0] ? link.ssid : "Wi-Fi Connected",
-                ip_line,
+                url_line,
             };
             show_status("SomnoTrace", lines, 2);
         } else {
@@ -489,19 +491,21 @@ void app_main(void)
                     };
                     bsp_display_show_lines("SomnoTrace", lines, 2);
                 } else {
-                    char ip_line[32];
-                    snprintf(ip_line, sizeof(ip_line), "IP: %s", link.ip);
+                    char mdns_name[12];
+                    netprov_get_mdns_name(mdns_name, sizeof(mdns_name));
+                    char url_line[32];
+                    snprintf(url_line, sizeof(url_line), "http://%s.local", mdns_name);
                     const char *ssid_str = link.ssid[0] ? link.ssid : "Wi-Fi Connected";
                     if (sd_storage_is_ready()) {
                         const char *lines[] = {
                             ssid_str,
-                            ip_line,
+                            url_line,
                         };
                         bsp_display_show_lines("SomnoTrace", lines, 2);
                     } else {
                         const char *lines[] = {
                             ssid_str,
-                            ip_line,
+                            url_line,
                             "SD Card Error",
                         };
                         bsp_display_show_lines("SomnoTrace", lines, 3);
