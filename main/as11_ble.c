@@ -882,10 +882,36 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         snprintf(addr_str, sizeof(addr_str), "%02x:%02x:%02x:%02x:%02x:%02x",
                  addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
 
-        int rc = ble_hs_adv_parse_fields(&f, event->disc.data, event->disc.length_data);
+        const uint8_t *raw = event->disc.data;
+        int raw_len = event->disc.length_data;
+
+        int rc = ble_hs_adv_parse_fields(&f, raw, raw_len);
         if (rc != 0) {
-            ESP_LOGI(TAG, "Scan report from %s: parse failed (rc=%d)", addr_str, rc);
-            return 0;
+            /* NimBLE rejects the entire packet if any AD structure is
+             * truncated.  The AS11's ADV_IND has a trailing field (type
+             * 0x1b) that is 1 byte short, causing rc=10 (BLE_HS_EBADDATA)
+             * even though the name field earlier in the payload is valid.
+             * Manually walk the AD structures to salvage what we can. */
+            ESP_LOGD(TAG, "Scan report from %s: parse failed (rc=%d), "
+                     "trying manual AD parse", addr_str, rc);
+            memset(&f, 0, sizeof(f));
+            for (int off = 0; off + 1 < raw_len; ) {
+                uint8_t ad_len = raw[off];
+                if (ad_len == 0 || off + 1 + ad_len > raw_len) break;
+                uint8_t ad_type = raw[off + 1];
+                const uint8_t *ad_data = raw + off + 2;
+                int ad_data_len = ad_len - 1;
+                if (ad_type == 0x09 || ad_type == 0x08) {
+                    /* Complete or Shortened Local Name */
+                    f.name = ad_data;
+                    f.name_len = ad_data_len;
+                } else if (ad_type == 0x03 || ad_type == 0x02) {
+                    /* Complete or Incomplete 16-bit Service UUID list */
+                    f.uuids16 = (void *)ad_data;
+                    f.num_uuids16 = ad_data_len / 2;
+                }
+                off += 1 + ad_len;
+            }
         }
 
         bool match = false;
@@ -900,21 +926,16 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         }
 
         // Also check 16-bit UUIDs for ResMed service 0xfd56
-        if (!match && f.uuids16 != NULL) {
+        if (!match && f.uuids16 != NULL && f.num_uuids16 > 0) {
             for (int i = 0; i < f.num_uuids16; i++) {
                 if (f.uuids16[i].value == UUID_SERVICE.value) {
                     match = true;
-                    // If we have a cached name or default name
-                    strlcpy(name, "ResMed AS11", sizeof(name));
+                    if (name[0] == '\0') {
+                        strlcpy(name, "ResMed AS11", sizeof(name));
+                    }
                     break;
                 }
             }
-        }
-
-        if (name[0] != '\0' || match) {
-            ESP_LOGI(TAG, "Scan matches: %s (name: '%s', rssi: %d)", addr_str, name, event->disc.rssi);
-        } else {
-            ESP_LOGD(TAG, "Scan report: %s (rssi: %d, name_len: %d)", addr_str, event->disc.rssi, f.name_len);
         }
 
         if (!match) {
@@ -924,6 +945,16 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         for (int i = 0; i < s_scan_count; i++) {
             if (memcmp(&s_scan[i].addr, &event->disc.addr, sizeof(ble_addr_t)) == 0) {
                 s_scan[i].rssi = event->disc.rssi;
+                /* If the first packet matched by UUID only (fallback name
+                 * "ResMed AS11") and the scan response now carries the real
+                 * device name (e.g. "ResMed 436648"), update it.  Never
+                 * overwrite a real name with the fallback. */
+                if (name[0] != '\0' &&
+                    strncmp(name, "ResMed AS11", 11) != 0) {
+                    strlcpy(s_scan[i].name, name, sizeof(s_scan[i].name));
+                }
+                ESP_LOGD(TAG, "Scan update: %s (name: '%s', rssi: %d)",
+                         addr_str, s_scan[i].name, event->disc.rssi);
                 return 0;
             }
         }
@@ -1361,23 +1392,30 @@ done:
 /* ------------------------------------------------------------------ */
 /*  NVS credential store                                              */
 /* ------------------------------------------------------------------ */
-static esp_err_t nvs_save_pairing(const char *addr, const char *name,
-                                  const char *client_id, const char *pair_key)
+struct nvs_pair_arg {
+    char addr[18];
+    char name[32];
+    char client_id[64];
+    char pair_key[80];
+};
+
+static esp_err_t do_save_pairing_nvs(void *arg)
 {
+    struct nvs_pair_arg *a = arg;
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_str(h, NVS_K_ADDR, addr);
-    nvs_set_str(h, NVS_K_NAME, name);
-    nvs_set_str(h, NVS_K_CLIENTID, client_id);
-    nvs_set_str(h, NVS_K_PAIRKEY, pair_key);
+    nvs_set_str(h, NVS_K_ADDR, a->addr);
+    nvs_set_str(h, NVS_K_NAME, a->name);
+    nvs_set_str(h, NVS_K_CLIENTID, a->client_id);
+    nvs_set_str(h, NVS_K_PAIRKEY, a->pair_key);
     e = nvs_commit(h);
     nvs_close(h);
     if (e == ESP_OK) {
-        strlcpy(s_pair_cache.addr, addr, sizeof(s_pair_cache.addr));
-        strlcpy(s_pair_cache.name, name, sizeof(s_pair_cache.name));
-        strlcpy(s_pair_cache.client_id, client_id, sizeof(s_pair_cache.client_id));
-        strlcpy(s_pair_cache.pair_key, pair_key, sizeof(s_pair_cache.pair_key));
+        strlcpy(s_pair_cache.addr, a->addr, sizeof(s_pair_cache.addr));
+        strlcpy(s_pair_cache.name, a->name, sizeof(s_pair_cache.name));
+        strlcpy(s_pair_cache.client_id, a->client_id, sizeof(s_pair_cache.client_id));
+        strlcpy(s_pair_cache.pair_key, a->pair_key, sizeof(s_pair_cache.pair_key));
         s_pair_cache.valid = true;
     }
     return e;
@@ -1629,8 +1667,8 @@ static void pair_task(void *arg)
         return;
     }
     /* stash serverPk + salt for the confirm step */
-    strlcpy(s_server_pk, spk->valuestring, sizeof(s_server_pk));
-    strlcpy(s_salt, salt->valuestring, sizeof(s_salt));
+    strlcpy(s_server_pk, spk->valuestring, SERVER_PK_MAX);
+    strlcpy(s_salt, salt->valuestring, SALT_MAX);
     s_kex_ready = true;
     cJSON_Delete(resp);
 
@@ -1722,8 +1760,12 @@ static void confirm_task(void *arg)
     addr_to_str(&s_target_addr, addr_str);
     char cid_buf[64];
     strlcpy(cid_buf, cid->valuestring, sizeof(cid_buf));
-    esp_err_t ns = nvs_save_pairing(addr_str, s_target_name,
-                                    cid->valuestring, s_srp.master_key_hex);
+    struct nvs_pair_arg nvarg;
+    strlcpy(nvarg.addr, addr_str, sizeof(nvarg.addr));
+    strlcpy(nvarg.name, s_target_name, sizeof(nvarg.name));
+    strlcpy(nvarg.client_id, cid->valuestring, sizeof(nvarg.client_id));
+    strlcpy(nvarg.pair_key, s_srp.master_key_hex, sizeof(nvarg.pair_key));
+    esp_err_t ns = nvs_writer_run(do_save_pairing_nvs, &nvarg);
     cJSON_Delete(resp);
     if (ns != ESP_OK) {
         set_error("NVS save failed");
@@ -2306,7 +2348,7 @@ esp_err_t as11_ble_scan(int timeout_sec)
         .filter_policy = 0,
         .limited = 0,
         .passive = 0,          /* active scan to collect names */
-        .filter_duplicates = 1,
+        .filter_duplicates = 0,  /* need both ADV_IND (name) and SCAN_RSP (UUID) */
     };
     /* drain stale completion signal */
     xSemaphoreTake(s_scan_done, 0);

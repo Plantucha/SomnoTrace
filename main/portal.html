@@ -1829,6 +1829,7 @@ function bleScan() {
       o.textContent = n.name + ' (' + n.rssi + ' dBm)';
       sel.appendChild(o);
     });
+    sel.selectedIndex = 0;
     document.getElementById('ble-select-group').style.display = 'block';
     document.getElementById('btn-ble-pair').style.display = '';
     bleStatusMsg(d.length + ' device(s) found');
