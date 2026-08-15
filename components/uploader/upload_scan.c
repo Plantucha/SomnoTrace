@@ -384,14 +384,36 @@ int upload_scan_reconcile_all(int max_days, const int *slots, int n_slots)
         beyond++;
     }
 
+    /* Forget orphan days: index entries whose SD card folder no longer
+     * exists.  The card is the truth about which files exist — a stale
+     * state file (e.g. after a manual folder deletion) must not inflate
+     * the progress count.  Guarded by n_days > 0 so a transient card
+     * absence (remount, glitch) does not wipe the entire index. */
+    int orphaned = 0;
+    if (n_days > 0) {
+        int n_idx = upload_index_day_count();
+        for (int j = n_idx - 1; j >= 0; j--) {
+            upload_day_t *d = upload_index_day_at(j);
+            if (!d) continue;
+            bool found = false;
+            for (int k = 0; k < n_days; k++) {
+                if (days[k] == d->day) { found = true; break; }
+            }
+            if (!found) {
+                upload_index_forget_day(d->day);
+                orphaned++;
+            }
+        }
+    }
+
     int pending = 0;
     for (int s = 0; s < n_slots; s++) {
         pending += upload_index_backend_pending(slots[s], max_days);
     }
 
     ESP_LOGI(TAG, "scan: %d folder(s) on card, %d day(s) with data in window, "
-             "%d empty, %d beyond window, %d unit(s) pending",
-             n_days, with_data, empty, beyond, pending);
+             "%d empty, %d beyond window, %d orphaned, %d unit(s) pending",
+             n_days, with_data, empty, beyond, orphaned, pending);
     free(days);
     return pending;
 }

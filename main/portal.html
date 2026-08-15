@@ -2485,9 +2485,30 @@ function otaFetchLatest() {
       }
     }
     if (!otaAsset) throw new Error('No *-ota.bin asset found in ' + rel.tag_name);
-    urlInput.value = otaAsset.browser_download_url;
-    statusEl.textContent = 'Found: ' + rel.tag_name + ' — ' + otaAsset.name + ' (' + (otaAsset.size / 1024).toFixed(0) + ' KB). Click "Download & Flash" to proceed.';
-    statusEl.className = 'status-msg success';
+
+    /* Compare latest release tag against the installed firmware version.
+     * fw_ver is set by loadStatusTab from /api/status (e.g. "1.2.3");
+     * rel.tag_name has a leading "v" (e.g. "v1.2.3").  Strip it and also
+     * trim any "+N-gHASH" suffix from git describe for the comparison. */
+    var fwEl = document.getElementById('status-fw');
+    var installed = fwEl ? (fwEl.textContent || '').trim() : '';
+    var latest = rel.tag_name.replace(/^v/, '');
+    var installedBase = installed.replace(/\+.*$/, '');
+    var upToDate = installedBase && installedBase === latest;
+
+    if (upToDate) {
+      urlInput.value = '';
+      statusEl.innerHTML = 'You\u2019re already on the latest version (' + rel.tag_name + ').' +
+        ' <a href="#" onclick="document.getElementById(\'ota-url-input\').value=\'' + otaAsset.browser_download_url + '\';' +
+        'document.getElementById(\'ota-url-status\').textContent=\'Ready: ' + otaAsset.name + ' (' + (otaAsset.size / 1024).toFixed(0) + ' KB). Click Download &amp; Flash to reflash.\';' +
+        'document.getElementById(\'ota-url-status\').className=\'status-msg\';return false">Reflash anyway</a>';
+      statusEl.className = 'status-msg success';
+    } else {
+      urlInput.value = otaAsset.browser_download_url;
+      var youHave = installedBase ? ' (you have v' + installedBase + ')' : '';
+      statusEl.textContent = 'Update available: ' + rel.tag_name + youHave + ' — ' + otaAsset.name + ' (' + (otaAsset.size / 1024).toFixed(0) + ' KB). Click "Download & Flash" to proceed.';
+      statusEl.className = 'status-msg success';
+    }
   }).catch(function(e) {
     statusEl.textContent = 'Failed to fetch latest release: ' + (e.message || 'network error');
     statusEl.className = 'status-msg error';

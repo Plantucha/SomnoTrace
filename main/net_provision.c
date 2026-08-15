@@ -376,6 +376,14 @@ esp_err_t netprov_init(void)
     s_netif_sta = esp_netif_create_default_wifi_sta();
     s_netif_ap = esp_netif_create_default_wifi_ap();
 
+    /* Set the DHCP hostname so routers show the friendly name instead of
+     * the ESP-IDF default ("espressif").  Must be set before the interface
+     * comes up for it to take effect on the first DHCP lease. */
+    char dhname[MDNS_NAME_MAX];
+    netprov_get_mdns_name(dhname, sizeof(dhname));
+    esp_netif_set_hostname(s_netif_sta, dhname);
+    esp_netif_set_hostname(s_netif_ap, dhname);
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
@@ -1839,9 +1847,10 @@ static void recreate_edfs_task(void *arg)
     int max_days = uploader_max_days();
     ESP_LOGI(TAG, "recreate_edfs_task: upload window = %d days (newest first)", max_days);
 
-    /* 1. Delete everything in SDCARD/ recursively. */
-    recursive_delete(SD_SDCARD_DIR);
-    ESP_LOGI(TAG, "recreate_edfs_task: SDCARD/ deleted");
+    /* 1. Per-day deletion happens inline during generation (below) so that
+     * days outside the upload window are left untouched.  The shared root
+     * artifacts (STR.edf, Identification.json, SETTINGS/) are overwritten
+     * by edf_gen_generate via atomic rename — no pre-deletion needed. */
 
     /* 2. First pass: count total _session.json files so we can allocate the
      * exact-sized array (no arbitrary cap). */
@@ -2005,6 +2014,12 @@ static void recreate_edfs_task(void *arg)
                  * older; stop processing. */
                 break;
             }
+            /* Delete just this day's existing EDF folder before recreating
+             * it, so stale files from a previous export don't survive. */
+            char old_day_dir[300];
+            snprintf(old_day_dir, sizeof(old_day_dir), "%s/%s",
+                     SD_SDCARD_DATALOG, day_folder);
+            recursive_delete(old_day_dir);
             strlcpy(queued_days[n_queued_days++], day_folder, sizeof(queued_days[0]));
         }
 
