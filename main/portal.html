@@ -2493,7 +2493,7 @@ function otaFetchLatest() {
     var fwEl = document.getElementById('status-fw');
     var installed = fwEl ? (fwEl.textContent || '').trim() : '';
     var latest = rel.tag_name.replace(/^v/, '');
-    var installedBase = installed.replace(/\+.*$/, '');
+    var installedBase = installed.replace(/^v/, '').replace(/\+.*$/, '');
     var upToDate = installedBase && installedBase === latest;
 
     if (upToDate) {
