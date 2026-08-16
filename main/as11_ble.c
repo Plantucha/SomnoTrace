@@ -201,7 +201,7 @@ typedef struct {
 typedef struct {
     spool_frag_t frags[SPOOL_MAX_FRAGS];
     int      frag_count;
-    char     status[32];                /* SPOOL_INCOMPLETE / SPOOL_COMPLETE / ... */
+    char     status[48];                /* SPOOL_INCOMPLETE / SPOOL_COMPLETE / ... */
     char     next_addr_json[256];       /* nextSpoolAddress for multi-round pulls */
     bool     done;                      /* set when status != SPOOL_INCOMPLETE */
     SemaphoreHandle_t sem;              /* given when done */

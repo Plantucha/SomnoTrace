@@ -8,9 +8,9 @@ CONFIG_IDF_TARGET="esp32s3"
 # CPU: run at 240 MHz for faster BLE notification processing
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# Main task stack: recovery + cJSON need more than default 3584.
-# 6144 is enough once heavy work is off the main task; saves ~2 KB DRAM.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+# Main task stack: recovery + cJSON + SDMMC VFS operations.
+# 10240 gives ample headroom for crash recovery of interrupted sessions.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
 
 # System event task (sys_evt) stack: default 2304 is too small for Wi-Fi/IP event handlers
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3584

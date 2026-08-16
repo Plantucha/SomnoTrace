@@ -1198,7 +1198,7 @@ static void pending_export_mark(const char *day)
     mkdir(SD_APP_DIR, 0775);
     mkdir(SD_PENDING_EXPORT_DIR, 0775);
 
-    char path[300];
+    char path[128];
     pending_path(day, path, sizeof(path));
 
     struct stat st;
@@ -1207,7 +1207,7 @@ static void pending_export_mark(const char *day)
         return;
     }
 
-    char tmp[320];
+    char tmp[140];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) {
@@ -2490,6 +2490,21 @@ static int64_t parse_iso8601_utc_ms(const char *iso_str)
     return secs * 1000 + ms;
 }
 
+/* Allocate helper prioritizing PSRAM to conserve internal DRAM. */
+static inline void *psram_or_heap_malloc(size_t sz)
+{
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = malloc(sz);
+    return p;
+}
+
+static inline void *psram_or_heap_calloc(size_t n, size_t sz)
+{
+    void *p = heap_caps_calloc(n, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = calloc(n, sz);
+    return p;
+}
+
 /* Derive a session-local drift from a durable event carrying both the AS11
  * reportTime and the NTP time captured at receipt.  Preferred over any
  * persisted estimate because it belongs to *this* session. */
@@ -2499,9 +2514,13 @@ static bool drift_from_events(const char *events_path, int64_t *out_drift,
     FILE *f = fopen(events_path, "r");
     if (!f) return false;
 
-    char line[1024];
+    char *line = psram_or_heap_malloc(2048);
+    if (!line) {
+        fclose(f);
+        return false;
+    }
     bool found = false;
-    while (fgets(line, sizeof(line), f)) {
+    while (fgets(line, 2048, f)) {
         if (!strstr(line, "ntpTimeMs")) continue;
         cJSON *root = cJSON_Parse(line);
         if (!root) continue;
@@ -2529,6 +2548,7 @@ static bool drift_from_events(const char *events_path, int64_t *out_drift,
         cJSON_Delete(root);
         if (found) break;
     }
+    free(line);
     fclose(f);
     return found;
 }
@@ -2545,7 +2565,7 @@ static bool manifest_is_final(const char *path)
     fseek(f, 0, SEEK_SET);
     if (size <= 0 || size > 16384) { fclose(f); return false; }
 
-    char *buf = malloc(size + 1);
+    char *buf = psram_or_heap_malloc(size + 1);
     if (!buf) { fclose(f); return false; }
     size_t rd = fread(buf, 1, size, f);
     fclose(f);
@@ -2570,6 +2590,22 @@ static bool manifest_is_final(const char *path)
     return final;
 }
 
+typedef struct {
+    char day_path[300];
+    char tmp_path[420];
+    char json_path[420];
+    char path[420];
+    char tmp[440];
+    char prefix[40];
+    char iso_start[32];
+    snt_scan_t flow_s;
+    snt_scan_t press_s;
+    snt_scan_t mm_s;
+    snt_scan_t sa2_s;
+    snt_scan_t pld_s;
+    snt_ckpt_t ck;
+} recover_ctx_t;
+
 void session_writer_recover(void)
 {
     if (!sd_storage_is_ready()) return;
@@ -2585,8 +2621,17 @@ void session_writer_recover(void)
         }
     }
 
+    recover_ctx_t *ctx = psram_or_heap_calloc(1, sizeof(recover_ctx_t));
+    if (!ctx) {
+        ESP_LOGE(TAG, "recover: failed to allocate recovery context");
+        return;
+    }
+
     DIR *dir = opendir(SD_STREAMS_DIR);
-    if (!dir) return;
+    if (!dir) {
+        free(ctx);
+        return;
+    }
 
     struct dirent *ent;
     int recovered = 0;
@@ -2595,10 +2640,9 @@ void session_writer_recover(void)
         if (ent->d_name[0] == '.') continue;
         if (strlen(ent->d_name) != 8) continue;  /* YYYYMMDD */
 
-        char day_path[300];
-        snprintf(day_path, sizeof(day_path), "%s/%s", SD_STREAMS_DIR, ent->d_name);
+        snprintf(ctx->day_path, sizeof(ctx->day_path), "%s/%s", SD_STREAMS_DIR, ent->d_name);
 
-        DIR *day_dir = opendir(day_path);
+        DIR *day_dir = opendir(ctx->day_path);
         if (!day_dir) continue;
 
         struct dirent *day_ent;
@@ -2612,73 +2656,71 @@ void session_writer_recover(void)
             bool is_v2 = (flow_suffix != NULL);
 
             size_t prefix_len = suffix - day_ent->d_name;
-            if (prefix_len >= 40) continue;
-            char prefix[40];
-            memcpy(prefix, day_ent->d_name, prefix_len);
-            prefix[prefix_len] = '\0';
+            if (prefix_len >= sizeof(ctx->prefix)) continue;
+            memcpy(ctx->prefix, day_ent->d_name, prefix_len);
+            ctx->prefix[prefix_len] = '\0';
 
             /* Leftover temp manifest from a crash mid-rename. */
-            char tmp_path[420];
-            snprintf(tmp_path, sizeof(tmp_path), "%s/%s_session.json.tmp",
-                     day_path, prefix);
-            if (unlink(tmp_path) == 0) {
-                ESP_LOGW(TAG, "recover: removed stale temp manifest for %s", prefix);
+            snprintf(ctx->tmp_path, sizeof(ctx->tmp_path), "%s/%s_session.json.tmp",
+                     ctx->day_path, ctx->prefix);
+            if (unlink(ctx->tmp_path) == 0) {
+                ESP_LOGW(TAG, "recover: removed stale temp manifest for %s", ctx->prefix);
             }
 
-            char json_path[420];
-            snprintf(json_path, sizeof(json_path), "%s/%s_session.json",
-                     day_path, prefix);
-            if (manifest_is_final(json_path)) continue;
+            snprintf(ctx->json_path, sizeof(ctx->json_path), "%s/%s_session.json",
+                     ctx->day_path, ctx->prefix);
+            if (manifest_is_final(ctx->json_path)) continue;
 
             ESP_LOGW(TAG, "found interrupted session: %s/%s — recovering",
-                     ent->d_name, prefix);
+                     ent->d_name, ctx->prefix);
 
-            char path[420];
             int64_t start_epoch_ms = 0;
-            snt_scan_t flow_s = {0}, press_s = {0}, mm_s = {0},
-                       sa2_s = {0}, pld_s = {0};
+            memset(&ctx->flow_s, 0, sizeof(ctx->flow_s));
+            memset(&ctx->press_s, 0, sizeof(ctx->press_s));
+            memset(&ctx->mm_s, 0, sizeof(ctx->mm_s));
+            memset(&ctx->sa2_s, 0, sizeof(ctx->sa2_s));
+            memset(&ctx->pld_s, 0, sizeof(ctx->pld_s));
 
             if (is_v2) {
-                snprintf(path, sizeof(path), "%s/%s_flow.snt", day_path, prefix);
-                flow_s = scan_and_repair_snt(path, 1, 250);
-                snprintf(path, sizeof(path), "%s/%s_press.snt", day_path, prefix);
-                press_s = scan_and_repair_snt(path, 1, 250);
-                snprintf(path, sizeof(path), "%s/%s_flow_mm.snt", day_path, prefix);
-                mm_s = scan_and_repair_snt(path, 2, 10);
+                snprintf(ctx->path, sizeof(ctx->path), "%s/%s_flow.snt", ctx->day_path, ctx->prefix);
+                ctx->flow_s = scan_and_repair_snt(ctx->path, 1, 250);
+                snprintf(ctx->path, sizeof(ctx->path), "%s/%s_press.snt", ctx->day_path, ctx->prefix);
+                ctx->press_s = scan_and_repair_snt(ctx->path, 1, 250);
+                snprintf(ctx->path, sizeof(ctx->path), "%s/%s_flow_mm.snt", ctx->day_path, ctx->prefix);
+                ctx->mm_s = scan_and_repair_snt(ctx->path, 2, 10);
             } else {
-                snprintf(path, sizeof(path), "%s/%s_brp.snt", day_path, prefix);
-                flow_s = scan_and_repair_snt(path, 0, 0);
-                snprintf(path, sizeof(path), "%s/%s_brp_mm.snt", day_path, prefix);
-                mm_s = scan_and_repair_snt(path, 0, 0);
+                snprintf(ctx->path, sizeof(ctx->path), "%s/%s_brp.snt", ctx->day_path, ctx->prefix);
+                ctx->flow_s = scan_and_repair_snt(ctx->path, 0, 0);
+                snprintf(ctx->path, sizeof(ctx->path), "%s/%s_brp_mm.snt", ctx->day_path, ctx->prefix);
+                ctx->mm_s = scan_and_repair_snt(ctx->path, 0, 0);
             }
-            snprintf(path, sizeof(path), "%s/%s_sa2.snt", day_path, prefix);
-            sa2_s = scan_and_repair_snt(path, 2, 10);
-            snprintf(path, sizeof(path), "%s/%s_pld.snt", day_path, prefix);
-            pld_s = scan_and_repair_snt(path, 12, 5);
+            snprintf(ctx->path, sizeof(ctx->path), "%s/%s_sa2.snt", ctx->day_path, ctx->prefix);
+            ctx->sa2_s = scan_and_repair_snt(ctx->path, 2, 10);
+            snprintf(ctx->path, sizeof(ctx->path), "%s/%s_pld.snt", ctx->day_path, ctx->prefix);
+            ctx->pld_s = scan_and_repair_snt(ctx->path, 12, 5);
 
-            if (flow_s.valid) start_epoch_ms = flow_s.start_epoch_ms;
+            if (ctx->flow_s.valid) start_epoch_ms = ctx->flow_s.start_epoch_ms;
 
             /* v2 pair: the exported lockstep length is the shorter of the
              * two, and a mismatch is worth saying out loud. */
-            uint32_t brp_records = flow_s.records;
-            if (is_v2 && press_s.valid) {
-                if (press_s.records != flow_s.records) {
+            uint32_t brp_records = ctx->flow_s.records;
+            if (is_v2 && ctx->press_s.valid) {
+                if (ctx->press_s.records != ctx->flow_s.records) {
                     ESP_LOGW(TAG, "recover: flow/press count mismatch "
                              "(%u vs %u) — using the smaller",
-                             (unsigned)flow_s.records, (unsigned)press_s.records);
+                             (unsigned)ctx->flow_s.records, (unsigned)ctx->press_s.records);
                 }
-                brp_records = flow_s.records < press_s.records
-                            ? flow_s.records : press_s.records;
+                brp_records = ctx->flow_s.records < ctx->press_s.records
+                            ? ctx->flow_s.records : ctx->press_s.records;
             }
 
             /* Checkpoint: newest valid slot. */
-            snt_ckpt_t ck;
             bool have_ckpt = false;
-            snprintf(path, sizeof(path), "%s/%s.ckpt", day_path, prefix);
-            memset(&ck, 0, sizeof(ck));
-            have_ckpt = ckpt_read_best(path, &ck);
+            snprintf(ctx->path, sizeof(ctx->path), "%s/%s.ckpt", ctx->day_path, ctx->prefix);
+            memset(&ctx->ck, 0, sizeof(ctx->ck));
+            have_ckpt = ckpt_read_best(ctx->path, &ctx->ck);
             if (have_ckpt && start_epoch_ms <= 0)
-                start_epoch_ms = ck.start_epoch_ms;
+                start_epoch_ms = ctx->ck.start_epoch_ms;
 
             /* Last resort: reconstruct the start from the session id so the
              * day bucketing stays correct instead of defaulting to epoch 0
@@ -2686,7 +2728,7 @@ void session_writer_recover(void)
             if (start_epoch_ms <= 0) {
                 struct tm tm_id = {0};
                 int y, mo, d, h, mi, sec;
-                if (sscanf(prefix, "%4d%2d%2d_%2d%2d%2d",
+                if (sscanf(ctx->prefix, "%4d%2d%2d_%2d%2d%2d",
                            &y, &mo, &d, &h, &mi, &sec) == 6) {
                     tm_id.tm_year = y - 1900; tm_id.tm_mon = mo - 1;
                     tm_id.tm_mday = d; tm_id.tm_hour = h;
@@ -2697,24 +2739,24 @@ void session_writer_recover(void)
                 }
                 if (start_epoch_ms <= 0) {
                     ESP_LOGW(TAG, "skipping %s/%s — no valid header, no "
-                             "checkpoint, unparseable id", ent->d_name, prefix);
+                             "checkpoint, unparseable id", ent->d_name, ctx->prefix);
                     continue;
                 }
                 ESP_LOGW(TAG, "recover: start time reconstructed from id for %s",
-                         prefix);
+                         ctx->prefix);
             }
 
             /* End time, with provenance. */
             int64_t end_epoch_ms = 0;
             const char *end_source = "none";
-            if (have_ckpt && ck.elapsed_us > 0) {
-                end_epoch_ms = start_epoch_ms + ck.elapsed_us / 1000;
+            if (have_ckpt && ctx->ck.elapsed_us > 0) {
+                end_epoch_ms = start_epoch_ms + ctx->ck.elapsed_us / 1000;
                 end_source = "checkpoint";
-                if (brp_records > ck.flow_count) {
+                if (brp_records > ctx->ck.flow_count) {
                     /* Records exist beyond the checkpoint: recover them and
                      * extend the estimate by their duration rather than
                      * discarding the tail or pretending it was observed. */
-                    uint32_t extra = brp_records - ck.flow_count;
+                    uint32_t extra = brp_records - ctx->ck.flow_count;
                     end_epoch_ms += (int64_t)extra * 1000 / 25;
                     end_source = "checkpoint_extrapolated";
                     ESP_LOGW(TAG, "recover: %u records past checkpoint — "
@@ -2729,8 +2771,8 @@ void session_writer_recover(void)
             int64_t drift_ms = 0, drift_at = 0;
             const char *drift_source = "none";
             bool drift_usable = false;
-            snprintf(path, sizeof(path), "%s/%s_events.snt", day_path, prefix);
-            if (drift_from_events(path, &drift_ms, &drift_at)) {
+            snprintf(ctx->path, sizeof(ctx->path), "%s/%s_events.snt", ctx->day_path, ctx->prefix);
+            if (drift_from_events(ctx->path, &drift_ms, &drift_at)) {
                 drift_source = "session_events";
                 drift_usable = true;
                 ESP_LOGI(TAG, "recover: drift %lld ms from session events",
@@ -2754,25 +2796,24 @@ void session_writer_recover(void)
             pending_export_mark(ent->d_name);
 
             /* Write the manifest atomically. */
-            char tmp[440];
-            snprintf(tmp, sizeof(tmp), "%s.tmp", json_path);
-            FILE *f = fopen(tmp, "w");
+            snprintf(ctx->tmp, sizeof(ctx->tmp), "%s.tmp", ctx->json_path);
+            FILE *f = fopen(ctx->tmp, "w");
             if (!f) {
-                ESP_LOGE(TAG, "recover: cannot create %s", tmp);
+                ESP_LOGE(TAG, "recover: cannot create %s", ctx->tmp);
                 continue;
             }
 
-            char iso_start[32] = {0};
+            ctx->iso_start[0] = '\0';
             {
                 time_t st = (time_t)(start_epoch_ms / 1000);
                 struct tm tm;
                 localtime_r(&st, &tm);
-                strftime(iso_start, sizeof(iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
+                strftime(ctx->iso_start, sizeof(ctx->iso_start), "%Y-%m-%dT%H:%M:%S", &tm);
             }
 
             fprintf(f, "{\"id\":\"%s\",\"state\":\"interrupted\","
                        "\"start_epoch_ms\":%lld",
-                    prefix, (long long)start_epoch_ms);
+                    ctx->prefix, (long long)start_epoch_ms);
             if (end_epoch_ms > 0)
                 fprintf(f, ",\"end_epoch_ms\":%lld", (long long)end_epoch_ms);
             fprintf(f, ",\"end_source\":\"%s\"", end_source);
@@ -2784,15 +2825,15 @@ void session_writer_recover(void)
                 fprintf(f, ",\"clock_drift_measured_at_ms\":%lld", (long long)drift_at);
             fprintf(f, ",\"brp_samples\":%u,\"brp_mm_samples\":%u,"
                        "\"sa2_samples\":%u,\"pld_samples\":%u",
-                    (unsigned)brp_records, (unsigned)mm_s.records,
-                    (unsigned)sa2_s.records, (unsigned)pld_s.records);
+                    (unsigned)brp_records, (unsigned)ctx->mm_s.records,
+                    (unsigned)ctx->sa2_s.records, (unsigned)ctx->pld_s.records);
             if (is_v2)
                 fprintf(f, ",\"fmt\":2,\"press_samples\":%u",
-                        (unsigned)press_s.records);
+                        (unsigned)ctx->press_s.records);
             if (have_ckpt)
-                fprintf(f, ",\"checkpoint_seq\":%u", (unsigned)ck.seq);
-            if (iso_start[0])
-                fprintf(f, ",\"start_iso\":\"%s\"", iso_start);
+                fprintf(f, ",\"checkpoint_seq\":%u", (unsigned)ctx->ck.seq);
+            if (ctx->iso_start[0])
+                fprintf(f, ",\"start_iso\":\"%s\"", ctx->iso_start);
             if (s_device_addr[0])
                 fprintf(f, ",\"as11_device\":\"%s\"", s_device_addr);
             if (s_client_id[0])
@@ -2802,23 +2843,25 @@ void session_writer_recover(void)
             bool ok = (fflush(f) == 0) && (fsync(fileno(f)) == 0);
             if (fclose(f) != 0) ok = false;
             if (ok) {
-                unlink(json_path);
-                ok = (rename(tmp, json_path) == 0);
+                unlink(ctx->json_path);
+                ok = (rename(ctx->tmp, ctx->json_path) == 0);
             }
             if (!ok) {
-                unlink(tmp);
-                ESP_LOGE(TAG, "recover: failed to write %s", json_path);
+                unlink(ctx->tmp);
+                ESP_LOGE(TAG, "recover: failed to write %s", ctx->json_path);
                 continue;
             }
 
             ESP_LOGI(TAG, "recovered %s: brp=%u end_source=%s drift=%s",
-                     prefix, (unsigned)brp_records, end_source, drift_source);
+                     ctx->prefix, (unsigned)brp_records, end_source, drift_source);
             recovered++;
         }
         closedir(day_dir);
     }
 
     closedir(dir);
+    free(ctx);
+
     if (recovered > 0) {
         ESP_LOGI(TAG, "recovered %d interrupted session(s)", recovered);
         ESP_LOGI(TAG, "their day(s) are queued for automatic export; the "
