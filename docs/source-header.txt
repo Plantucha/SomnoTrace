@@ -2,7 +2,7 @@ Add the following header to the top of every source file in this project.
 Adjust the comment syntax to the language (e.g. // for C/C++, # for Python).
 
 --------------------------------------------------------------------------------
-SomnoTrace - <one-line description of this file>
+SomnoTrace - <one-line synopsis of this file's purpose>
 Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
 
 This file is part of SomnoTrace.

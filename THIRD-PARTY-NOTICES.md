@@ -95,6 +95,19 @@ determined to have been incorporated.
   code was copied; only register addresses and initialization values
   (protocol facts) were used.
 
+## OSCAR (Open Source CPAP Analysis Reporter)
+
+- **Project:** OSCAR
+- **Source:** https://gitlab.com/pholy/OSCAR-code
+- **Referenced for:** Understanding European Data Format (EDF) compatibility
+  requirements, signal channel mappings, and statistical calculation parity
+  (notably AHI calculation and weighted histogram percentile interpolation
+  matching `SleepLib/day.cpp`).
+- **License:** GPL-3.0-or-later
+- **Notes:** Clean-room reference only. No source code was copied.
+  Algorithms and metric definitions were implemented independently in
+  JavaScript (`main/portal.html`) and C (`main/edf_gen.c`).
+
 ---
 
 ## MIT License (reference text)

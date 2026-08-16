@@ -20,6 +20,10 @@
  * ADDITIONAL TERM (GPLv3 Section 7(b)): Redistributions must preserve the
  * attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
  * (https://github.com/ilyakruchinin)." See the NOTICE file for details.
+ *
+ * Glyph bitmap data and metrics in this file are derived from Google's Roboto
+ * typeface, licensed under the SIL Open Font License 1.1 (OFL).
+ * See assets/fonts/Roboto/OFL.txt and assets/fonts/Roboto/ORIGIN.md.
  */
 
 #pragma once
