@@ -62,7 +62,7 @@ flowchart LR
 SomnoTrace includes a self-contained web interface served directly from the ESP32-S3:
 
 <p align="center">
-  <img width="100%" alt="SomnoTrace Web UI Portal" src="https://github.com/user-attachments/assets/953748c4-4f96-4d44-a925-9ef701b63558" />
+  <img width="100%" alt="SomnoTrace Web UI Portal" src="https://private-user-images.githubusercontent.com/16409780/633590291-27704cb3-21ff-41d2-8f43-124b6daf151d.png" />
 </p>
 
 - **Interactive Time-Series Charts:** High-density stacked charts powered by [uPlot](https://github.com/leeoniya/uPlot) for Flow Rate, Mask Pressure, Leak, Respiratory Rate, and SpO2.
