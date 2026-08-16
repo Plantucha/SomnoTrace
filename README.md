@@ -85,7 +85,7 @@ SomnoTrace includes a self-contained web interface served directly from the ESP3
 | **NTP Time Sync** | ✅ Implemented | Accurate wall-clock stamping and timezone mapping (via embedded IANA database). |
 | **FTP File Server** | ✅ Implemented | Lightweight background FTP server for direct SD card file management over Wi-Fi. |
 | **Wellue O2 Ring Sync** | 🔄 Planned | Direct BLE sync for O2 Ring S / SleepHQ O2 Ring Pro pulse oximetry data. |
-| **Therapy Interruption Alarm** | 🔄 Planned | Configurable audio alert if therapy unexpectedly stops during the night. |
+| **Therapy Interruption Alarm** | ✅ Implemented | Configurable audio alert if therapy unexpectedly stops during the night. |
 | **AirSense 10 Wi-Fi SD Support** | 🔄 Planned | Support for pulling therapy data from AirSense 10 machines using Wi-Fi SD cards. |
 
 ---
