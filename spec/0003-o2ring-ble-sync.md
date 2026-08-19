@@ -67,14 +67,15 @@ paired   → low-duty *passive* scan
          → ring present + not yet served this presence
          → connect 2nd slot (AS11 stays up)
          → AUTH+SETUP + GET_INFO (serial must match) + one LIVE_B
-         → [5]!=0x00 → disconnect, retry in 30 s (still recording)
+         → [5]!=0x00 → disconnect, retry in 60 s (still recording)
          → [5]==0x00 (END window) → SET_UTC + GET_CONFIG + F4
          → F1 → pull new files → F4 → disconnect ring
-         → mark served, stay quiet 90 s (let END power off)
-         → still advertising after 90 s → LIVE_B probe
-              [5]==0x01 → clear served (put back on; next take-off pulls)
-              [5]==0x00 → stay served (still END)
-         → ring gone → clear served
+         → mark served → **never reconnect while this advert lasts**
+           (any GATT connection resets the ring's power-off timer)
+         → advert stops (power-off) → clear served
+         → advert STILL present at pull+130 s ⇒ END (≤ take-off+120 s,
+           and pull ran inside it) must already be over ⇒ ring was
+           put back on → clear served, resume 60 s worn probes
 AS11 reconnect / pair / post_therapy_collect → pause ring I/O and scan
 ```
 
@@ -121,20 +122,23 @@ SomnoTrace must:
    `0x03` = file handle open (**never pull now**).
    Only `0x00` continues. Any other value or no reply →
    **disconnect immediately, do not pull, do not mark served.**
-   While still advertising and on-finger, probe again after **30 s**
-   (oximetry dominates ring power; a short GATT probe is acceptable).
+   While still advertising and on-finger, probe again after **60 s**
+   (still lands well inside the ~120 s END window; a pull takes
+   ~4–30 s, leaving ≥60 s margin).
 6. Off-finger (`0x00`) only: SET_UTC + GET_CONFIG + F4, then F1 →
    pull new / unfinalised files. Promote only if trailer magic
    `48 12 5a da` is at `file_size-44`. Incomplete files stay in
    `inbox/`.
 7. **Always disconnect** (F4 if a file was open, then GAP disconnect).
-8. Mark this presence **served**. Stay off the link for **90 s** so
-   END can power off. There is **no documented safe power-off
-   opcode** (`0xEE` stays dead until USB; `0xE3` wipes recordings;
-   SDK RESET is uncaptured). Do not invent one.
-9. If it is still advertising after 90 s, one LIVE_B probe:
-   `[5]==0x01` → user put it back on; **clear served** so the next
-   take-off is a new pull. `[5]==0x00` → still END; stay served.
+8. Mark this presence **served** and **never reconnect while this
+   advert continues** (measured: any GATT connection resets the
+   ring's ~120 s END power-off timer). There is **no documented safe
+   power-off opcode** (`0xEE` stays dead until USB; `0xE3` wipes
+   recordings; SDK RESET is uncaptured). Do not invent one.
+9. Re-worn detection is passive: END ends at take-off + ≤120 s and
+   the pull ran inside that window, so if the advert is **still
+   present at pull + 130 s** the ring must be back on a finger.
+   Clear served and resume 60 s worn probes.
 10. When scan no longer sees it, clear served.
 
 **Not a trigger:**
@@ -322,12 +326,15 @@ time; last error. Battery optional. Unpaired ⇒ no background pull.
 - [ ] No third-party protocol source copied; header on new files.
 - [ ] `0xE3` / `0xEE` never sent.
 - [ ] Background path never holds the link; while worn it may
-      probe LIVE_B at most once per 30 s, then disconnect.
+      probe LIVE_B at most once per 60 s, then disconnect.
 - [ ] After pair or pull the ring GAP link is down (no leftover
       connection). The ring can finish END and power off.
-- [ ] After a completed pull, firmware stays off the link for 90 s.
-      Then one LIVE_B: on-finger clears served; still off-finger
-      stays served. `0xE3` / `0xEE` never sent.
+- [ ] After a completed pull, firmware never reconnects while the
+      same advert continues (a connection would reset the ring's
+      power-off timer). Ring powers off on its own ~120 s after
+      take-off. `0xE3` / `0xEE` never sent.
+- [ ] If the advert persists past pull + 130 s, served is cleared
+      (re-worn inference) and the next take-off pulls normally.
 - [ ] After advertising stops, the next appearance starts a new
       pull (new session after take-off).
 - [ ] Never pulls while LIVE_B `[5]==0x01` (on-finger) or on a
@@ -369,5 +376,8 @@ time; last error. Battery optional. Unpaired ⇒ no background pull.
   Window X ≈ 120 s then power-off. Probe = AUTH+SETUP+LIVE_B;
   F4 only after `[5]==0x00`. 30 s reconnect while worn is OK.
 - 2026-08-19: SHQO2Pro keeps advertising if put back on after a
-  pull (no advert gap). After 90 s quiet, LIVE_B `0x01` clears
-  served. No power-off command (`0xEE` / `0xE3` forbidden).
+  pull (no advert gap). Measured: a GATT connection during END
+  resets the ~120 s power-off timer, so after a pull the firmware
+  never reconnects while the advert lasts. Re-worn is inferred
+  passively (advert alive at pull + 130 s). No power-off command
+  (`0xEE` / `0xE3` forbidden). Worn probe interval 60 s.

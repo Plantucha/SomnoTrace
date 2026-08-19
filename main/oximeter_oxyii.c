@@ -256,9 +256,14 @@ static char s_name_prefix[16];
 static char s_paired_addr[18];
 static bool s_paired = false;
 static bool s_presence_served = false;
+static bool s_ring_present = false;
 static TickType_t s_served_at;
 
-#define OX_END_QUIET_MS   90000  /* after pull, let END power off */
+/* Measured: END powers off ~120s after take-off IF no one connects.
+ * Any GATT connection resets that timer. Pull happens inside the
+ * window, so after a pull: never reconnect while the advert lasts.
+ * Still advertising at pull+130s can only mean re-worn. */
+#define OX_END_WINDOW_MS  130000
 #define OX_WORN_PROBE_MS  60000  /* LIVE_B interval while worn; END lasts ~120s */
 
 /* BLE connection state */
@@ -444,7 +449,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_scan[s_scan_count].rssi = event->disc.rssi;
             s_scan[s_scan_count].mfg = cid;
             s_scan_count++;
-            ESP_LOGI(TAG, "scan: '%s' rssi=%d addr=%s mfg=0x%04x",
+            ESP_LOGD(TAG, "scan: '%s' rssi=%d addr=%s mfg=0x%04x",
                      name, event->disc.rssi, addr_str, cid);
         }
         return 0;
@@ -1098,25 +1103,36 @@ static void pull_task(void *arg)
         }
 
         if (s_scan_count == 0) {
-            if (s_presence_served) {
+            if (s_ring_present)
                 ESP_LOGI(TAG, "ring gone — next appearance is a new sync window");
+            s_ring_present = false;
+            if (s_presence_served)
                 s_presence_served = false;
-            }
             xSemaphoreGive(s_ops_mtx);
             continue;
+        }
+
+        if (!s_ring_present) {
+            ESP_LOGI(TAG, "ring present: '%s' rssi=%d",
+                     s_scan[0].name, s_scan[0].rssi);
+            s_ring_present = true;
         }
 
         /* Remember last seen addr (hint; MAC can rotate on factory reset). */
         addr_to_str(&s_scan[0].addr, s_paired_addr, sizeof(s_paired_addr));
 
         if (s_presence_served) {
-            /* Stay off the link for OX_END_QUIET_MS so END can power
-             * off. After that, SHQO2Pro may still be advertising
-             * because the user put it back on — probe LIVE_B. */
-            if ((xTaskGetTickCount() - s_served_at) < pdMS_TO_TICKS(OX_END_QUIET_MS)) {
+            /* Never reconnect during END — a connection resets the
+             * ring's power-off timer (measured). Passive scans only.
+             * Still advertising past the longest possible END window
+             * (take-off + ~120s; pull ran inside it) ⇒ back on a
+             * finger ⇒ clear served so the next take-off pulls. */
+            if ((xTaskGetTickCount() - s_served_at) < pdMS_TO_TICKS(OX_END_WINDOW_MS)) {
                 xSemaphoreGive(s_ops_mtx);
                 continue;
             }
+            ESP_LOGI(TAG, "watch: still advertising past END window — re-worn, resuming probes");
+            s_presence_served = false;
         }
 
         set_state(OX_STATUS_CONNECTING);
@@ -1155,27 +1171,12 @@ static void pull_task(void *arg)
          * finish countdown and sleep. Do not mark served. */
         int off = oxyii_off_finger();
         if (off != 1) {
-            if (s_presence_served) {
-                ESP_LOGI(TAG, "watch: back on-finger — new session after next take-off");
-                s_presence_served = false;
-            } else {
-                ESP_LOGI(TAG, "watch: not off-finger (live_b=%d) — disconnect, retry in %ds",
-                         off, OX_WORN_PROBE_MS / 1000);
-            }
+            ESP_LOGI(TAG, "watch: not off-finger (live_b=%d) — disconnect, retry in %ds",
+                     off, OX_WORN_PROBE_MS / 1000);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
             xSemaphoreGive(s_ops_mtx);
             vTaskDelay(pdMS_TO_TICKS(OX_WORN_PROBE_MS));
-            continue;
-        }
-
-        if (s_presence_served) {
-            /* Still END after the quiet window. Do not pull again. */
-            ESP_LOGI(TAG, "watch: still off-finger after pull — staying quiet");
-            s_served_at = xTaskGetTickCount();
-            do_disconnect();
-            set_state(OX_STATUS_PAIRED);
-            xSemaphoreGive(s_ops_mtx);
             continue;
         }
 
@@ -1223,8 +1224,7 @@ static void pull_task(void *arg)
         if (pull_ok) {
             s_presence_served = true;
             s_served_at = xTaskGetTickCount();
-            ESP_LOGI(TAG, "sync window served — quiet %ds so the ring can sleep",
-                     OX_END_QUIET_MS / 1000);
+            ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
         } else {
             ESP_LOGW(TAG, "sync incomplete — will retry this presence");
         }
