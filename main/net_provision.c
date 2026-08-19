@@ -25,6 +25,7 @@
 
 #include "net_provision.h"
 #include "as11_ble.h"
+#include "oximeter.h"
 #include "time_sync.h"
 #include "uploader.h"
 #include "upload_sched.h"
@@ -931,6 +932,20 @@ cJSON *netprov_build_status_json(void)
         }
     }
 
+    /* Oximeter (O2 Ring) status (only in connected mode) */
+    if (!s_portal_mode) {
+        cJSON *ox = cJSON_AddObjectToObject(resp, "oximeter");
+        cJSON_AddStringToObject(ox, "state", oximeter_get_status());
+        cJSON_AddStringToObject(ox, "error", oximeter_get_error());
+        cJSON_AddBoolToObject(ox, "paired", oximeter_is_paired());
+        if (oximeter_is_paired()) {
+            cJSON *oinfo = oximeter_get_paired_info();
+            if (oinfo) {
+                cJSON_AddItemToObject(ox, "device", oinfo);
+            }
+        }
+    }
+
     /* Upload summary (only in connected mode) */
     if (!s_portal_mode) {
         int pending = 0;
@@ -1176,6 +1191,55 @@ static esp_err_t ble_confirm_handler(httpd_req_t *req)
 static esp_err_t ble_forget_handler(httpd_req_t *req)
 {
     as11_ble_forget();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* ── Oximeter (O2 Ring) endpoints ──────────────────────────────────── */
+static esp_err_t ox_scan_handler(httpd_req_t *req)
+{
+    if (oximeter_scan(6) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oximeter not ready");
+        return ESP_FAIL;
+    }
+    cJSON *arr = oximeter_get_scan_results();
+    char *json = cJSON_PrintUnformatted(arr);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(json);
+    cJSON_Delete(arr);
+    return ESP_OK;
+}
+
+static esp_err_t ox_pair_handler(httpd_req_t *req)
+{
+    char body[128];
+    if (recv_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+        return ESP_FAIL;
+    }
+    cJSON *j = cJSON_Parse(body);
+    cJSON *addr = j ? cJSON_GetObjectItem(j, "addr") : NULL;
+    if (!cJSON_IsString(addr)) {
+        if (j) cJSON_Delete(j);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing addr");
+        return ESP_FAIL;
+    }
+    esp_err_t e = oximeter_pair(addr->valuestring);
+    cJSON_Delete(j);
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pair start failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t ox_forget_handler(httpd_req_t *req)
+{
+    oximeter_forget();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -2712,6 +2776,14 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &ble_conf);
     httpd_register_uri_handler(s_httpd, &ble_forget);
     httpd_register_uri_handler(s_httpd, &ble_pass);
+
+    /* Oximeter (O2 Ring) BLE pairing endpoints (status folded into /api/status) */
+    httpd_uri_t ox_scan = { .uri = "/api/ox/scan", .method = HTTP_GET, .handler = ox_scan_handler };
+    httpd_uri_t ox_pair = { .uri = "/api/ox/pair", .method = HTTP_POST, .handler = ox_pair_handler };
+    httpd_uri_t ox_forget = { .uri = "/api/ox/forget", .method = HTTP_POST, .handler = ox_forget_handler };
+    httpd_register_uri_handler(s_httpd, &ox_scan);
+    httpd_register_uri_handler(s_httpd, &ox_pair);
+    httpd_register_uri_handler(s_httpd, &ox_forget);
 
     /* EZShare-compatible file server endpoints */
     httpd_uri_t dir_hdl = { .uri = "/dir", .method = HTTP_GET, .handler = dir_get_handler };

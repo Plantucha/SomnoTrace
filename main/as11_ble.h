@@ -41,6 +41,14 @@
  * Call once at boot, after netprov_init(). */
 esp_err_t as11_ble_init(void);
 
+/* Return true if the NimBLE host has synced and is ready for operations.
+ * Shared with the oximeter module which reuses the same NimBLE host. */
+bool as11_ble_is_host_ready(void);
+
+/* Return the own address type for ble_gap_disc/ble_gap_connect calls.
+ * Shared with the oximeter module. */
+uint8_t as11_ble_get_own_addr_type(void);
+
 /* Start an active BLE scan for AirSense 11 devices.
  * Results are collected internally; retrieve with as11_ble_get_scan_results().
  * timeout_sec: scan duration in seconds (typically 5–10). */

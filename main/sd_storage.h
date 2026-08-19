@@ -48,6 +48,9 @@
 /* Uploader persistent state (migrated off the LittleFS flash partition) */
 #define SD_UPLOAD_STATE_DIR  SD_APP_DIR "/upload_state"
 
+/* Oximetry raw files from O2 Ring (Format A blobs, not EDF) */
+#define SD_OXYMETRY_DIR       SD_APP_DIR "/oximetry"
+
 /* ResMed-compatible export folder (self-contained, OSCAR-ready) */
 #define SD_SDCARD_DIR        SD_MOUNT_POINT "/SDCARD"
 #define SD_SDCARD_DATALOG    SD_SDCARD_DIR "/DATALOG"

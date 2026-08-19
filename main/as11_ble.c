@@ -2336,6 +2336,16 @@ esp_err_t as11_ble_init(void)
     return ESP_OK;
 }
 
+bool as11_ble_is_host_ready(void)
+{
+    return s_host_ready;
+}
+
+uint8_t as11_ble_get_own_addr_type(void)
+{
+    return s_own_addr_type;
+}
+
 esp_err_t as11_ble_scan(int timeout_sec)
 {
     if (!s_host_ready) return ESP_ERR_INVALID_STATE;

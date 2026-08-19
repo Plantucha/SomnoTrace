@@ -30,9 +30,9 @@ CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUFFER=y
 # CONFIG_ESP_WIFI_STATIC_RX_MGMT_BUFFER is not set
 
-# BLE controller: single AS11 connection.  Defaults (MAX_ACT=6, 100-entry
-# scan/adv caches, DTM, unused ATT prepare writes) waste internal RAM.
-CONFIG_BT_CTRL_BLE_MAX_ACT=3
+# BLE controller: two connections (AS11 + O2 Ring).  Defaults (MAX_ACT=6,
+# 100-entry scan/adv caches, DTM, unused ATT prepare writes) waste RAM.
+CONFIG_BT_CTRL_BLE_MAX_ACT=4
 CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=16
 CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=16
 CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10
@@ -132,7 +132,7 @@ CONFIG_HTTPD_WS_SUPPORT=y
 # See spec/0001-airsense11-ble-sync.md §4.4 and as11_ble.c file header.
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
 # Use default memory allocation (allows PSRAM) instead of internal-only.
 # Internal RAM is exhausted by Wi-Fi + libsmb2 + certificate bundle,
 # causing ble_buf_alloc() to fail with "hci inits failed".
@@ -149,12 +149,11 @@ CONFIG_ESP_WIFI_TASK_CORE_ID_0=y
 CONFIG_ESP_WIFI_TASK_CORE_ID=0
 CONFIG_BT_NIMBLE_PINNED_TO_CORE_CHOICE=y
 CONFIG_BT_NIMBLE_PINNED_TO_CORE=1
-# NimBLE msys1 / ACL buffer pool — required for BLE pairing.  Reduced from
-# 64 to 24 to save RAM while remaining sufficient for single-connection
-# GATT client traffic with the AirSense 11.
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+# NimBLE msys1 / ACL buffer pool — two connections (AS11 + O2 Ring).
+# Raised from 24 to 32 to provide headroom for concurrent GATT traffic.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=32
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE=256
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=24
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=32
 # CONFIG_BT_NIMBLE_SECURITY_ENABLE is not set
 # CONFIG_BT_NIMBLE_DEBUG is not set
 # CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG is not set

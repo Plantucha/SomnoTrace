@@ -33,6 +33,7 @@
 #include "bsp_display.h"
 #include "net_provision.h"
 #include "as11_ble.h"
+#include "oximeter.h"
 #include "sd_storage.h"
 #include "session_writer.h"
 #include "esp_system.h"
@@ -187,6 +188,11 @@ void app_main(void)
     ESP_LOGI(TAG, "[heap] after BLE init: internal free=%u min=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+
+    /* 4c-ter. Initialise O2 Ring oximeter (shares NimBLE host with AS11). */
+    if (oximeter_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Oximeter init failed; O2 Ring sync unavailable");
+    }
 
     /* 4c-bis. BLE startup has begun, so reconnect can now establish whether
      * therapy is already running.  Only now is it safe to let the idle post
