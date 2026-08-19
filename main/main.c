@@ -397,11 +397,14 @@ void app_main(void)
             snprintf(url_line, sizeof(url_line), "http://%s.local", mdns_name);
             netprov_link_t link;
             netprov_get_link(&link);
+            char ip_line[20];
+            snprintf(ip_line, sizeof(ip_line), "%s", link.ip);
             const char *lines[] = {
                 link.ssid[0] ? link.ssid : "Wi-Fi Connected",
                 url_line,
+                ip_line,
             };
-            show_status("SomnoTrace", lines, 2);
+            show_status("SomnoTrace", lines, 3);
         } else {
             /* Booted without Wi-Fi.  Recording still works (time comes from
              * the AS11), but keep hunting for a configured network in the
@@ -503,19 +506,23 @@ void app_main(void)
                     char url_line[32];
                     snprintf(url_line, sizeof(url_line), "http://%s.local", mdns_name);
                     const char *ssid_str = link.ssid[0] ? link.ssid : "Wi-Fi Connected";
+                    char ip_line[20];
+                    snprintf(ip_line, sizeof(ip_line), "%s", link.ip);
                     if (sd_storage_is_ready()) {
                         const char *lines[] = {
                             ssid_str,
                             url_line,
+                            ip_line,
                         };
-                        bsp_display_show_lines("SomnoTrace", lines, 2);
+                        bsp_display_show_lines("SomnoTrace", lines, 3);
                     } else {
                         const char *lines[] = {
                             ssid_str,
                             url_line,
+                            ip_line,
                             "SD Card Error",
                         };
-                        bsp_display_show_lines("SomnoTrace", lines, 3);
+                        bsp_display_show_lines("SomnoTrace", lines, 4);
                     }
                 }
 
