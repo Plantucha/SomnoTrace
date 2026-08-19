@@ -128,6 +128,7 @@ void app_main(void)
     device_settings_load(&dev_cfg);
     bsp_display_set_brightness(dev_cfg.brightness);
     bsp_audio_set_volume(dev_cfg.alert_volume);
+    bsp_display_set_rotation(dev_cfg.lcd_rotation);
 
     /* 4a-bis. Apply the saved timezone now, before BLE can reconnect.
      * as11_ble_init() may find therapy already running and start a session

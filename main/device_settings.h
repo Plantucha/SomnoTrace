@@ -35,10 +35,17 @@ typedef enum {
                                  * except during boot and SoftAP mode */
 } lcd_therapy_mode_t;
 
+/* LCD rotation in degrees (0 = default, 90 = clockwise) */
+typedef enum {
+    LCD_ROTATION_0   = 0,
+    LCD_ROTATION_90  = 90,
+} lcd_rotation_t;
+
 typedef struct {
     uint8_t brightness;        /* tenth-percent units: 1=0.1%, 200=20.0% */
     lcd_therapy_mode_t lcd_therapy_mode;
     uint8_t alert_volume;      /* speaker volume for alerts: 0-100 */
+    uint8_t lcd_rotation;      /* degrees: 0 or 90 */
 } device_settings_t;
 
 /* Load settings from NVS. Returns ESP_OK if loaded, ESP_ERR_NVS_NOT_FOUND
@@ -62,6 +69,10 @@ esp_err_t device_settings_set_lcd_therapy_mode(lcd_therapy_mode_t mode);
 /* Set alert speaker volume (0-100). Updates in-memory copy and applies to
  * bsp_audio. Call device_settings_save() to persist. */
 esp_err_t device_settings_set_alert_volume(uint8_t percent);
+
+/* Set LCD rotation (0 or 90 degrees). Updates in-memory copy and
+ * applies to hardware immediately. Call device_settings_save() to persist. */
+esp_err_t device_settings_set_lcd_rotation(uint8_t degrees);
 
 /* Get settings as JSON string for web UI. Caller must free(). */
 esp_err_t device_settings_get_json(char **out_json);

@@ -83,12 +83,14 @@ static void fb_draw_wifi_indicator(int x, int y, bool connected);
 static void render_graph(void);
 static void render_status(void);
 static void display_task(void *arg);
+static void apply_panel_rotation(uint8_t degrees);
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_io = NULL;
 static uint16_t *s_fb = NULL;
 static bool s_wifi_connected = false;
 static bool s_as11_paired = false;
+static uint8_t s_rotation = 0;  /* current LCD rotation in degrees */
 
 /* Strip blit: the framebuffer lives in PSRAM (not DMA-capable), so it is
  * pushed to the panel in chunks via small internal DMA-capable buffers.
@@ -269,8 +271,51 @@ static void lcd_panel_hw_recover(void)
     esp_lcd_panel_init(s_panel);
     esp_lcd_panel_invert_color(s_panel, LCD_INVERT_COLOR);
     esp_lcd_panel_set_gap(s_panel, 0, 0);
+    /* Re-apply rotation — panel reset wipes MADCTL back to 0° */
+    if (s_rotation != 0) {
+        apply_panel_rotation(s_rotation);
+    }
     esp_lcd_panel_disp_on_off(s_panel, true);
-    ESP_LOGI(TAG, "panel hardware reset + re-init");
+    ESP_LOGI(TAG, "panel hardware reset + re-init (rot=%u)", s_rotation);
+}
+
+/* Apply rotation to the ST7789 panel via MADCTL (swap_xy + mirror).
+ * Called after panel init/recover and when the user changes the setting.
+ * The framebuffer layout (s_fb[y * 240 + x]) stays the same; the panel
+ * remaps GRAM addressing so the physical pixels appear rotated. */
+static void apply_panel_rotation(uint8_t degrees)
+{
+    if (!s_panel) return;
+    bool swap_xy = false;
+    bool mirror_x = false, mirror_y = false;
+
+    switch (degrees) {
+        case 0:
+            break;
+        case 90:   /* clockwise 90° */
+            swap_xy = true;
+            mirror_x = true;
+            break;
+        default:
+            return;
+    }
+
+    esp_lcd_panel_swap_xy(s_panel, swap_xy);
+    esp_lcd_panel_mirror(s_panel, mirror_x, mirror_y);
+}
+
+void bsp_display_set_rotation(uint8_t degrees)
+{
+    switch (degrees) {
+        case 0: case 90:
+            break;
+        default:
+            ESP_LOGW(TAG, "set_rotation: invalid %u", degrees);
+            return;
+    }
+    s_rotation = degrees;
+    apply_panel_rotation(degrees);
+    ESP_LOGI(TAG, "rotation set to %u°", degrees);
 }
 
 static void lcd_flush(void)

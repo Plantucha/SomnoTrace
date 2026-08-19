@@ -38,6 +38,7 @@ static const char *TAG = "dev_settings";
 #define NVS_KEY_BRIGHTNESS   "bright"
 #define NVS_KEY_LCD_THERAPY  "lcd_thr"
 #define NVS_KEY_ALERT_VOL    "alrtvol"
+#define NVS_KEY_LCD_ROTATION "lcd_rot"
 
 /* Brightness stored in tenth-percent units: 1=0.1%, 200=20.0%
  * Discrete steps: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 (roughly 2x each) */
@@ -46,6 +47,7 @@ static const char *TAG = "dev_settings";
 #define MAX_BRIGHTNESS           200 /* 20.0% */
 #define DEFAULT_ALERT_VOLUME     65
 #define MIN_ALERT_VOLUME         50
+#define DEFAULT_LCD_ROTATION     0
 
 static device_settings_t s_settings;
 
@@ -55,6 +57,7 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     cfg->brightness = DEFAULT_BRIGHTNESS;
     cfg->lcd_therapy_mode = LCD_THERAPY_GRAPH;
     cfg->alert_volume = DEFAULT_ALERT_VOLUME;
+    cfg->lcd_rotation = DEFAULT_LCD_ROTATION;
     /* Clamp stale NVS values to current valid range */
 
     nvs_handle_t h;
@@ -75,12 +78,23 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     if (nvs_get_u8(h, NVS_KEY_ALERT_VOL, &u8val) == ESP_OK) {
         cfg->alert_volume = (u8val < MIN_ALERT_VOLUME) ? MIN_ALERT_VOLUME : u8val;
     }
+    if (nvs_get_u8(h, NVS_KEY_LCD_ROTATION, &u8val) == ESP_OK) {
+        switch (u8val) {
+            case 0: case 90:
+                cfg->lcd_rotation = u8val;
+                break;
+            default:
+                cfg->lcd_rotation = DEFAULT_LCD_ROTATION;
+                break;
+        }
+    }
 
     nvs_close(h);
     memcpy(&s_settings, cfg, sizeof(s_settings));
-    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u",
+    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u",
              s_settings.brightness, s_settings.brightness / 10.0,
-             s_settings.lcd_therapy_mode, s_settings.alert_volume);
+             s_settings.lcd_therapy_mode, s_settings.alert_volume,
+             s_settings.lcd_rotation);
     return ESP_OK;
 }
 
@@ -94,6 +108,7 @@ static esp_err_t do_device_settings_save(void *arg)
     nvs_set_u8(h, NVS_KEY_BRIGHTNESS, cfg->brightness);
     nvs_set_u8(h, NVS_KEY_LCD_THERAPY, (uint8_t)cfg->lcd_therapy_mode);
     nvs_set_u8(h, NVS_KEY_ALERT_VOL, cfg->alert_volume);
+    nvs_set_u8(h, NVS_KEY_LCD_ROTATION, cfg->lcd_rotation);
     ret = nvs_commit(h);
     nvs_close(h);
     return ret;
@@ -107,9 +122,10 @@ esp_err_t device_settings_save(const device_settings_t *cfg)
     esp_err_t ret = nvs_writer_run(do_device_settings_save, (void *)cfg);
     if (ret == ESP_OK) {
         memcpy(&s_settings, cfg, sizeof(s_settings));
-        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u",
+        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u",
                  s_settings.brightness, s_settings.brightness / 10.0,
-                 s_settings.lcd_therapy_mode, s_settings.alert_volume);
+                 s_settings.lcd_therapy_mode, s_settings.alert_volume,
+                 s_settings.lcd_rotation);
     }
     return ret;
 }
@@ -144,6 +160,19 @@ esp_err_t device_settings_set_alert_volume(uint8_t percent)
     return ESP_OK;
 }
 
+esp_err_t device_settings_set_lcd_rotation(uint8_t degrees)
+{
+    switch (degrees) {
+        case 0: case 90:
+            break;
+        default:
+            return ESP_ERR_INVALID_ARG;
+    }
+    s_settings.lcd_rotation = degrees;
+    bsp_display_set_rotation(degrees);
+    return ESP_OK;
+}
+
 esp_err_t device_settings_get_json(char **out_json)
 {
     if (!out_json) return ESP_ERR_INVALID_ARG;
@@ -152,6 +181,7 @@ esp_err_t device_settings_get_json(char **out_json)
     cJSON_AddNumberToObject(root, "brightness", s_settings.brightness);
     cJSON_AddNumberToObject(root, "lcd_therapy_mode", (int)s_settings.lcd_therapy_mode);
     cJSON_AddNumberToObject(root, "alert_volume", s_settings.alert_volume);
+    cJSON_AddNumberToObject(root, "lcd_rotation", s_settings.lcd_rotation);
 
     *out_json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -192,6 +222,17 @@ esp_err_t device_settings_save_json(const char *json_str)
         if (val > 100) val = 100;
         cfg.alert_volume = (uint8_t)val;
     }
+    if ((v = cJSON_GetObjectItem(root, "lcd_rotation")) && cJSON_IsNumber(v)) {
+        int val = v->valueint;
+        switch (val) {
+            case 0: case 90:
+                cfg.lcd_rotation = (uint8_t)val;
+                break;
+            default:
+                cfg.lcd_rotation = 0;
+                break;
+        }
+    }
 
     cJSON_Delete(root);
 
@@ -199,6 +240,8 @@ esp_err_t device_settings_save_json(const char *json_str)
     bsp_display_set_brightness(cfg.brightness);
     /* Apply alert volume immediately */
     bsp_audio_set_volume(cfg.alert_volume);
+    /* Apply LCD rotation immediately */
+    bsp_display_set_rotation(cfg.lcd_rotation);
 
     /* Persist first so device_settings_get() returns the new mode,
      * then re-evaluate backlight based on the new mode.
