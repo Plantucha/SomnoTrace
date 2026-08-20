@@ -258,6 +258,7 @@ static bool s_paired = false;
 static bool s_presence_served = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
+static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
 
 /* Measured: END powers off ~120s after take-off IF no one connects.
  * Any GATT connection resets that timer. Pull happens inside the
@@ -265,6 +266,7 @@ static TickType_t s_served_at;
  * Still advertising at pull+130s can only mean re-worn. */
 #define OX_END_WINDOW_MS  130000
 #define OX_WORN_PROBE_MS  60000  /* LIVE_B interval while worn; END lasts ~120s */
+#define OX_F1_MAX_RETRIES 3      /* give up on F1 after N consecutive timeouts */
 
 /* BLE connection state */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -1108,6 +1110,7 @@ static void pull_task(void *arg)
             s_ring_present = false;
             if (s_presence_served)
                 s_presence_served = false;
+            s_f1_fail_count = 0;
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
@@ -1133,6 +1136,7 @@ static void pull_task(void *arg)
             }
             ESP_LOGI(TAG, "watch: still advertising past END window — re-worn, resuming probes");
             s_presence_served = false;
+            s_f1_fail_count = 0;
         }
 
         set_state(OX_STATUS_CONNECTING);
@@ -1193,13 +1197,26 @@ static void pull_task(void *arg)
         char names[32][17];
         int count = oxyii_get_file_list(names, 32);
         if (count < 0) {
-            ESP_LOGW(TAG, "file list failed (op=0x%02x len=%d) — not marking served",
-                     s_resp_opcode, s_resp_payload_len);
+            s_f1_fail_count++;
+            ESP_LOGW(TAG, "file list failed (op=0x%02x len=%d), attempt %d/%d",
+                     s_resp_opcode, s_resp_payload_len,
+                     s_f1_fail_count, OX_F1_MAX_RETRIES);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
+            if (s_f1_fail_count >= OX_F1_MAX_RETRIES) {
+                /* F1 never responds on this ring (firmware quirk).
+                 * Mark served so we stop reconnecting — each connection
+                 * resets the ring's power-off timer.  Next sync window
+                 * (next take-off) will try again fresh. */
+                s_presence_served = true;
+                s_served_at = xTaskGetTickCount();
+                ESP_LOGW(TAG, "F1 unreachable after %d attempts — treating as served, ring can sleep",
+                         OX_F1_MAX_RETRIES);
+            }
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
+        s_f1_fail_count = 0;
         ESP_LOGI(TAG, "file list: %d files", count);
 
         bool pull_ok = true;
