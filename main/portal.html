@@ -3728,10 +3728,11 @@ function renderSummary() {
    * then changes once the PLD stream and events finish loading. Everything
    * reads '--' until it can be computed; usage comes from the summary spool and
    * is accurate immediately. */
-  var press = computePldStats('press');
-  var epap  = computePldStats('eprPress');
-  var resp  = computePldStats('respRate');
-  var leak  = computePldStats('leak');
+  var press  = computePldStats('press');
+  var epap   = computePldStats('eprPress');
+  var resp   = computePldStats('respRate');
+  var leak   = computePldStats('leak');
+  var flowlim = computePldStats('flowlim');
 
   var ahi = idx ? idx.ahi : null;
   setStat('stat-ahi', num(ahi, 2));
@@ -3791,7 +3792,8 @@ function renderSummary() {
       statRow('Pressure (cmH\u2082O)', press) +
       statRow('EPAP (cmH\u2082O)', epap) +
       statRow('Leak (L/min)', leak) +
-      statRow('Resp rate (bpm)', resp);
+      statRow('Resp rate (bpm)', resp) +
+      statRow('Flow Limit', flowlim);
   }
   var panel = document.getElementById('dash-summary'); if (panel) panel.style.display = '';
 }
