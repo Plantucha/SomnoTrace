@@ -140,6 +140,17 @@ If you prefer building from source code, Docker is the only dependency:
 - 🏠 **[Smart Home & Home Assistant Guide](docs/automations.md)** — Set up bedtime automations, compliance tracking, and mask-off alerts.
 - 🛠️ **[Hardware Reference](docs/hardware/README.md)** — Pinouts, schematics, and hardware architecture.
 
+<details>
+<summary><b>📁 Accessing Files via FTP</b></summary>
+
+SomnoTrace includes a built-in FTP server for downloading EDF and session files directly from the MicroSD card over Wi-Fi — no need to physically remove the card. FTP is optional and can be enabled or disabled from the web dashboard. By default, it allows anonymous (no password) access on your local network, but you can configure a username and password if you prefer.
+
+Connect with any FTP client (e.g., FileZilla) to `ftp://somnotrace.local`.
+
+> **FileZilla tip:** If you experience connection errors, go to **Site Manager → Edit → Transfer Settings** and set **"Limit number of simultaneous connections"** to **1**. The ESP32-S3 FTP server processes one connection at a time.
+
+</details>
+
 ---
 
 ## Feature Overview
@@ -155,7 +166,8 @@ If you prefer building from source code, Docker is the only dependency:
 | **Sub-Second NTP Clock Sync** | ✅ Implemented | Internet time sync eliminating AirSense 11 clock drift for pulse oximeter alignment. |
 | **Therapy Interruption Alarm** | ✅ Implemented | Push notifications via ntfy (phone/smartwatch/bed shaker) and escalating audio buzzer. |
 | **BLE → Wi-Fi RPC Proxy** | ✅ Implemented | Local HTTP endpoint for remote machine queries and smart home control. |
-| **O2 Ring Bluetooth Sync** | ✅ Implemented | Wireless download of stored oximetry recordings from Wellue O2 Ring S / SleepHQ Pro. |
+| **FTP File Server** | ✅ Implemented | Download EDF and session files directly from the MicroSD card using any FTP client (e.g., FileZilla). |
+| **O2 Ring Bluetooth Sync** | 🔄 In Progress | Downloads stored oximetry recordings from Wellue O2 Ring S / SleepHQ Pro over Bluetooth. Automatic upload to SMB/SleepHQ is not yet available — files can be accessed via FTP or the web dashboard. |
 
 ---
 
