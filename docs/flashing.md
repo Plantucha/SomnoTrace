@@ -26,11 +26,11 @@
 
 ### Step 2: Connect Your Device
 
-1. Plug the USB-C cable into the Waveshare board and connect the other end to your computer.
-2. The screen may light up or remain dark — either is normal.
+1. Plug the USB-C cable into the Waveshare board.
+2. **Press and hold the BOOT button** (the left physical button on the side of the board) while plugging the other end into your computer. This puts the board into flashing mode.
+3. Once plugged in, release the BOOT button. The screen may light up or remain dark — either is normal.
 
-> **Tip (If the device is not detected):**  
-> If your computer does not see the board, unplug it, press and **hold down the BOOT button** (the top physical button on the right side), plug the USB cable back in, and then release the button. This puts the board into flashing mode.
+> **Already plugged in?** Unplug the cable, hold the BOOT button, plug it back in, then release.
 
 ---
 
@@ -43,12 +43,14 @@
 
 ### Step 4: Connect to the Board
 
-1. In the Web Flasher, leave the baud rate at default (`115200` or `460800`).
+1. In the Web Flasher, leave the baud rate at the default (**921600**).
 2. Click the blue **Connect** button at the top.
 3. A browser popup will appear showing available serial devices:
    - Look for **`USB JTAG/serial debug unit`** or **`ESP32-S3`** (or a COM / tty port).
    - Select it and click **Connect**.
 4. Once connected, the console at the bottom will display device details (confirming it is an ESP32-S3).
+
+> **Port already in use?** If the Connect button doesn't work or the port doesn't appear, refresh the browser page and try again.
 
 ---
 

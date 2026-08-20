@@ -66,6 +66,21 @@ These figures are **not** a recommendation to run unplugged overnight.
 
 </details>
 
+<details>
+<summary><b>🔘 Button Controls</b></summary>
+
+The board has three physical buttons on the side. Here's what each one does:
+
+| Button | Action | What It Does |
+|---|---|---|
+| **BOOT** (left) | Hold 5 seconds | Enters Wi-Fi setup mode (AP hotspot) for initial configuration or network changes. |
+| **POWER** (middle) | Hold 10 seconds | Powers off the device. |
+| **POWER** (middle) | Hold 2 seconds | Powers on the device (when off). |
+| **PLUS** (right) | Single click | Acknowledges and silences an interrupted therapy alert (if enabled). |
+| **PLUS** (right) | Double click | Starts or stops therapy on the AirSense 11 (toggle — same as pressing the machine's own button). |
+
+</details>
+
 ---
 
 ## How It Works
