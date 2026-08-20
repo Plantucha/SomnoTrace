@@ -79,6 +79,6 @@ int bsp_power_battery_percent(void);
 bool bsp_power_is_charging(void);
 
 /* Start a background task that monitors the PLUS button (IO4) for
- * double-clicks. On a double-click, sends EnterStandby RPC to stop
- * AS11 therapy (only if therapy is currently active). */
+ * double-clicks. On a double-click, toggles AS11 therapy: sends
+ * EnterStandby RPC if therapy is active, or EnterTherapy RPC if not. */
 void bsp_power_start_plus_monitor(void);

@@ -106,7 +106,7 @@ void app_main(void)
     /* 2. Start button monitors. */
     bsp_power_start_button_monitor(5000);   /* PWR 5 s = power off */
     bsp_power_start_boot_monitor(&s_softap_requested, 5000);
-    bsp_power_start_plus_monitor();         /* PLUS double-click = stop therapy */
+    bsp_power_start_plus_monitor();         /* PLUS double-click = toggle therapy */
 
     /* 3. Initialise display. */
     if (bsp_display_init() != ESP_OK) {

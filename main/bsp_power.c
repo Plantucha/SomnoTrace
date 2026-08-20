@@ -155,7 +155,7 @@ static void button_monitor_task(void *arg)
             s_btn.boot_held_ms = 0;
         }
 
-        /* --- PLUS button: double-click = stop therapy, single-click = alert ack --- */
+        /* --- PLUS button: double-click = toggle therapy, single-click = alert ack --- */
         if (gpio_get_level(BSP_PIN_KEY_PLUS) == 0) {
             int now_ms = (int)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
@@ -171,7 +171,12 @@ static void button_monitor_task(void *arg)
                                  esp_err_to_name(ret));
                     }
                 } else {
-                    ESP_LOGD(TAG, "PLUS double-click: therapy not active, ignoring");
+                    ESP_LOGI(TAG, "starting therapy via EnterTherapy RPC");
+                    esp_err_t ret = as11_ble_start_therapy();
+                    if (ret != ESP_OK) {
+                        ESP_LOGW(TAG, "start_therapy failed: %s",
+                                 esp_err_to_name(ret));
+                    }
                 }
 
                 s_btn.plus_last_press_ms = -1;
@@ -205,7 +210,12 @@ static void button_monitor_task(void *arg)
                                          esp_err_to_name(ret));
                             }
                         } else {
-                            ESP_LOGD(TAG, "PLUS double-click: therapy not active, ignoring");
+                            ESP_LOGI(TAG, "starting therapy via EnterTherapy RPC");
+                            esp_err_t ret = as11_ble_start_therapy();
+                            if (ret != ESP_OK) {
+                                ESP_LOGW(TAG, "start_therapy failed: %s",
+                                         esp_err_to_name(ret));
+                            }
                         }
                         s_btn.plus_last_press_ms = -1;
                         /* Wait for release before resuming normal polling */
