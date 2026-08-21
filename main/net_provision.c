@@ -369,6 +369,10 @@ static void link_supervisor_task(void *arg)
             strlcpy(s_connected_ip, ip, sizeof(s_connected_ip));
             ESP_LOGI(TAG, "failover: reconnected to '%s', ip=%s",
                      s_link_ssid[0] ? s_link_ssid : "?", ip);
+        } else if (s_portal_mode) {
+            /* Portal mode was activated while we were trying to connect.
+             * Don't schedule another rescan — the AP is now up. */
+            ESP_LOGI(TAG, "failover: portal mode active, suspending rescan");
         } else {
             /* Nothing reachable right now.  Back off and let the next
              * disconnect cycle raise another rescan. */
@@ -423,6 +427,7 @@ esp_err_t netprov_init(void)
 static esp_err_t try_single_ssid(const char *ssid, const char *pass,
                                  char *ip_out, int timeout_ms)
 {
+    if (s_portal_mode) return ESP_FAIL;
     s_wifi_events = xEventGroupCreate();
     s_retry_num = 0;
     s_connecting = true;
@@ -454,7 +459,8 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
         result = ESP_OK;
     } else {
         ESP_LOGW(TAG, "connect to '%s' failed", ssid);
-        esp_wifi_stop();
+        if (!s_portal_mode)
+            esp_wifi_stop();
         result = ESP_FAIL;
     }
 
@@ -467,6 +473,7 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
 esp_err_t netprov_try_connect(const struct netprov_config *cfg,
                                char *ip_out, int timeout_ms)
 {
+    if (s_portal_mode) return ESP_FAIL;
     link_mark_down();
 
     /* Cache the credentials so the link supervisor can rescan on its own
@@ -545,6 +552,7 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
         }
     }
 
+    if (s_portal_mode) return ESP_FAIL;
     esp_wifi_stop();
 
     if (n_cands == 0) {
@@ -561,8 +569,11 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
         }
     }
 
+    if (s_portal_mode) return ESP_FAIL;
+
     /* 3. Try each candidate: 3 attempts, 5 s between retries */
     for (int i = 0; i < n_cands; i++) {
+        if (s_portal_mode) return ESP_FAIL;
         int slot = cands[i].slot;
         ESP_LOGI(TAG, "trying candidate %d: '%s' (%d dBm)",
                  i + 1, cfg->wifi[slot].ssid, cands[i].rssi);
