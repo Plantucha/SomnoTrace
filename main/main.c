@@ -206,6 +206,15 @@ void app_main(void)
     therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);
     therapy_alert_init();
 
+    /* 4e. Initialise audio codec unconditionally so the buzzer is always
+     * ready.  Without this, bsp_audio_beep() silently returns
+     * ESP_ERR_INVALID_STATE on nights where Wi-Fi+NTP succeed (the only
+     * previous init paths were the degraded-mode and total-failure branches
+     * below).  The existing calls in those branches become harmless no-ops. */
+    if (bsp_audio_init() != ESP_OK) {
+        ESP_LOGW(TAG, "audio codec init failed — buzzer will be unavailable");
+    }
+
     /* 5. Load config from NVS. */
     struct netprov_config cfg;
     bool has_creds = netprov_load_config(&cfg);
