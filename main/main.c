@@ -367,6 +367,16 @@ void app_main(void)
         }
     }
 
+    /* ── Reset boot failure counter on a fully successful boot ─── */
+    if (wifi_connected && ntp_ok && !degraded_mode) {
+        nvs_handle_t nvs_h;
+        if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
+            nvs_set_i32(nvs_h, "boot_fail", 0);
+            nvs_commit(nvs_h);
+            nvs_close(nvs_h);
+        }
+    }
+
     /* ── Normal boot continuation (Wi-Fi connected or degraded mode) ─── */
     if (!in_softap) {
         if (wifi_connected) {
