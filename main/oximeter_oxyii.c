@@ -696,6 +696,7 @@ static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
  * LIVE_B replies even with no AUTH; GET_INFO needs this prefix. */
 static esp_err_t oxyii_session_open(void)
 {
+    s_seq = 0;
     uint8_t auth[16];
     oxyii_auth_payload(auth);
     if (oxyii_request(OP_AUTH, auth, 16, false, 0) != ESP_OK)
@@ -708,20 +709,33 @@ static esp_err_t oxyii_session_open(void)
     return ESP_OK;
 }
 
-/* File-session prep. Only after LIVE_B says off-finger. */
+/* File-session prep. Only after LIVE_B says off-finger.
+ *
+ * Sequence note: After an overnight recording, the ring's internal firmware
+ * holds an unclosed recording handle. Sending F4 (READ_FILE_END) first
+ * explicitly finalises the handle. A 250ms delay allows the ring's SPI NOR
+ * flash commit to complete before time sync, config read, and directory listing. */
 static esp_err_t oxyii_prepare_files(void)
 {
+    /* 1. Explicitly clear any phantom recording handle first */
+    if (oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000) != ESP_OK)
+        ESP_LOGW(TAG, "initial F4 ack missing — continuing");
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    /* 2. Set UTC time */
     uint8_t tp[8];
     oxyii_time_payload(tp);
     if (oxyii_request(OP_SET_UTC_TIME, tp, 8, true, 5000) != ESP_OK)
         return ESP_FAIL;
 
+    /* 3. Read config struct */
     if (oxyii_request(OP_GET_CONFIG, NULL, 0, true, 5000) != ESP_OK)
         return ESP_FAIL;
 
-    /* F4 acks. Must consume it or the next F1 sees this frame. */
+    /* 4. Safety F4 + settling delay before directory listing */
     if (oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000) != ESP_OK)
-        ESP_LOGW(TAG, "F4 ack missing — continuing");
+        ESP_LOGW(TAG, "final F4 ack missing — continuing");
+    vTaskDelay(pdMS_TO_TICKS(250));
     return ESP_OK;
 }
 
@@ -783,6 +797,7 @@ static int oxyii_off_finger(void)
     if (state == 0x03) {
         ESP_LOGI(TAG, "live_b: file handle open — clearing wedge with F4");
         oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000);
+        vTaskDelay(pdMS_TO_TICKS(200));
         if (oxyii_request(OP_LIVE_B, NULL, 0, true, 2000) != ESP_OK)
             return -1;
         if (s_resp_payload_len < 9) return -1;
@@ -800,8 +815,21 @@ static int oxyii_off_finger(void)
 /* ── GET_FILE_LIST: return count + names ───────────────────────────── */
 static int oxyii_get_file_list(char names[][17], int max_count)
 {
-    if (oxyii_request(OP_GET_FILE_LIST, NULL, 0, true, 5000) != ESP_OK)
-        return -1;
+    int rc = oxyii_request(OP_GET_FILE_LIST, NULL, 0, true, 5000);
+    if (rc != ESP_OK) {
+        /* In-session unwedge attempt: if F1 drops (e.g. from flash latency or
+         * third-party app disconnect), force-close handles, reset parser with
+         * SETUP (0x10), and retry once on this connection before failing. */
+        ESP_LOGW(TAG, "F1 initial attempt failed (rc=%d) — trying in-session unwedge", rc);
+        oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        uint8_t setup = 0x00;
+        oxyii_request(OP_SETUP, &setup, 1, true, 2000);
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        if (oxyii_request(OP_GET_FILE_LIST, NULL, 0, true, 5000) != ESP_OK)
+            return -1;
+    }
 
     if (s_resp_payload_len < 1) return -1;
     int count = s_resp_payload[0];
