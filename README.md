@@ -26,7 +26,7 @@ SomnoTrace is the **first and only** open-source project that delivers:
 - **Automatic uploads:** Sends your completed sleep sessions directly to your local computer / NAS share (SMB) and [SleepHQ](https://sleephq.com) as soon as therapy stops.
 - **Built-in color screen & live breathing graphs:** View real-time airflow graphs, Wi-Fi status, battery level, and clock directly on the bedside device.
 - **Easy-to-use Web Dashboard:** Connect from your phone, tablet, or computer browser to see interactive sleep charts, AHI metrics, leak rates, and device settings.
-- **Camping Mode (Temporary Offline Use):** SomnoTrace works normally without internet. The only things that need an internet connection are clock synchronization (NTP) and, if configured, SleepHQ cloud uploads. If you're offline — say, camping or your internet is down — therapy data is still recorded to the MicroSD card and uploaded to any local network shares (SMB/NAS) on your home network. Once internet is back, the clock re-syncs automatically and any pending SleepHQ uploads go through. No data is sent anywhere else.
+- **Camping Mode (Temporary Offline Use):** SomnoTrace can record therapy data without any internet connection — all you need is the AirSense 11 nearby. See the [Camping Mode guide](#camping-mode-offline-use) below for details.
 
 ---
 
@@ -78,6 +78,35 @@ The board has three physical buttons on the side. Here's what each one does:
 | **POWER** (middle) | Hold 2 seconds | Powers on the device (when off). |
 | **PLUS** (right) | Single click | Acknowledges and silences an interrupted therapy alert (if enabled). |
 | **PLUS** (right) | Double click | Starts or stops therapy on the AirSense 11 (toggle — same as pressing the machine's own button). |
+
+</details>
+
+<details>
+<summary><b>🏕️ Camping Mode (Offline Use)</b></summary>
+
+SomnoTrace can record therapy data with **no Wi-Fi or internet connection at all** — useful for camping, travel, or during internet outages. Here's how it works and what you need to know.
+
+### Prerequisites
+
+Camping mode is **not available out of the box**. The following must be true:
+
+1. **At least one previous online session completed.** SomnoTrace needs to have previously connected to Wi-Fi, synced its clock via NTP, and recorded at least one therapy session with the AirSense 11. This establishes a "clock drift" reference that allows accurate timekeeping without internet.
+2. **The AirSense 11 must be paired.** The Bluetooth pairing happens during normal setup — once paired, the bond persists across reboots.
+
+### How to Use It
+
+1. **Turn on your AirSense 11 first**, and wait for it to be ready (screen on, not in a startup/error state).
+2. **Then power on SomnoTrace** (plug in USB-C or hold the POWER button for 2 seconds).
+3. SomnoTrace will detect that Wi-Fi is unavailable, connect to the AirSense 11 over Bluetooth, and estimate the current time using the stored clock drift.
+4. The screen will show an **"Estimated time"** notice — this is normal. Recording proceeds as usual.
+5. Therapy data is saved to the MicroSD card. If you have a local NAS/SMB share on a network without internet, uploads to that share will still work.
+6. SleepHQ cloud uploads are queued and will upload automatically once internet connectivity is restored.
+
+### Important Notes
+
+- **Always power on the AirSense 11 before SomnoTrace.** SomnoTrace waits up to 30 seconds for the AirSense 11 to connect over Bluetooth at boot. If the AS11 isn't ready in time, the device will retry a few times and may eventually enter Wi-Fi setup mode.
+- **The estimated time may drift slightly** over long offline periods, since it's based on the AS11's internal clock plus a previously measured offset. The longer since the last NTP sync, the less precise the timestamp.
+- **No data is lost.** Everything recorded during camping mode is stored on the MicroSD card and will upload to SleepHQ once you're back online.
 
 </details>
 
