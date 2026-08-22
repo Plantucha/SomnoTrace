@@ -137,7 +137,7 @@ flowchart LR
 Access the built-in web portal from any device on your Wi-Fi network without installing any apps:
 
 <p align="center">
-  <img width="1795" height="1296" alt="SomnoTrace Web Dashboard" src="https://github.com/user-attachments/assets/809996ed-d04c-42bb-854c-0170ccd4049a" />
+  <img width="1111" height="1317" alt="SomnoTrace Web Dashboard" src="assets/images/ui.png" />
 </p>
 
 - **Interactive Sleep Graphs:** High-resolution zoomable graphs for Breathing Flow, Mask Pressure, Leak Rate, Respiratory Rate, and Flow Limitation.
