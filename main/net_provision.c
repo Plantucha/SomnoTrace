@@ -657,6 +657,14 @@ extern const char _binary_uPlot_min_css_end[];
 #define UPLOT_CSS_START _binary_uPlot_min_css_start
 #define UPLOT_CSS_LEN   ((size_t)(_binary_uPlot_min_css_end - _binary_uPlot_min_css_start))
 
+extern const char _binary_logo_full_svg_start[];
+extern const char _binary_logo_full_svg_end[];
+#define LOGO_FULL_SVG_START _binary_logo_full_svg_start
+
+extern const char _binary_logo_small_svg_start[];
+extern const char _binary_logo_small_svg_end[];
+#define LOGO_SMALL_SVG_START _binary_logo_small_svg_start
+
 /* portal.html and uPlot assets are embedded via CMakeLists.txt target_add_binary_data */
 
 
@@ -713,8 +721,8 @@ static esp_err_t manifest_get_handler(httpd_req_t *req)
         "  \"orientation\": \"any\",\n"
         "  \"icons\": [\n"
         "    {\n"
-        "      \"src\": \"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='40' fill='%2310b981'/></svg>\",\n"
-        "      \"sizes\": \"192x192\",\n"
+        "      \"src\": \"/favicon.svg\",\n"
+        "      \"sizes\": \"512x512\",\n"
         "      \"type\": \"image/svg+xml\"\n"
         "    }\n"
         "  ]\n"
@@ -728,10 +736,10 @@ static esp_err_t sw_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Connection", "close");
     const char sw[] =
-        "const CACHE_NAME = 'somnotrace-v2';\n"
+        "const CACHE_NAME = 'somnotrace-v3';\n"
         "self.addEventListener('install', e => {\n"
         "  self.skipWaiting();\n"
-        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(['/', '/manifest.json', '/uplot.js', '/uplot.css'])));\n"
+        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(['/', '/manifest.json', '/uplot.js', '/uplot.css', '/logo.svg', '/favicon.svg'])));\n"
         "});\n"
         "self.addEventListener('activate', e => {\n"
         "  e.waitUntil(caches.keys().then(keys => Promise.all(\n"
@@ -774,6 +782,24 @@ static esp_err_t uplot_css_get_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
     httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, UPLOT_CSS_START, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t logo_svg_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "image/svg+xml");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, LOGO_FULL_SVG_START, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t favicon_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "image/svg+xml");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, LOGO_SMALL_SVG_START, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -2764,6 +2790,12 @@ static esp_err_t start_webserver(void)
 
     httpd_uri_t uplot_css = { .uri = "/uplot.css", .method = HTTP_GET, .handler = uplot_css_get_handler };
     httpd_register_uri_handler(s_httpd, &uplot_css);
+
+    httpd_uri_t logo_svg = { .uri = "/logo.svg", .method = HTTP_GET, .handler = logo_svg_get_handler };
+    httpd_register_uri_handler(s_httpd, &logo_svg);
+
+    httpd_uri_t favicon = { .uri = "/favicon.svg", .method = HTTP_GET, .handler = favicon_get_handler };
+    httpd_register_uri_handler(s_httpd, &favicon);
 
     httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
     httpd_register_uri_handler(s_httpd, &status);

@@ -181,6 +181,13 @@ void app_main(void)
         session_writer_recover();
     }
 
+    /* 4b-2. Initialise audio codec BEFORE BLE — BLE RF activity during
+     * connection causes I2C bus noise that makes ES8311 register writes
+     * NACK.  The codec only depends on bsp_display_init (shared I2C pins). */
+    if (bsp_audio_init() != ESP_OK) {
+        ESP_LOGW(TAG, "audio codec init failed — buzzer will be unavailable");
+    }
+
     /* 4c. Initialise BLE (AirSense 11 pairing). Non-fatal on failure.
      * Runs after storage init + crash recovery (see 4b). */
     if (as11_ble_init() != ESP_OK) {
@@ -205,15 +212,6 @@ void app_main(void)
     therapy_alert_set_beep_fn(bsp_audio_beep);
     therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);
     therapy_alert_init();
-
-    /* 4e. Initialise audio codec unconditionally so the buzzer is always
-     * ready.  Without this, bsp_audio_beep() silently returns
-     * ESP_ERR_INVALID_STATE on nights where Wi-Fi+NTP succeed (the only
-     * previous init paths were the degraded-mode and total-failure branches
-     * below).  The existing calls in those branches become harmless no-ops. */
-    if (bsp_audio_init() != ESP_OK) {
-        ESP_LOGW(TAG, "audio codec init failed — buzzer will be unavailable");
-    }
 
     /* 5. Load config from NVS. */
     struct netprov_config cfg;
