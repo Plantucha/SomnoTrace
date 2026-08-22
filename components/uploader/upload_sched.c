@@ -462,8 +462,8 @@ static void run_pass(void)
         if (s_rt[i].state == SB_COOLDOWN) cooling = true;
     }
     if (pending == 0) set_status("All uploaded");
-    else if (cooling)  set_status("%d file groups pending — waiting to retry", pending);
-    else               set_status("%d file groups pending", pending);
+    else if (cooling)  set_status("%d parts pending — waiting to retry", pending);
+    else               set_status("%d parts pending", pending);
 }
 
 /* ── Task ─────────────────────────────────────────────────────────── */
@@ -487,7 +487,7 @@ static void do_scan(void)
     }
 
     s_scanning = true;
-    set_status("Scanning for new sessions");
+    set_status("Scanning for new data");
     upload_scan_reconcile_all(max_days, slots, n_slots);
     s_scanning = false;
     s_next_scan_us = now_us() + (int64_t)SCAN_INTERVAL_MS * 1000;

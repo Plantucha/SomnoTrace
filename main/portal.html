@@ -947,7 +947,7 @@ Save &amp; Reboot
 <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
 Upload Progress
 </div>
-<p class="card-desc">Each destination is tracked independently, per session. Only new sessions are uploaded.</p>
+<p class="card-desc">Each destination is tracked independently, per part. Only new parts are uploaded.</p>
 <div id="upload-progress" class="mt-xs"></div>
 <div class="upload-status-footer" style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--card-border);margin-top:12px;padding-top:10px;font-size:.82rem">
 <span style="color:var(--text-muted)">Status</span>
@@ -2406,7 +2406,7 @@ function renderBackendRow(b) {
     var sub = '';
     if (b.state === 'uploading' && b.cur) {
       sub = 'Uploading ' + b.cur.day;
-      if (b.cur.units) sub += ' \u00b7 session ' + b.cur.unit + '/' + b.cur.units;
+      if (b.cur.units) sub += ' \u00b7 part ' + b.cur.unit + '/' + b.cur.units;
     } else if (b.state === 'cooldown') {
       sub = (b.err_permanent ? 'Needs attention' : 'Retry in ' + fmtLeft(b.retry_in_s));
       if (b.err) sub += ' \u2014 ' + b.err;
