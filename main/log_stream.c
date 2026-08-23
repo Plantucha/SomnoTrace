@@ -344,6 +344,9 @@ void log_stream_request_ble_push(void)
     s_push_ble_now = true;
 }
 
+static esp_err_t ws_queue_send(httpd_handle_t hd, int fd, uint8_t type,
+                               const char *payload, size_t len);
+
 static void ws_remove_client_locked(int fd)
 {
     for (int i = 0; i < s_ws_client_count; i++) {
@@ -368,19 +371,9 @@ static void ws_add_client_locked(httpd_handle_t hd, int fd)
         ESP_LOGI(TAG, "ws: evicting oldest client (fd=%d) for new client (fd=%d)", old_fd, fd);
 
         const char *evict_msg = "{\"type\":\"evicted\",\"reason\":\"max_clients_exceeded\"}";
-        httpd_ws_frame_t evict_pkt = {
-            .final = true,
-            .type = HTTPD_WS_TYPE_TEXT,
-            .payload = (uint8_t *)evict_msg,
-            .len = strlen(evict_msg),
-        };
-        httpd_ws_send_frame_async(old_hd, old_fd, &evict_pkt);
-
-        httpd_ws_frame_t close_pkt = {
-            .final = true,
-            .type = HTTPD_WS_TYPE_CLOSE,
-        };
-        httpd_ws_send_frame_async(old_hd, old_fd, &close_pkt);
+        ws_queue_send(old_hd, old_fd, HTTPD_WS_TYPE_TEXT, evict_msg,
+                      strlen(evict_msg));
+        ws_queue_send(old_hd, old_fd, HTTPD_WS_TYPE_CLOSE, NULL, 0);
 
         for (int i = 0; i < s_ws_client_count - 1; i++) {
             s_ws_clients[i] = s_ws_clients[i + 1];
@@ -391,6 +384,55 @@ static void ws_add_client_locked(httpd_handle_t hd, int fd)
     s_ws_clients[s_ws_client_count].fd = fd;
     s_ws_client_count++;
     ESP_LOGI(TAG, "ws: client connected (fd=%d, total=%d)", fd, s_ws_client_count);
+}
+
+typedef struct {
+    httpd_handle_t hd;
+    int fd;
+    uint8_t type;
+    char *payload;
+    size_t len;
+} ws_send_work_t;
+
+static void ws_send_work(void *arg)
+{
+    ws_send_work_t *work = arg;
+    if (!work) return;
+    httpd_ws_frame_t pkt = {
+        .final = true,
+        .type = work->type,
+        .payload = (uint8_t *)work->payload,
+        .len = work->len,
+    };
+    esp_err_t err = httpd_ws_send_frame_async(work->hd, work->fd, &pkt);
+    if (err != ESP_OK && err != ESP_ERR_TIMEOUT && err != ESP_ERR_NO_MEM) {
+        if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
+            ws_remove_client_locked(work->fd);
+            xSemaphoreGive(s_ws_mutex);
+        }
+    }
+    free(work->payload);
+    free(work);
+}
+
+static esp_err_t ws_queue_send(httpd_handle_t hd, int fd, uint8_t type,
+                               const char *payload, size_t len)
+{
+    ws_send_work_t *work = calloc(1, sizeof(*work));
+    if (!work) return ESP_ERR_NO_MEM;
+    if (len > 0) {
+        work->payload = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+        if (!work->payload) work->payload = malloc(len);
+        if (!work->payload) { free(work); return ESP_ERR_NO_MEM; }
+        memcpy(work->payload, payload, len);
+    }
+    work->hd = hd; work->fd = fd; work->type = type; work->len = len;
+    esp_err_t err = httpd_queue_work(hd, ws_send_work, work);
+    if (err != ESP_OK) {
+        free(work->payload);
+        free(work);
+    }
+    return err;
 }
 
 static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
@@ -407,15 +449,9 @@ static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
     }
     if (count <= 0) return ESP_OK;
 
-    httpd_ws_frame_t ws_pkt = {
-        .final = true,
-        .type = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)payload_str,
-        .len = len,
-    };
-
     for (int i = 0; i < count; i++) {
-        esp_err_t err = httpd_ws_send_frame_async(clients[i].hd, clients[i].fd, &ws_pkt);
+        esp_err_t err = ws_queue_send(clients[i].hd, clients[i].fd,
+                                      HTTPD_WS_TYPE_TEXT, payload_str, len);
         if (err != ESP_OK) {
             bool transient = (err == ESP_ERR_TIMEOUT || err == ESP_ERR_NO_MEM);
             if (!transient) {
@@ -590,7 +626,7 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
         }
 
         if (!s_ws_fwd_task) {
-            s_ws_fwd_task = psram_task_create(ws_forwarder_task, "ws_fwd", 4096,
+            s_ws_fwd_task = psram_task_create(ws_forwarder_task, "ws_fwd", 12288,
                                                NULL, 3, 0, NULL, NULL);
         }
         return ESP_OK;
