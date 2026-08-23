@@ -116,51 +116,58 @@ static esp_netif_t *s_netif_ap = NULL;
 /* ------------------------------------------------------------------ */
 /*  NVS config storage                                                */
 /* ------------------------------------------------------------------ */
-bool netprov_load_config(struct netprov_config *cfg)
+static esp_err_t do_netprov_load(void *arg)
 {
-    memset(cfg, 0, sizeof(*cfg));
-    strlcpy(cfg->hostname, "SomnoTrace", sizeof(cfg->hostname));
-
+    struct netprov_config *out = arg;
+    struct netprov_config local = {0};
+    strlcpy(local.hostname, "SomnoTrace", sizeof(local.hostname));
     nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        return false;
-    }
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return ESP_ERR_NVS_NOT_FOUND;
 
-    size_t len = sizeof(cfg->hostname);
-    nvs_get_str(h, NVS_KEY_HOSTNAME, cfg->hostname, &len);
-
+    size_t len = sizeof(local.hostname);
+    nvs_get_str(h, NVS_KEY_HOSTNAME, local.hostname, &len);
     bool any = false;
     for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
         char key[16];
         snprintf(key, sizeof(key), NVS_KEY_SSID_FMT, i + 1);
-        size_t ssid_len = sizeof(cfg->wifi[i].ssid);
-        if (nvs_get_str(h, key, cfg->wifi[i].ssid, &ssid_len) == ESP_OK
-            && cfg->wifi[i].ssid[0] != '\0') {
+        size_t ssid_len = sizeof(local.wifi[i].ssid);
+        if (nvs_get_str(h, key, local.wifi[i].ssid, &ssid_len) == ESP_OK &&
+            local.wifi[i].ssid[0] != '\0') {
             any = true;
             snprintf(key, sizeof(key), NVS_KEY_PASS_FMT, i + 1);
-            size_t pass_len = sizeof(cfg->wifi[i].pass);
-            nvs_get_str(h, key, cfg->wifi[i].pass, &pass_len);
+            size_t pass_len = sizeof(local.wifi[i].pass);
+            nvs_get_str(h, key, local.wifi[i].pass, &pass_len);
         }
     }
     nvs_close(h);
-    return any;
+    memcpy(out, &local, sizeof(local));
+    return any ? ESP_OK : ESP_ERR_NVS_NOT_FOUND;
+}
+
+bool netprov_load_config(struct netprov_config *cfg)
+{
+    if (!cfg) return false;
+    memset(cfg, 0, sizeof(*cfg));
+    strlcpy(cfg->hostname, "SomnoTrace", sizeof(cfg->hostname));
+    return nvs_writer_run(do_netprov_load, cfg) == ESP_OK;
 }
 
 /* Actual NVS write — runs on the internal-stack nvs_writer task. */
 static esp_err_t do_netprov_save(void *arg)
 {
     const struct netprov_config *cfg = (const struct netprov_config *)arg;
+    struct netprov_config local = *cfg;
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
 
-    nvs_set_str(h, NVS_KEY_HOSTNAME, cfg->hostname);
+    nvs_set_str(h, NVS_KEY_HOSTNAME, local.hostname);
     for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
         char key[16];
         snprintf(key, sizeof(key), NVS_KEY_SSID_FMT, i + 1);
-        nvs_set_str(h, key, cfg->wifi[i].ssid);
+        nvs_set_str(h, key, local.wifi[i].ssid);
         snprintf(key, sizeof(key), NVS_KEY_PASS_FMT, i + 1);
-        nvs_set_str(h, key, cfg->wifi[i].pass);
+        nvs_set_str(h, key, local.wifi[i].pass);
     }
     err = nvs_commit(h);
     nvs_close(h);
@@ -188,19 +195,36 @@ static esp_err_t do_save_mdns_name(void *arg)
     return err;
 }
 
+typedef struct {
+    char *out;
+    size_t out_len;
+    bool ok;
+} mdns_read_args_t;
+
+static esp_err_t do_load_mdns_name(void *arg)
+{
+    mdns_read_args_t *a = arg;
+    char *out = a->out;
+    size_t out_len = a->out_len;
+    char value[MDNS_NAME_MAX] = {0};
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) { a->ok = false; return err; }
+    size_t value_len = sizeof(value);
+    err = nvs_get_str(h, NVS_KEY_MDNS_NAME, value, &value_len);
+    nvs_close(h);
+    a->ok = err == ESP_OK && value[0] != '\0';
+    if (a->ok && out && out_len) strlcpy(out, value, out_len);
+    return err;
+}
+
 void netprov_get_mdns_name(char *out, size_t out_len)
 {
     if (!out || out_len == 0) return;
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        size_t len = out_len;
-        if (nvs_get_str(h, NVS_KEY_MDNS_NAME, out, &len) != ESP_OK || out[0] == '\0') {
-            strlcpy(out, "somnotrace", out_len);
-        }
-        nvs_close(h);
-    } else {
-        strlcpy(out, "somnotrace", out_len);
-    }
+    out[0] = '\0';
+    mdns_read_args_t args = { .out = out, .out_len = out_len, .ok = false };
+    nvs_writer_run(do_load_mdns_name, &args);
+    if (!args.ok || out[0] == '\0') strlcpy(out, "somnotrace", out_len);
     strlcpy(s_mdns_name, out, sizeof(s_mdns_name));
 }
 

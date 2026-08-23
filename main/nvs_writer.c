@@ -45,6 +45,7 @@ typedef struct {
 static QueueHandle_t     s_cmd_q      = NULL;   /* holds nvs_cmd_t* */
 static SemaphoreHandle_t s_submit_mtx = NULL;   /* serialises submitters */
 static SemaphoreHandle_t s_done       = NULL;   /* writer -> submitter completion */
+static volatile uint8_t  s_init_state = 0;      /* 0=not attempted, 1=ready, 2=failed */
 
 static void nvs_writer_task(void *arg)
 {
@@ -60,7 +61,8 @@ static void nvs_writer_task(void *arg)
 
 void nvs_writer_init(void)
 {
-    if (s_cmd_q) return;   /* already initialised */
+    if (s_init_state != 0) return;   /* already initialised/failed */
+    s_init_state = 2;                /* fail closed until fully ready */
 
     s_submit_mtx = xSemaphoreCreateMutex();
     s_done       = xSemaphoreCreateBinary();
@@ -68,16 +70,17 @@ void nvs_writer_init(void)
     if (!s_submit_mtx || !s_done || !s_cmd_q) {
         ESP_LOGE(TAG, "alloc failed (mtx=%p done=%p q=%p)",
                  s_submit_mtx, s_done, s_cmd_q);
-        s_cmd_q = NULL;   /* force inline fallback in nvs_writer_run() */
+        s_cmd_q = NULL;   /* nvs_writer_run() will fail closed */
         return;
     }
 
     if (xTaskCreatePinnedToCore(nvs_writer_task, "nvs_writer", NVS_WRITER_STACK,
                                 NULL, NVS_WRITER_PRIO, NULL, 0) != pdPASS) {
-        ESP_LOGE(TAG, "task create failed — falling back to inline writes");
+        ESP_LOGE(TAG, "task create failed — NVS proxy will fail closed");
         s_cmd_q = NULL;
         return;
     }
+    s_init_state = 1;
     ESP_LOGI(TAG, "nvs_writer task started (internal stack=%d)", NVS_WRITER_STACK);
 }
 
@@ -85,9 +88,11 @@ esp_err_t nvs_writer_run(nvs_writer_fn_t fn, void *arg)
 {
     if (!fn) return ESP_ERR_INVALID_ARG;
 
-    /* Not yet initialised (early boot): the caller still has an internal-RAM
-     * stack at this point, so running the write inline is safe. */
-    if (!s_cmd_q) return fn(arg);
+    /* Before initialisation is attempted, early boot callers are still on an
+     * internal-RAM stack and may run inline. After an init failure, fail closed
+     * rather than performing a flash operation from an unknown stack. */
+    if (s_init_state == 0) return fn(arg);
+    if (s_init_state != 1 || !s_cmd_q) return ESP_ERR_INVALID_STATE;
 
     xSemaphoreTake(s_submit_mtx, portMAX_DELAY);
     nvs_cmd_t cmd = { .fn = fn, .arg = arg, .result = ESP_FAIL };

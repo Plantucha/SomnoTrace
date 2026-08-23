@@ -698,8 +698,12 @@ esp_err_t oximetry_canonical_migrate_legacy(const char *device_id)
         if (!start) continue;
         char source[OXIMETRY_CANONICAL_MAX_PATH];
         if (!path_join2(source, sizeof(source), dir, e->d_name)) continue;
+        if (!source_complete_format_a(source)) {
+            ESP_LOGI(TAG, "legacy migration skipped %s (not a complete OxyII Format A file; retained)", source);
+            continue;
+        }
         if (oximetry_canonical_convert_format_a(device_id, name, source, start) != ESP_OK)
-            ESP_LOGW(TAG, "legacy migration skipped %s", source);
+            ESP_LOGW(TAG, "legacy migration failed %s (source retained)", source);
     }
     closedir(d);
     return ESP_OK;

@@ -242,10 +242,11 @@ static void set_state(alert_state_t st)
 static esp_err_t do_save_config(void *arg)
 {
     const therapy_alert_config_t *cfg = (const therapy_alert_config_t *)arg;
+    therapy_alert_config_t local = *cfg;
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
-    err = nvs_set_blob(h, NVS_KEY_CFG, cfg, sizeof(*cfg));
+    err = nvs_set_blob(h, NVS_KEY_CFG, &local, sizeof(local));
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err;

@@ -1401,21 +1401,22 @@ struct nvs_pair_arg {
 
 static esp_err_t do_save_pairing_nvs(void *arg)
 {
-    struct nvs_pair_arg *a = arg;
+    const struct nvs_pair_arg *a = arg;
+    struct nvs_pair_arg local = *a;
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_str(h, NVS_K_ADDR, a->addr);
-    nvs_set_str(h, NVS_K_NAME, a->name);
-    nvs_set_str(h, NVS_K_CLIENTID, a->client_id);
-    nvs_set_str(h, NVS_K_PAIRKEY, a->pair_key);
+    nvs_set_str(h, NVS_K_ADDR, local.addr);
+    nvs_set_str(h, NVS_K_NAME, local.name);
+    nvs_set_str(h, NVS_K_CLIENTID, local.client_id);
+    nvs_set_str(h, NVS_K_PAIRKEY, local.pair_key);
     e = nvs_commit(h);
     nvs_close(h);
     if (e == ESP_OK) {
-        strlcpy(s_pair_cache.addr, a->addr, sizeof(s_pair_cache.addr));
-        strlcpy(s_pair_cache.name, a->name, sizeof(s_pair_cache.name));
-        strlcpy(s_pair_cache.client_id, a->client_id, sizeof(s_pair_cache.client_id));
-        strlcpy(s_pair_cache.pair_key, a->pair_key, sizeof(s_pair_cache.pair_key));
+        strlcpy(s_pair_cache.addr, local.addr, sizeof(s_pair_cache.addr));
+        strlcpy(s_pair_cache.name, local.name, sizeof(s_pair_cache.name));
+        strlcpy(s_pair_cache.client_id, local.client_id, sizeof(s_pair_cache.client_id));
+        strlcpy(s_pair_cache.pair_key, local.pair_key, sizeof(s_pair_cache.pair_key));
         s_pair_cache.valid = true;
     }
     return e;

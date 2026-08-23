@@ -100,12 +100,16 @@ typedef struct {
 static esp_err_t do_set_timezone(void *arg)
 {
     const tz_save_args_t *a = (const tz_save_args_t *)arg;
+    char tz_str[TZ_STR_MAX];
+    char tz_name[TZ_NAME_MAX];
+    strlcpy(tz_str, a->tz_str ? a->tz_str : "", sizeof(tz_str));
+    strlcpy(tz_name, a->tz_name ? a->tz_name : "", sizeof(tz_name));
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
-    err = nvs_set_str(h, NVS_KEY_TZ_STR, a->tz_str);
-    if (err == ESP_OK && a->tz_name && a->tz_name[0]) {
-        nvs_set_str(h, NVS_KEY_TZ_NAME, a->tz_name);
+    err = nvs_set_str(h, NVS_KEY_TZ_STR, tz_str);
+    if (err == ESP_OK && tz_name[0]) {
+        nvs_set_str(h, NVS_KEY_TZ_NAME, tz_name);
     }
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
@@ -126,36 +130,65 @@ esp_err_t time_sync_set_timezone(const char *tz_str, const char *tz_name)
     return err;
 }
 
+typedef struct {
+    const char *key;
+    char *out;
+    size_t out_len;
+    bool ok;
+} nvs_string_read_args_t;
+
+/* The output pointer may refer to a PSRAM-backed caller stack.  Keep the NVS
+ * read destination on this internal-stack proxy task, close the handle first,
+ * and only then copy the result to the caller. */
+static esp_err_t do_read_nvs_string(void *arg)
+{
+    nvs_string_read_args_t *a = arg;
+    char key[16];
+    strlcpy(key, a->key ? a->key : "", sizeof(key));
+    char *out = a->out;
+    size_t out_len = a->out_len;
+    char value[64] = {0};
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) { a->ok = false; return err; }
+    size_t value_len = sizeof(value);
+    err = nvs_get_str(h, key, value, &value_len);
+    nvs_close(h);
+    a->ok = err == ESP_OK;
+    if (a->ok && out && out_len) strlcpy(out, value, out_len);
+    return err;
+}
+
+static void read_nvs_string(const char *key, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    nvs_string_read_args_t args = {
+        .key = key, .out = out, .out_len = out_len, .ok = false,
+    };
+    nvs_writer_run(do_read_nvs_string, &args);
+}
+
 void time_sync_get_timezone(char *tz_str, size_t tz_str_len)
 {
-    if (!tz_str || tz_str_len == 0) return;
-    tz_str[0] = '\0';
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_str(h, NVS_KEY_TZ_STR, tz_str, &tz_str_len);
-        nvs_close(h);
-    }
+    read_nvs_string(NVS_KEY_TZ_STR, tz_str, tz_str_len);
 }
 
 void time_sync_get_tz_name(char *tz_name, size_t tz_name_len)
 {
-    if (!tz_name || tz_name_len == 0) return;
-    tz_name[0] = '\0';
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_str(h, NVS_KEY_TZ_NAME, tz_name, &tz_name_len);
-        nvs_close(h);
-    }
+    read_nvs_string(NVS_KEY_TZ_NAME, tz_name, tz_name_len);
 }
 
 static esp_err_t do_set_ntp_server(void *arg)
 {
-    const char *server = (const char *)arg;
+    const char *server_arg = (const char *)arg;
+    char server[ NTP_SRV_MAX ];
+    strlcpy(server, server_arg ? server_arg : "", sizeof(server));
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
 
-    if (server && server[0] != '\0') {
+    if (server[0] != '\0') {
         err = nvs_set_str(h, NVS_KEY_NTP_SRV, server);
     } else {
         err = nvs_erase_key(h, NVS_KEY_NTP_SRV);
@@ -179,13 +212,7 @@ esp_err_t time_sync_set_ntp_server(const char *server)
 
 void time_sync_get_ntp_server(char *server, size_t server_len)
 {
-    if (!server || server_len == 0) return;
-    server[0] = '\0';
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_str(h, NVS_KEY_NTP_SRV, server, &server_len);
-        nvs_close(h);
-    }
+    read_nvs_string(NVS_KEY_NTP_SRV, server, server_len);
 }
 
 bool time_sync_is_synced(void)
@@ -252,11 +279,13 @@ typedef struct {
 static esp_err_t do_save_drift(void *arg)
 {
     const drift_save_args_t *a = (const drift_save_args_t *)arg;
+    int64_t drift_ms = a->drift_ms;
+    int64_t measured_at_ms = a->measured_at_ms;
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
-    err = nvs_set_i64(h, NVS_KEY_DRIFT, a->drift_ms);
-    if (err == ESP_OK) err = nvs_set_i64(h, NVS_KEY_DRIFT_AT, a->measured_at_ms);
+    err = nvs_set_i64(h, NVS_KEY_DRIFT, drift_ms);
+    if (err == ESP_OK) err = nvs_set_i64(h, NVS_KEY_DRIFT_AT, measured_at_ms);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err;
@@ -279,28 +308,55 @@ void time_sync_save_drift(int64_t drift_ms, int64_t measured_at_ms)
     }
 }
 
-/* Load drift from NVS into s_drift_ms / s_drift_at_ms.
- * Returns true if a valid drift sample was found. */
-static bool load_drift_from_nvs(void)
+typedef struct {
+    int64_t drift_ms;
+    int64_t measured_at_ms;
+    bool ok;
+} drift_read_args_t;
+
+/* Executed by nvs_writer on its internal-RAM stack.  Copy the request values
+ * into locals before entering NVS/flash, and copy results back only after the
+ * NVS handle is closed and flash access is restored.  This is important even
+ * though the caller may be using a PSRAM-backed stack. */
+static esp_err_t do_load_drift_from_nvs(void *arg)
 {
+    drift_read_args_t *a = arg;
     nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        a->ok = false;
+        return err;
+    }
 
     int64_t drift = 0, at = 0;
     bool ok = (nvs_get_i64(h, NVS_KEY_DRIFT, &drift) == ESP_OK &&
                nvs_get_i64(h, NVS_KEY_DRIFT_AT, &at) == ESP_OK);
     nvs_close(h);
+    a->drift_ms = drift;
+    a->measured_at_ms = at;
+    a->ok = ok;
+    return ok ? ESP_OK : ESP_ERR_NVS_NOT_FOUND;
+}
 
-    if (ok) {
-        s_drift_ms = drift;
-        s_drift_at_ms = at;
+/* Load drift from NVS into s_drift_ms / s_drift_at_ms.
+ * Returns true if a valid drift sample was found.  All NVS access is routed
+ * through the internal-stack proxy because this function is also reached from
+ * the PSRAM-backed AS11 reconnect task. */
+static bool load_drift_from_nvs(void)
+{
+    drift_read_args_t args = {0};
+    nvs_writer_run(do_load_drift_from_nvs, &args);
+
+    if (args.ok) {
+        s_drift_ms = args.drift_ms;
+        s_drift_at_ms = args.measured_at_ms;
         s_drift_loaded = true;
         s_drift_src = "nvs";
         ESP_LOGI(TAG, "drift loaded from NVS: %lld ms (age %lld s)",
-                 (long long)drift,
-                 (long long)((time(NULL) * 1000 - at) / 1000));
+                 (long long)args.drift_ms,
+                 (long long)((time(NULL) * 1000 - args.measured_at_ms) / 1000));
     }
-    return ok;
+    return args.ok;
 }
 
 /* Fallback: scan SD session JSONs for the newest clock_drift_valid entry.

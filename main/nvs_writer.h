@@ -31,15 +31,16 @@
  * its PSRAM stack mid-operation faults. (Other PSRAM-stack tasks are protected
  * by CONFIG_SPI_FLASH_AUTO_SUSPEND, but the task *executing* the write is not.)
  *
- * To let the httpd worker run on a PSRAM stack (task_caps = MALLOC_CAP_SPIRAM)
- * while its handlers still persist settings, all NVS writes are funnelled to
- * this single task, which is created with an ordinary internal-RAM stack. The
- * submitting task blocks until the write completes and receives its result, so
- * HTTP responses still reflect success/failure synchronously.
+ * To let the httpd worker and BLE reconnect workers run on PSRAM stacks while
+ * they still access NVS, all NVS reads and writes are funnelled to this single
+ * task, which is created with an ordinary internal-RAM stack. The submitting
+ * task blocks until the operation completes and receives its result.
  */
 
-/* Callback executed on the nvs_writer task. Must perform only the flash write
- * (e.g. nvs_open/set/commit); do any parsing/allocation in the caller. */
+/* Callback executed on the nvs_writer task. It may perform NVS reads/writes,
+ * but must copy all input values into internal-stack locals before entering
+ * flash and copy output values to caller memory only after the NVS operation
+ * has completed. */
 typedef esp_err_t (*nvs_writer_fn_t)(void *arg);
 
 /* Create the writer task + queue. Idempotent. MUST be called before any task
@@ -47,7 +48,8 @@ typedef esp_err_t (*nvs_writer_fn_t)(void *arg);
 void nvs_writer_init(void);
 
 /* Run fn(arg) on the internal-stack writer task and block until it finishes,
- * returning fn's result. If the writer is not yet initialised (early boot),
- * fn runs inline on the calling task (which at that point has an internal
- * stack), so this is always safe to call. */
+ * returning fn's result. If the writer has not yet been initialised during
+ * early boot, fn runs inline on the calling task (which at that point has an
+ * internal stack). If initialisation was attempted but failed, returns
+ * ESP_ERR_INVALID_STATE rather than performing an unsafe inline flash access. */
 esp_err_t nvs_writer_run(nvs_writer_fn_t fn, void *arg);

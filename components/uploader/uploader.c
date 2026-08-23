@@ -170,24 +170,25 @@ void uploader_set_nvs_executor(uploader_nvs_exec_fn_t exec)
 static esp_err_t do_uploader_save_config(void *arg)
 {
     const uploader_config_t *cfg = (const uploader_config_t *)arg;
+    uploader_config_t local = *cfg;
     nvs_handle_t h;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
 
-    nvs_set_u8(h, "smb_en", cfg->smb_enabled ? 1 : 0);
-    nvs_set_u8(h, "shq_en", cfg->shq_enabled ? 1 : 0);
-    nvs_set_u8(h, "ftp_en", cfg->ftp_enabled ? 1 : 0);
-    nvs_set_u8(h, "ftp_anon", cfg->ftp_anonymous ? 1 : 0);
-    nvs_set_i32(h, "max_days", cfg->max_days);
-    nvs_set_str(h, "smb_host", cfg->smb_host);
-    nvs_set_str(h, "smb_share", cfg->smb_share);
-    nvs_set_str(h, "smb_user", cfg->smb_user);
-    nvs_set_str(h, "smb_pass", cfg->smb_pass);
-    nvs_set_str(h, "smb_path", cfg->smb_path);
-    nvs_set_str(h, "shq_cid", cfg->shq_client_id);
-    nvs_set_str(h, "shq_secret", cfg->shq_client_secret);
-    nvs_set_str(h, "ftp_user", cfg->ftp_user);
-    nvs_set_str(h, "ftp_pass", cfg->ftp_pass);
+    nvs_set_u8(h, "smb_en", local.smb_enabled ? 1 : 0);
+    nvs_set_u8(h, "shq_en", local.shq_enabled ? 1 : 0);
+    nvs_set_u8(h, "ftp_en", local.ftp_enabled ? 1 : 0);
+    nvs_set_u8(h, "ftp_anon", local.ftp_anonymous ? 1 : 0);
+    nvs_set_i32(h, "max_days", local.max_days);
+    nvs_set_str(h, "smb_host", local.smb_host);
+    nvs_set_str(h, "smb_share", local.smb_share);
+    nvs_set_str(h, "smb_user", local.smb_user);
+    nvs_set_str(h, "smb_pass", local.smb_pass);
+    nvs_set_str(h, "smb_path", local.smb_path);
+    nvs_set_str(h, "shq_cid", local.shq_client_id);
+    nvs_set_str(h, "shq_secret", local.shq_client_secret);
+    nvs_set_str(h, "ftp_user", local.ftp_user);
+    nvs_set_str(h, "ftp_pass", local.ftp_pass);
     nvs_commit(h);
     nvs_close(h);
     return ESP_OK;

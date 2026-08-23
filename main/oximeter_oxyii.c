@@ -953,14 +953,15 @@ struct ox_nvs_arg {
 
 static esp_err_t do_save_nvs(void *arg)
 {
-    struct ox_nvs_arg *a = arg;
+    const struct ox_nvs_arg *a = arg;
+    struct ox_nvs_arg local = *a;
     nvs_handle_t h;
     esp_err_t e = nvs_open(OX_NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_str(h, "serial", a->serial);
-    nvs_set_str(h, "firmware", a->firmware);
-    nvs_set_str(h, "name_prefix", a->name_prefix);
-    nvs_set_str(h, "last_addr", a->last_addr);
+    nvs_set_str(h, "serial", local.serial);
+    nvs_set_str(h, "firmware", local.firmware);
+    nvs_set_str(h, "name_prefix", local.name_prefix);
+    nvs_set_str(h, "last_addr", local.last_addr);
     e = nvs_commit(h);
     nvs_close(h);
     return e;
