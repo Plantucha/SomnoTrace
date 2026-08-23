@@ -564,36 +564,72 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
                                                const char *source_path,
                                                int64_t start_utc_ms)
 {
-    if (!sd_storage_is_ready() || !safe_component(device_id, OXIMETRY_CANONICAL_MAX_COMPONENT) ||
-        !valid_recording_id(recording_id) || !source_path ||
-        !source_complete_format_a(source_path))
+    ESP_LOGI(TAG, "convert %s: entry dev=%s src=%s start=%lld",
+             recording_id, device_id, source_path, (long long)start_utc_ms);
+    if (!sd_storage_is_ready()) {
+        ESP_LOGW(TAG, "convert %s: SD not ready", recording_id);
         return ESP_ERR_INVALID_ARG;
-    if (oximetry_canonical_ensure_dirs() != ESP_OK) return ESP_FAIL;
+    }
+    if (!safe_component(device_id, OXIMETRY_CANONICAL_MAX_COMPONENT)) {
+        ESP_LOGW(TAG, "convert %s: bad device_id '%s'", recording_id, device_id);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!valid_recording_id(recording_id)) {
+        ESP_LOGW(TAG, "convert: bad recording_id");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!source_path) {
+        ESP_LOGW(TAG, "convert %s: null source_path", recording_id);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!source_complete_format_a(source_path)) {
+        ESP_LOGW(TAG, "convert %s: source not complete format A: %s", recording_id, source_path);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (oximetry_canonical_ensure_dirs() != ESP_OK) {
+        ESP_LOGW(TAG, "convert %s: ensure_dirs failed", recording_id);
+        return ESP_FAIL;
+    }
 
     char day[9];
-    if (!day_for_epoch(start_utc_ms, day)) return ESP_ERR_INVALID_ARG;
+    if (!day_for_epoch(start_utc_ms, day)) {
+        ESP_LOGW(TAG, "convert %s: day_for_epoch failed for %lld", recording_id, (long long)start_utc_ms);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     struct stat st;
-    if (stat(source_path, &st) != 0 || st.st_size > OXIMETRY_CANONICAL_MAX_SOURCE_BYTES)
+    if (stat(source_path, &st) != 0) {
+        ESP_LOGW(TAG, "convert %s: stat failed: %s", recording_id, strerror(errno));
         return ESP_ERR_INVALID_SIZE;
+    }
+    if (st.st_size > OXIMETRY_CANONICAL_MAX_SOURCE_BYTES) {
+        ESP_LOGW(TAG, "convert %s: source too large %lld > %d", recording_id,
+                 (long long)st.st_size, OXIMETRY_CANONICAL_MAX_SOURCE_BYTES);
+        return ESP_ERR_INVALID_SIZE;
+    }
     uint32_t count = (uint32_t)(((uint64_t)st.st_size - OX_SOURCE_HEADER - OX_SOURCE_TRAILER) / 3);
     int64_t end_ms = start_utc_ms + (int64_t)(count - 1) * 1000;
 
     /* Heap-allocate path buffers to avoid ~8 KB of stack usage. */
     convert_ctx_t *p = heap_caps_malloc(sizeof(*p), MALLOC_CAP_SPIRAM);
     if (!p) p = malloc(sizeof(*p));
-    if (!p) return ESP_ERR_NO_MEM;
+    if (!p) {
+        ESP_LOGW(TAG, "convert %s: malloc failed", recording_id);
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_err_t ret = ESP_FAIL;
 
     if (!path_join3(p->final_dir, sizeof(p->final_dir), OX_RECORDINGS, day, recording_id) ||
         !path_join2(p->final_pointer, sizeof(p->final_pointer), p->final_dir, "recording.json")) {
+        ESP_LOGW(TAG, "convert %s: path_join final failed", recording_id);
         free(p);
         return ESP_ERR_INVALID_SIZE;
     }
 
     cJSON *existing = read_json_file(p->final_pointer);
     if (existing) {
+        ESP_LOGD(TAG, "convert %s: already exists at %s, skipping", recording_id, p->final_pointer);
         cJSON_Delete(existing);
         free(p);
         return ESP_OK;
@@ -611,6 +647,7 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
         !path_join3(p->stage_export, sizeof(p->stage_export), p->stage_gen_dir, "exports", "sleephq") ||
         !path_join2(p->stage_export_file, sizeof(p->stage_export_file), p->stage_export, "recording.vld") ||
         !path_join2(p->stage_gen_manifest, sizeof(p->stage_gen_manifest), p->stage_gen_dir, "manifest.json")) {
+        ESP_LOGW(TAG, "convert %s: path_join stage failed", recording_id);
         free(p);
         return ESP_ERR_INVALID_SIZE;
     }
@@ -629,11 +666,12 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     mkdir_one(p->stage_export);
 
     if (!path_join2(p->stage_pointer, sizeof(p->stage_pointer), p->stage_dir, "recording.json")) {
+        ESP_LOGW(TAG, "convert %s: path_join stage_pointer failed", recording_id);
         free(p);
         return ESP_ERR_INVALID_SIZE;
     }
     cJSON *pending = cJSON_CreateObject();
-    if (!pending) { free(p); return ESP_ERR_NO_MEM; }
+    if (!pending) { ESP_LOGW(TAG, "convert %s: pending cJSON alloc failed", recording_id); free(p); return ESP_ERR_NO_MEM; }
     cJSON_AddStringToObject(pending, "schema", "somnotrace.oximetry.recording/1");
     cJSON_AddStringToObject(pending, "recording_id", recording_id);
     cJSON_AddNumberToObject(pending, "active_generation", 1);
@@ -643,7 +681,7 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     cJSON_AddNumberToObject(pending, "start_epoch_ms", (double)start_utc_ms);
     esp_err_t pending_err = write_json_atomic(p->stage_pointer, pending);
     cJSON_Delete(pending);
-    if (pending_err != ESP_OK) { free(p); return pending_err; }
+    if (pending_err != ESP_OK) { ESP_LOGW(TAG, "convert %s: write pending pointer failed: %d", recording_id, pending_err); free(p); return pending_err; }
 
     uint32_t source_crc = 0;
     uint32_t track_crc = 0;
@@ -653,20 +691,49 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
         source_ok = file_crc_size(source_path, &source_crc, &source_size);
     else
         source_ok = copy_file_crc(source_path, p->stage_source, &source_crc, &source_size);
-    if (!source_ok || source_size != (uint64_t)st.st_size ||
-        !write_snt3_format_a(source_path, p->stage_track_tmp, start_utc_ms, &count, &track_crc) ||
-        (unlink(p->stage_track), rename(p->stage_track_tmp, p->stage_track) != 0) ||
-        !write_vld3_export(source_path, p->stage_export_file, start_utc_ms) ||
-        build_generation_manifest(p->stage_gen_manifest, device_id, recording_id,
+    if (!source_ok) {
+        ESP_LOGW(TAG, "convert %s: source copy/crc failed", recording_id);
+        unlink(p->stage_track_tmp);
+        free(p);
+        return ESP_FAIL;
+    }
+    if (source_size != (uint64_t)st.st_size) {
+        ESP_LOGW(TAG, "convert %s: source size mismatch %llu != %llu",
+                 recording_id, (unsigned long long)source_size, (unsigned long long)st.st_size);
+        unlink(p->stage_track_tmp);
+        free(p);
+        return ESP_FAIL;
+    }
+    if (!write_snt3_format_a(source_path, p->stage_track_tmp, start_utc_ms, &count, &track_crc)) {
+        ESP_LOGW(TAG, "convert %s: write_snt3_format_a failed", recording_id);
+        unlink(p->stage_track_tmp);
+        free(p);
+        return ESP_FAIL;
+    }
+    unlink(p->stage_track);
+    if (rename(p->stage_track_tmp, p->stage_track) != 0) {
+        ESP_LOGW(TAG, "convert %s: rename %s -> %s failed: %s", recording_id,
+                 p->stage_track_tmp, p->stage_track, strerror(errno));
+        free(p);
+        return ESP_FAIL;
+    }
+    if (!write_vld3_export(source_path, p->stage_export_file, start_utc_ms)) {
+        ESP_LOGW(TAG, "convert %s: write_vld3_export failed", recording_id);
+        unlink(p->stage_track_tmp);
+        free(p);
+        return ESP_FAIL;
+    }
+    if (build_generation_manifest(p->stage_gen_manifest, device_id, recording_id,
                                   basename_safe(source_path), start_utc_ms, end_ms,
                                   (uint32_t)source_size, source_crc, count, track_crc) != ESP_OK) {
+        ESP_LOGW(TAG, "convert %s: build_generation_manifest failed", recording_id);
         unlink(p->stage_track_tmp);
         free(p);
         return ESP_FAIL;
     }
 
     cJSON *pointer = cJSON_CreateObject();
-    if (!pointer) { free(p); return ESP_ERR_NO_MEM; }
+    if (!pointer) { ESP_LOGW(TAG, "convert %s: final cJSON alloc failed", recording_id); free(p); return ESP_ERR_NO_MEM; }
     cJSON_AddStringToObject(pointer, "schema", "somnotrace.oximetry.recording/1");
     cJSON_AddStringToObject(pointer, "recording_id", recording_id);
     cJSON_AddNumberToObject(pointer, "active_generation", 1);
@@ -677,8 +744,9 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     cJSON_AddNumberToObject(pointer, "end_epoch_ms", (double)end_ms);
     esp_err_t pe = write_json_atomic(p->stage_pointer, pointer);
     cJSON_Delete(pointer);
-    if (pe != ESP_OK) { free(p); return pe; }
+    if (pe != ESP_OK) { ESP_LOGW(TAG, "convert %s: write final pointer failed: %d", recording_id, pe); free(p); return pe; }
 
+    ESP_LOGI(TAG, "convert %s: publishing rename %s -> %s", recording_id, p->stage_dir, p->final_dir);
     /* The stage and final directory are on the same FAT volume.  The root
      * pointer is written before publication and is the final readiness gate. */
     if (rename(p->stage_dir, p->final_dir) != 0) {
@@ -792,6 +860,8 @@ esp_err_t oximetry_canonical_reconcile(void)
             bool can_resume = cJSON_IsString(state) && strcmp(state->valuestring, "converting") == 0 &&
                               cJSON_IsString(device) && cJSON_IsNumber(start) &&
                               path_join3(source, sizeof(source), stage_dir, "source", "source.bin");
+            ESP_LOGI(TAG, "reconcile staging: %s state=%s can_resume=%d",
+                     se->d_name, cJSON_IsString(state) ? state->valuestring : "(null)", can_resume);
             if (can_resume && oximetry_canonical_convert_format_a(
                     device->valuestring, se->d_name, source, (int64_t)start->valuedouble) != ESP_OK)
                 ESP_LOGW(TAG, "staging conversion still pending: %s", se->d_name);
