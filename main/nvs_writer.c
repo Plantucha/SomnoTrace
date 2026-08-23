@@ -33,7 +33,7 @@ static const char *TAG = "nvs_writer";
 
 /* Internal-RAM stack: this task performs the actual flash writes, so its own
  * stack must not be in PSRAM. NVS commits fit comfortably in 4 KB. */
-#define NVS_WRITER_STACK   4096
+#define NVS_WRITER_STACK   8192
 #define NVS_WRITER_PRIO    6      /* >= httpd worker so a submitted write runs promptly */
 
 typedef struct {
@@ -54,6 +54,11 @@ static void nvs_writer_task(void *arg)
         nvs_cmd_t *cmd = NULL;
         if (xQueueReceive(s_cmd_q, &cmd, portMAX_DELAY) == pdTRUE && cmd) {
             cmd->result = cmd->fn ? cmd->fn(cmd->arg) : ESP_ERR_INVALID_ARG;
+            UBaseType_t high_water = uxTaskGetStackHighWaterMark(NULL);
+            if (high_water < 512) {
+                ESP_LOGW(TAG, "low stack watermark after NVS operation: %u words",
+                         (unsigned)high_water);
+            }
             xSemaphoreGive(s_done);
         }
     }
@@ -81,7 +86,7 @@ void nvs_writer_init(void)
         return;
     }
     s_init_state = 1;
-    ESP_LOGI(TAG, "nvs_writer task started (internal stack=%d)", NVS_WRITER_STACK);
+    ESP_LOGI(TAG, "nvs_writer task started (internal stack=%d bytes)", NVS_WRITER_STACK);
 }
 
 esp_err_t nvs_writer_run(nvs_writer_fn_t fn, void *arg)
