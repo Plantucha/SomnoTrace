@@ -353,6 +353,43 @@ static upload_result_t smb_put_bundle(const char *day,
     return UPLOAD_OK;
 }
 
+static upload_result_t smb_ox_day_begin(const char *day)
+{
+    if (!s_smb || !day) return UPLOAD_ERR_TRANSIENT;
+    char path[640];
+    snprintf(path, sizeof(path), "%s/OXYMETRY", s_remote_base); smb2_mkdir(s_smb, path);
+    snprintf(path, sizeof(path), "%s/OXYMETRY/%s", s_remote_base, day); smb2_mkdir(s_smb, path);
+    return UPLOAD_OK;
+}
+
+static upload_result_t smb_put_oximetry(const upload_ox_ref_t *ref)
+{
+    if (!s_smb || !ref || !ref->recording_id[0]) return UPLOAD_ERR_TRANSIENT;
+    char base[640];
+    snprintf(base, sizeof(base), "%s/OXYMETRY/%s/%s", s_remote_base,
+             ref->day, ref->recording_id);
+    smb2_mkdir(s_smb, base);
+    char tree[760];
+    snprintf(tree, sizeof(tree), "%s/source", base); smb2_mkdir(s_smb, tree);
+    snprintf(tree, sizeof(tree), "%s/generations", base); smb2_mkdir(s_smb, tree);
+    snprintf(tree, sizeof(tree), "%s/generations/%u", base, (unsigned)ref->generation); smb2_mkdir(s_smb, tree);
+    snprintf(tree, sizeof(tree), "%s/generations/%u/data", base, (unsigned)ref->generation); smb2_mkdir(s_smb, tree);
+    char path[760];
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < ref->n_files; i++) {
+            bool root_pointer = strcmp(ref->relative_paths[i], "recording.json") == 0;
+            if ((pass == 0 && root_pointer) || (pass == 1 && !root_pointer)) continue;
+            snprintf(path, sizeof(path), "%s/%s", base, ref->relative_paths[i]);
+            char parent[760]; strlcpy(parent, path, sizeof(parent));
+            char *slash = strrchr(parent, '/');
+            if (slash) { *slash = '\0'; smb2_mkdir(s_smb, parent); }
+            if (smb_upload_file(s_smb, ref->local_paths[i], path) != UPLOAD_OK)
+                return UPLOAD_ERR_TRANSIENT;
+        }
+    }
+    return UPLOAD_OK;
+}
+
 static upload_result_t smb_day_end(const char *day, bool any_uploaded)
 {
     (void)day;
@@ -368,6 +405,9 @@ const upload_backend_t smb_backend = {
     .session_begin = smb_session_begin,
     .day_begin = smb_day_begin,
     .put_group = smb_put_group,
+    .ox_day_begin = smb_ox_day_begin,
+    .put_oximetry = smb_put_oximetry,
+    .ox_day_end = smb_day_end,
     .put_bundle = smb_put_bundle,
     .day_end = smb_day_end,
     .session_end = smb_session_end,

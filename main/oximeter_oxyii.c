@@ -30,6 +30,9 @@
 #include "as11_ble.h"
 #include "psram_task.h"
 #include "nvs_writer.h"
+#include "oximetry_canonical.h"
+#include "time_sync.h"
+#include "upload_sched.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -208,6 +211,27 @@ static void oxyii_time_payload(uint8_t *out8)
     out8[5] = tm.tm_min;
     out8[6] = tm.tm_sec;
     out8[7] = 0x00;
+}
+
+static int64_t oxyii_filename_epoch_ms(const char *name)
+{
+    if (!name || strlen(name) < 14) return 0;
+    for (int i = 0; i < 14; i++)
+        if (name[i] < '0' || name[i] > '9') return 0;
+    struct tm tm = {0};
+    int year, mon, day, hour, min, sec;
+    if (sscanf(name, "%4d%2d%2d%2d%2d%2d", &year, &mon, &day,
+               &hour, &min, &sec) != 6)
+        return 0;
+    tm.tm_year = year - 1900;
+    tm.tm_mon = mon - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+    tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    return t == (time_t)-1 ? 0 : (int64_t)t * 1000;
 }
 
 /* ── READ_FILE_START payload (20 bytes) ────────────────────────────── */
@@ -714,6 +738,10 @@ static esp_err_t oxyii_session_open(void)
  * recording handle; without it, F1 is silently dropped (the F1 wedge). */
 static esp_err_t oxyii_prepare_files(void)
 {
+    if (!time_is_usable()) {
+        ESP_LOGW(TAG, "not setting ring clock: host time is unusable");
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t tp[8];
     oxyii_time_payload(tp);
     if (oxyii_request(OP_SET_UTC_TIME, tp, 8, true, 5000) != ESP_OK)
@@ -844,13 +872,17 @@ static esp_err_t oxyii_pull_file(const char *name)
                     (s_resp_payload[2] << 16) | (s_resp_payload[3] << 24);
     ESP_LOGI(TAG, "pulling '%s' (%lu bytes)", name, (unsigned long)file_size);
 
-    /* Remove any stale .part file — always start fresh */
-    ox_store_part_remove(name);
-
-    /* READ_FILE_DATA loop */
-    uint32_t offset = 0;
+    /* Resume from the durable partial length.  The device's reported size is
+     * not completion evidence; the decoder validates the trailer later. */
+    long prior = ox_store_part_size(name);
+    if (prior < 0 || (file_size > 0 && (uint32_t)prior > file_size)) {
+        ox_store_part_remove(name);
+        prior = 0;
+    }
+    uint32_t offset = (uint32_t)prior;
     int empty_count = 0;
-    while (true) {
+    bool transfer_complete = (file_size > 0 && offset == file_size);
+    while (!transfer_complete) {
         uint8_t off_pl[4];
         oxyii_file_data_payload(off_pl, offset);
         if (oxyii_request(OP_READ_FILE_DATA, off_pl, 4, true, 10000) != ESP_OK) {
@@ -866,24 +898,46 @@ static esp_err_t oxyii_pull_file(const char *name)
         }
         empty_count = 0;
 
+        if (file_size > 0 && (uint64_t)offset + chunk_len > file_size) {
+            ESP_LOGW(TAG, "device returned data past file size at offset=%lu",
+                     (unsigned long)offset);
+            break;
+        }
         if (ox_store_part_append(name, s_resp_payload, chunk_len) != ESP_OK) {
             ESP_LOGE(TAG, "SD write failed at offset=%lu", (unsigned long)offset);
             break;
         }
         offset += chunk_len;
 
-        if (file_size > 0 && offset >= file_size) break;
+        if (file_size > 0 && offset == file_size) {
+            transfer_complete = true;
+        }
     }
 
     /* READ_FILE_END */
     if (oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000) != ESP_OK)
         ESP_LOGW(TAG, "F4 ack missing after '%s'", name);
 
-    /* Promote .part to .bin */
+    /* Completion requires both an exact transfer and the O2 Ring S trailer. */
+    if (!transfer_complete || file_size == 0) {
+        ESP_LOGW(TAG, "incomplete '%s': %lu/%lu bytes; retaining .part",
+                 name, (unsigned long)offset, (unsigned long)file_size);
+        return ESP_FAIL;
+    }
     bool finalised = ox_store_promote(s_serial, name);
     ESP_LOGI(TAG, "pulled '%s': %lu bytes, finalised=%d",
              name, (unsigned long)offset, finalised);
+    if (!finalised) return ESP_FAIL;
 
+    char source_path[640];
+    snprintf(source_path, sizeof(source_path), "%s/oximetry/files/%s/%s.bin",
+             SD_MOUNT_POINT, s_serial, name);
+    if (oximetry_canonical_convert_format_a(s_serial, name, source_path,
+                                            oxyii_filename_epoch_ms(name)) != ESP_OK) {
+        ESP_LOGW(TAG, "canonical conversion pending for '%s'", name);
+        return ESP_FAIL;
+    }
+    upload_sched_request_scan();
     return ESP_OK;
 }
 
@@ -1241,6 +1295,7 @@ static void pull_task(void *arg)
             ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
             if (oxyii_pull_file(names[i]) != ESP_OK) {
                 ESP_LOGW(TAG, "pull failed for '%s'", names[i]);
+                if (sd_storage_is_ready()) oximetry_canonical_migrate_legacy(s_serial);
                 pull_ok = false;
                 break;
             }
@@ -1275,6 +1330,11 @@ esp_err_t oximeter_init(void)
 
     load_paired_from_nvs();
     ox_store_ensure_dirs();
+    if (sd_storage_is_ready()) {
+        oximetry_canonical_ensure_dirs();
+        oximetry_canonical_reconcile();
+        oximetry_canonical_migrate_all_legacy();
+    }
 
     if (s_paired)
         set_state(OX_STATUS_PAIRED);

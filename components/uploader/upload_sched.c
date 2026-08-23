@@ -25,6 +25,7 @@
 #include "upload_sched.h"
 #include "upload_index.h"
 #include "upload_scan.h"
+#include "upload_ox.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -170,6 +171,16 @@ static void cooldown_reset(backend_rt_t *r)
     r->last_err_permanent = false;
 }
 
+static void ox_mark_day_failed(upload_ox_ref_t *refs, int n_refs, int slot,
+                               const char *day)
+{
+    for (int i = 0; i < n_refs; i++) {
+        if (strcmp(refs[i].day, day) != 0) continue;
+        if (upload_ox_status(&refs[i], slot) == UG_OK)
+            upload_ox_mark(&refs[i], slot, UG_FAILED, NULL);
+    }
+}
+
 /* ── One backend pass ─────────────────────────────────────────────────
  * Returns true if the backend did any work (so the caller can log/report). */
 
@@ -204,14 +215,18 @@ static bool run_backend(backend_rt_t *r, int max_days)
     bool have_bundle = upload_scan_bundle(&bundle);
     bool bundle_changed = have_bundle &&
                           (upload_index_bundle_ok_fp(r->slot) != bundle.fp);
+    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
+    int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
+    int ox_pending = upload_ox_pending(ox_refs, n_ox, r->slot);
 
-    if (n_days == 0 && !bundle_changed) {
+    if (n_days == 0 && !bundle_changed && ox_pending == 0) {
         set_be_state(r, SB_IDLE);
         r->cur_day[0] = '\0';
         return false;
     }
-    if (!have_bundle) {
-        /* No STR.edf yet: uploading session files alone would be useless. */
+    if (!have_bundle && (n_days > 0 || bundle_changed)) {
+        /* CPAP session uploads still require their root bundle. Oximetry
+         * packages are self-contained and may upload before any EDF exists. */
         set_be_state(r, SB_IDLE);
         return false;
     }
@@ -220,7 +235,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
      * it now; the rest wait for the next session upload to carry it, so a
      * short session that produced no EDFs does not cause a pointless visit. */
     bool bundle_only_run = false;
-    if (n_days == 0) {
+    if (n_days == 0 && ox_pending == 0) {
         if (!be->bundle_only_ok) {
             ESP_LOGI(TAG, "%s: only root files changed — deferring to the "
                      "next session upload", be->id);
@@ -257,7 +272,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
     }
 
     set_be_state(r, SB_UPLOADING);
-    r->n_units = n_units;
+    r->n_units = n_units + ox_pending;
     r->cur_unit = 0;
 
     /* Say plainly which of the two kinds of run this is.  The old message
@@ -395,6 +410,62 @@ static bool run_backend(backend_rt_t *r, int max_days)
         if (bundle_ok && bundle_pushed) bundle_committed = true;
     }
 
+    /* Oximetry packages are self-contained and are tracked independently from
+     * EDF groups. A backend connection is reused, but each noon-day gets its
+     * own transport scope so SleepHQ can create one O2 import per day. */
+    if (ox_pending > 0 && be->put_oximetry) {
+        char ox_day[12] = {0};
+        bool ox_day_any = false;
+        for (int oi = 0; oi < n_ox && fails < FAILS_BEFORE_SWITCH; oi++) {
+            if (upload_ox_status(&ox_refs[oi], r->slot) == UG_OK) continue;
+            if (strcmp(ox_day, ox_refs[oi].day) != 0) {
+                if (ox_day_any && (be->ox_day_end || be->day_end)) {
+                    res = be->ox_day_end ? be->ox_day_end(ox_day, true) :
+                          be->day_end(ox_day, true);
+                    if (res != UPLOAD_OK) {
+                        ox_mark_day_failed(ox_refs, n_ox, r->slot, ox_day);
+                        fails++;
+                        strlcpy(r->err, "oximetry finalise failed", sizeof(r->err));
+                    }
+                }
+                strlcpy(ox_day, ox_refs[oi].day, sizeof(ox_day));
+                ox_day_any = false;
+                res = be->ox_day_begin ? be->ox_day_begin(ox_day) :
+                      (be->day_begin ? be->day_begin(ox_day) : UPLOAD_OK);
+                if (res != UPLOAD_OK) {
+                    fails++;
+                    strlcpy(r->err, "cannot open oximetry day", sizeof(r->err));
+                    break;
+                }
+            }
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            strlcpy(r->cur_day, ox_refs[oi].day, sizeof(r->cur_day));
+            xSemaphoreGive(s_lock);
+            res = be->put_oximetry(&ox_refs[oi]);
+            upload_ox_mark(&ox_refs[oi], r->slot,
+                           res == UPLOAD_OK ? UG_OK : UG_FAILED, NULL);
+            if (res == UPLOAD_OK) {
+                ox_day_any = true;
+                any_ok = true;
+                r->cur_unit++;
+                r->last_ok_s = now_s();
+            } else {
+                fails++;
+                ESP_LOGW(TAG, "%s: oximetry %s failed", be->id,
+                         ox_refs[oi].recording_id);
+            }
+        }
+        if (ox_day_any && ox_day[0] && (be->ox_day_end || be->day_end)) {
+            res = be->ox_day_end ? be->ox_day_end(ox_day, true) :
+                  be->day_end(ox_day, true);
+            if (res != UPLOAD_OK) {
+                ox_mark_day_failed(ox_refs, n_ox, r->slot, ox_day);
+                fails++;
+                strlcpy(r->err, "oximetry finalise failed", sizeof(r->err));
+            }
+        }
+    }
+
     free(refs);
     if (be->session_end) be->session_end();
     uploader_lease_give();
@@ -456,9 +527,12 @@ static void run_pass(void)
     /* Summarise for the UI. */
     int pending = 0;
     bool cooling = false;
+    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
+    int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
     for (int i = 0; i < s_n_rt; i++) {
         if (s_rt[i].state == SB_DISABLED) continue;
         pending += upload_index_backend_pending(s_rt[i].slot, max_days);
+        pending += upload_ox_pending(ox_refs, n_ox, s_rt[i].slot);
         if (s_rt[i].state == SB_COOLDOWN) cooling = true;
     }
     if (pending == 0) set_status("All uploaded");
@@ -489,6 +563,8 @@ static void do_scan(void)
     s_scanning = true;
     set_status("Scanning for new data");
     upload_scan_reconcile_all(max_days, slots, n_slots);
+    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
+    upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
     s_scanning = false;
     s_next_scan_us = now_us() + (int64_t)SCAN_INTERVAL_MS * 1000;
 }
@@ -579,6 +655,7 @@ esp_err_t upload_sched_init(void)
 
     s_lock = xSemaphoreCreateMutex();
     s_queue = xQueueCreate(SCHED_QUEUE_LEN, sizeof(sched_ev_t));
+    upload_ox_init();
     if (!s_lock || !s_queue) return ESP_ERR_NO_MEM;
 
     /* Pre-create runtime slots so the progress API can report a backend
@@ -696,6 +773,8 @@ esp_err_t upload_sched_progress_json(char **out_json)
 void upload_sched_summary(int *out_pending, const char **out_worst)
 {
     int max_days = uploader_max_days();
+    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
+    int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
     int pending = 0;
     const char *worst = "idle";
 
@@ -703,6 +782,7 @@ void upload_sched_summary(int *out_pending, const char **out_worst)
         backend_rt_t *r = &s_rt[i];
         if (!r->be || !r->be->is_configured || !r->be->is_configured()) continue;
         pending += upload_index_backend_pending(r->slot, max_days);
+        pending += upload_ox_pending(ox_refs, n_ox, r->slot);
         if (r->state == SB_COOLDOWN) worst = "cooldown";
         else if (r->state == SB_UPLOADING && strcmp(worst, "cooldown") != 0)
             worst = "uploading";

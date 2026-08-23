@@ -26,6 +26,7 @@
 #include "esp_err.h"
 #include <stdbool.h>
 #include "upload_scan.h"
+#include "upload_ox.h"
 
 /* ── Upload backend interface ──────────────────────────────────────────
  *
@@ -92,6 +93,12 @@ typedef struct {
     /* Transfer every file of one group. All-or-nothing: return an error
      * unless every file in the group was accepted. */
     upload_result_t (*put_group)(const char *day, const upload_group_ref_t *g);
+
+    /* Oximetry transport scope. If omitted, the normal day callbacks are
+     * reused (SMB); SleepHQ uses a distinct O2 import scope. */
+    upload_result_t (*ox_day_begin)(const char *day);
+    upload_result_t (*put_oximetry)(const upload_ox_ref_t *ref);
+    upload_result_t (*ox_day_end)(const char *day, bool any_uploaded);
 
     /* Offer the root bundle for this day (see note above). */
     upload_result_t (*put_bundle)(const char *day,

@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 
 #include "esp_log.h"
 #include "cJSON.h"
@@ -255,8 +256,9 @@ esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len
         return ESP_FAIL;
     }
     size_t w = fwrite(data, 1, len, f);
+    bool durable = (w == len && fflush(f) == 0 && fsync(fileno(f)) == 0);
     fclose(f);
-    if (w != len) {
+    if (!durable) {
         ESP_LOGE(TAG, "short write to %s: %zu/%zu", path, w, len);
         return ESP_FAIL;
     }
@@ -281,6 +283,20 @@ bool ox_store_promote(const char *serial, const char *name)
         return false;
     }
 
+    /* Do not promote incomplete data.  The partial remains resumable until a
+     * driver-specific completion validator succeeds. */
+    if (fseek(f, fsize - 44, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    uint8_t trailer_magic[4];
+    if (fread(trailer_magic, 1, sizeof(trailer_magic), f) != sizeof(trailer_magic) ||
+        memcmp(trailer_magic, TRAILER_MAGIC, sizeof(trailer_magic)) != 0) {
+        fclose(f);
+        return false;
+    }
+    fseek(f, 0, SEEK_SET);
+
     /* Read the whole file into memory (files are typically < 300 KB). */
     uint8_t *data = malloc(fsize);
     if (!data) {
@@ -295,12 +311,8 @@ bool ox_store_promote(const char *serial, const char *name)
         return false;
     }
 
-    /* Check trailer magic at file_size - 44. */
-    bool finalised = false;
-    if (fsize >= TRAILER_LEN &&
-        memcmp(data + fsize - 44, TRAILER_MAGIC, 4) == 0) {
-        finalised = true;
-    }
+    /* Completion was already validated before allocating/copying the file. */
+    bool finalised = true;
 
     /* Create files/<serial>/ directory. */
     char serial_dir[160];
@@ -308,20 +320,27 @@ bool ox_store_promote(const char *serial, const char *name)
     mkdir(OXY_FILES, 0775);
     mkdir(serial_dir, 0775);
 
-    /* Write the final .bin file. */
+    /* Write the final .bin file atomically. */
     char bin_path[256];
+    char tmp_path[260];
     snprintf(bin_path, sizeof(bin_path), "%s/%s/%s.bin", OXY_FILES, serial, name);
-    f = fopen(bin_path, "wb");
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", bin_path);
+    f = fopen(tmp_path, "wb");
     if (!f) {
-        ESP_LOGE(TAG, "cannot create %s", bin_path);
+        ESP_LOGE(TAG, "cannot create %s", tmp_path);
         free(data);
         return false;
     }
-    fwrite(data, 1, fsize, f);
+    bool written = fwrite(data, 1, fsize, f) == (size_t)fsize &&
+                   fflush(f) == 0 && fsync(fileno(f)) == 0;
     fclose(f);
     free(data);
+    if (!written || rename(tmp_path, bin_path) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
 
-    /* Remove the .part file. */
+    /* Remove the .part file only after the complete final file is durable. */
     remove(part_path);
 
     /* Update index. */

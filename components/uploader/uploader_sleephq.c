@@ -54,6 +54,7 @@ static const char *TAG = "upload_shq";
 #define SHQ_TOKEN_PATH  "/oauth/token"
 #define SHQ_ME_PATH     "/api/v1/me"
 #define SHQ_IMPORTS_FMT "/api/v1/teams/%s/imports"
+#define SHQ_IMPORT_FMT  "/api/v1/imports/%s"
 #define SHQ_FILES_FMT   "/api/v1/imports/%s/files"
 #define SHQ_PROCESS_FMT "/api/v1/imports/%s/process_files"
 
@@ -419,7 +420,7 @@ static esp_err_t shq_discover_team(esp_tls_t *tls)
 
 /* ── Create import session ──────────────────────────────────────────── */
 
-static esp_err_t shq_create_import(esp_tls_t *tls, char *out_import_id, size_t id_len)
+static esp_err_t shq_create_import(esp_tls_t *tls, char *out_import_id, size_t id_len, bool o2)
 {
     ESP_LOGI(TAG, "creating import session...");
 
@@ -428,7 +429,7 @@ static esp_err_t shq_create_import(esp_tls_t *tls, char *out_import_id, size_t i
 
     char *resp_body = NULL;
     size_t resp_len = 0;
-    int status = shq_http_request(tls, "POST", path, NULL, s_token,
+    int status = shq_http_request(tls, "POST", path, o2 ? "o2=true" : NULL, s_token,
                                   NULL, NULL, &resp_body, &resp_len);
     if (status < 200) {
         free(resp_body);
@@ -485,6 +486,31 @@ static esp_err_t shq_process_import(esp_tls_t *tls, const char *import_id)
     return ESP_OK;
 }
 
+static esp_err_t shq_wait_import(esp_tls_t *tls, const char *import_id)
+{
+    char path[256];
+    snprintf(path, sizeof(path), SHQ_IMPORT_FMT, import_id);
+    for (int attempt = 0; attempt < 30; attempt++) {
+        char *body = NULL; size_t body_len = 0;
+        int status = shq_http_request(tls, "GET", path, NULL, s_token,
+                                       NULL, NULL, &body, &body_len);
+        if (status < 200 || status >= 300) { free(body); return ESP_FAIL; }
+        cJSON *root = cJSON_Parse(body); free(body);
+        if (!root) return ESP_FAIL;
+        cJSON *data = cJSON_GetObjectItem(root, "data");
+        cJSON *attrs = data ? cJSON_GetObjectItem(data, "attributes") : NULL;
+        cJSON *st = attrs ? cJSON_GetObjectItem(attrs, "status") : NULL;
+        const char *name = cJSON_IsString(st) ? st->valuestring : "";
+        bool complete = strcmp(name, "complete") == 0 || strcmp(name, "completed") == 0;
+        bool failed = strcmp(name, "failed") == 0 || strcmp(name, "error") == 0;
+        cJSON_Delete(root);
+        if (complete) return ESP_OK;
+        if (failed) return ESP_FAIL;
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
 /* ── Multipart file upload (streaming, on-the-fly MD5) ────────────────
  *
  * Streams the file directly from SD card to the TLS socket in a single
@@ -496,7 +522,8 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
                                        const char *import_id,
                                        const char *local_path,
                                        const char *remote_subpath,
-                                       const char *filename)
+                                       const char *filename,
+                                       bool filename_first)
 {
     FILE *f = fopen(local_path, "rb");
     if (!f) {
@@ -599,6 +626,10 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
     mbedtls_md5_context md5;
     mbedtls_md5_init(&md5);
     mbedtls_md5_starts(&md5);
+    /* O2 imports use filename + content; preserve the CPAP contract unless
+     * the caller explicitly selects the O2 profile. */
+    if (filename_first)
+        mbedtls_md5_update(&md5, (const unsigned char *)filename, strlen(filename));
 
     size_t total_sent = 0;
     while (total_sent < file_size) {
@@ -637,8 +668,9 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
     free(chunk);
     fclose(f);
 
-    /* Finalize MD5: append filename, compute digest */
-    mbedtls_md5_update(&md5, (const unsigned char *)filename, strlen(filename));
+    /* Finalize the profile-specific MD5 ordering. */
+    if (!filename_first)
+        mbedtls_md5_update(&md5, (const unsigned char *)filename, strlen(filename));
     unsigned char md5_raw[16];
     mbedtls_md5_finish(&md5, md5_raw);
     mbedtls_md5_free(&md5);
@@ -748,12 +780,44 @@ static upload_result_t shq_day_begin(const char *day)
     s_import_id[0] = '\0';
     s_day_files = 0;
 
-    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id)) != ESP_OK) {
+    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), false) != ESP_OK) {
         ESP_LOGE(TAG, "import creation failed for day %s", day);
         return UPLOAD_ERR_TRANSIENT;
     }
     ESP_LOGI(TAG, "day %s -> import %s", day, s_import_id);
     return UPLOAD_OK;
+}
+
+static upload_result_t shq_ox_day_begin(const char *day)
+{
+    if (!s_tls) return UPLOAD_ERR_TRANSIENT;
+    s_import_id[0] = '\0';
+    s_day_files = 0;
+    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), true) != ESP_OK) {
+        ESP_LOGE(TAG, "O2 import creation failed for day %s", day);
+        return UPLOAD_ERR_TRANSIENT;
+    }
+    ESP_LOGI(TAG, "O2 day %s -> import %s", day, s_import_id);
+    return UPLOAD_OK;
+}
+
+static upload_result_t shq_put_oximetry(const upload_ox_ref_t *ref)
+{
+    if (!s_tls || !s_import_id[0] || !ref) return UPLOAD_ERR_TRANSIENT;
+    for (int i = 0; i < ref->n_files; i++) {
+        if (!strstr(ref->relative_paths[i], "/exports/sleephq/recording.vld")) continue;
+        char subpath[96];
+        snprintf(subpath, sizeof(subpath), "/OXYMETRY/%s", ref->day);
+        char filename[128];
+        snprintf(filename, sizeof(filename), "%s.vld",
+                 ref->source_name[0] ? ref->source_name : "oximetry");
+        if (shq_upload_file(s_tls, s_import_id, ref->local_paths[i], subpath,
+                            filename, true) != UPLOAD_OK)
+            return UPLOAD_ERR_TRANSIENT;
+        s_day_files++;
+        return UPLOAD_OK;
+    }
+    return UPLOAD_ERR_PERMANENT;
 }
 
 static upload_result_t shq_put_group(const char *day, const upload_group_ref_t *g)
@@ -769,7 +833,7 @@ static upload_result_t shq_put_group(const char *day, const upload_group_ref_t *
                  g->files[i]);
 
         if (shq_upload_file(s_tls, s_import_id, local, remote_subpath,
-                            g->files[i]) != UPLOAD_OK) {
+                            g->files[i], false) != UPLOAD_OK) {
             ESP_LOGW(TAG, "  failed to upload %s", g->files[i]);
             return UPLOAD_ERR_TRANSIENT;
         }
@@ -789,7 +853,7 @@ static upload_result_t shq_put_bundle(const char *day,
     for (int i = 0; i < b->n_files; i++) {
         const char *subpath = b->in_settings[i] ? "/SETTINGS" : "";
         if (shq_upload_file(s_tls, s_import_id, b->paths[i], subpath,
-                            b->names[i]) != UPLOAD_OK) {
+                            b->names[i], false) != UPLOAD_OK) {
             ESP_LOGW(TAG, "  failed to upload %s", b->names[i]);
             return UPLOAD_ERR_TRANSIENT;
         }
@@ -812,6 +876,7 @@ static upload_result_t shq_day_end(const char *day, bool any_uploaded)
     }
 
     esp_err_t err = shq_process_import(s_tls, s_import_id);
+    if (err == ESP_OK) err = shq_wait_import(s_tls, s_import_id);
     s_import_id[0] = '\0';
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "import processing failed for day %s", day);
@@ -829,6 +894,9 @@ const upload_backend_t sleephq_backend = {
     .session_begin = shq_session_begin,
     .day_begin = shq_day_begin,
     .put_group = shq_put_group,
+    .ox_day_begin = shq_ox_day_begin,
+    .put_oximetry = shq_put_oximetry,
+    .ox_day_end = shq_day_end,
     .put_bundle = shq_put_bundle,
     .day_end = shq_day_end,
     .session_end = shq_session_end,

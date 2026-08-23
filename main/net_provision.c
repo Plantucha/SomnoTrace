@@ -37,6 +37,7 @@
 #include "device_settings.h"
 #include "session_graph.h"
 #include "session_writer.h"
+#include "oximetry_http.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -2772,6 +2773,7 @@ static esp_err_t start_webserver(void)
     }
 
     session_graph_init();
+    oximetry_http_register_handlers(s_httpd);
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
     httpd_register_uri_handler(s_httpd, &root);

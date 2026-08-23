@@ -937,6 +937,11 @@ Save &amp; Reboot
 <div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:6px"></div>
 </div>
 <div id="dash-stream-quality" class="card" style="display:none;padding:12px 16px;font-size:.8rem;color:var(--text-muted);line-height:1.6"></div>
+<div id="oximetry-panel" class="card dashboard-charts-panel" style="display:none;position:relative">
+<div class="card-title">Oximetry</div>
+<div id="oximetry-status" style="font-size:.75rem;color:var(--text-muted);margin:4px 0 8px"></div>
+<div id="oximetry-chart-stack"></div>
+</div>
 </section>
 
 <!-- ═══════════════ STATUS TAB ═══════════════ -->
@@ -3045,6 +3050,124 @@ var DASH_MAX_DISPLAY = 3000;
 var SNT_MISSING_V1 = -1;
 var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
 
+/* Canonical oximetry tracks are the only oximetry representation consumed by
+ * the browser. Vendor files are decoded on the device. */
+var oxLoadSeq = 0;
+var oxCharts = [];
+var oxData = null;
+
+function parseOximetrySnt(buf) {
+  if (!buf || buf.byteLength < 64) return null;
+  var d = new DataView(buf);
+  if (d.getUint32(0, true) !== 0x33544e53 || d.getUint8(4) !== 3) return null;
+  var hlen = d.getUint16(10, true), nCh = d.getUint8(7), bytes = d.getUint8(8);
+  var periodNum = d.getUint32(12, true), periodDen = d.getUint32(16, true);
+  var start = Number(d.getBigInt64(20, true));
+  var count = d.getUint32(28, true), dataBytes = d.getUint32(32, true);
+  if (hlen < 64 || bytes !== 2 || nCh < 2 || nCh > 16 || periodNum < 1 ||
+      periodDen < 1 || count > 1000000 || hlen + count * nCh * bytes > buf.byteLength ||
+      dataBytes !== count * nCh * bytes) return null;
+  var out = {t:[], spo2:[], pulse:[], motion:[], status:[]};
+  var off = hlen;
+  for (var i = 0; i < count; i++) {
+    out.t.push(start + i * (periodNum / periodDen) / 1000);
+    var vals = [];
+    for (var c = 0; c < nCh; c++) vals.push(d.getInt16(off + (c * 2), true));
+    off += nCh * 2;
+    out.spo2.push(vals[0] === SNT_MISSING_V2 ? NaN : vals[0] / 100);
+    out.pulse.push(vals[1] === SNT_MISSING_V2 ? NaN : vals[1] / 100);
+    out.motion.push(nCh > 2 && vals[2] !== SNT_MISSING_V2 ? vals[2] : NaN);
+    out.status.push(nCh > 3 ? vals[3] : 0);
+  }
+  return out;
+}
+
+function mergeOxTrack(records, key) {
+  var t = [], v = [];
+  records.sort(function(a,b){ return a.t[0] - b.t[0]; });
+  records.forEach(function(r, ri) {
+    if (!r.t.length) return;
+    if (ri > 0) { t.push(r.t[0] - 1); v.push(NaN); }
+    for (var i = 0; i < r.t.length; i++) { t.push(r.t[i]); v.push(r[key][i]); }
+  });
+  return [t, v];
+}
+
+function renderOximetryCharts(records) {
+  var panel = document.getElementById('oximetry-panel');
+  var stack = document.getElementById('oximetry-chart-stack');
+  if (!panel || !stack) return;
+  oxCharts.forEach(function(c){ if (c) c.destroy(); });
+  oxCharts = [];
+  stack.textContent = '';
+  if (!records.length || typeof uPlot === 'undefined') {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+  var shared = (typeof dashFullRange === 'function') ? dashFullRange() : null;
+  records.forEach(function(r){ if (r.t.length) { var lo=r.t[0], hi=r.t[r.t.length-1]; if (!shared) shared={min:lo,max:hi}; else { shared.min=Math.min(shared.min,lo); shared.max=Math.max(shared.max,hi); } } });
+  var specs = [
+    {key:'spo2', label:'SpO2', unit:'%', color:'#60a5fa', min:70, max:100},
+    {key:'pulse', label:'Pulse Rate', unit:'bpm', color:'#f87171', min:0, max:null},
+    {key:'motion', label:'Motion', unit:'source index', color:'#a78bfa', min:0, max:null}
+  ];
+  specs.forEach(function(spec) {
+    var row = document.createElement('div'); row.className = 'dash-signal-row';
+    var label = document.createElement('div'); label.className = 'dash-signal-label';
+    label.textContent = spec.label + ' (' + spec.unit + ')'; label.style.color = spec.color;
+    var el = document.createElement('div'); el.style.cssText = 'position:relative;touch-action:pan-y';
+    row.appendChild(label); row.appendChild(el); stack.appendChild(row);
+    var pair = mergeOxTrack(records.map(function(r){return {t:r.t,spo2:r.spo2,pulse:r.pulse,motion:r.motion};}), spec.key);
+    var opts = {
+      width: dashChartWidth(el), height: 170, padding:[6,8,0,0],
+      scales:{x:shared ? {time:false, min:shared.min, max:shared.max} : {time:false}, y:{auto:spec.max == null, min:spec.min, max:spec.max}},
+      series:[
+        {label:'Time', value:function(u,v){return v == null ? '' : new Date(v).toLocaleTimeString();}},
+        {label:spec.label, stroke:spec.color, width:0.8, spanGaps:false}
+      ],
+      axes:[
+        {stroke:cssVar('--text-muted'), font:'10px sans-serif', values:function(u,vals){return vals.map(function(v){return new Date(v).toLocaleTimeString();});}},
+        {stroke:cssVar('--text-muted'), font:'9px sans-serif', size:42}
+      ],
+      cursor:{sync:{key:'oximetry',setSeries:true},drag:{x:true,y:false}}, legend:{show:false}
+    };
+    try { oxCharts.push(new uPlot(opts, [pair[0], pair[1]], el)); } catch(e) { console.error('Oximetry chart error', e); }
+  });
+}
+
+function loadOximetryData(noonDay) {
+  var seq = ++oxLoadSeq;
+  var panel = document.getElementById('oximetry-panel');
+  var status = document.getElementById('oximetry-status');
+  if (panel) panel.style.display = 'none';
+  fetch('/api/oximetry/recordings').then(function(r){
+    if (!r.ok) throw new Error('oximetry list ' + r.status);
+    return r.json();
+  }).then(function(list) {
+    if (seq !== oxLoadSeq) return;
+    var selected = (list || []).filter(function(x){ return x.noon_day === noonDay && x.state === 'ready'; });
+    if (!selected.length) { if (status) status.textContent = ''; return; }
+    if (status) status.textContent = 'Loading canonical oximetry data...';
+    return Promise.all(selected.map(function(item) {
+      return fetch('/api/oximetry/file?id=' + encodeURIComponent(item.recording_id) + '&track=vitals')
+        .then(function(r){ return r.ok ? r.arrayBuffer() : null; })
+        .then(function(buf){ var p = parseOximetrySnt(buf); if (p) p.device = item.device_key || ''; return p; });
+    }));
+  }).then(function(records) {
+    if (!records || seq !== oxLoadSeq) return;
+    records = records.filter(Boolean);
+    oxData = records;
+    if (status) status.textContent = records.length ? (records.length + ' oximetry recording' + (records.length === 1 ? '' : 's')) : '';
+    renderOximetryCharts(records);
+  }).catch(function(e) {
+    if (seq !== oxLoadSeq) return;
+    oxData = null; if (status) status.textContent = 'Oximetry unavailable';
+    if (panel) panel.style.display = 'none';
+    console.warn(e);
+  });
+}
+
 /* Signal descriptor table — drives parsing, per-panel layout, scaling and
  * y-ranges.  All panels share one x time-range (dashXRange/dashFullRange) and
  * a synced cursor (cursor.sync key 'dash').  Order here is top→bottom on screen.
@@ -3990,6 +4113,7 @@ function loadDashboardData() {
   if (!dateStr) return;
   var noonDay = noonDayStr(dateStr);
   dashNoonDay = noonDay;
+  loadOximetryData(noonDay);
   clearSummary();
   /* Reset per-day state before any async fetches complete to prevent
    * stale data from a previous day being used by renderSummary() when
