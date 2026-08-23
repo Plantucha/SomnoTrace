@@ -215,11 +215,13 @@ static bool run_backend(backend_rt_t *r, int max_days)
     bool have_bundle = upload_scan_bundle(&bundle);
     bool bundle_changed = have_bundle &&
                           (upload_index_bundle_ok_fp(r->slot) != bundle.fp);
-    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
+    upload_ox_ref_t *ox_refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);
+    if (!ox_refs) { set_be_state(r, SB_IDLE); return false; }
     int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
     int ox_pending = upload_ox_pending(ox_refs, n_ox, r->slot);
 
     if (n_days == 0 && !bundle_changed && ox_pending == 0) {
+        free(ox_refs);
         set_be_state(r, SB_IDLE);
         r->cur_day[0] = '\0';
         return false;
@@ -227,6 +229,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
     if (!have_bundle && (n_days > 0 || bundle_changed)) {
         /* CPAP session uploads still require their root bundle. Oximetry
          * packages are self-contained and may upload before any EDF exists. */
+        free(ox_refs);
         set_be_state(r, SB_IDLE);
         return false;
     }
@@ -239,6 +242,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         if (!be->bundle_only_ok) {
             ESP_LOGI(TAG, "%s: only root files changed — deferring to the "
                      "next session upload", be->id);
+            free(ox_refs);
             set_be_state(r, SB_IDLE);
             return false;
         }
@@ -259,6 +263,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         if (attach == 0) {
             ESP_LOGI(TAG, "%s: root files changed but no exported day to attach "
                      "them to — nothing to do", be->id);
+            free(ox_refs);
             set_be_state(r, SB_IDLE);
             return false;
         }
@@ -268,6 +273,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
 
     if (!uploader_lease_take(LEASE_WAIT_MS)) {
         ESP_LOGI(TAG, "%s: storage busy, deferring", be->id);
+        free(ox_refs);
         return false;
     }
 
@@ -293,6 +299,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
                        res == UPLOAD_ERR_PERMANENT);
         if (be->session_end) be->session_end();
         uploader_lease_give();
+        free(ox_refs);
         return true;
     }
 
@@ -303,10 +310,12 @@ static bool run_backend(backend_rt_t *r, int max_days)
      * "changed" and the backend reconnecting forever. */
     bool bundle_committed = false;
 
-    upload_group_ref_t *refs = calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs));
+    upload_group_ref_t *refs = heap_caps_calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs), MALLOC_CAP_SPIRAM);
+    if (!refs) refs = calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs));
     if (!refs) {
         if (be->session_end) be->session_end();
         uploader_lease_give();
+        free(ox_refs);
         return false;
     }
 
@@ -467,6 +476,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
     }
 
     free(refs);
+    free(ox_refs);
     if (be->session_end) be->session_end();
     uploader_lease_give();
 
@@ -527,7 +537,8 @@ static void run_pass(void)
     /* Summarise for the UI. */
     int pending = 0;
     bool cooling = false;
-    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
+    upload_ox_ref_t *ox_refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);
+    if (!ox_refs) { set_status("Memory low"); return; }
     int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
     for (int i = 0; i < s_n_rt; i++) {
         if (s_rt[i].state == SB_DISABLED) continue;
@@ -535,6 +546,7 @@ static void run_pass(void)
         pending += upload_ox_pending(ox_refs, n_ox, s_rt[i].slot);
         if (s_rt[i].state == SB_COOLDOWN) cooling = true;
     }
+    free(ox_refs);
     if (pending == 0) set_status("All uploaded");
     else if (cooling)  set_status("%d parts pending — waiting to retry", pending);
     else               set_status("%d parts pending", pending);
@@ -563,8 +575,11 @@ static void do_scan(void)
     s_scanning = true;
     set_status("Scanning for new data");
     upload_scan_reconcile_all(max_days, slots, n_slots);
-    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
-    upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
+    upload_ox_ref_t *ox_refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);
+    if (ox_refs) {
+        upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
+        free(ox_refs);
+    }
     s_scanning = false;
     s_next_scan_us = now_us() + (int64_t)SCAN_INTERVAL_MS * 1000;
 }
@@ -773,7 +788,12 @@ esp_err_t upload_sched_progress_json(char **out_json)
 void upload_sched_summary(int *out_pending, const char **out_worst)
 {
     int max_days = uploader_max_days();
-    upload_ox_ref_t ox_refs[UPLOAD_OX_MAX_UNITS];
+    upload_ox_ref_t *ox_refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);
+    if (!ox_refs) {
+        if (out_pending) *out_pending = 0;
+        if (out_worst) *out_worst = "idle";
+        return;
+    }
     int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
     int pending = 0;
     const char *worst = "idle";
@@ -787,6 +807,7 @@ void upload_sched_summary(int *out_pending, const char **out_worst)
         else if (r->state == SB_UPLOADING && strcmp(worst, "cooldown") != 0)
             worst = "uploading";
     }
+    free(ox_refs);
     if (out_pending) *out_pending = pending;
     if (out_worst) *out_worst = worst;
 }

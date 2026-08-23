@@ -1637,7 +1637,8 @@ session_writer_t *session_writer_start(void)
         sw_request_finalize(prev, "rotated", (int64_t)time(NULL) * 1000, true);
     }
 
-    session_writer_t *s = calloc(1, sizeof(session_writer_t));
+    session_writer_t *s = heap_caps_calloc(1, sizeof(session_writer_t), MALLOC_CAP_SPIRAM);
+    if (!s) s = calloc(1, sizeof(session_writer_t));
     if (!s) return NULL;
 
     s->fill_mutex = xSemaphoreCreateMutex();

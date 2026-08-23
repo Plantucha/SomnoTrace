@@ -36,6 +36,7 @@
 #include "oximeter.h"
 #include "sd_storage.h"
 #include "session_writer.h"
+#include "nvs_writer.h"
 #include "esp_system.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -316,6 +317,7 @@ void app_main(void)
         if (time_failed) {
             nvs_handle_t nvs_h;
             int boot_fail_count = 0;
+            nvs_writer_lock();
             if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
                 nvs_get_i32(nvs_h, "boot_fail", (int32_t *)&boot_fail_count);
                 boot_fail_count++;
@@ -323,14 +325,17 @@ void app_main(void)
                 nvs_commit(nvs_h);
                 nvs_close(nvs_h);
             }
+            nvs_writer_unlock();
 
             if (boot_fail_count >= 3) {
                 ESP_LOGW(TAG, "3+ consecutive boot failures — entering SoftAP for user intervention");
+                nvs_writer_lock();
                 if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
                     nvs_set_i32(nvs_h, "boot_fail", 0);
                     nvs_commit(nvs_h);
                     nvs_close(nvs_h);
                 }
+                nvs_writer_unlock();
                 enter_softap(&cfg);
                 in_softap = true;
                 softap_start_ticks = xTaskGetTickCount();
@@ -367,21 +372,25 @@ void app_main(void)
     } else {
         /* Degraded mode — reset boot failure counter. */
         nvs_handle_t nvs_h;
+        nvs_writer_lock();
         if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
             nvs_set_i32(nvs_h, "boot_fail", 0);
             nvs_commit(nvs_h);
             nvs_close(nvs_h);
         }
+        nvs_writer_unlock();
     }
 
     /* ── Reset boot failure counter on a fully successful boot ─── */
     if (wifi_connected && ntp_ok && !degraded_mode) {
         nvs_handle_t nvs_h;
+        nvs_writer_lock();
         if (nvs_open("cfg", NVS_READWRITE, &nvs_h) == ESP_OK) {
             nvs_set_i32(nvs_h, "boot_fail", 0);
             nvs_commit(nvs_h);
             nvs_close(nvs_h);
         }
+        nvs_writer_unlock();
     }
 
     /* ── Normal boot continuation (Wi-Fi connected or degraded mode) ─── */

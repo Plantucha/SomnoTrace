@@ -985,7 +985,8 @@ static esp_err_t do_erase_nvs(void *arg)
 static void load_paired_from_nvs(void)
 {
     nvs_handle_t h;
-    if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    nvs_writer_lock();
+    if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) != ESP_OK) { nvs_writer_unlock(); return; }
     size_t len;
 
     len = sizeof(s_serial);
@@ -999,6 +1000,7 @@ static void load_paired_from_nvs(void)
         nvs_get_str(h, "last_addr", s_paired_addr, &len);
     }
     nvs_close(h);
+    nvs_writer_unlock();
 
     /* Also try loading from paired.json (SD) as fallback */
     if (!s_paired) {
@@ -1356,7 +1358,7 @@ esp_err_t oximeter_init(void)
         ESP_LOGW(TAG, "failed to create pull task");
     }
     TaskHandle_t migration = psram_task_create(canonical_migration_task,
-                                               "ox_migrate", 8192, NULL, 1,
+                                               "ox_migrate", 12288, NULL, 1,
                                                0, NULL, NULL);
     if (!migration) ESP_LOGW(TAG, "failed to create canonical migration task");
     return ESP_OK;

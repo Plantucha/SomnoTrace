@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "esp_heap_caps.h"
 
 #include "esp_log.h"
 
@@ -131,7 +132,8 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
     }
     if (fseek(f, start, SEEK_SET) != 0) { fclose(f); return ESP_FAIL; }
     long remaining = end - start + 1;
-    uint8_t *buf = malloc(4096);
+    uint8_t *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc(4096);
     if (!buf) {
         fclose(f);
         httpd_resp_send_500(req);

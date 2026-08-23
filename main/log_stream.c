@@ -264,6 +264,16 @@ static void log_flush_task(void *arg)
         }
 
         if (f) fclose(f);
+
+        /* One-shot high-water mark after the first flush to verify the
+         * 4 KB PSRAM stack is sufficient for the FATFS write path. */
+        static bool hwm_logged = false;
+        if (!hwm_logged) {
+            hwm_logged = true;
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "log_flush: stack high-water = %u bytes",
+                     (unsigned)(hwm * sizeof(StackType_t)));
+        }
     }
 }
 
@@ -418,7 +428,8 @@ static void ws_send_work(void *arg)
 static esp_err_t ws_queue_send(httpd_handle_t hd, int fd, uint8_t type,
                                const char *payload, size_t len)
 {
-    ws_send_work_t *work = calloc(1, sizeof(*work));
+    ws_send_work_t *work = heap_caps_calloc(1, sizeof(*work), MALLOC_CAP_SPIRAM);
+    if (!work) work = calloc(1, sizeof(*work));
     if (!work) return ESP_ERR_NO_MEM;
     if (len > 0) {
         work->payload = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
@@ -521,12 +532,22 @@ static void ws_forwarder_task(void *arg)
     const TickType_t upload_interval = pdMS_TO_TICKS(5000);
     TickType_t last_status_tick = xTaskGetTickCount();
     TickType_t last_upload_tick = xTaskGetTickCount();
+    bool hwm_logged = false;
 
     while (true) {
         int client_count = 0;
         if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             client_count = s_ws_client_count;
             xSemaphoreGive(s_ws_mutex);
+        }
+
+        /* One-shot high-water mark after the first status push to verify
+         * the 12 KB PSRAM stack is sufficient for the JSON build path. */
+        if (!hwm_logged && client_count > 0) {
+            hwm_logged = true;
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "ws_fwd: stack high-water = %u bytes",
+                     (unsigned)(hwm * sizeof(StackType_t)));
         }
 
         if (client_count <= 0) {
@@ -811,7 +832,8 @@ static esp_err_t logs_history_handler(httpd_req_t *req)
         xSemaphoreTake(s_writebuf_mutex, portMAX_DELAY);
         size_t pending = s_writebuf_head - s_writebuf_tail;
         if (pending > 0) {
-            uint8_t *tmp = malloc(pending);
+            uint8_t *tmp = heap_caps_malloc(pending, MALLOC_CAP_SPIRAM);
+            if (!tmp) tmp = malloc(pending);
             if (tmp) {
                 size_t pos = s_writebuf_tail % WRITEBUF_SIZE;
                 size_t chunk1 = WRITEBUF_SIZE - pos;
@@ -874,7 +896,8 @@ static esp_err_t logs_download_handler(httpd_req_t *req)
         xSemaphoreTake(s_writebuf_mutex, portMAX_DELAY);
         size_t pending = s_writebuf_head - s_writebuf_tail;
         if (pending > 0) {
-            uint8_t *tmp = malloc(pending);
+            uint8_t *tmp = heap_caps_malloc(pending, MALLOC_CAP_SPIRAM);
+            if (!tmp) tmp = malloc(pending);
             if (tmp) {
                 size_t pos = s_writebuf_tail % WRITEBUF_SIZE;
                 size_t chunk1 = WRITEBUF_SIZE - pos;

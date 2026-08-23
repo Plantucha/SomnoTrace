@@ -45,16 +45,41 @@ typedef struct {
 static QueueHandle_t     s_cmd_q      = NULL;   /* holds nvs_cmd_t* */
 static SemaphoreHandle_t s_submit_mtx = NULL;   /* serialises submitters */
 static SemaphoreHandle_t s_done       = NULL;   /* writer -> submitter completion */
+static SemaphoreHandle_t s_nvs_lock   = NULL;   /* global NVS access serialisation */
 static volatile uint8_t  s_init_state = 0;      /* 0=not attempted, 1=ready, 2=failed */
+
+void nvs_writer_lock(void)
+{
+    if (s_nvs_lock) xSemaphoreTakeRecursive(s_nvs_lock, portMAX_DELAY);
+}
+
+void nvs_writer_unlock(void)
+{
+    if (s_nvs_lock) xSemaphoreGiveRecursive(s_nvs_lock);
+}
 
 static void nvs_writer_task(void *arg)
 {
     (void)arg;
+    bool hwm_logged = false;
     for (;;) {
         nvs_cmd_t *cmd = NULL;
         if (xQueueReceive(s_cmd_q, &cmd, portMAX_DELAY) == pdTRUE && cmd) {
+            /* Acquire the global NVS lock so that direct NVS callers (which
+             * call nvs_writer_lock/unlock around their own nvs_open/commit)
+             * are serialized with proxy operations.  This prevents a
+             * concurrent flash erase from disabling the cache while the
+             * other task is mid-read from flash-mapped memory. */
+            nvs_writer_lock();
             cmd->result = cmd->fn ? cmd->fn(cmd->arg) : ESP_ERR_INVALID_ARG;
+            nvs_writer_unlock();
+
             UBaseType_t high_water = uxTaskGetStackHighWaterMark(NULL);
+            if (!hwm_logged) {
+                hwm_logged = true;
+                ESP_LOGI(TAG, "stack high-water = %u bytes",
+                         (unsigned)(high_water * sizeof(StackType_t)));
+            }
             if (high_water < 512) {
                 ESP_LOGW(TAG, "low stack watermark after NVS operation: %u words",
                          (unsigned)high_water);
@@ -71,8 +96,9 @@ void nvs_writer_init(void)
 
     s_submit_mtx = xSemaphoreCreateMutex();
     s_done       = xSemaphoreCreateBinary();
+    s_nvs_lock   = xSemaphoreCreateRecursiveMutex();
     s_cmd_q      = xQueueCreate(1, sizeof(nvs_cmd_t *));
-    if (!s_submit_mtx || !s_done || !s_cmd_q) {
+    if (!s_submit_mtx || !s_done || !s_nvs_lock || !s_cmd_q) {
         ESP_LOGE(TAG, "alloc failed (mtx=%p done=%p q=%p)",
                  s_submit_mtx, s_done, s_cmd_q);
         s_cmd_q = NULL;   /* nvs_writer_run() will fail closed */

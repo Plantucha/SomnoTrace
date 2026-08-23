@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "ox_store";
@@ -72,7 +73,8 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
     fseek(f, 0, SEEK_SET);
     if (sz <= 0 || sz > 1024) { fclose(f); return false; }
 
-    char *buf = malloc(sz + 1);
+    char *buf = heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return false; }
     int n = fread(buf, 1, sz, f);
     fclose(f);
@@ -142,7 +144,8 @@ int ox_store_index_check(const char *serial, const char *name)
     fseek(f, 0, SEEK_SET);
     if (sz <= 0 || sz > 65536) { fclose(f); return -1; }
 
-    char *buf = malloc(sz + 1);
+    char *buf = heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return -1; }
     int n = fread(buf, 1, sz, f);
     fclose(f);
@@ -186,7 +189,8 @@ void ox_store_index_add(const char *serial, const char *name,
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
         if (sz > 0 && sz < 65536) {
-            char *buf = malloc(sz + 1);
+            char *buf = heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM);
+            if (!buf) buf = malloc((size_t)sz + 1);
             if (buf) {
                 int n = fread(buf, 1, sz, f);
                 buf[n] = '\0';
@@ -298,7 +302,8 @@ bool ox_store_promote(const char *serial, const char *name)
     fseek(f, 0, SEEK_SET);
 
     /* Read the whole file into memory (files are typically < 300 KB). */
-    uint8_t *data = malloc(fsize);
+    uint8_t *data = heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM);
+    if (!data) data = malloc(fsize);
     if (!data) {
         fclose(f);
         ESP_LOGE(TAG, "promote: OOM %ld bytes", fsize);

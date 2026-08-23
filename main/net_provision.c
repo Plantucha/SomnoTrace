@@ -536,7 +536,8 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
         esp_wifi_scan_get_ap_num(&ap_count);
         if (ap_count > 32) ap_count = 32;
 
-        records = calloc(ap_count, sizeof(wifi_ap_record_t));
+        records = heap_caps_calloc(ap_count, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
+        if (!records) records = calloc(ap_count, sizeof(wifi_ap_record_t));
         if (records && ap_count) {
             esp_wifi_scan_get_ap_records(&ap_count, records);
         }
@@ -1103,7 +1104,8 @@ static void wifi_scan_task(void *arg)
     esp_wifi_scan_get_ap_num(&ap_count);
     if (ap_count > 20) ap_count = 20;
 
-    wifi_ap_record_t *records = calloc(ap_count, sizeof(wifi_ap_record_t));
+    wifi_ap_record_t *records = heap_caps_calloc(ap_count, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
+    if (!records) records = calloc(ap_count, sizeof(wifi_ap_record_t));
     cJSON *arr = cJSON_CreateArray();
     if (records && ap_count) {
         esp_wifi_scan_get_ap_records(&ap_count, records);
@@ -1560,7 +1562,8 @@ static esp_err_t dir_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
 
     /* Build HTML <pre> listing — heap-allocated to avoid stack overflow */
-    char *html = malloc(4096);
+    char *html = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!html) html = malloc(4096);
     if (!html) {
         closedir(d);
         httpd_resp_send_500(req);
@@ -1632,7 +1635,8 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Connection", "close");
 
     /* Heap-allocate to avoid stack overflow */
-    char *buf = malloc(2048);
+    char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc(2048);
     if (!buf) {
         fclose(f);
         httpd_resp_send_500(req);
@@ -1715,7 +1719,8 @@ static esp_err_t upload_config_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
         return ESP_FAIL;
     }
-    char *body = malloc(total + 1);
+    char *body = heap_caps_malloc((size_t)total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = malloc((size_t)total + 1);
     if (!body) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -1765,7 +1770,8 @@ static esp_err_t alert_config_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
         return ESP_FAIL;
     }
-    char *body = malloc(total + 1);
+    char *body = heap_caps_malloc((size_t)total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = malloc((size_t)total + 1);
     if (!body) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -1795,7 +1801,8 @@ static esp_err_t alert_test_push_handler(httpd_req_t *req)
     char *body = NULL;
     int total = req->content_len;
     if (total > 0 && total <= 2048) {
-        body = malloc(total + 1);
+        body = heap_caps_malloc((size_t)total + 1, MALLOC_CAP_SPIRAM);
+        if (!body) body = malloc((size_t)total + 1);
         if (body) {
             int received = httpd_req_recv(req, body, total);
             if (received < 0) {
@@ -1889,7 +1896,8 @@ static esp_err_t device_settings_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
         return ESP_FAIL;
     }
-    char *body = malloc(total + 1);
+    char *body = heap_caps_malloc((size_t)total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = malloc((size_t)total + 1);
     if (!body) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -2077,7 +2085,8 @@ static void recreate_edfs_task(void *arg)
                 long fsize = ftell(f);
                 fseek(f, 0, SEEK_SET);
                 if (fsize <= 0 || fsize > 4096) { fclose(f); continue; }
-                char *buf = malloc(fsize + 1);
+                char *buf = heap_caps_malloc((size_t)fsize + 1, MALLOC_CAP_SPIRAM);
+                if (!buf) buf = malloc((size_t)fsize + 1);
                 if (!buf) { fclose(f); continue; }
                 fread(buf, 1, fsize, f);
                 buf[fsize] = '\0';

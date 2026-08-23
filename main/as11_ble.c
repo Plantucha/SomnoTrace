@@ -804,7 +804,8 @@ static void handle_notify(const uint8_t *data, int len)
                         size_t b64_len = strlen(b64);
                         if (b64_len > 0) {
                             size_t dec_max = (b64_len / 4) * 3 + 4;
-                            uint8_t *frag = malloc(dec_max);
+                            uint8_t *frag = heap_caps_malloc(dec_max, MALLOC_CAP_SPIRAM);
+                            if (!frag) frag = malloc(dec_max);
                             if (frag) {
                                 size_t dec_len = 0;
                                 int rc = mbedtls_base64_decode(
@@ -1042,7 +1043,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                 }
             }
 
-            uint8_t *notif_data = malloc(notif_len);
+            uint8_t *notif_data = heap_caps_malloc(notif_len, MALLOC_CAP_SPIRAM);
+            if (!notif_data) notif_data = malloc(notif_len);
             if (notif_data) {
                 int rc = os_mbuf_copydata(event->notify_rx.om, 0, notif_len, notif_data);
                 if (rc == 0) {
@@ -1435,7 +1437,8 @@ static void pair_cache_load(void)
 {
     memset(&s_pair_cache, 0, sizeof(s_pair_cache));
     nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    nvs_writer_lock();
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) { nvs_writer_unlock(); return; }
     bool ok = nvs_get_str_opt(h, NVS_K_CLIENTID, s_pair_cache.client_id,
                               sizeof(s_pair_cache.client_id));
     nvs_get_str_opt(h, NVS_K_ADDR, s_pair_cache.addr, sizeof(s_pair_cache.addr));
@@ -1443,6 +1446,7 @@ static void pair_cache_load(void)
     nvs_get_str_opt(h, NVS_K_PAIRKEY, s_pair_cache.pair_key,
                     sizeof(s_pair_cache.pair_key));
     nvs_close(h);
+    nvs_writer_unlock();
     s_pair_cache.valid = ok;
 }
 
@@ -1626,7 +1630,8 @@ static void pair_task(void *arg)
 
     ESP_LOGI(TAG, "Sending StartKeyExchange...");
     bytes_to_hex(s_srp.A_pad, SRP_PAD, A_hex);
-    char *json = malloc(800);
+    char *json = heap_caps_malloc(800, MALLOC_CAP_SPIRAM);
+    if (!json) json = malloc(800);
     snprintf(json, 800,
              "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"StartKeyExchange\","
              "\"params\":{\"clientPk\":\"%s\"}}", A_hex);
@@ -1943,7 +1948,8 @@ static void reconnect_task(void *arg)
     }
 
     /* 1. RequestSession */
-    char *rpc = malloc(512);
+    char *rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    if (!rpc) rpc = malloc(512);
     snprintf(rpc, 512,
              "{\"id\":10,\"jsonrpc\":\"2.0\",\"method\":\"RequestSession\","
              "\"params\":{\"clientId\":\"%s\"}}", cid_str);
@@ -2003,7 +2009,8 @@ static void reconnect_task(void *arg)
              challenge_j->valuestring, response_hex);
 
     /* 3. CheckSessionIntegrity */
-    rpc = malloc(512);
+    rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    if (!rpc) rpc = malloc(512);
     snprintf(rpc, 512,
              "{\"id\":11,\"jsonrpc\":\"2.0\",\"method\":\"CheckSessionIntegrity\","
              "\"params\":{\"response\":\"%s\"}}", response_hex);
@@ -2064,7 +2071,8 @@ static void reconnect_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(200));
 
     /* ---- Test encrypted channel: Get device identity ---- */
-    rpc = malloc(512);
+    rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    if (!rpc) rpc = malloc(512);
     snprintf(rpc, 512,
              "{\"id\":12,\"jsonrpc\":\"1.0\",\"method\":\"Get\","
              "\"params\":[\"ProductGeographicIdentifier\",\"HardwareIdentifier\"]}");
@@ -2121,7 +2129,8 @@ static void reconnect_task(void *arg)
      *     signal when the AS11 starts/stops accepting valid flow data,
      *     providing a more accurate EDF start alignment than MaskOn.
      * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
-    rpc = malloc(700);
+    rpc = heap_caps_malloc(700, MALLOC_CAP_SPIRAM);
+    if (!rpc) rpc = malloc(700);
     snprintf(rpc, 700,
              "{\"id\":13,\"jsonrpc\":\"1.0\",\"method\":\"SubscribeEvent\","
              "\"params\":{\"dataIds\":["
@@ -2168,7 +2177,8 @@ static void reconnect_task(void *arg)
      * AS11 normalizes short tags to long names in StreamData notifications.
      * Unsupported signals return valid:false in the StartStream response.
      * sampleIntervalMs:40 applies to all; reportIntervalMs:200 gives 5 reports/s. */
-    rpc = malloc(600);
+    rpc = heap_caps_malloc(600, MALLOC_CAP_SPIRAM);
+    if (!rpc) rpc = malloc(600);
     snprintf(rpc, 600,
              "{\"id\":14,\"jsonrpc\":\"1.0\",\"method\":\"StartStream\","
              "\"params\":{\"dataIds\":["
@@ -2732,7 +2742,8 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
         total += coll.frags[i].len;
     }
 
-    uint8_t *data = malloc(total);
+    uint8_t *data = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+    if (!data) data = malloc(total);
     if (!data) {
         ESP_LOGE(TAG, "spool: malloc %u failed", (unsigned)total);
         for (int i = 0; i < coll.frag_count; i++) free(coll.frags[i].data);
@@ -2848,7 +2859,8 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
     /* Build JSON params array: ["key1","key2",...] */
     /* Worst case: each key is ~40 chars, plus quotes and comma */
     size_t buf_size = n_keys * 48 + 64;
-    char *params = malloc(buf_size);
+    char *params = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+    if (!params) params = malloc(buf_size);
     if (!params) return NULL;
 
     size_t pos = 0;

@@ -371,7 +371,8 @@ static void load_day_file(uint32_t day)
     fseek(f, 0, SEEK_SET);
     if (size <= 0 || size > 64 * 1024) { fclose(f); return; }
 
-    char *buf = malloc(size + 1);
+    char *buf = heap_caps_malloc((size_t)size + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)size + 1);
     if (!buf) { fclose(f); return; }
     size_t rd = fread(buf, 1, size, f);
     fclose(f);

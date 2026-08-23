@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_rom_crc.h"
 
 static const char *TAG = "up_scan";
@@ -201,7 +202,8 @@ static uint64_t fold_fp(uint64_t fp, const char *name, const char *path,
     uint32_t crc = 0;
     FILE *f = fopen(path, "rb");
     if (f) {
-        uint8_t *buf = malloc(FP_CHUNK);
+        uint8_t *buf = heap_caps_malloc(FP_CHUNK, MALLOC_CAP_SPIRAM);
+        if (!buf) buf = malloc(FP_CHUNK);
         if (buf) {
             size_t n;
             while ((n = fread(buf, 1, FP_CHUNK, f)) > 0) {
@@ -292,7 +294,8 @@ int upload_scan_reconcile_day(uint32_t day)
     char daystr[12];
     snprintf(daystr, sizeof(daystr), "%08u", (unsigned)day);
 
-    upload_group_ref_t *refs = calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs));
+    upload_group_ref_t *refs = heap_caps_calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs), MALLOC_CAP_SPIRAM);
+    if (!refs) refs = calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs));
     if (!refs) return 0;
 
     int n = upload_scan_day_groups(daystr, refs, UPLOAD_MAX_GROUPS_PER_DAY);
@@ -361,7 +364,8 @@ int upload_scan_reconcile_all(int max_days, const int *slots, int n_slots)
     if (max_days <= 0) max_days = UPLOAD_DEFAULT_MAX_DAYS;
     if (max_days > UPLOAD_MAX_DAYS_CAP) max_days = UPLOAD_MAX_DAYS_CAP;
 
-    uint32_t *days = calloc(UPLOAD_MAX_DAYS_CAP, sizeof(uint32_t));
+    uint32_t *days = heap_caps_calloc(UPLOAD_MAX_DAYS_CAP, sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+    if (!days) days = calloc(UPLOAD_MAX_DAYS_CAP, sizeof(uint32_t));
     if (!days) return 0;
 
     int n_days = upload_scan_days(days, UPLOAD_MAX_DAYS_CAP);

@@ -61,7 +61,9 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     /* Clamp stale NVS values to current valid range */
 
     nvs_handle_t h;
+    nvs_writer_lock();
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        nvs_writer_unlock();
         ESP_LOGI(TAG, "no device settings in NVS — using defaults");
         memcpy(&s_settings, cfg, sizeof(s_settings));
         return ESP_ERR_NVS_NOT_FOUND;
@@ -90,6 +92,7 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     }
 
     nvs_close(h);
+    nvs_writer_unlock();
     memcpy(&s_settings, cfg, sizeof(s_settings));
     ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u",
              s_settings.brightness, s_settings.brightness / 10.0,

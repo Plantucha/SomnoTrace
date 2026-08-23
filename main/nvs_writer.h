@@ -53,3 +53,21 @@ void nvs_writer_init(void);
  * internal stack). If initialisation was attempted but failed, returns
  * ESP_ERR_INVALID_STATE rather than performing an unsafe inline flash access. */
 esp_err_t nvs_writer_run(nvs_writer_fn_t fn, void *arg);
+
+/* Global NVS access lock.  ALL NVS access — both proxy (nvs_writer_run) and
+ * direct (nvs_open/nvs_commit from tasks with internal stacks) — must be
+ * serialized to prevent concurrent flash erase/write operations from disabling
+ * the cache while another task is mid-read from flash-mapped memory.  A
+ * concurrent write+read causes an MMU entry fault (cache error) crash.
+ *
+ * Usage from direct NVS callers (internal-stack tasks only):
+ *   nvs_writer_lock();
+ *   nvs_open(...);
+ *   nvs_get_str(...);
+ *   nvs_close(h);
+ *   nvs_writer_unlock();
+ *
+ * nvs_writer_run() acquires this lock internally; callers that use the proxy
+ * do NOT need to call lock/unlock themselves. */
+void nvs_writer_lock(void);
+void nvs_writer_unlock(void);

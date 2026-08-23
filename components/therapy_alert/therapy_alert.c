@@ -252,19 +252,33 @@ static esp_err_t do_save_config(void *arg)
     return err;
 }
 
+static esp_err_t do_load_config(void *arg)
+{
+    therapy_alert_config_t *out = arg;
+    therapy_alert_config_t local;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    size_t required = sizeof(local);
+    err = nvs_get_blob(h, NVS_KEY_CFG, &local, &required);
+    nvs_close(h);
+    if (err == ESP_OK) *out = local;
+    return err;
+}
+
 esp_err_t therapy_alert_load_config(therapy_alert_config_t *cfg)
 {
     if (!cfg) return ESP_ERR_INVALID_ARG;
 
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        *cfg = (therapy_alert_config_t)ALERT_DEFAULTS;
-        return ESP_ERR_NVS_NOT_FOUND;
+    /* Use the injected NVS executor (nvs_writer_run) if available so the
+     * read is serialized with all other NVS access.  Fall back to direct
+     * access only before the executor is set (early boot, internal stack). */
+    esp_err_t err;
+    if (s_nvs_exec) {
+        err = s_nvs_exec(do_load_config, cfg);
+    } else {
+        err = do_load_config(cfg);
     }
-
-    size_t required = sizeof(*cfg);
-    esp_err_t err = nvs_get_blob(h, NVS_KEY_CFG, cfg, &required);
-    nvs_close(h);
 
     if (err != ESP_OK) {
         *cfg = (therapy_alert_config_t)ALERT_DEFAULTS;

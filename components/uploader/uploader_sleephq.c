@@ -118,7 +118,8 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
 {
     /* Buffer for entire response (headers + body) */
     size_t buf_cap = SHQ_RESP_CAP + 1024;
-    char *buf = malloc(buf_cap);
+    char *buf = heap_caps_malloc(buf_cap, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc(buf_cap);
     if (!buf) return -1;
 
     size_t buf_len = 0;
@@ -231,7 +232,8 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
     if (body_out) {
         size_t body_total = buf_len - (body_start - buf);
         if (body_total > SHQ_RESP_CAP) body_total = SHQ_RESP_CAP;
-        char *body = malloc(SHQ_RESP_CAP);
+        char *body = heap_caps_malloc(SHQ_RESP_CAP, MALLOC_CAP_SPIRAM);
+        if (!body) body = malloc(SHQ_RESP_CAP);
         if (!body) { free(buf); return -1; }
         memcpy(body, body_start, body_total);
         if (body_total < SHQ_RESP_CAP) body[body_total] = '\0';
@@ -616,7 +618,8 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
     }
 
     /* Stream file data with on-the-fly MD5 */
-    uint8_t *chunk = malloc(SHQ_READ_BUF);
+    uint8_t *chunk = heap_caps_malloc(SHQ_READ_BUF, MALLOC_CAP_SPIRAM);
+    if (!chunk) chunk = malloc(SHQ_READ_BUF);
     if (!chunk) {
         ESP_LOGE(TAG, "  cannot alloc chunk buffer for %s", filename);
         fclose(f);

@@ -367,7 +367,8 @@ static esp_err_t do_save_bat_anchor(void *arg)
 static void bat_load_anchor(void)
 {
     nvs_handle_t h;
-    if (nvs_open(BAT_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    nvs_writer_lock();
+    if (nvs_open(BAT_NVS_NS, NVS_READONLY, &h) != ESP_OK) { nvs_writer_unlock(); return; }
     int32_t mv = 4200;
     if (nvs_get_i32(h, BAT_NVS_KEY_FULL, &mv) == ESP_OK &&
         mv >= BAT_ANCHOR_MIN_MV && mv <= BAT_ANCHOR_MAX_MV) {
@@ -375,6 +376,7 @@ static void bat_load_anchor(void)
         ESP_LOGI(TAG, "battery: loaded full-charge anchor = %dmV from NVS", mv);
     }
     nvs_close(h);
+    nvs_writer_unlock();
 }
 
 static int bat_mv_to_percent(int mv)
@@ -511,6 +513,14 @@ static void battery_monitor_task(void *arg)
         return;
     }
 
+    /* Diagnostic: report stack high-water mark after init (which calls
+     * adc_cali_create_scheme_curve_fitting — the deepest call path in this
+     * task).  This helps distinguish a genuine stack overflow from external
+     * PSRAM corruption if the canary is ever tripped again. */
+    UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "battery: init done, stack high-water = %u bytes",
+             (unsigned)(hwm * sizeof(StackType_t)));
+
     int  filtered_mv = -1;   /* IIR-filtered VBAT */
     int  shown_pct = -1;     /* slew-limited percentage actually published */
     bool prev_charging = bsp_power_is_charging();
@@ -621,7 +631,7 @@ esp_err_t bsp_power_battery_monitor_start(void)
     s_bat_mutex = xSemaphoreCreateMutex();
     if (!s_bat_mutex) return ESP_ERR_NO_MEM;
 
-    TaskHandle_t h = psram_task_create(battery_monitor_task, "bat_mon", 4096,
+    TaskHandle_t h = psram_task_create(battery_monitor_task, "bat_mon", 8192,
                                        NULL, 3, tskNO_AFFINITY, NULL, NULL);
     if (!h) {
         vSemaphoreDelete(s_bat_mutex);

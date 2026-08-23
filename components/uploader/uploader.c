@@ -68,7 +68,75 @@ void uploader_register_backend(const upload_backend_t *backend)
 extern const upload_backend_t smb_backend;
 extern const upload_backend_t sleephq_backend;
 
+/* Injected NVS-write executor (the app's internal-stack nvs_writer). */
+static uploader_nvs_exec_fn_t s_nvs_exec = NULL;
+
 /* ── Config load / save (NVS) ───────────────────────────────────────── */
+
+/* NVS-read portion — runs on the injected executor's task (internal stack)
+ * when one is set, so the read is serialized with all other NVS access and
+ * is safe even when uploader_load_config() is called from a PSRAM-stacked
+ * task.  The output struct is filled into a stack-local copy first, then
+ * copied to the caller only after the NVS handle is closed. */
+static esp_err_t do_uploader_load_config(void *arg)
+{
+    uploader_config_t *out = arg;
+    uploader_config_t local;
+    memset(&local, 0, sizeof(local));
+
+    /* Defaults: all toggles enabled for backward compatibility */
+    local.smb_enabled   = true;
+    local.shq_enabled   = true;
+    local.ftp_enabled   = true;
+    local.ftp_anonymous = true;
+    local.max_days      = UPLOAD_DEFAULT_MAX_DAYS;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+
+    /* Boolean toggles — use u8 with backward-compatible defaults.
+     * If key is missing (first boot after upgrade), default to enabled
+     * for SMB/SHQ and FTP so existing setups keep working. */
+    uint8_t u8val;
+    local.smb_enabled   = (nvs_get_u8(h, "smb_en", &u8val) == ESP_OK) ? u8val : 1;
+    local.shq_enabled   = (nvs_get_u8(h, "shq_en", &u8val) == ESP_OK) ? u8val : 1;
+    local.ftp_enabled   = (nvs_get_u8(h, "ftp_en", &u8val) == ESP_OK) ? u8val : 1;
+    local.ftp_anonymous = (nvs_get_u8(h, "ftp_anon", &u8val) == ESP_OK) ? u8val : 1;
+
+    /* Upload window: how many of the newest days are ever considered. Caps a
+     * manual "reset state" so it cannot kick off months of re-uploading. */
+    int32_t i32val;
+    local.max_days = (nvs_get_i32(h, "max_days", &i32val) == ESP_OK)
+                     ? (int)i32val : UPLOAD_DEFAULT_MAX_DAYS;
+    if (local.max_days < 1) local.max_days = 1;
+    if (local.max_days > UPLOAD_MAX_DAYS_CAP) local.max_days = UPLOAD_MAX_DAYS_CAP;
+
+    size_t len;
+    len = sizeof(local.smb_host);
+    nvs_get_str(h, "smb_host", local.smb_host, &len);
+    len = sizeof(local.smb_share);
+    nvs_get_str(h, "smb_share", local.smb_share, &len);
+    len = sizeof(local.smb_user);
+    nvs_get_str(h, "smb_user", local.smb_user, &len);
+    len = sizeof(local.smb_pass);
+    nvs_get_str(h, "smb_pass", local.smb_pass, &len);
+    len = sizeof(local.smb_path);
+    nvs_get_str(h, "smb_path", local.smb_path, &len);
+    len = sizeof(local.shq_client_id);
+    nvs_get_str(h, "shq_cid", local.shq_client_id, &len);
+    len = sizeof(local.shq_client_secret);
+    nvs_get_str(h, "shq_secret", local.shq_client_secret, &len);
+    len = sizeof(local.ftp_user);
+    nvs_get_str(h, "ftp_user", local.ftp_user, &len);
+    len = sizeof(local.ftp_pass);
+    nvs_get_str(h, "ftp_pass", local.ftp_pass, &len);
+
+    nvs_close(h);
+    *out = local;
+    return ESP_OK;
+}
 
 esp_err_t uploader_load_config(uploader_config_t *cfg)
 {
@@ -82,55 +150,16 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
     cfg->ftp_anonymous = true;
     cfg->max_days      = UPLOAD_DEFAULT_MAX_DAYS;
 
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+    /* Use the injected NVS executor (nvs_writer_run) if available so the
+     * read is serialized with all other NVS access.  Fall back to direct
+     * access only before the executor is set (early boot, internal stack). */
+    esp_err_t err = s_nvs_exec ? s_nvs_exec(do_uploader_load_config, cfg)
+                               : do_uploader_load_config(cfg);
+    if (err != ESP_OK) {
         ESP_LOGI(TAG, "no uploader config in NVS — using defaults");
-        return ESP_ERR_NVS_NOT_FOUND;
     }
-
-    /* Boolean toggles — use u8 with backward-compatible defaults.
-     * If key is missing (first boot after upgrade), default to enabled
-     * for SMB/SHQ and FTP so existing setups keep working. */
-    uint8_t u8val;
-    cfg->smb_enabled   = (nvs_get_u8(h, "smb_en", &u8val) == ESP_OK) ? u8val : 1;
-    cfg->shq_enabled   = (nvs_get_u8(h, "shq_en", &u8val) == ESP_OK) ? u8val : 1;
-    cfg->ftp_enabled   = (nvs_get_u8(h, "ftp_en", &u8val) == ESP_OK) ? u8val : 1;
-    cfg->ftp_anonymous = (nvs_get_u8(h, "ftp_anon", &u8val) == ESP_OK) ? u8val : 1;
-
-    /* Upload window: how many of the newest days are ever considered. Caps a
-     * manual "reset state" so it cannot kick off months of re-uploading. */
-    int32_t i32val;
-    cfg->max_days = (nvs_get_i32(h, "max_days", &i32val) == ESP_OK)
-                    ? (int)i32val : UPLOAD_DEFAULT_MAX_DAYS;
-    if (cfg->max_days < 1) cfg->max_days = 1;
-    if (cfg->max_days > UPLOAD_MAX_DAYS_CAP) cfg->max_days = UPLOAD_MAX_DAYS_CAP;
-
-    size_t len;
-    len = sizeof(cfg->smb_host);
-    nvs_get_str(h, "smb_host", cfg->smb_host, &len);
-    len = sizeof(cfg->smb_share);
-    nvs_get_str(h, "smb_share", cfg->smb_share, &len);
-    len = sizeof(cfg->smb_user);
-    nvs_get_str(h, "smb_user", cfg->smb_user, &len);
-    len = sizeof(cfg->smb_pass);
-    nvs_get_str(h, "smb_pass", cfg->smb_pass, &len);
-    len = sizeof(cfg->smb_path);
-    nvs_get_str(h, "smb_path", cfg->smb_path, &len);
-    len = sizeof(cfg->shq_client_id);
-    nvs_get_str(h, "shq_cid", cfg->shq_client_id, &len);
-    len = sizeof(cfg->shq_client_secret);
-    nvs_get_str(h, "shq_secret", cfg->shq_client_secret, &len);
-    len = sizeof(cfg->ftp_user);
-    nvs_get_str(h, "ftp_user", cfg->ftp_user, &len);
-    len = sizeof(cfg->ftp_pass);
-    nvs_get_str(h, "ftp_pass", cfg->ftp_pass, &len);
-
-    nvs_close(h);
-    return ESP_OK;
+    return err;
 }
-
-/* Injected NVS-write executor (the app's internal-stack nvs_writer). */
-static uploader_nvs_exec_fn_t s_nvs_exec = NULL;
 
 /* Injected storage-lease hooks (the app's sd_storage arbitration). */
 static uploader_lease_acquire_fn_t s_lease_acquire = NULL;

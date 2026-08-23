@@ -1224,5 +1224,15 @@ static void display_task(void *arg)
             }
         }
         last_mode = mode;
+
+        /* One-shot high-water mark after the first render to verify the
+         * 4 KB PSRAM stack is sufficient for the rendering + SPI blit path. */
+        static bool hwm_logged = false;
+        if (!hwm_logged) {
+            hwm_logged = true;
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "display: stack high-water = %u bytes",
+                     (unsigned)(hwm * sizeof(StackType_t)));
+        }
     }
 }

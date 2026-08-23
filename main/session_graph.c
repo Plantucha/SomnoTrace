@@ -260,7 +260,8 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
 
     /* Collect completed sessions into an array for sorting */
     int cap = 8, count = 0;
-    session_manifest_t *sessions = calloc(cap, sizeof(session_manifest_t));
+    session_manifest_t *sessions = heap_caps_calloc(cap, sizeof(session_manifest_t), MALLOC_CAP_SPIRAM);
+    if (!sessions) sessions = calloc(cap, sizeof(session_manifest_t));
     if (!sessions) { closedir(dd); httpd_resp_send_500(req); return ESP_FAIL; }
 
     struct dirent *fent;
@@ -285,7 +286,8 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         long fsz = ftell(f);
         fseek(f, 0, SEEK_SET);
         if (fsz <= 0 || fsz > 4096) { fclose(f); continue; }
-        char *buf = malloc(fsz + 1);
+        char *buf = heap_caps_malloc((size_t)fsz + 1, MALLOC_CAP_SPIRAM);
+        if (!buf) buf = malloc((size_t)fsz + 1);
         if (!buf) { fclose(f); continue; }
         fread(buf, 1, fsz, f);
         buf[fsz] = '\0';
@@ -447,7 +449,8 @@ esp_err_t days_list_handler(httpd_req_t *req)
     /* Collect day-folder names (exactly 8 digits) first, then close before
      * re-opening each for counting (keep one dir handle open at a time). */
     int cap = 64, n = 0;
-    char **days = calloc(cap, sizeof(char *));
+    char **days = heap_caps_calloc(cap, sizeof(char *), MALLOC_CAP_SPIRAM);
+    if (!days) days = calloc(cap, sizeof(char *));
     if (!days) { closedir(dd); httpd_resp_send_500(req); return ESP_FAIL; }
     struct dirent *ent;
     while ((ent = readdir(dd)) != NULL) {
@@ -806,7 +809,8 @@ esp_err_t session_graph_handler(httpd_req_t *req)
             int n_out = n_samples / group;
             if (n_out > target_points) n_out = target_points;
 
-            float *flow = malloc(n_out * sizeof(float) * 2);
+            float *flow = heap_caps_malloc(n_out * sizeof(float) * 2, MALLOC_CAP_SPIRAM);
+        if (!flow) flow = malloc(n_out * sizeof(float) * 2);
             if (!flow) { fclose(f); free(json); httpd_resp_send_500(req); return ESP_FAIL; }
             float *press = flow + n_out;
 
@@ -902,7 +906,8 @@ esp_err_t session_graph_handler(httpd_req_t *req)
             int n_out = n_samples / group;
             if (n_out > target_points) n_out = target_points;
 
-            float *dec = malloc(n_out * sizeof(float));
+            float *dec = heap_caps_malloc(n_out * sizeof(float), MALLOC_CAP_SPIRAM);
+        if (!dec) dec = malloc(n_out * sizeof(float));
             if (!dec) { fclose(f); free(json); httpd_resp_send_500(req); return ESP_FAIL; }
 
             fseek(f, SNT_HDR_SIZE + (long)start_sample * rec_bytes, SEEK_SET);
@@ -964,7 +969,7 @@ typedef struct {
                                   * send buffer so lwIP can fit several
                                   * in-flight segments between BLE coex slots */
 #define SNT_QUEUE_DEPTH  6       /* pending requests before we reject with 503 */
-#define SNT_WORKER_STACK 6144
+#define SNT_WORKER_STACK 8192
 static QueueHandle_t s_download_queue = NULL;
 
 /* Stream one file to its (async) request using the caller-provided chunk
@@ -1030,6 +1035,7 @@ static void snt_download_worker(void *arg)
     (void)arg;
     /* One reusable chunk buffer in PSRAM for the worker's lifetime. */
     char *buf = heap_caps_malloc(SNT_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
+    bool hwm_logged = false;
     for (;;) {
         session_file_async_t *transfer = NULL;
         if (xQueueReceive(s_download_queue, &transfer, portMAX_DELAY) != pdTRUE || !transfer)
@@ -1042,6 +1048,15 @@ static void snt_download_worker(void *arg)
         }
         httpd_req_async_handler_complete(transfer->req);
         free(transfer);
+
+        /* One-shot high-water mark after the first download to verify the
+         * 8 KB PSRAM stack is sufficient for the FATFS read + lwIP send path. */
+        if (!hwm_logged) {
+            hwm_logged = true;
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "snt_download: stack high-water = %u bytes",
+                     (unsigned)(hwm * sizeof(StackType_t)));
+        }
     }
 }
 
@@ -1188,7 +1203,8 @@ esp_err_t session_file_handler(httpd_req_t *req)
      * next request. */
     httpd_resp_set_hdr(req, "Connection", "close");
 
-    session_file_async_t *transfer = calloc(1, sizeof(*transfer));
+    session_file_async_t *transfer = heap_caps_calloc(1, sizeof(*transfer), MALLOC_CAP_SPIRAM);
+    if (!transfer) transfer = calloc(1, sizeof(*transfer));
     httpd_req_t *async_req = NULL;
     if (!transfer || httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         free(transfer);

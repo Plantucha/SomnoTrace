@@ -33,6 +33,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "esp_heap_caps.h"
 
 #include "esp_log.h"
 #include "cJSON.h"
@@ -53,7 +54,8 @@ static int adopt_day(uint32_t day, int slot, uint32_t last_try_s)
     char daystr[12];
     snprintf(daystr, sizeof(daystr), "%08u", (unsigned)day);
 
-    upload_group_ref_t *refs = calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs));
+    upload_group_ref_t *refs = heap_caps_calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs), MALLOC_CAP_SPIRAM);
+    if (!refs) refs = calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs));
     if (!refs) return 0;
 
     int n = upload_scan_day_groups(daystr, refs, UPLOAD_MAX_GROUPS_PER_DAY);
@@ -92,7 +94,8 @@ bool upload_migrate_legacy_state(void)
 
     FILE *f = fopen(LEGACY_PATH, "r");
     if (!f) return false;
-    char *buf = malloc(st.st_size + 1);
+    char *buf = heap_caps_malloc((size_t)st.st_size + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)st.st_size + 1);
     if (!buf) { fclose(f); return false; }
     size_t rd = fread(buf, 1, st.st_size, f);
     fclose(f);

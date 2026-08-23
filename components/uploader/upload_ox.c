@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "esp_heap_caps.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -82,7 +83,8 @@ static cJSON *read_json_file(const char *path)
     if (!f) return NULL;
     fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
     if (size <= 0 || size > 16 * 1024) { fclose(f); return NULL; }
-    char *buf = malloc((size_t)size + 1);
+    char *buf = heap_caps_malloc((size_t)size + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)size + 1);
     if (!buf) { fclose(f); return NULL; }
     size_t n = fread(buf, 1, (size_t)size, f); fclose(f); buf[n] = '\0';
     cJSON *root = n == (size_t)size ? cJSON_Parse(buf) : NULL;
@@ -147,7 +149,8 @@ static cJSON *read_state(void)
     if (!f) return NULL;
     fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
     if (size <= 0 || size > 256 * 1024) { fclose(f); return NULL; }
-    char *buf = malloc((size_t)size + 1);
+    char *buf = heap_caps_malloc((size_t)size + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)size + 1);
     if (!buf) { fclose(f); return NULL; }
     size_t n = fread(buf, 1, (size_t)size, f); fclose(f); buf[n] = '\0';
     cJSON *root = n == (size_t)size ? cJSON_Parse(buf) : NULL;
@@ -345,9 +348,10 @@ int upload_ox_pending(const upload_ox_ref_t *refs, int n_refs, int backend_slot)
 
 char *upload_ox_status_json(void)
 {
-    upload_ox_ref_t refs[UPLOAD_OX_MAX_UNITS];
+    upload_ox_ref_t *refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);
+    if (!refs) return NULL;
     int n = upload_ox_scan(refs, UPLOAD_OX_MAX_UNITS);
-    cJSON *arr = cJSON_CreateArray(); if (!arr) return NULL;
+    cJSON *arr = cJSON_CreateArray(); if (!arr) { free(refs); return NULL; }
     for (int i = 0; i < n; i++) {
         cJSON *u = cJSON_CreateObject();
         cJSON_AddStringToObject(u, "recording_id", refs[i].recording_id);
@@ -363,5 +367,5 @@ char *upload_ox_status_json(void)
         }
         cJSON_AddItemToArray(arr, u);
     }
-    char *out = cJSON_PrintUnformatted(arr); cJSON_Delete(arr); return out;
+    char *out = cJSON_PrintUnformatted(arr); cJSON_Delete(arr); free(refs); return out;
 }
