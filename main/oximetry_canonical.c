@@ -25,6 +25,9 @@
 #include "sd_storage.h"
 #include "time_sync.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
@@ -704,6 +707,7 @@ esp_err_t oximetry_canonical_migrate_legacy(const char *device_id)
         }
         if (oximetry_canonical_convert_format_a(device_id, name, source, start) != ESP_OK)
             ESP_LOGW(TAG, "legacy migration failed %s (source retained)", source);
+        vTaskDelay(1);
     }
     closedir(d);
     return ESP_OK;
@@ -753,6 +757,7 @@ esp_err_t oximetry_canonical_reconcile(void)
                     device->valuestring, se->d_name, source, (int64_t)start->valuedouble) != ESP_OK)
                 ESP_LOGW(TAG, "staging conversion still pending: %s", se->d_name);
             cJSON_Delete(p);
+            vTaskDelay(1);
         }
         closedir(staging);
     }
@@ -773,6 +778,7 @@ esp_err_t oximetry_canonical_reconcile(void)
             if (!path_join2(record_path, sizeof(record_path), day_path, re->d_name)) continue;
             if (!recording_ready_at(record_path))
                 ESP_LOGW(TAG, "recording is not ready: %s", record_path);
+            vTaskDelay(1);
         }
         closedir(records);
     }

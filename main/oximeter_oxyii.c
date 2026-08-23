@@ -1132,6 +1132,20 @@ static esp_err_t do_scan(int timeout_sec)
     return ESP_OK;
 }
 
+static void canonical_migration_task(void *arg)
+{
+    (void)arg;
+    /* Do not block app_main while AS11 and its notification worker start. */
+    vTaskDelay(pdMS_TO_TICKS(30000));
+    while (sd_storage_recording_active())
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    if (sd_storage_is_ready()) {
+        oximetry_canonical_reconcile();
+        oximetry_canonical_migrate_all_legacy();
+    }
+    vTaskDelete(NULL);
+}
+
 /* ── Background watch: scan-only, connect only in the END window ──── */
 static void pull_task(void *arg)
 {
@@ -1331,11 +1345,7 @@ esp_err_t oximeter_init(void)
 
     load_paired_from_nvs();
     ox_store_ensure_dirs();
-    if (sd_storage_is_ready()) {
-        oximetry_canonical_ensure_dirs();
-        oximetry_canonical_reconcile();
-        oximetry_canonical_migrate_all_legacy();
-    }
+    if (sd_storage_is_ready()) oximetry_canonical_ensure_dirs();
 
     if (s_paired)
         set_state(OX_STATUS_PAIRED);
@@ -1345,6 +1355,10 @@ esp_err_t oximeter_init(void)
     if (!h) {
         ESP_LOGW(TAG, "failed to create pull task");
     }
+    TaskHandle_t migration = psram_task_create(canonical_migration_task,
+                                               "ox_migrate", 8192, NULL, 1,
+                                               0, NULL, NULL);
+    if (!migration) ESP_LOGW(TAG, "failed to create canonical migration task");
     return ESP_OK;
 }
 
