@@ -232,7 +232,8 @@ esp_err_t upload_ox_save(void)
     bool ok = f && fwrite(text, 1, strlen(text), f) == strlen(text) && fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (f) fclose(f);
     cJSON_free(text);
-    if (!ok || rename(OX_STATE_TMP, OX_STATE_PATH) != 0) { unlink(OX_STATE_TMP); return ESP_FAIL; }
+    if (ok) { unlink(OX_STATE_PATH); /* FATFS cannot rename-over */ ok = (rename(OX_STATE_TMP, OX_STATE_PATH) == 0); }
+    if (!ok) { unlink(OX_STATE_TMP); return ESP_FAIL; }
     return ESP_OK;
 }
 
