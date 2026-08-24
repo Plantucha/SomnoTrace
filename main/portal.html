@@ -4564,11 +4564,6 @@ function renderDashboardCharts() {
   if (typeof uPlot === 'undefined') { dashSetStatus('uPlot not loaded'); return; }
   var stack = document.getElementById('dash-chart-stack');
   if (!stack) return;
-  /* Blur the focused element before tearing down the DOM: if a button that
-   * triggered the re-render still has focus, removing it makes the browser
-   * jump to the top of the page. */
-  if (document.activeElement && document.activeElement !== document.body)
-    document.activeElement.blur();
   /* Tear down existing charts */
   for (var i = 0; i < dashCharts.length; i++) { if (dashCharts[i]) dashCharts[i].destroy(); }
   dashCharts = [];
@@ -4895,7 +4890,8 @@ function reloadDashCharts() {
 
 function dashboardZoomReset() {
   dashXRange = null;
-  renderDashboardCharts();
+  if (dashCharts.length) updateDashView();
+  else renderDashboardCharts();
   dashSetStatus('');
 }
 
