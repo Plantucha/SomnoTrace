@@ -39,6 +39,21 @@
 #define OX_STATUS_PULLING    "pulling"
 #define OX_STATUS_PAIRED     "paired"
 #define OX_STATUS_ERROR      "error"
+#define OX_STATUS_MONITORING "monitoring"  /* persistent connection held, polling LIVE_B */
+
+/* Probe mode determines how the watch task monitors a worn ring.
+ *
+ * OX_PROBE_LEGACY:     Reconnect + full AUTH/SETUP/GET_INFO handshake every
+ *                      ~60 s.  Most intrusive; suspected to cause HR artifacts
+ *                      on some ring firmware revisions.
+ * OX_PROBE_PERSISTENT: Hold one GATT connection, poll unauthenticated LIVE_B
+ *                      (cmd=0x04) every 30 s.  AUTH/SETUP/GET_INFO and file
+ *                      transfer are deferred until off-finger is detected.
+ *                      Recommended mode (see .ai/OXIMETRY2.md). */
+typedef enum {
+    OX_PROBE_LEGACY     = 0,
+    OX_PROBE_PERSISTENT = 1,
+} ox_probe_mode_t;
 
 /* Initialise the oximeter module.  Must be called after as11_ble_init()
  * (shares the NimBLE host) and sd_storage_init().  Loads paired serial
@@ -75,3 +90,8 @@ bool oximeter_is_paired(void);
 /* Return a cJSON object with paired ring info: serial, firmware,
  * name_prefix, last_addr.  NULL if not paired.  Caller cJSON_Delete(). */
 cJSON *oximeter_get_paired_info(void);
+
+/* Get/set the probe mode (see ox_probe_mode_t).  Persists to NVS.
+ * The watch task picks up the new mode on its next iteration. */
+ox_probe_mode_t oximeter_get_probe_mode(void);
+esp_err_t oximeter_set_probe_mode(ox_probe_mode_t mode);

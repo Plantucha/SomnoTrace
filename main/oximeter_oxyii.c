@@ -283,6 +283,7 @@ static bool s_presence_served = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
 static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
+static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
 
 /* Measured: END powers off ~120s after take-off IF no one connects.
  * Any GATT connection resets that timer. Pull happens inside the
@@ -291,6 +292,10 @@ static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window 
 #define OX_END_WINDOW_MS  130000
 #define OX_WORN_PROBE_MS  60000  /* LIVE_B interval while worn; END lasts ~120s */
 #define OX_F1_MAX_RETRIES 3      /* give up on F1 after N consecutive timeouts */
+
+/* Persistent-mode polling: one held connection, unauthenticated LIVE_B.
+ * See .ai/OXIMETRY2.md for the experiment that established this value. */
+#define OX_PERSISTENT_POLL_MS 30000
 
 /* BLE connection state */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -588,7 +593,9 @@ static int on_write_done(uint16_t conn, const struct ble_gatt_error *err,
 }
 
 /* ── Connect and discover GATT services ────────────────────────────── */
-static esp_err_t do_connect_and_discover(ble_addr_t *target)
+/* do_mtu=false skips MTU exchange (persistent-mode contact polling uses
+ * only tiny LIVE_B frames that fit in the default 23-byte ATT MTU). */
+static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
 {
     s_write_handle = s_notify_handle = s_cccd_handle = 0;
     s_svc_start = s_svc_end = 0;
@@ -614,10 +621,12 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target)
     }
     ESP_LOGI(TAG, "connected, handle=%d", s_conn_handle);
 
-    /* MTU exchange */
-    clear_op_sem();
-    ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
-    wait_op(2000);
+    /* MTU exchange (skipped in persistent contact-polling mode) */
+    if (do_mtu) {
+        clear_op_sem();
+        ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
+        wait_op(2000);
+    }
 
     /* Discover OxyII service by UUID */
     clear_op_sem();
@@ -977,6 +986,19 @@ static esp_err_t do_erase_nvs(void *arg)
     nvs_erase_key(h, "firmware");
     nvs_erase_key(h, "name_prefix");
     nvs_erase_key(h, "last_addr");
+    nvs_erase_key(h, "probe_mode");
+    e = nvs_commit(h);
+    nvs_close(h);
+    return e;
+}
+
+static esp_err_t do_save_probe_mode(void *arg)
+{
+    uint8_t mode = (uint8_t)(intptr_t)arg;
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(OX_NVS_NS, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    nvs_set_u8(h, "probe_mode", mode);
     e = nvs_commit(h);
     nvs_close(h);
     return e;
@@ -999,6 +1021,9 @@ static void load_paired_from_nvs(void)
         len = sizeof(s_paired_addr);
         nvs_get_str(h, "last_addr", s_paired_addr, &len);
     }
+    uint8_t pm;
+    if (nvs_get_u8(h, "probe_mode", &pm) == ESP_OK && pm <= 1)
+        s_probe_mode = (ox_probe_mode_t)pm;
     nvs_close(h);
     nvs_writer_unlock();
 
@@ -1035,7 +1060,7 @@ static void pair_task(void *arg)
         return;
     }
 
-    if (do_connect_and_discover(&target) != ESP_OK) {
+    if (do_connect_and_discover(&target, true) != ESP_OK) {
         do_disconnect();
         free(addr_str);
         xSemaphoreGive(s_ops_mtx);
@@ -1148,6 +1173,59 @@ static void canonical_migration_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* ── File pull helper (shared by legacy and persistent paths) ─────── */
+/* Caller must be connected with session opened and files prepared.
+ * Sets OX_STATUS_PULLING, runs F1 → file list → per-file pull.
+ * On F1 exhaustion, marks served so the watch stops reconnecting.
+ * Returns true if all files pulled (or none to pull), false on failure.
+ * s_presence_served may be set inside on F1 exhaustion. */
+static bool do_pull_and_mark(void)
+{
+    set_state(OX_STATUS_PULLING);
+
+    char names[32][17];
+    int count = oxyii_get_file_list(names, 32);
+    if (count < 0) {
+        s_f1_fail_count++;
+        ESP_LOGW(TAG, "file list failed (op=0x%02x len=%d), attempt %d/%d",
+                 s_resp_opcode, s_resp_payload_len,
+                 s_f1_fail_count, OX_F1_MAX_RETRIES);
+        if (s_f1_fail_count >= OX_F1_MAX_RETRIES) {
+            /* F1 never responds on this ring (firmware quirk).
+             * Mark served so we stop reconnecting — each connection
+             * resets the ring's power-off timer.  Next sync window
+             * (next take-off) will try again fresh. */
+            s_presence_served = true;
+            s_served_at = xTaskGetTickCount();
+            ESP_LOGW(TAG, "F1 unreachable after %d attempts — treating as served, ring can sleep",
+                     OX_F1_MAX_RETRIES);
+        }
+        return false;
+    }
+    s_f1_fail_count = 0;
+    ESP_LOGI(TAG, "file list: %d files", count);
+
+    bool pull_ok = true;
+    for (int i = 0; i < count; i++) {
+        if (names[i][0] == '\0') continue;
+
+        int idx = ox_store_index_check(s_serial, names[i]);
+        if (idx == 1) {
+            ESP_LOGD(TAG, "skip '%s' (already finalised)", names[i]);
+            continue;
+        }
+
+        ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
+        if (oxyii_pull_file(names[i]) != ESP_OK) {
+            ESP_LOGW(TAG, "pull failed for '%s'", names[i]);
+            if (sd_storage_is_ready()) oximetry_canonical_migrate_legacy(s_serial);
+            pull_ok = false;
+            break;
+        }
+    }
+    return pull_ok;
+}
+
 /* ── Background watch: scan-only, connect only in the END window ──── */
 static void pull_task(void *arg)
 {
@@ -1219,9 +1297,95 @@ static void pull_task(void *arg)
             s_f1_fail_count = 0;
         }
 
+        if (s_probe_mode == OX_PROBE_PERSISTENT) {
+            /* ── Persistent mode ───────────────────────────────────────
+             * Hold one GATT connection, poll unauthenticated LIVE_B
+             * every OX_PERSISTENT_POLL_MS. AUTH/SETUP/GET_INFO and
+             * file transfer are deferred until off-finger is detected.
+             * See .ai/OXIMETRY2.md for the experiment that validated
+             * this approach. */
+            set_state(OX_STATUS_CONNECTING);
+
+            if (do_connect_and_discover(&s_scan[0].addr, false) != ESP_OK) {
+                ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
+                do_disconnect();
+                set_state(OX_STATUS_PAIRED);
+                xSemaphoreGive(s_ops_mtx);
+                continue;
+            }
+
+            /* Poll loop: LIVE_B every 30 s while on-finger. */
+            bool pulled = false;
+            while (s_probe_mode == OX_PROBE_PERSISTENT && !pulled) {
+                int off = oxyii_off_finger();
+                if (off == 1) {
+                    /* Off-finger: upgrade to full session for pull. */
+                    ESP_LOGI(TAG, "watch: off-finger detected — upgrading to full session");
+                    /* MTU exchange now for file-transfer throughput. */
+                    clear_op_sem();
+                    ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
+                    wait_op(2000);
+
+                    if (oxyii_session_open() != ESP_OK) {
+                        ESP_LOGW(TAG, "watch: session open failed after off-finger");
+                        break;
+                    }
+
+                    char serial[32] = {0}, firmware[16] = {0};
+                    if (oxyii_get_info(serial, sizeof(serial),
+                                       firmware, sizeof(firmware)) != ESP_OK
+                        || serial[0] == '\0'
+                        || strcmp(serial, s_serial) != 0) {
+                        ESP_LOGW(TAG, "watch: serial mismatch (got '%s', want '%s')",
+                                 serial, s_serial);
+                        break;
+                    }
+
+                    if (oxyii_prepare_files() != ESP_OK) {
+                        ESP_LOGW(TAG, "watch: file prep failed");
+                        break;
+                    }
+
+                    bool pull_ok = do_pull_and_mark();
+                    do_disconnect();
+
+                    if (pull_ok) {
+                        s_presence_served = true;
+                        s_served_at = xTaskGetTickCount();
+                        ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
+                    } else if (!s_presence_served) {
+                        ESP_LOGW(TAG, "sync incomplete — will retry this presence");
+                    }
+                    pulled = true;
+                } else if (off == 0) {
+                    /* On-finger: hold connection, wait before next poll. */
+                    set_state(OX_STATUS_MONITORING);
+                    vTaskDelay(pdMS_TO_TICKS(OX_PERSISTENT_POLL_MS));
+                    /* Connection may have dropped during the delay. */
+                    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+                        ESP_LOGI(TAG, "watch: persistent connection dropped — will reconnect");
+                        break;
+                    }
+                } else {
+                    /* LIVE_B error (-1): connection may be stale. */
+                    ESP_LOGW(TAG, "watch: LIVE_B error — dropping connection");
+                    break;
+                }
+            }
+
+            /* If we broke out without pulling, clean up the connection. */
+            if (!pulled) {
+                do_disconnect();
+                set_state(OX_STATUS_PAIRED);
+            }
+            xSemaphoreGive(s_ops_mtx);
+            continue;
+        }
+
+        /* ── Legacy mode (reconnect + full handshake each cycle) ─────── */
         set_state(OX_STATUS_CONNECTING);
 
-        if (do_connect_and_discover(&s_scan[0].addr) != ESP_OK) {
+        if (do_connect_and_discover(&s_scan[0].addr, true) != ESP_OK) {
             ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
@@ -1272,58 +1436,13 @@ static void pull_task(void *arg)
             continue;
         }
 
-        set_state(OX_STATUS_PULLING);
-
-        char names[32][17];
-        int count = oxyii_get_file_list(names, 32);
-        if (count < 0) {
-            s_f1_fail_count++;
-            ESP_LOGW(TAG, "file list failed (op=0x%02x len=%d), attempt %d/%d",
-                     s_resp_opcode, s_resp_payload_len,
-                     s_f1_fail_count, OX_F1_MAX_RETRIES);
-            do_disconnect();
-            set_state(OX_STATUS_PAIRED);
-            if (s_f1_fail_count >= OX_F1_MAX_RETRIES) {
-                /* F1 never responds on this ring (firmware quirk).
-                 * Mark served so we stop reconnecting — each connection
-                 * resets the ring's power-off timer.  Next sync window
-                 * (next take-off) will try again fresh. */
-                s_presence_served = true;
-                s_served_at = xTaskGetTickCount();
-                ESP_LOGW(TAG, "F1 unreachable after %d attempts — treating as served, ring can sleep",
-                         OX_F1_MAX_RETRIES);
-            }
-            xSemaphoreGive(s_ops_mtx);
-            continue;
-        }
-        s_f1_fail_count = 0;
-        ESP_LOGI(TAG, "file list: %d files", count);
-
-        bool pull_ok = true;
-        for (int i = 0; i < count; i++) {
-            if (names[i][0] == '\0') continue;
-
-            int idx = ox_store_index_check(s_serial, names[i]);
-            if (idx == 1) {
-                ESP_LOGD(TAG, "skip '%s' (already finalised)", names[i]);
-                continue;
-            }
-
-            ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
-            if (oxyii_pull_file(names[i]) != ESP_OK) {
-                ESP_LOGW(TAG, "pull failed for '%s'", names[i]);
-                if (sd_storage_is_ready()) oximetry_canonical_migrate_legacy(s_serial);
-                pull_ok = false;
-                break;
-            }
-        }
-
+        bool pull_ok = do_pull_and_mark();
         do_disconnect();
         if (pull_ok) {
             s_presence_served = true;
             s_served_at = xTaskGetTickCount();
             ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
-        } else {
+        } else if (!s_presence_served) {
             ESP_LOGW(TAG, "sync incomplete — will retry this presence");
         }
         set_state(OX_STATUS_PAIRED);
@@ -1476,4 +1595,23 @@ cJSON *oximeter_get_paired_info(void)
     if (s_firmware[0]) cJSON_AddStringToObject(info, "firmware", s_firmware);
     if (s_paired_addr[0]) cJSON_AddStringToObject(info, "addr", s_paired_addr);
     return info;
+}
+
+ox_probe_mode_t oximeter_get_probe_mode(void)
+{
+    return s_probe_mode;
+}
+
+esp_err_t oximeter_set_probe_mode(ox_probe_mode_t mode)
+{
+    if (mode != OX_PROBE_LEGACY && mode != OX_PROBE_PERSISTENT)
+        return ESP_ERR_INVALID_ARG;
+    if (mode == s_probe_mode)
+        return ESP_OK;
+    s_probe_mode = mode;
+    /* Persist to NVS (fire-and-forget; nvs_writer_run handles flash safety). */
+    nvs_writer_run(do_save_probe_mode, (void *)(intptr_t)mode);
+    ESP_LOGI(TAG, "probe mode set to %s",
+             mode == OX_PROBE_PERSISTENT ? "persistent" : "legacy");
+    return ESP_OK;
 }
