@@ -185,6 +185,9 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .date-btn:focus,.date-btn:focus-visible{outline:none}
 .date-display{font-size:.95rem;font-weight:600;padding:0 14px;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);user-select:none;border-left:1px solid var(--card-border);border-right:1px solid var(--card-border)}
 .date-picker-hidden{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
+.dash-options-bar{display:flex;justify-content:center}
+.dash-toggle-row{display:flex;align-items:center;gap:6px;font-size:.8rem;color:var(--text-muted);cursor:pointer;user-select:none}
+.dash-toggle-row input{cursor:pointer}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .stat-card{position:relative;overflow:hidden;display:flex;flex-direction:column;gap:6px;padding:16px;border-radius:12px;transition:transform .2s ease,box-shadow .2s ease;backdrop-filter:blur(8px)}
 .stat-card:hover{transform:translateY(-2px)}
@@ -309,9 +312,6 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(1.2)}}
 
 /* ── Responsive ────────────────────────────────────────────────── */
-@media(min-height:900px){
-.dashboard-charts-panel .uplot{height:240px !important}
-}
 @media(max-width:768px){
 .status-grid,.settings-grid-2col{grid-template-columns:1fr}
 }
@@ -934,13 +934,15 @@ Save &amp; Reboot
 </div>
 <div class="card dashboard-charts-panel" style="position:relative">
 <div id="dash-chart-stack"></div>
-<div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:6px"></div>
+<div id="oximetry-status" style="font-size:.75rem;color:var(--text-muted);margin-top:6px"></div>
+<div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:4px"></div>
 </div>
 <div id="dash-stream-quality" class="card" style="display:none;padding:12px 16px;font-size:.8rem;color:var(--text-muted);line-height:1.6"></div>
-<div id="oximetry-panel" class="card dashboard-charts-panel" style="display:none;position:relative">
-<div class="card-title">Oximetry</div>
-<div id="oximetry-status" style="font-size:.75rem;color:var(--text-muted);margin:4px 0 8px"></div>
-<div id="oximetry-chart-stack"></div>
+<div class="dash-options-bar" style="margin-top:12px">
+<label class="dash-toggle-row" title="When enabled, the time axis and oximetry data are clamped to CPAP therapy start/end times only">
+<input type="checkbox" id="dash-clamp-cpap" onchange="onDashClampCpapChange()">
+<span>Show SpO₂ only inside CPAP therapy times</span>
+</label>
 </div>
 </section>
 
@@ -3030,7 +3032,8 @@ function loadSessionData() { loadDashboardData(); }
  * Invalid marker: v1 dig == -1 -> gap, v2 dig == INT16_MIN -> gap
  */
 var dashCache = new Map();
-var dashCharts = [];        /* one uPlot per DASH_SIGNALS entry (parallel arrays) */
+var dashCharts = [];        /* one uPlot per dashActiveSignals entry (parallel arrays) */
+var dashActiveSignals = [];  /* filtered subset of DASH_SIGNALS currently rendered */
 var dashSessions = [];      /* sorted manifest from /api/sessions */
 var dashSessionData = [];   /* per-session { brp: {...}|null, pld: {...}|null } */
 var dashXRange = null;
@@ -3053,8 +3056,12 @@ var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
 /* Canonical oximetry tracks are the only oximetry representation consumed by
  * the browser. Vendor files are decoded on the device. */
 var oxLoadSeq = 0;
-var oxCharts = [];
 var oxData = null;
+
+/* When true, the x-axis range is derived from CPAP therapy times only
+ * (ignoring oximetry extents), and oximetry data is filtered to that range.
+ * Persisted in localStorage as 'somnotrace_clamp_cpap'. */
+var dashClampToCpap = false;
 
 function parseOximetrySnt(buf) {
   if (!buf || buf.byteLength < 64) return null;
@@ -3082,65 +3089,9 @@ function parseOximetrySnt(buf) {
   return out;
 }
 
-function mergeOxTrack(records, key) {
-  var t = [], v = [];
-  records.sort(function(a,b){ return a.t[0] - b.t[0]; });
-  records.forEach(function(r, ri) {
-    if (!r.t.length) return;
-    if (ri > 0) { t.push(r.t[0] - 1); v.push(NaN); }
-    for (var i = 0; i < r.t.length; i++) { t.push(r.t[i]); v.push(r[key][i]); }
-  });
-  return [t, v];
-}
-
-function renderOximetryCharts(records) {
-  var panel = document.getElementById('oximetry-panel');
-  var stack = document.getElementById('oximetry-chart-stack');
-  if (!panel || !stack) return;
-  oxCharts.forEach(function(c){ if (c) c.destroy(); });
-  oxCharts = [];
-  stack.textContent = '';
-  if (!records.length || typeof uPlot === 'undefined') {
-    panel.style.display = 'none';
-    return;
-  }
-  panel.style.display = '';
-  var shared = (typeof dashFullRange === 'function') ? dashFullRange() : null;
-  records.forEach(function(r){ if (r.t.length) { var lo=r.t[0], hi=r.t[r.t.length-1]; if (!shared) shared={min:lo,max:hi}; else { shared.min=Math.min(shared.min,lo); shared.max=Math.max(shared.max,hi); } } });
-  var specs = [
-    {key:'spo2', label:'SpO2', unit:'%', color:'#60a5fa', min:70, max:100},
-    {key:'pulse', label:'Pulse Rate', unit:'bpm', color:'#f87171', min:0, max:null},
-    {key:'motion', label:'Motion', unit:'source index', color:'#a78bfa', min:0, max:null}
-  ];
-  specs.forEach(function(spec) {
-    var row = document.createElement('div'); row.className = 'dash-signal-row';
-    var label = document.createElement('div'); label.className = 'dash-signal-label';
-    label.textContent = spec.label + ' (' + spec.unit + ')'; label.style.color = spec.color;
-    var el = document.createElement('div'); el.style.cssText = 'position:relative;touch-action:pan-y';
-    row.appendChild(label); row.appendChild(el); stack.appendChild(row);
-    var pair = mergeOxTrack(records.map(function(r){return {t:r.t,spo2:r.spo2,pulse:r.pulse,motion:r.motion};}), spec.key);
-    var opts = {
-      width: dashChartWidth(el), height: 170, padding:[6,8,0,0],
-      scales:{x:shared ? {time:false, min:shared.min, max:shared.max} : {time:false}, y:{auto:spec.max == null, min:spec.min, max:spec.max}},
-      series:[
-        {label:'Time', value:function(u,v){return v == null ? '' : new Date(v).toLocaleTimeString();}},
-        {label:spec.label, stroke:spec.color, width:0.8, spanGaps:false}
-      ],
-      axes:[
-        {stroke:cssVar('--text-muted'), font:'10px sans-serif', values:function(u,vals){return vals.map(function(v){return new Date(v).toLocaleTimeString();});}},
-        {stroke:cssVar('--text-muted'), font:'9px sans-serif', size:42}
-      ],
-      cursor:{sync:{key:'oximetry',setSeries:true},drag:{x:true,y:false}}, legend:{show:false}
-    };
-    try { oxCharts.push(new uPlot(opts, [pair[0], pair[1]], el)); } catch(e) { console.error('Oximetry chart error', e); }
-  });
-}
-
 function loadOximetryData(noonDay) {
   var seq = ++oxLoadSeq;
-  var panel = document.getElementById('oximetry-panel');
   var status = document.getElementById('oximetry-status');
-  if (panel) panel.style.display = 'none';
   fetch('/api/oximetry/recordings').then(function(r){
     if (!r.ok) throw new Error('oximetry list ' + r.status);
     return r.json();
@@ -3148,7 +3099,7 @@ function loadOximetryData(noonDay) {
     if (seq !== oxLoadSeq) return;
     var selected = (list || []).filter(function(x){ return x.noon_day === noonDay && x.state === 'ready'; });
     if (!selected.length) { if (status) status.textContent = ''; return; }
-    if (status) status.textContent = 'Loading canonical oximetry data...';
+    if (status) status.textContent = 'Loading oximetry...';
     return Promise.all(selected.map(function(item) {
       return fetch('/api/oximetry/file?id=' + encodeURIComponent(item.recording_id) + '&track=vitals')
         .then(function(r){ return r.ok ? r.arrayBuffer() : null; })
@@ -3159,11 +3110,19 @@ function loadOximetryData(noonDay) {
     records = records.filter(Boolean);
     oxData = records;
     if (status) status.textContent = records.length ? (records.length + ' oximetry recording' + (records.length === 1 ? '' : 's')) : '';
-    renderOximetryCharts(records);
+    /* If charts already exist and include oximetry panels, just push new data.
+     * If no charts exist or oximetry panels aren't present yet (signal set
+     * changed), rebuild from scratch to add them. */
+    var hasOxiPanels = dashActiveSignals.some(function(s) { return s.src === 'oxi'; });
+    if (dashCharts.length && hasOxiPanels) {
+      updateDashView();
+    } else {
+      dashXRange = null;
+      renderDashboardCharts();
+    }
   }).catch(function(e) {
     if (seq !== oxLoadSeq) return;
     oxData = null; if (status) status.textContent = 'Oximetry unavailable';
-    if (panel) panel.style.display = 'none';
     console.warn(e);
   });
 }
@@ -3172,25 +3131,32 @@ function loadOximetryData(noonDay) {
  * y-ranges.  All panels share one x time-range (dashXRange/dashFullRange) and
  * a synced cursor (cursor.sync key 'dash').  Order here is top→bottom on screen.
  *
- * src      — which parsed source sub-object the channel lives in ('brp'|'pld').
- * ch       — value key inside that sub-object (e.g. 'flow', 'press', 'leak').
+ * src      — which parsed source sub-object the channel lives in ('brp'|'pld'|'oxi').
+ * ch       — value key inside that sub-object (e.g. 'flow', 'press', 'leak', 'spo2').
  * minKey/maxKey — optional precomputed envelope arrays (only BRP L1 has them).
  * overlay  — optional second channel to plot on the same panel (e.g. EPR pressure).
- * y        — fixed {min,max} axis range, or {min,max:null} for floored auto-scale.
+ * y        — fixed {min,max} axis range, {min,max:null} for floored auto-scale,
+ *             or {range:fn} for fully custom auto-scaling.
  * height   — panel pixel height.
  */
 var DASH_SIGNALS = [
   { key:'flow',    label:'Breathing',  unit:'L/min', src:'brp', ch:'flow',
     minKey:'flowMin',  maxKey:'flowMax',  color:'#3b82f6',          y:{min:-150,max:150}, height:200, decimals:1 },
   { key:'press',   label:'Pressure',   unit:'cmH\u2082O', src:'pld', ch:'press',
-    minKey:null, maxKey:null,            color:'--color-pressure', y:{min:0,max:null},    height:200, decimals:1,
+    minKey:null, maxKey:null,            color:'--color-pressure', y:null,               height:200, decimals:1,
     overlay: { ch:'eprPress', label:'EPR', color:'#22c55e' } },
   { key:'leak',    label:'Leak Rate',  unit:'L/min', src:'pld', ch:'leak',
     minKey:null, maxKey:null,            color:'--color-leak',      y:{min:0,max:null},   height:200, decimals:1 },
   { key:'flowlim', label:'Flow Limit', unit:'',      src:'pld', ch:'flowlim',
     minKey:null, maxKey:null,            color:'--color-flowlim',   y:{min:0,max:1},      height:200, decimals:2 },
   { key:'snore',   label:'Snore',      unit:'',      src:'pld', ch:'snore',
-    minKey:null, maxKey:null,            color:'--color-snore',     y:{min:0,max:null},   height:200, decimals:2 }
+    minKey:null, maxKey:null,            color:'--color-snore',     y:{min:0,max:null},   height:200, decimals:2 },
+  { key:'spo2',    label:'SpO\u2082',      unit:'%',     src:'oxi', ch:'spo2',
+    minKey:null, maxKey:null,            color:'#60a5fa',           y:{range:function(u,dMin,dMax){if(dMin==null||!isFinite(dMin))return[90,100];var pad=Math.max(2,(dMax-dMin)*0.15);return[Math.max(50,Math.floor(dMin-pad)),Math.min(100,Math.ceil(dMax+pad))];}}, height:200, decimals:0 },
+  { key:'pulse',   label:'Pulse Rate',  unit:'bpm',   src:'oxi', ch:'pulse',
+    minKey:null, maxKey:null,            color:'#f87171',           y:null,               height:200, decimals:0 },
+  { key:'motion',  label:'Motion',      unit:'',      src:'oxi', ch:'motion',
+    minKey:null, maxKey:null,            color:'#a78bfa',           y:{min:0,max:null},   height:200, decimals:0 }
 ];
 
 /* ── AS11 data-gating window ────────────────────────────────────────────
@@ -3295,6 +3261,7 @@ function dashHasData() {
     var d = dashSessionData[i];
     if (d && ((d.brp && d.brp.ready) || (d.pld && d.pld.ready))) return true;
   }
+  if (oxData && oxData.length) return true;
   return false;
 }
 
@@ -3402,7 +3369,6 @@ function dashProgHide() {
  * the manifest's TherapyStart/Stop before the gates have loaded. Sessions with
  * no therapy are excluded. */
 function dashFullRange() {
-  if (!dashSessions.length) return null;
   var lo = Infinity, hi = -Infinity;
   for (var i = 0; i < dashSessions.length; i++) {
     var s = dashSessions[i];
@@ -3415,6 +3381,15 @@ function dashFullRange() {
                                        : (s.end_epoch_ms || s.start_epoch_ms);
     if (st < lo) lo = st;
     if (en > hi) hi = en;
+  }
+  if (oxData && !dashClampToCpap) {
+    for (var oi = 0; oi < oxData.length; oi++) {
+      var r = oxData[oi];
+      if (r && r.t && r.t.length) {
+        if (r.t[0] < lo) lo = r.t[0];
+        if (r.t[r.t.length - 1] > hi) hi = r.t[r.t.length - 1];
+      }
+    }
   }
   if (hi === -Infinity) return null;
   return {min: lo, max: hi};
@@ -3575,7 +3550,6 @@ function dashLowerBound(t, target) {
  * dashSessionData[i][sig.src]; value array is sub[sig.ch], with optional
  * precomputed envelope arrays sub[sig.minKey]/[sig.maxKey] (BRP L1). */
 function buildSignalData(sig, range, cols) {
-  if (!dashSessionData || !dashSessionData.length) return null;
   var full = dashFullRange();
   if (!full) return null;
   var vMin = range ? range.min : full.min;
@@ -3590,13 +3564,24 @@ function buildSignalData(sig, range, cols) {
   /* Sessions holding this signal's source that overlap the viewport, sorted by
    * start (ascending) so later sessions overwrite earlier ones per column. */
   var slices = [];
-  for (var i = 0; i < dashSessionData.length; i++) {
-    var rec = dashSessionData[i];
-    if (rec && rec.noTherapy) continue;
-    var sd = rec ? rec[sig.src] : null;
-    if (!sd || !sd.ready || !sd.t || !sd.t.length || !sd[sig.ch]) continue;
-    if (sd.t[sd.t.length - 1] < vMin || sd.t[0] > vMax) continue;
-    slices.push(sd);
+  if (sig.src === 'oxi') {
+    if (!oxData || !oxData.length) return null;
+    for (var oi = 0; oi < oxData.length; oi++) {
+      var orec = oxData[oi];
+      if (!orec || !orec.t || !orec.t.length || !orec[sig.ch]) continue;
+      if (orec.t[orec.t.length - 1] < vMin || orec.t[0] > vMax) continue;
+      slices.push(orec);
+    }
+  } else {
+    if (!dashSessionData || !dashSessionData.length) return null;
+    for (var i = 0; i < dashSessionData.length; i++) {
+      var rec = dashSessionData[i];
+      if (rec && rec.noTherapy) continue;
+      var sd = rec ? rec[sig.src] : null;
+      if (!sd || !sd.ready || !sd.t || !sd.t.length || !sd[sig.ch]) continue;
+      if (sd.t[sd.t.length - 1] < vMin || sd.t[0] > vMax) continue;
+      slices.push(sd);
+    }
   }
   if (!slices.length) return null;
   slices.sort(function(a, b) { return a.t[0] - b.t[0]; });
@@ -3651,14 +3636,19 @@ function buildSignalData(sig, range, cols) {
    * empty column. Without this, zooming in (pixel grid finer than the samples)
    * would isolate each sample between nulls and shatter the line into dots. */
   var gapThresh = Math.max(nativeDt, dt) * 2.5;
+  var hasEnv = !!(sig.minKey && sig.maxKey);
   var outT = [], outV = [];
   var prevTc = null;
   for (var k = 0; k < W; k++) {
     if (isNaN(gridMin[k])) continue;
     var tc = vMin + (k + 0.5) * dt;
     if (prevTc !== null && (tc - prevTc) > gapThresh) { outT.push(null); outV.push(null); }
-    outT.push(tc); outV.push(gridMin[k]);
-    outT.push(tc); outV.push(gridMax[k]);
+    if (hasEnv) {
+      outT.push(tc); outV.push(gridMin[k]);
+      outT.push(tc); outV.push(gridMax[k]);
+    } else {
+      outT.push(tc); outV.push((gridMin[k] + gridMax[k]) / 2);
+    }
     prevTc = tc;
   }
   if (!outT.length) return null;
@@ -4048,6 +4038,105 @@ function loadEvents(noonDay, loadId) {
     renderSummary();   /* AHI/indices now computable from event counts */
   });
 }
+/* uPlot draw hook for SpO2: overpaints the single-colour series with
+ * value-dependent segments to visualise desaturation risk.
+ *   >=95   → blue (#3b82f6)
+ *   90–95  → gradient blue→orange
+ *   85–90  → orange (#f59e0b)
+ *   <85    → bright red (#ef4444) */
+function spo2ColorMap(v) {
+  if (v >= 95) return '#3b82f6';
+  if (v < 85) return '#ef4444';
+  if (v < 90) return '#f59e0b';
+  /* 90–95: gradient blue → orange */
+  var t = (v - 90) / 5;
+  var r = Math.round(245 + (59 - 245) * t);
+  var g = Math.round(158 + (130 - 158) * t);
+  var b = Math.round(11 + (246 - 11) * t);
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+function spo2ColorHook(u) {
+  var idx = 1;
+  var data = u.data;
+  if (!data || !data[idx] || data[idx].length === 0) return;
+  var ctx = u.ctx;
+  var pr = u.pxRatio || 1;
+  var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(left, top, wid, hgt);
+  ctx.clip();
+  ctx.lineWidth = Math.max(1, pr);
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  var xs = data[0], ys = data[idx];
+  var prevPx = null, prevPy = null, prevV = null;
+  for (var i = 0; i < xs.length; i++) {
+    if (xs[i] == null || ys[i] == null || isNaN(ys[i])) { prevPx = null; continue; }
+    var px = u.valToPos(xs[i], 'x', true);
+    var py = u.valToPos(ys[i], 'spo2', true);
+    if (prevPx != null) {
+      var segV = (prevV + ys[i]) / 2;
+      ctx.strokeStyle = spo2ColorMap(segV);
+      ctx.beginPath();
+      ctx.moveTo(prevPx, prevPy);
+      ctx.lineTo(px, py);
+      ctx.stroke();
+    }
+    prevPx = px; prevPy = py; prevV = ys[i];
+  }
+  ctx.restore();
+}
+/* uPlot draw hook for oximetry panels: draws a dashed horizontal line at the
+ * average value across the current viewport, with a readable label.  The
+ * average is computed from the raw oxData filtered to the visible x-range so
+ * it stays accurate regardless of the column-based decimation.
+ * `sigKey` is 'spo2' or 'pulse', `unit` is '%' or 'bpm'. */
+var oxiAvgColors = { spo2: '#60a5fa', pulse: '#f87171' };
+function oxiAverageHook(sigKey, unit) {
+  return function(u) {
+    if (!oxData || !oxData.length) return;
+    var xmin = u.scales.x.min, xmax = u.scales.x.max;
+    var sum = 0, count = 0;
+    for (var i = 0; i < oxData.length; i++) {
+      var rec = oxData[i];
+      if (!rec || !rec.t || !rec[sigKey]) continue;
+      for (var j = 0; j < rec.t.length; j++) {
+        var t = rec.t[j];
+        if (t < xmin || t > xmax) continue;
+        var v = rec[sigKey][j];
+        if (!isNaN(v)) { sum += v; count++; }
+      }
+    }
+    if (count === 0) return;
+    var avg = sum / count;
+    var ctx = u.ctx;
+    var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
+    var y = u.valToPos(avg, sigKey, true);
+    if (y < top || y > top + hgt) return;
+    var pr = u.pxRatio || 1;
+    var color = oxiAvgColors[sigKey] || '#2563eb';
+    var lineColor = cssVar('--text-muted');
+    ctx.save();
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = Math.max(2, 2 * pr);
+    ctx.setLineDash([pr, 2 * pr]);
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(left + wid, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = color;
+    var fpx = (window.innerWidth <= 600) ? 28 : 16;
+    ctx.font = Math.round(fpx * pr) + 'px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('Avg ' + avg.toFixed(1) + unit, left + wid - 6, top + hgt - 4);
+    ctx.restore();
+  };
+}
 /* uPlot draw hook for the Breathing panel: translucent band + rotated label
  * per event visible in the current viewport (min 2px wide so brief events
  * stay visible when zoomed out). */
@@ -4122,6 +4211,7 @@ function loadDashboardData() {
   dashSessionData = [];
   dashEvents = [];
   dashEventsLoaded = false;
+  oxData = null;
   renderStreamQuality();
   loadSummary(noonDay, dashLoadId + 1);   /* loadId matches the increment below */
 
@@ -4347,15 +4437,22 @@ function dashChartCols(chart, el) {
 }
 
 /* Push current-range data into every panel without recreating them. */
+var updateDashViewTimer = null;
 function updateDashView() {
   if (!dashCharts.length) { renderDashboardCharts(); return; }
+  if (updateDashViewTimer) cancelAnimationFrame(updateDashViewTimer);
+  updateDashViewTimer = requestAnimationFrame(updateDashViewImpl);
+}
+
+function updateDashViewImpl() {
+  updateDashViewTimer = null;
   var full = dashFullRange(); if (!full) return;
   var cur = dashXRange || full;
   dashProgrammaticScale = true;
   for (var i = 0; i < dashCharts.length; i++) {
     var chart = dashCharts[i];
     if (!chart) continue;
-    var sig = DASH_SIGNALS[i];
+    var sig = dashActiveSignals[i] || DASH_SIGNALS[i];
     var src = buildSignalData(sig, cur, dashChartCols(chart));
     var chartEl = document.getElementById('chart-' + sig.key);
     if (chartEl) {
@@ -4393,11 +4490,13 @@ function makeDashPanel(sig, el, cur) {
   var data = sig.overlay
     ? [src ? src.t : ovSrc ? ovSrc.t : [], src ? src.v : [], ovSrc ? ovSrc.v : []]
     : (src ? [src.t, src.v] : [[], []]);
-  /* Y scale: no sig.y -> fully auto; both bounds -> fixed; only min (max null)
-   * -> hard floor with a dynamic top (used by Snore, floored at 0). */
+  /* Y scale: no sig.y -> fully auto; y.range fn -> custom auto; both bounds ->
+   * fixed; only min (max null) -> hard floor with a dynamic top. */
   var yScaleOpts;
   if (!sig.y) {
     yScaleOpts = { auto: true };
+  } else if (sig.y.range) {
+    yScaleOpts = { auto: true, range: sig.y.range };
   } else if (sig.y.max == null) {
     var floor = sig.y.min;
     yScaleOpts = { auto: true, range: function(u, dataMin, dataMax) {
@@ -4413,11 +4512,11 @@ function makeDashPanel(sig, el, cur) {
     padding: [6, 8, 0, 0],
     series: [
       { label: 'Time', value: function(u, v) { return v == null ? '' : dashTimeFmt(u)(v); } },
-      { label: sig.label, stroke: sigColor(sig),
-        scale: sig.key, width: 0.5, points: { show: false }, spanGaps: false }
+      { label: sig.label, stroke: (sig.key === 'spo2') ? 'transparent' : sigColor(sig),
+        scale: sig.key, width: 1, points: { show: false }, spanGaps: false }
     ].concat(sig.overlay ? [
       { label: sig.overlay.label, stroke: sig.overlay.color,
-        scale: sig.key, width: 0.5, points: { show: false }, spanGaps: false }
+        scale: sig.key, width: 1, points: { show: false }, spanGaps: false }
     ] : []),
     scales: (function(){ var sc = { x: cur || {} }; sc[sig.key] = yScaleOpts; return sc; })(),
     axes: [
@@ -4434,7 +4533,12 @@ function makeDashPanel(sig, el, cur) {
     },
     legend: { show: false },
     hooks: {
-      draw: (sig.key === 'flow') ? [breathEventsHook] : [],
+      draw: (sig.key === 'flow') ? [breathEventsHook]
+        : (sig.key === 'spo2') ? [spo2ColorHook]
+        : [],
+      drawAxes: (sig.key === 'spo2') ? [oxiAverageHook('spo2', '%')]
+        : (sig.key === 'pulse') ? [oxiAverageHook('pulse', 'bpm')]
+        : [],
       ready: [function(u) { attachDashInteractions(u, el, sig); attachDashTooltip(u, el, sig); }],
       setScale: [function(u, key) {
         if (key !== 'x' || dashIsPanning || dashProgrammaticScale) return;
@@ -4469,11 +4573,30 @@ function renderDashboardCharts() {
   var cur = dashXRange || full;
 
   if (!dashHasData()) {
-    stack.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:280px;color:var(--text-muted)">No session data</div>';
+    stack.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:280px;color:var(--text-muted)">No data for this day</div>';
     return;
   }
 
-  DASH_SIGNALS.forEach(function(sig) {
+  /* When there are no CPAP sessions at all but oximetry data exists, only show
+   * oximetry panels.  dashSessions.length is the right check because data
+   * loads asynchronously — brp/pld may not be ready yet on first render. */
+  var hasCpap = dashSessions && dashSessions.length > 0;
+  var hasOxi = oxData && oxData.length > 0;
+  /* When clamping to CPAP times, only show oximetry panels if the oximetry
+   * data actually overlaps the CPAP therapy time window. */
+  if (hasOxi && dashClampToCpap && full) {
+    hasOxi = oxData.some(function(rec) {
+      return rec && rec.t && rec.t.length &&
+             rec.t[0] <= full.max && rec.t[rec.t.length - 1] >= full.min;
+    });
+  }
+  var signals = DASH_SIGNALS.filter(function(sig) {
+    if (sig.src === 'oxi') return hasOxi;
+    return hasCpap;
+  });
+  dashActiveSignals = signals;
+
+  signals.forEach(function(sig) {
     var row = document.createElement('div');
     row.className = 'dash-signal-row';
     var lbl = document.createElement('div');
@@ -4592,7 +4715,24 @@ function attachDashInteractions(chart, el, sig) {
     dashboardZoomReset();
   });
 
+  /* Scroll-to-zoom is limited to the central 20% of each chart so the page
+   * can still scroll normally when the cursor is near the left/right edges.
+   * The cursor changes to ew-resize inside the zoom zone for visual feedback. */
+  var ZOOM_ZONE = 0.40; /* 40% margin each side → 20% active centre */
+  function inZoomZone(clientX) {
+    var rect = over.getBoundingClientRect();
+    var frac = (clientX - rect.left) / rect.width;
+    return frac >= ZOOM_ZONE && frac <= 1 - ZOOM_ZONE;
+  }
+  over.addEventListener('mousemove', function(e) {
+    over.style.cursor = inZoomZone(e.clientX) ? 'ew-resize' : '';
+  });
+  over.addEventListener('mouseleave', function() {
+    over.style.cursor = '';
+  });
+
   over.addEventListener('wheel', function(e) {
+    if (!inZoomZone(e.clientX)) return;  /* let page scroll */
     e.preventDefault();
     if (!dashCharts.length) return;
     var full = dashFullRange(); if (!full) return;
@@ -4754,6 +4894,15 @@ function dashboardZoomReset() {
   dashSetStatus('');
 }
 
+function onDashClampCpapChange() {
+  var cb = document.getElementById('dash-clamp-cpap');
+  if (!cb) return;
+  dashClampToCpap = cb.checked;
+  localStorage.setItem('somnotrace_clamp_cpap', dashClampToCpap ? '1' : '0');
+  dashXRange = null;
+  renderDashboardCharts();
+}
+
 function dashboardZoomIn() {
   if (!dashCharts.length) return;
   var full = dashFullRange(); if (!full) return;
@@ -4822,6 +4971,10 @@ window.addEventListener('resize', resizeDashboardChart);
 /* ── Boot ──────────────────────────────────────────────────────── */
 window.onload = function() {
   setTheme(localStorage.getItem('somnotrace_theme') || 'night');
+  var savedClamp = localStorage.getItem('somnotrace_clamp_cpap');
+  dashClampToCpap = savedClamp === null ? true : savedClamp === '1';
+  var clampCb = document.getElementById('dash-clamp-cpap');
+  if (clampCb) clampCb.checked = dashClampToCpap;
   applyPortalMode();
   connectWs();
   loadStatus();
