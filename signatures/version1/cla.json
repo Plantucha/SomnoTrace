@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "hungrycactus",
+      "id": 1281061,
+      "comment_id": 5402820230,
+      "created_at": "2026-08-24T23:22:48Z",
+      "repoId": 1285738854,
+      "pullRequestNo": 139
+    }
+  ]
 }
