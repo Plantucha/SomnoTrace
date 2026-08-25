@@ -3139,6 +3139,7 @@ function loadOximetryData(noonDay) {
  *             or {range:fn} for fully custom auto-scaling.
  * height   — panel pixel height.
  */
+var DASH_LINE_WIDTH = 0.75;   /* CSS px; all dashboard signal lines share this */
 var DASH_SIGNALS = [
   { key:'flow',    label:'Breathing',  unit:'L/min', src:'brp', ch:'flow',
     minKey:'flowMin',  maxKey:'flowMax',  color:'#3b82f6',          y:{min:-150,max:150}, height:200, decimals:1 },
@@ -3148,7 +3149,7 @@ var DASH_SIGNALS = [
   { key:'leak',    label:'Leak Rate',  unit:'L/min', src:'pld', ch:'leak',
     minKey:null, maxKey:null,            color:'--color-leak',      y:{min:0,max:null},   height:200, decimals:1 },
   { key:'flowlim', label:'Flow Limit', unit:'',      src:'pld', ch:'flowlim',
-    minKey:null, maxKey:null,            color:'--color-flowlim',   y:{min:0,max:1},      height:200, decimals:2 },
+    minKey:null, maxKey:null,            color:'--color-flowlim',   y:{min:0,max:null},   height:200, decimals:2 },
   { key:'snore',   label:'Snore',      unit:'',      src:'pld', ch:'snore',
     minKey:null, maxKey:null,            color:'--color-snore',     y:{min:0,max:null},   height:200, decimals:2 },
   { key:'spo2',    label:'SpO\u2082',      unit:'%',     src:'oxi', ch:'spo2',
@@ -4069,8 +4070,8 @@ function spo2ColorHook(u) {
   ctx.beginPath();
   ctx.rect(left, top, wid, hgt);
   ctx.clip();
-  /* Match uPlot's series line width: 1 CSS pixel in device pixels. */
-  var lw = Math.max(1, dpr);
+  /* Match the shared dashboard line width in device pixels. */
+  var lw = Math.max(0.1, dpr * DASH_LINE_WIDTH);
   ctx.lineWidth = lw;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
@@ -4186,7 +4187,7 @@ function breathEventsHook(u) {
     ctx.fillStyle = hexA(ev.color, 0.30);
     ctx.fillRect(x0, top, x1 - x0, hgt);
     ctx.strokeStyle = hexA(ev.color, 0.9);
-    ctx.lineWidth = Math.max(1, pr);
+    ctx.lineWidth = Math.max(0.1, pr * DASH_LINE_WIDTH);
     ctx.beginPath();
     ctx.moveTo(x0 + 0.5, top); ctx.lineTo(x0 + 0.5, top + hgt);
     ctx.moveTo(x1 - 0.5, top); ctx.lineTo(x1 - 0.5, top + hgt);
@@ -4525,10 +4526,10 @@ function makeDashPanel(sig, el, cur) {
     series: [
       { label: 'Time', value: function(u, v) { return v == null ? '' : dashTimeFmt(u)(v); } },
       { label: sig.label, stroke: (sig.key === 'spo2') ? 'transparent' : sigColor(sig),
-        scale: sig.key, width: 1, points: { show: false }, spanGaps: false }
+        scale: sig.key, width: DASH_LINE_WIDTH, points: { show: false }, spanGaps: false }
     ].concat(sig.overlay ? [
       { label: sig.overlay.label, stroke: sig.overlay.color,
-        scale: sig.key, width: 1, points: { show: false }, spanGaps: false }
+        scale: sig.key, width: DASH_LINE_WIDTH, points: { show: false }, spanGaps: false }
     ] : []),
     scales: (function(){ var sc = { x: cur || {} }; sc[sig.key] = yScaleOpts; return sc; })(),
     axes: [
