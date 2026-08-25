@@ -410,6 +410,24 @@ static bool write_vld3_export(const char *src, const char *dst, int64_t start_ms
     header[9] = size & 0xff; header[10] = (size >> 8) & 0xff; header[11] = (size >> 16) & 0xff;
     uint16_t duration = (uint16_t)(records * 4);
     header[13] = duration & 0xff; header[14] = duration >> 8;
+
+    /* Copy precomputed summary stats from the Format A trailer (48 bytes
+     * at end of source file) into the VLD v3 header.  Trailer layout
+     * per nglessner/o2ring-s-protocol README (verified against 27 vendor
+     * PDF exports).  VLD header offsets per OSCAR viatom_loader.cpp. */
+    uint8_t trailer[OX_SOURCE_TRAILER];
+    if (fseek(in, st.st_size - OX_SOURCE_TRAILER, SEEK_SET) != 0 ||
+        fread(trailer, 1, sizeof(trailer), in) != sizeof(trailer)) goto fail;
+    header[17] = trailer[34];              /* avg SpO2 */
+    header[18] = trailer[35];              /* min SpO2 (lowest) */
+    header[19] = trailer[36];              /* desaturation drops >= 3% */
+    header[20] = trailer[37];              /* desaturation drops >= 4% */
+    header[22] = trailer[39];              /* seconds with SpO2 < 90% (lo) */
+    header[23] = trailer[40];              /* seconds with SpO2 < 90% (hi) */
+    header[24] = trailer[41];              /* distinct desat episodes < 90% */
+    header[25] = trailer[42];              /* O2 score x10 (0xFF = N/A) */
+    header[30] = trailer[47];              /* avg HR */
+
     if (fwrite(header, 1, sizeof(header), out) != sizeof(header) || fseek(in, OX_SOURCE_HEADER, SEEK_SET) != 0) goto fail;
     for (uint32_t i = 0; i < records; i++) {
         uint8_t raw[3], selected[3] = {0xff, 0xff, 0};
@@ -417,10 +435,15 @@ static bool write_vld3_export(const char *src, const char *dst, int64_t start_ms
             if (fread(raw, 1, sizeof(raw), in) != sizeof(raw)) goto fail;
             if (j == 0) memcpy(selected, raw, sizeof(selected));
         }
-        uint8_t vld[5] = { selected[0], selected[1],
-                           (uint8_t)((selected[0] == 0 || selected[0] == 0xff ||
-                                      selected[1] == 0 || selected[1] == 0xff) ? 1 : 0),
-                           selected[2], 0 };
+        bool spo2_inv = (selected[0] == 0 || selected[0] == 0xff);
+        bool hr_inv   = (selected[1] == 0 || selected[1] == 0xff);
+        uint8_t vld[5] = {
+            spo2_inv ? 0xff : selected[0],
+            hr_inv   ? 0xff : selected[1],
+            (spo2_inv || hr_inv) ? 0xff : 0,
+            selected[2],
+            0
+        };
         if (fwrite(vld, 1, sizeof(vld), out) != sizeof(vld)) goto fail;
     }
     if (fflush(out) != 0 || fsync(fileno(out)) != 0) goto fail;
