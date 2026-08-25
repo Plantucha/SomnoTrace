@@ -4060,21 +4060,33 @@ function spo2ColorHook(u) {
   var data = u.data;
   if (!data || !data[idx] || data[idx].length === 0) return;
   var ctx = u.ctx;
-  var pr = u.pxRatio || 1;
+  /* Use the actual canvas backing-store / displayed ratio; u.pxRatio is set
+   * once at init and may not track zoom-induced DPPX changes. */
+  var canvas = ctx.canvas;
+  var dpr = (canvas && canvas.clientWidth > 0) ? (canvas.width / canvas.clientWidth) : (u.pxRatio || 1);
   var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
   ctx.save();
   ctx.beginPath();
   ctx.rect(left, top, wid, hgt);
   ctx.clip();
-  ctx.lineWidth = Math.max(1, pr);
+  /* Match uPlot's series line width: 1 CSS pixel in device pixels. */
+  var lw = Math.max(1, dpr);
+  ctx.lineWidth = lw;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
+  ctx.setLineDash([]);
+  ctx.miterLimit = 10;
+  /* Round to integer device pixels and apply a half-pixel offset when the
+   * line width is odd, matching uPlot's internal pxAlign behaviour. */
+  var round = Math.round;
+  var half = (lw % 2) / 2;
+  if (half) ctx.translate(half, half);
   var xs = data[0], ys = data[idx];
   var prevPx = null, prevPy = null, prevV = null;
   for (var i = 0; i < xs.length; i++) {
     if (xs[i] == null || ys[i] == null || isNaN(ys[i])) { prevPx = null; continue; }
-    var px = u.valToPos(xs[i], 'x', true);
-    var py = u.valToPos(ys[i], 'spo2', true);
+    var px = round(u.valToPos(xs[i], 'x', true));
+    var py = round(u.valToPos(ys[i], 'spo2', true));
     if (prevPx != null) {
       var segV = (prevV + ys[i]) / 2;
       ctx.strokeStyle = spo2ColorMap(segV);
