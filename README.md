@@ -124,7 +124,7 @@ flowchart LR
     ESP -->|View in Browser| WEB["Web Dashboard & Charts"]
 ```
 
-1. **Pair Once:** Pair SomnoTrace with your AirSense 11 over Bluetooth in seconds using the on-screen menu.
+1. **Pair Once:** [Pair SomnoTrace with your AirSense 11](docs/pairing.md) over Bluetooth in seconds using the on-screen menu.
 2. **Sleep Normally:** While you sleep, SomnoTrace records airflow, pressure, leak, and respiratory events in real time.
 3. **Automatic Processing:** When you turn off your CPAP, SomnoTrace generates standard, bit-accurate EDF files matching native SD card layouts.
 4. **Immediate Upload:** Sessions upload automatically to your configured network storage (SMB/NAS) and SleepHQ account.
@@ -180,6 +180,7 @@ If you prefer building from source code, Docker is the only dependency:
 ## Advanced Features & Documentation
 
 - 📖 **[Web Flashing Guide](docs/flashing.md)** — Easy browser-based installation guide for everyone.
+- 🔗 **[AirSense 11 Pairing Guide](docs/pairing.md)** — Pair your ResMed CPAP with SomnoTrace over Bluetooth.
 - ⚡ **[ResMed BLE RPC Bridge Guide](docs/rpc-bridge.md)** — Send direct queries and commands (`curl` examples) to the AirSense 11 over Wi-Fi.
 - 🏠 **[Smart Home & Home Assistant Guide](docs/automations.md)** — Set up bedtime automations, compliance tracking, and mask-off alerts.
 - 🛠️ **[Hardware Reference](docs/hardware/README.md)** — Pinouts, schematics, and hardware architecture.

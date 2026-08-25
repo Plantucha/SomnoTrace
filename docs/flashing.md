@@ -86,6 +86,14 @@ http://somnotrace.local
 
 ---
 
+### Step 7: Pair Your AirSense 11
+
+Once Wi-Fi is configured, the next step is to pair SomnoTrace with your CPAP over Bluetooth so therapy sessions can be recorded.
+
+👉 **[AirSense 11 Pairing Guide](pairing.md)**
+
+---
+
 ## Troubleshooting
 
 - **Browser doesn't show the Connect popup?**  
