@@ -121,7 +121,8 @@ A dedicated area showing real-time system metrics:
   - **Free Heap Memory** (split between Internal SRAM and PSRAM) over the last 60 seconds.
 
 ### 6.3 Logs Tab
-- A scrollable, terminal-style dark console container duplicating device logs (`stdout`/`stderr`).
+- A scrollable, terminal-style console container duplicating device logs (`stdout`/`stderr`), rendered with the active theme's tokens: dark console in Night mode, light console in Day mode.
+- Log lines are color-coded by ESP-IDF level for scannability, using the active theme's tokens: **Error** (`--danger`, bold, tinted row), **Warning** (`--warning`, tinted row), **Info** green, **Debug** muted grey, **Verbose** dim grey. Lines without a recognizable level prefix render in the console's plain text color.
 - Connects to `/api/logs/stream` via Server-Sent Events (SSE) or WebSockets to stream log output in real-time.
 - Features a "Download Logs" button and a search/filter search box.
 
@@ -175,3 +176,4 @@ Organized into simple sections:
 - 2026-07-02: Initial draft detailing design philosophy, split UI states, uPlot integration, and configurations.
 - 2026-07-02: Updated navigation tabs (Dashboard, Status, Logs, Settings), removed profile/notifications, added date picker with noon-to-noon boundary, expanded uPlot color palette to 8 distinct parameters, maximized mobile screen real estate, and detailed Status/Logs tabs.
 - 2026-07-02: Added keyboard typing prevention to the date picker, localized date format fallback rules (preventing `MM/DD/YYYY`), and text description helper labels to the theme selectors.
+- 2026-08-24: Logs Tab console now follows the active Day/Night theme tokens, and log lines are color-coded by ESP-IDF level — errors and warnings use tinted rows, info stays green.
