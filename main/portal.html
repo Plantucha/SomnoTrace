@@ -271,6 +271,9 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .info-row{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--card-border);padding-bottom:8px}
 .info-label{color:var(--text-muted);font-size:.85rem}
 .info-value{font-weight:600;font-size:.85rem}
+/* Status page network rows: wrapper is transparent to layout so the rows
+ * inherit .info-list's 10px flex gap exactly like every other info-row. */
+#status-nets{display:contents}
 
 /* ── Logs Tab ──────────────────────────────────────────────────── */
 .logs-container{display:flex;flex-direction:column;flex:1;min-height:380px;height:calc(100vh - 120px);height:calc(100dvh - 120px)}
@@ -961,14 +964,13 @@ Upload Progress
 <div class="info-row"><span class="info-label">Firmware</span><span class="info-value" id="status-fw">--</span></div>
 <div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="status-uptime">--</span></div>
 <div class="info-row"><span class="info-label">Local IP</span><span class="info-value" id="status-ip">--</span></div>
-<div class="info-row"><span class="info-label">Wi-Fi SSID</span><span class="info-value" id="status-ssid">--</span></div>
+<div id="status-nets"></div>
 <div class="info-row"><span class="info-label">Battery</span><span class="info-value" id="status-battery">--</span></div>
 <div class="info-row"><span class="info-label">Timezone</span><span class="info-value" id="status-tz">--</span></div>
 <div class="info-row"><span class="info-label">NTP Sync</span><span class="info-value" id="status-ntp">--</span></div>
 <div class="info-row"><span class="info-label">SD Card Free</span><span class="info-value" id="status-sd">--</span></div>
 <div class="info-row"><span class="info-label">Paired data source</span><span class="info-value" id="status-ble">--</span></div>
 <div class="info-row"><span class="info-label">O2 Ring</span><span class="info-value" id="status-ox">--</span></div>
-<div class="info-row"><span class="info-label">WiFi RSSI</span><span class="info-value" id="status-rssi">--</span></div>
 </div>
 <div class="card info-list">
 <div class="card-title">Device Telemetry</div>
@@ -1309,6 +1311,7 @@ var activeBlocks = 1;
 var manualSSID = {};
 var scannedNetworks = [];
 var savedPasswords = {};
+var connectedSSID = '';   /* SSID the device is currently associated with */
 
 var tzData = null;
 
@@ -1389,6 +1392,24 @@ function rssiIcon(rssi) {
   return svg;
 }
 
+/* Coloured quality circle for plain-text contexts (<option> can't do HTML):
+ * ≥ −60 dBm green, −74…−60 yellow, ≤ −75 red. */
+function sigCircle(rssi) {
+  return rssi >= -60 ? '🟢' : rssi >= -75 ? '🟡' : '🔴';
+}
+
+/* Matching CSS colour for the same signal bands. */
+function sigColor(rssi) {
+  return rssi >= -60 ? 'var(--success)' : rssi >= -75 ? 'var(--warning)' : 'var(--danger)';
+}
+
+/* Minimal HTML escaping for interpolated strings. */
+function escHtml(s) {
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
 /* ── WiFi Rendering ────────────────────────────────────────────── */
 function renderWifiBlocks() {
   var container = document.getElementById('wifi-blocks');
@@ -1404,7 +1425,12 @@ function renderWifiBlocks() {
     var block = document.createElement('div');
     block.className = 'wifi-block';
 
-    var headerHtml = '<div class="block-header"><span class="block-title">Network #' + i + '</span>';
+    /* Title and (CONNECTED) marker wrapped together so the space-between
+     * flex header keeps them adjacent, with Remove pushed to the right. */
+    var headerHtml = '<div class="block-header"><span style="display:flex;align-items:center;gap:8px">' +
+                     '<span class="block-title">Network #' + i + '</span>' +
+                     '<span id="conn-marker-' + i + '" style="display:none;color:var(--success);font-size:.72rem;font-weight:700;letter-spacing:.04em">(CONNECTED)</span>' +
+                     '</span>';
     if (i > 1) headerHtml += '<button type="button" class="btn-remove-net" onclick="removeWifiBlock(' + i + ')">Remove</button>';
     headerHtml += '</div>';
 
@@ -1431,7 +1457,7 @@ function renderWifiBlocks() {
     if (manualSSID[i]) {
       sCont.innerHTML = '<input id="ssid-' + i + '" type="text" placeholder="Enter network name" class="form-control" data-dirty="false" oninput="markWifiDirty()">';
     } else {
-      sCont.innerHTML = '<select id="ssid-' + i + '" class="form-control" data-dirty="false" onchange="markWifiDirty()"><option value="">— Select a network —</option></select>';
+      sCont.innerHTML = '<select id="ssid-' + i + '" class="form-control" data-dirty="false" onchange="markWifiDirty();updateConnMarkers()"><option value="">— Select a network —</option></select>';
       populateWifiSelect(i);
     }
 
@@ -1444,6 +1470,19 @@ function renderWifiBlocks() {
 
   var addBtn = document.getElementById('btn-add-wifi');
   if (addBtn) addBtn.style.display = (activeBlocks < 4) ? '' : 'none';
+  updateConnMarkers();
+}
+
+/* Show the green "(connected)" marker on the block whose SSID matches the
+ * currently associated network. */
+function updateConnMarkers() {
+  for (var i = 1; i <= activeBlocks; i++) {
+    var m = document.getElementById('conn-marker-' + i);
+    if (!m) continue;
+    var el = document.getElementById('ssid-' + i);
+    var ssidVal = el ? el.value.trim() : '';
+    m.style.display = (connectedSSID !== '' && ssidVal === connectedSSID) ? '' : 'none';
+  }
 }
 
 function populateWifiSelect(id) {
@@ -1456,7 +1495,7 @@ function populateWifiSelect(id) {
     o.value = n.ssid;
     o.innerHTML = n.ssid + '  ' + rssiIcon(n.rssi) + (n.lock ? ' 🔒' : '');
     // For option text (no HTML in options), use plain text fallback
-    o.textContent = n.ssid + ' (' + n.rssi + ' dBm)' + (n.lock ? ' 🔒' : '');
+    o.textContent = sigCircle(n.rssi) + ' ' + n.ssid + ' (' + n.rssi + ' dBm)' + (n.lock ? ' 🔒' : '');
     if (n.ssid === currentVal) o.selected = true;
     sel.appendChild(o);
   });
@@ -1648,8 +1687,42 @@ function loadStatusTab(d) {
    * old flat fields for backward compatibility. */
   var wifi = d.wifi || {};
   setEl('status-ip', wifi.up ? (wifi.ip || '--') : 'Disconnected');
-  setEl('status-ssid', wifi.up ? (wifi.ssid || '--') : '--');
-  setEl('status-rssi', (wifi.rssi != null && wifi.rssi > -128) ? (wifi.rssi + ' dBm') : '--');
+  connectedSSID = (wifi.up && wifi.ssid) ? wifi.ssid : '';
+  updateConnMarkers();
+
+  /* Configured networks: one row per slot (#1..#N). The connected network
+   * shows its live RSSI and coloured signal circle; the rest are greyed
+   * out as inactive, with last-seen scan dBm when available. */
+  var netsEl = document.getElementById('status-nets');
+  if (netsEl) {
+    var ssids = d.ssids || [];
+    var rows = '';
+    if (!ssids.length) {
+      rows = '<div class="info-row"><span class="info-label">Wi-Fi</span>' +
+             '<span class="info-value" style="color:var(--text-muted)">none configured</span></div>';
+    }
+    ssids.forEach(function(s, idx) {
+      if (!s) return;
+      var isConn = (s === connectedSSID);
+      var dbm = null;
+      if (isConn && wifi.rssi != null && wifi.rssi > -128) {
+        dbm = wifi.rssi;
+      } else {
+        for (var k = 0; k < scannedNetworks.length; k++) {
+          if (scannedNetworks[k].ssid === s) { dbm = scannedNetworks[k].rssi; break; }
+        }
+      }
+      rows += '<div class="info-row"><span class="info-label">Wi-Fi Network #' + (idx + 1) + '</span>' +
+              '<span class="info-value"' +
+              (isConn && dbm != null ? ' style="color:' + sigColor(dbm) + '"' :
+               !isConn ? ' style="color:var(--text-muted)"' : '') + '>' +
+              (isConn && dbm != null ? '<span style="font-size:.85rem;line-height:1">' + sigCircle(dbm) + '</span> ' : '') +
+              escHtml(s) +
+              (dbm != null ? ' (' + dbm + ' dBm)' : '') +
+              '</span></div>';
+    });
+    netsEl.innerHTML = rows;
+  }
 
   /* Battery */
   var batt = d.battery || {};
