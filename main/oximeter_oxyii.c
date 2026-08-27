@@ -939,8 +939,8 @@ static esp_err_t oxyii_pull_file(const char *name)
     if (!finalised) return ESP_FAIL;
 
     char source_path[640];
-    snprintf(source_path, sizeof(source_path), "%s/oximetry/files/%s/%s.bin",
-             SD_MOUNT_POINT, s_serial, name);
+    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s.bin",
+             s_serial, name);
     if (oximetry_canonical_convert_format_a(s_serial, name, source_path,
                                             oxyii_filename_epoch_ms(name)) != ESP_OK) {
         ESP_LOGW(TAG, "canonical conversion pending for '%s'", name);
@@ -1178,9 +1178,12 @@ static void canonical_migration_task(void *arg)
  * Sets OX_STATUS_PULLING, runs F1 → file list → per-file pull.
  * On F1 exhaustion, marks served so the watch stops reconnecting.
  * Returns true if all files pulled (or none to pull), false on failure.
+ * *pulled_any is set to true if at least one file was actually downloaded
+ * and finalised (as opposed to all files being already in the index).
  * s_presence_served may be set inside on F1 exhaustion. */
-static bool do_pull_and_mark(void)
+static bool do_pull_and_mark(bool *pulled_any)
 {
+    if (pulled_any) *pulled_any = false;
     set_state(OX_STATUS_PULLING);
 
     char names[32][17];
@@ -1222,6 +1225,7 @@ static bool do_pull_and_mark(void)
             pull_ok = false;
             break;
         }
+        if (pulled_any) *pulled_any = true;
     }
     return pull_ok;
 }
@@ -1346,7 +1350,29 @@ static void pull_task(void *arg)
                         break;
                     }
 
-                    bool pull_ok = do_pull_and_mark();
+                    /* Give the ring time to flush the just-finished
+                     * recording to its internal flash before we query
+                     * the file list.  Without this delay the new file
+                     * may not appear yet, causing a missed pull. */
+                    ESP_LOGI(TAG, "watch: off-finger — waiting 3s for ring to finalize recording");
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
+                        break;
+
+                    bool pulled_any = false;
+                    bool pull_ok = do_pull_and_mark(&pulled_any);
+
+                    /* If the first check found no new files, the ring
+                     * may still be finalizing.  Wait once more and retry
+                     * before giving up on this sync window. */
+                    if (pull_ok && !pulled_any &&
+                        s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                        ESP_LOGI(TAG, "watch: no new files yet — waiting 5s for ring to finalize");
+                        vTaskDelay(pdMS_TO_TICKS(5000));
+                        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+                            pull_ok = do_pull_and_mark(&pulled_any);
+                    }
+
                     do_disconnect();
 
                     if (pull_ok) {
@@ -1436,7 +1462,7 @@ static void pull_task(void *arg)
             continue;
         }
 
-        bool pull_ok = do_pull_and_mark();
+        bool pull_ok = do_pull_and_mark(NULL);
         do_disconnect();
         if (pull_ok) {
             s_presence_served = true;
