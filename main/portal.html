@@ -3743,19 +3743,14 @@ function buildSignalData(sig, range, cols) {
    * empty column. Without this, zooming in (pixel grid finer than the samples)
    * would isolate each sample between nulls and shatter the line into dots. */
   var gapThresh = Math.max(nativeDt, dt) * 2.5;
-  var hasEnv = !!(sig.minKey && sig.maxKey);
   var outT = [], outV = [];
   var prevTc = null;
   for (var k = 0; k < W; k++) {
     if (isNaN(gridMin[k])) continue;
     var tc = vMin + (k + 0.5) * dt;
     if (prevTc !== null && (tc - prevTc) > gapThresh) { outT.push(null); outV.push(null); }
-    if (hasEnv) {
-      outT.push(tc); outV.push(gridMin[k]);
-      outT.push(tc); outV.push(gridMax[k]);
-    } else {
-      outT.push(tc); outV.push((gridMin[k] + gridMax[k]) / 2);
-    }
+    outT.push(tc); outV.push(gridMin[k]);
+    outT.push(tc); outV.push(gridMax[k]);
     prevTc = tc;
   }
   if (!outT.length) return null;
