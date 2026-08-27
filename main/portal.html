@@ -2924,12 +2924,6 @@ window.addEventListener('beforeunload', closeWsCleanly);
 var LOG_LEVEL_CLASS = { E: 'log-error', W: 'log-warn', I: 'log-info', D: 'log-debug', V: 'log-verbose' };
 var LOG_LEVEL_RE = /^([EIWVD]) ?\(([\d:.]+)\) /;
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, function(c) {
-    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-  });
-}
-
 function logLineClass(line) {
   var m = LOG_LEVEL_RE.exec(line);
   return m ? LOG_LEVEL_CLASS[m[1]] : 'log-plain';
@@ -2943,7 +2937,7 @@ function renderLogTerminal(forceScroll) {
     : logLines;
   var html = '';
   for (var i = 0; i < lines.length; i++) {
-    html += '<div class="' + logLineClass(lines[i]) + '">' + (lines[i] ? escapeHtml(lines[i]) : ' ') + '</div>';
+    html += '<div class="' + logLineClass(lines[i]) + '">' + (lines[i] ? escHtml(lines[i]) : ' ') + '</div>';
   }
   term.innerHTML = html;
   /* Auto-scroll to bottom unless user has scrolled up deliberately. */
