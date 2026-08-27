@@ -270,13 +270,10 @@ static int scan_day(const char *day, upload_ox_ref_t *out, int max_out)
         if (!r->source_name[0]) strlcpy(r->source_name, "source.bin", sizeof(r->source_name));
         const char *rels[] = { "recording.json", "source/source.bin" };
         char gen_dir[32]; snprintf(gen_dir, sizeof(gen_dir), "generations/%u", (unsigned)r->generation);
-        char rel_manifest[UPLOAD_OX_REL_LEN]; char rel_track[UPLOAD_OX_REL_LEN];
-        char rel_export[UPLOAD_OX_REL_LEN];
+        char rel_manifest[UPLOAD_OX_REL_LEN];
         snprintf(rel_manifest, sizeof(rel_manifest), "%s/manifest.json", gen_dir);
-        snprintf(rel_track, sizeof(rel_track), "%s/data/vitals.snt", gen_dir);
-        snprintf(rel_export, sizeof(rel_export), "%s/exports/sleephq/recording.vld", gen_dir);
-        const char *all[] = { rels[0], rels[1], rel_manifest, rel_track, rel_export };
-        for (int i = 0; i < 5; i++) {
+        const char *all[] = { rels[0], rels[1], rel_manifest };
+        for (int i = 0; i < 3; i++) {
             char local[UPLOAD_OX_PATH_LEN]; if (!join2(local, sizeof(local), root, all[i])) continue;
             struct stat st; if (stat(local, &st) != 0 || !S_ISREG(st.st_mode)) continue;
             strlcpy(r->local_paths[r->n_files], local, sizeof(r->local_paths[r->n_files]));
@@ -284,7 +281,7 @@ static int scan_day(const char *day, upload_ox_ref_t *out, int max_out)
             r->fingerprint = file_fp(r->fingerprint, all[i], local);
         }
         cJSON_Delete(p);
-        if (r->n_files >= 4) n++;
+        if (r->n_files >= 2) n++;
     }
     closedir(d); return n;
 }

@@ -388,70 +388,6 @@ fail:
     return false;
 }
 
-static bool write_vld3_export(const char *src, const char *dst, int64_t start_ms)
-{
-    struct stat st;
-    if (stat(src, &st) != 0 || st.st_size < OX_SOURCE_HEADER + OX_SOURCE_TRAILER) return false;
-    uint64_t body = (uint64_t)st.st_size - OX_SOURCE_HEADER - OX_SOURCE_TRAILER;
-    uint32_t source_count = (uint32_t)(body / 3);
-    uint32_t records = (source_count + 3) / 4;
-    if (records == 0 || records > 65535 || 40ULL + (uint64_t)records * 5 > UINT32_MAX) return false;
-    FILE *in = fopen(src, "rb"); FILE *out = fopen(dst, "wb");
-    if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return false; }
-    uint8_t header[40] = {0};
-    struct tm tm; time_t sec = (time_t)(start_ms / 1000);
-    if (!localtime_r(&sec, &tm)) goto fail;
-    header[0] = 3; header[1] = 0;
-    uint16_t year = (uint16_t)(tm.tm_year + 1900);
-    header[2] = year & 0xff; header[3] = year >> 8;
-    header[4] = (uint8_t)(tm.tm_mon + 1); header[5] = (uint8_t)tm.tm_mday;
-    header[6] = (uint8_t)tm.tm_hour; header[7] = (uint8_t)tm.tm_min; header[8] = (uint8_t)tm.tm_sec;
-    uint32_t size = 40 + records * 5;
-    header[9] = size & 0xff; header[10] = (size >> 8) & 0xff; header[11] = (size >> 16) & 0xff;
-    uint16_t duration = (uint16_t)(records * 4);
-    header[13] = duration & 0xff; header[14] = duration >> 8;
-
-    /* Copy precomputed summary stats from the Format A trailer (48 bytes
-     * at end of source file) into the VLD v3 header.  Trailer layout
-     * per nglessner/o2ring-s-protocol README (verified against 27 vendor
-     * PDF exports).  VLD header offsets per OSCAR viatom_loader.cpp. */
-    uint8_t trailer[OX_SOURCE_TRAILER];
-    if (fseek(in, st.st_size - OX_SOURCE_TRAILER, SEEK_SET) != 0 ||
-        fread(trailer, 1, sizeof(trailer), in) != sizeof(trailer)) goto fail;
-    header[17] = trailer[34];              /* avg SpO2 */
-    header[18] = trailer[35];              /* min SpO2 (lowest) */
-    header[19] = trailer[36];              /* desaturation drops >= 3% */
-    header[20] = trailer[37];              /* desaturation drops >= 4% */
-    header[22] = trailer[39];              /* seconds with SpO2 < 90% (lo) */
-    header[23] = trailer[40];              /* seconds with SpO2 < 90% (hi) */
-    header[24] = trailer[41];              /* distinct desat episodes < 90% */
-    header[25] = trailer[42];              /* O2 score x10 (0xFF = N/A) */
-    header[30] = trailer[47];              /* avg HR */
-
-    if (fwrite(header, 1, sizeof(header), out) != sizeof(header) || fseek(in, OX_SOURCE_HEADER, SEEK_SET) != 0) goto fail;
-    for (uint32_t i = 0; i < records; i++) {
-        uint8_t raw[3], selected[3] = {0xff, 0xff, 0};
-        for (int j = 0; j < 4 && (i * 4 + (uint32_t)j) < source_count; j++) {
-            if (fread(raw, 1, sizeof(raw), in) != sizeof(raw)) goto fail;
-            if (j == 0) memcpy(selected, raw, sizeof(selected));
-        }
-        bool spo2_inv = (selected[0] == 0 || selected[0] == 0xff);
-        bool hr_inv   = (selected[1] == 0 || selected[1] == 0xff);
-        uint8_t vld[5] = {
-            spo2_inv ? 0xff : selected[0],
-            hr_inv   ? 0xff : selected[1],
-            (spo2_inv || hr_inv) ? 0xff : 0,
-            selected[2],
-            0
-        };
-        if (fwrite(vld, 1, sizeof(vld), out) != sizeof(vld)) goto fail;
-    }
-    if (fflush(out) != 0 || fsync(fileno(out)) != 0) goto fail;
-    fclose(in); if (fclose(out) != 0) return false; return true;
-fail:
-    fclose(in); fclose(out); unlink(dst); return false;
-}
-
 static bool source_complete_format_a(const char *path)
 {
     struct stat st;
@@ -585,9 +521,6 @@ typedef struct {
     char stage_source[OXIMETRY_CANONICAL_MAX_PATH];
     char stage_track_tmp[OXIMETRY_CANONICAL_MAX_PATH];
     char stage_track[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_export_dir[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_export[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_export_file[OXIMETRY_CANONICAL_MAX_PATH];
     char stage_gen_manifest[OXIMETRY_CANONICAL_MAX_PATH];
     char gen_parent[OXIMETRY_CANONICAL_MAX_PATH];
     char stage_pointer[OXIMETRY_CANONICAL_MAX_PATH];
@@ -641,9 +574,6 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
         !path_join2(p->stage_source, sizeof(p->stage_source), p->stage_source_dir, "source.bin") ||
         !path_join2(p->stage_track_tmp, sizeof(p->stage_track_tmp), p->stage_data_dir, "vitals.snt.tmp") ||
         !path_join2(p->stage_track, sizeof(p->stage_track), p->stage_data_dir, "vitals.snt") ||
-        !path_join2(p->stage_export_dir, sizeof(p->stage_export_dir), p->stage_gen_dir, "exports") ||
-        !path_join3(p->stage_export, sizeof(p->stage_export), p->stage_gen_dir, "exports", "sleephq") ||
-        !path_join2(p->stage_export_file, sizeof(p->stage_export_file), p->stage_export, "recording.vld") ||
         !path_join2(p->stage_gen_manifest, sizeof(p->stage_gen_manifest), p->stage_gen_dir, "manifest.json")) {
         free(p);
         return ESP_ERR_INVALID_SIZE;
@@ -659,8 +589,6 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     mkdir_one(p->gen_parent);
     mkdir_one(p->stage_gen_dir);
     mkdir_one(p->stage_data_dir);
-    mkdir_one(p->stage_export_dir);
-    mkdir_one(p->stage_export);
 
     if (!path_join2(p->stage_pointer, sizeof(p->stage_pointer), p->stage_dir, "recording.json")) {
         free(p);
@@ -690,7 +618,6 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     if (!source_ok || source_size != (uint64_t)st.st_size ||
         !write_snt3_format_a(source_path, p->stage_track_tmp, start_utc_ms, &count, &track_crc) ||
         (unlink(p->stage_track), rename(p->stage_track_tmp, p->stage_track) != 0) ||
-        !write_vld3_export(source_path, p->stage_export_file, start_utc_ms) ||
         build_generation_manifest(p->stage_gen_manifest, device_id, recording_id,
                                   basename_safe(source_path), start_utc_ms, end_ms,
                                   (uint32_t)source_size, source_crc, count, track_crc) != ESP_OK) {

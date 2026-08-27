@@ -808,11 +808,11 @@ static upload_result_t shq_put_oximetry(const upload_ox_ref_t *ref)
 {
     if (!s_tls || !s_import_id[0] || !ref) return UPLOAD_ERR_TRANSIENT;
     for (int i = 0; i < ref->n_files; i++) {
-        if (!strstr(ref->relative_paths[i], "/exports/sleephq/recording.vld")) continue;
+        if (strcmp(ref->relative_paths[i], "source/source.bin") != 0) continue;
         char subpath[96];
         snprintf(subpath, sizeof(subpath), "/OXYMETRY/%s", ref->day);
         char filename[128];
-        snprintf(filename, sizeof(filename), "%s.vld",
+        snprintf(filename, sizeof(filename), "%s",
                  ref->source_name[0] ? ref->source_name : "oximetry");
         if (shq_upload_file(s_tls, s_import_id, ref->local_paths[i], subpath,
                             filename, true) != UPLOAD_OK)

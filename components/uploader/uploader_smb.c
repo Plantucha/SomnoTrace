@@ -365,29 +365,14 @@ static upload_result_t smb_ox_day_begin(const char *day)
 static upload_result_t smb_put_oximetry(const upload_ox_ref_t *ref)
 {
     if (!s_smb || !ref || !ref->recording_id[0]) return UPLOAD_ERR_TRANSIENT;
-    char base[640];
-    snprintf(base, sizeof(base), "%s/OXYMETRY/%s/%s", s_remote_base,
-             ref->day, ref->recording_id);
-    smb2_mkdir(s_smb, base);
-    char tree[760];
-    snprintf(tree, sizeof(tree), "%s/source", base); smb2_mkdir(s_smb, tree);
-    snprintf(tree, sizeof(tree), "%s/generations", base); smb2_mkdir(s_smb, tree);
-    snprintf(tree, sizeof(tree), "%s/generations/%u", base, (unsigned)ref->generation); smb2_mkdir(s_smb, tree);
-    snprintf(tree, sizeof(tree), "%s/generations/%u/data", base, (unsigned)ref->generation); smb2_mkdir(s_smb, tree);
-    char path[760];
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < ref->n_files; i++) {
-            bool root_pointer = strcmp(ref->relative_paths[i], "recording.json") == 0;
-            if ((pass == 0 && root_pointer) || (pass == 1 && !root_pointer)) continue;
-            snprintf(path, sizeof(path), "%s/%s", base, ref->relative_paths[i]);
-            char parent[760]; strlcpy(parent, path, sizeof(parent));
-            char *slash = strrchr(parent, '/');
-            if (slash) { *slash = '\0'; smb2_mkdir(s_smb, parent); }
-            if (smb_upload_file(s_smb, ref->local_paths[i], path) != UPLOAD_OK)
-                return UPLOAD_ERR_TRANSIENT;
-        }
+    for (int i = 0; i < ref->n_files; i++) {
+        if (strcmp(ref->relative_paths[i], "source/source.bin") != 0) continue;
+        char path[760];
+        snprintf(path, sizeof(path), "%s/OXYMETRY/%s/%s", s_remote_base,
+                 ref->day, ref->recording_id);
+        return smb_upload_file(s_smb, ref->local_paths[i], path);
     }
-    return UPLOAD_OK;
+    return UPLOAD_ERR_PERMANENT;
 }
 
 static upload_result_t smb_day_end(const char *day, bool any_uploaded)
