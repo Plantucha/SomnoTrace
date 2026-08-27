@@ -38,6 +38,9 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 --color-airflow:#38bdf8;--color-pressure:#fb923c;--color-leak:#c084fc;
 --color-spo2:#60a5fa;--color-pulse:#f87171;
 --color-flowlim:#f472b6;--color-snore:#34d399;
+--term-bg:#0b1120;--term-border:#1e293b;
+--log-error:#f87171;--log-warn:#fbbf24;--log-info:#34d399;--log-debug:#94a3b8;--log-verbose:#64748b;--log-plain:#cbd5e1;
+--log-error-bg:rgba(248,113,113,.14);--log-warn-bg:rgba(251,191,36,.11);
 --space-xs:4px;--space-sm:8px;--space-md:14px;--space-lg:20px;--space-xl:28px;
 --text-xs:.72rem;--text-sm:.8rem;--text-base:.85rem;--text-md:.9rem;--text-lg:.95rem;--text-xl:1rem;
 }
@@ -49,6 +52,9 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 --color-airflow:#0284c7;--color-pressure:#ea580c;--color-leak:#7c3aed;
 --color-spo2:#2563eb;--color-pulse:#dc2626;
 --color-flowlim:#db2777;--color-snore:#059669;
+--term-bg:#ffffff;--term-border:#e2e8f0;
+--log-error:#dc2626;--log-warn:#b45309;--log-info:#047857;--log-debug:#64748b;--log-verbose:#94a3b8;--log-plain:#334155;
+--log-error-bg:rgba(220,38,38,.06);--log-warn-bg:rgba(217,119,6,.08);
 }
 [data-theme="day"] .badge-green{background:#ecfdf5;color:#047857;border:1px solid #10b981;box-shadow:0 1px 5px rgba(16,185,129,.25)}
 [data-theme="day"] .badge-blue{background:#eff6ff;color:#1d4ed8;border:1px solid #3b82f6;box-shadow:0 1px 5px rgba(59,130,246,.25)}
@@ -283,7 +289,14 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .logs-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap}
 .logs-search{background:var(--input-bg);border:1px solid var(--border-color);color:var(--text);padding:8px 12px;border-radius:6px;outline:none;font-size:.85rem;width:220px}
 .logs-search:focus{border-color:var(--input-focus)}
-.terminal{flex:1;min-height:0;background:#030712;border:1px solid #1e293b;border-radius:8px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.82rem;overflow-y:auto;color:#34d399;white-space:pre-wrap;line-height:1.4}
+.terminal{flex:1;min-height:0;background:var(--term-bg);border:1px solid var(--term-border);border-radius:8px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.82rem;overflow-y:auto;color:var(--log-plain);white-space:pre-wrap;line-height:1.4}
+.terminal *{font-family:inherit}
+.log-error{color:var(--log-error);font-weight:600;background:var(--log-error-bg)}
+.log-warn{color:var(--log-warn);background:var(--log-warn-bg)}
+.log-info{color:var(--log-info)}
+.log-debug{color:var(--log-debug)}
+.log-verbose{color:var(--log-verbose)}
+.log-plain{color:var(--log-plain)}
 
 /* ── BLE Section ───────────────────────────────────────────────── */
 .ble-status-paired{font-size:.9rem;margin-bottom:8px;padding:10px 12px;background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.2);border-radius:8px}
@@ -2908,13 +2921,31 @@ var closeWsCleanly = function() {
 window.addEventListener('pagehide', closeWsCleanly);
 window.addEventListener('beforeunload', closeWsCleanly);
 
+var LOG_LEVEL_CLASS = { E: 'log-error', W: 'log-warn', I: 'log-info', D: 'log-debug', V: 'log-verbose' };
+var LOG_LEVEL_RE = /^([EIWVD]) ?\(([\d:.]+)\) /;
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function logLineClass(line) {
+  var m = LOG_LEVEL_RE.exec(line);
+  return m ? LOG_LEVEL_CLASS[m[1]] : 'log-plain';
+}
+
 function renderLogTerminal(forceScroll) {
   var term = document.getElementById('log-terminal');
   if (!term) return;
   var lines = logFilterQuery
     ? logLines.filter(function(l) { return l.toLowerCase().indexOf(logFilterQuery) >= 0; })
     : logLines;
-  term.textContent = lines.join('\n');
+  var html = '';
+  for (var i = 0; i < lines.length; i++) {
+    html += '<div class="' + logLineClass(lines[i]) + '">' + (lines[i] ? escapeHtml(lines[i]) : ' ') + '</div>';
+  }
+  term.innerHTML = html;
   /* Auto-scroll to bottom unless user has scrolled up deliberately. */
   var atBottom = forceScroll || (term.scrollHeight - term.scrollTop - term.clientHeight) < 80;
   if (atBottom) term.scrollTop = term.scrollHeight;
