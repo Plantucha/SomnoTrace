@@ -261,10 +261,21 @@ esp_err_t bsp_audio_init(void)
     esp_err_t ret = i2c_bus_setup();
     if (ret != ESP_OK) return ret;
 
-    /* ── ES8311 codec ─── */
-    ret = es8311_init();
+    /* ── ES8311 codec ───
+     * The ES8311 may NACK register writes immediately after power-up
+     * even when the I2C probe succeeds — the codec ACKs its address
+     * but is not yet ready to accept data.  Retry the full init
+     * sequence with a delay between attempts. */
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        ret = es8311_init();
+        if (ret == ESP_OK) break;
+        if (attempt < 3) {
+            ESP_LOGW(TAG, "ES8311 init attempt %d/3 failed, retrying in 300ms", attempt);
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ES8311 init failed, audio will be unavailable");
+        ESP_LOGE(TAG, "ES8311 init failed after 3 attempts, audio will be unavailable");
         return ret;
     }
 
