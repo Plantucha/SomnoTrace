@@ -450,6 +450,7 @@ esp_err_t netprov_init(void)
 /*  STA connect with scan + candidate selection                       */
 /* ------------------------------------------------------------------ */
 static esp_err_t try_single_ssid(const char *ssid, const char *pass,
+                                 const wifi_ap_record_t *rec,
                                  char *ip_out, int timeout_ms)
 {
     if (s_portal_mode) return ESP_FAIL;
@@ -461,6 +462,11 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
     strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
     strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
     wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    if (rec) {
+        memcpy(wc.sta.bssid, rec->bssid, sizeof(wc.sta.bssid));
+        wc.sta.bssid_set = true;
+        wc.sta.channel   = rec->primary;
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
@@ -606,8 +612,9 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
 
         for (int attempt = 1; attempt <= MAX_STA_RETRY; attempt++) {
             esp_err_t err = try_single_ssid(cfg->wifi[slot].ssid,
-                                            cfg->wifi[slot].pass, ip_out,
-                                            timeout_ms);
+                                            cfg->wifi[slot].pass,
+                                            &cands[i].rec,
+                                            ip_out, timeout_ms);
             if (err == ESP_OK) return ESP_OK;
             if (attempt < MAX_STA_RETRY) {
                 ESP_LOGI(TAG, "waiting 5 s before retry %d/%d",
