@@ -1406,7 +1406,7 @@ function sigCircle(rssi) {
 }
 
 /* Matching CSS colour for the same signal bands. */
-function sigColor(rssi) {
+function rssiColor(rssi) {
   return rssi >= -60 ? 'var(--success)' : rssi >= -75 ? 'var(--warning)' : 'var(--danger)';
 }
 
@@ -1721,7 +1721,7 @@ function loadStatusTab(d) {
       }
       rows += '<div class="info-row"><span class="info-label">Wi-Fi Network #' + (idx + 1) + '</span>' +
               '<span class="info-value"' +
-              (isConn && dbm != null ? ' style="color:' + sigColor(dbm) + '"' :
+              (isConn && dbm != null ? ' style="color:' + rssiColor(dbm) + '"' :
                !isConn ? ' style="color:var(--text-muted)"' : '') + '>' +
               (isConn && dbm != null ? '<span style="font-size:.85rem;line-height:1">' + sigCircle(dbm) + '</span> ' : '') +
               escHtml(s) +
