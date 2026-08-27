@@ -101,6 +101,7 @@ static uint8_t s_rotation = 0;  /* current LCD rotation in degrees */
 #define LCD_STRIP_BUFS 2
 static uint16_t *s_strip[LCD_STRIP_BUFS] = { NULL, NULL };
 static SemaphoreHandle_t s_flush_done = NULL;
+static volatile bool s_flush_stuck = false;
 static TaskHandle_t s_display_task = NULL;
 
 /* ── Display state (single-owner render task model) ──────────────────
@@ -336,9 +337,17 @@ static void lcd_flush(void)
 
         /* Wait for a strip buffer to become free.  Never abandon a transfer
          * mid-flight — reusing a buffer whose DMA is still running corrupts
-         * the panel's DC/RAMWR stream and wedges the controller. */
+         * the panel's DC/RAMWR stream and wedges the controller.
+         *
+         * A 200 ms timeout (2000× the expected ~0.1 ms transfer time)
+         * guards against a permanently wedged DMA — the panel is reset on
+         * the next display_task iteration via lcd_panel_hw_recover(). */
         if (inflight >= LCD_STRIP_BUFS) {
-            xSemaphoreTake(s_flush_done, portMAX_DELAY);
+            if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(200)) != pdTRUE) {
+                ESP_LOGW(TAG, "lcd_flush: DMA timeout, aborting frame");
+                s_flush_stuck = true;
+                return;
+            }
             inflight--;
         }
 
@@ -353,7 +362,11 @@ static void lcd_flush(void)
     }
     /* Drain remaining in-flight transfers. */
     while (inflight > 0) {
-        xSemaphoreTake(s_flush_done, portMAX_DELAY);
+        if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(200)) != pdTRUE) {
+            ESP_LOGW(TAG, "lcd_flush: DMA drain timeout, aborting");
+            s_flush_stuck = true;
+            return;
+        }
         inflight--;
     }
 }
@@ -1223,6 +1236,16 @@ static void display_task(void *arg)
                 last_render = now;
             }
         }
+
+        /* If lcd_flush() timed out, the DMA/SPI bus is wedged.  Reset the
+         * panel hardware and force a full re-render on the next iteration. */
+        if (s_flush_stuck) {
+            s_flush_stuck = false;
+            lcd_panel_hw_recover();
+            last_mode = (disp_mode_t)-1;
+            continue;
+        }
+
         last_mode = mode;
 
         /* One-shot high-water mark after the first render to verify the

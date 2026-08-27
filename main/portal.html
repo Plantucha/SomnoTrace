@@ -2031,7 +2031,15 @@ function updateBleUI(ble) {
   var pg = document.getElementById('ble-passkey-group');
 
   if (ble.state === 'waiting_passkey') { pg.style.display = 'block'; bleStatusMsg('Enter the code shown on your CPAP screen'); return; }
-  if (ble.state === 'connecting') { bleStatusMsg('Connecting to device…'); return; }
+  if (ble.state === 'connecting') {
+    if (ble.paired) {
+      if (paired) paired.style.display = 'none';
+      if (unp) unp.style.display = 'none';
+      if (fgt) fgt.style.display = 'none';
+    }
+    bleStatusMsg('Connecting to device…');
+    return;
+  }
   if (ble.state === 'confirming') { bleStatusMsg('Verifying code…'); return; }
   if (ble.state === 'error') { if (blePollTimer) clearInterval(blePollTimer); if (pg) pg.style.display = 'none'; bleStatusMsg('Error: ' + (ble.error || 'pairing failed')); return; }
 
