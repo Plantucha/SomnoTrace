@@ -2,8 +2,6 @@
   <img src="assets/svg/logo-full.svg" alt="SomnoTrace" width="480" />
 </p>
 
-# SomnoTrace
-
 > A plug-and-play wireless bridge that pulls CPAP therapy and pulse oximetry data over Bluetooth, automatically saves standard European Data Format (EDF) files, and uploads them to your home network (NAS/SMB) or SleepHQ — **no SD card swapping or Wi-Fi SD cards required**.
 
 Created and architected by **Ilya Kruchinin** ([@ilyakruchinin](https://github.com/ilyakruchinin)).  
