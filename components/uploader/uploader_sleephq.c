@@ -808,7 +808,9 @@ static upload_result_t shq_put_oximetry(const upload_ox_ref_t *ref)
 {
     if (!s_tls || !s_import_id[0] || !ref) return UPLOAD_ERR_TRANSIENT;
     for (int i = 0; i < ref->n_files; i++) {
-        if (strcmp(ref->relative_paths[i], "source/source.bin") != 0) continue;
+        const char *rel = ref->relative_paths[i];
+        if (strcmp(rel, "source/source.bin") != 0 &&
+            strcmp(rel, "source/source.vld") != 0) continue;
         char subpath[96];
         snprintf(subpath, sizeof(subpath), "/OXYMETRY/%s", ref->day);
         char filename[128];

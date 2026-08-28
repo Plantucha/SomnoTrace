@@ -1295,12 +1295,20 @@ static esp_err_t ox_pair_handler(httpd_req_t *req)
     }
     cJSON *j = cJSON_Parse(body);
     cJSON *addr = j ? cJSON_GetObjectItem(j, "addr") : NULL;
+    cJSON *type = j ? cJSON_GetObjectItem(j, "type") : NULL;
     if (!cJSON_IsString(addr)) {
         if (j) cJSON_Delete(j);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing addr");
         return ESP_FAIL;
     }
-    esp_err_t e = oximeter_pair(addr->valuestring);
+    ox_driver_t driver = OX_DRIVER_OXYII;
+    if (cJSON_IsString(type)) {
+        if (strcmp(type->valuestring, "legacy") == 0)
+            driver = OX_DRIVER_LEGACY;
+        else if (strcmp(type->valuestring, "oxyii") == 0)
+            driver = OX_DRIVER_OXYII;
+    }
+    esp_err_t e = oximeter_pair(addr->valuestring, driver);
     cJSON_Delete(j);
     if (e != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pair start failed");

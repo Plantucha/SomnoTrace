@@ -1,13 +1,13 @@
 /*
- * SomnoTrace - O2 Ring (OxyII) BLE protocol codec and session
+ * SomnoTrace - O2 Ring (Legacy/Gen1) BLE protocol codec and session
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  *
  * This file is part of SomnoTrace.
  *
  * SomnoTrace is free software: you can redistribute it and/or modify it under
- * the terms of the GNU General Public License as published by the Free Software
- * Foundation, either version 3 of the License, or (at your option) any later
- * version.
+ * the terms of the GNU General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version.
  *
  * SomnoTrace is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
@@ -21,8 +21,9 @@
  * attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
  * (https://github.com/ilyakruchinin)." See the NOTICE file for details.
  *
- * Clean-room OxyII BLE protocol for Wellue O2 Ring S / SleepHQ O2 Ring Pro.
- * See spec/0003-o2ring-ble-sync.md.
+ * Clean-room Legacy BLE protocol for Wellue O2 Ring (Gen1) / ViaTom rings.
+ * Protocol studied from published documentation; no third-party source
+ * code copied.
  */
 
 #include "oximeter.h"
@@ -59,7 +60,7 @@
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 
-static const char *TAG = "ox_oxyii";
+static const char *TAG = "ox_legacy";
 
 /* ── Store forward declarations (oximeter_store.c) ─────────────────── */
 void ox_store_ensure_dirs(void);
@@ -77,48 +78,47 @@ void ox_store_index_add(const char *serial, const char *name,
                         uint32_t bytes, bool finalised);
 long ox_store_part_size(const char *name);
 esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len);
-bool ox_store_promote(const char *serial, const char *name);
+bool ox_store_promote_vld3(const char *serial, const char *name);
 void ox_store_part_remove(const char *name);
 
-/* ── OxyII protocol constants ──────────────────────────────────────── */
-#define OXYII_LEAD         0xA5
-#define OXYII_HEADER_LEN   7
-#define OXYII_MAX_FRAME    2048
+/* ── Legacy protocol constants ──────────────────────────────────────── */
+#define LEGACY_REQ_LEAD     0xAA
+#define LEGACY_RSP_LEAD     0x55
+#define LEGACY_HEADER_LEN   7   /* sync | cmd | cmd^0xFF | block(2) | len(2) */
+#define LEGACY_MAX_FRAME    2048
+#define LEGACY_BLE_CHUNK    20  /* max bytes per BLE write */
 
-#define OP_GET_CONFIG      0x00
-#define OP_LIVE_B          0x04
-#define OP_SETUP           0x10
-#define OP_SET_UTC_TIME    0xC0
-#define OP_GET_INFO        0xE1
-#define OP_GET_BATTERY     0xE4
-#define OP_GET_FILE_LIST   0xF1
-#define OP_READ_FILE_START 0xF2
-#define OP_READ_FILE_DATA  0xF3
-#define OP_READ_FILE_END   0xF4
-#define OP_AUTH            0xFF
+/* Command codes */
+#define CMD_FILE_OPEN       0x03
+#define CMD_FILE_READ       0x04
+#define CMD_FILE_CLOSE      0x05
+#define CMD_INFO            0x14
+#define CMD_PING            0x15
+#define CMD_CONFIG          0x16
+#define CMD_READ_SENSORS    0x17
+#define CMD_RT_DATA         0x1B
 
-#define MFG_OXYII          0xF34E
-#define MFG_RECORDING      0x036F
+/* VLD3 file format constants */
+#define VLD3_HEADER_LEN     40
+#define VLD3_RECORD_LEN     5
+#define VLD3_NO_FINGER      0xFF
 
-/* MD5("lepucloud") = c2a7cf50dafed885a8f8f7eac44335f3 */
-static const uint8_t LEPUCLOUD_MD5[16] = {
-    0xc2, 0xa7, 0xcf, 0x50, 0xda, 0xfe, 0xd8, 0x85,
-    0xa8, 0xf8, 0xf7, 0xea, 0xc4, 0x43, 0x35, 0xf3,
-};
+/* Legacy GATT UUIDs (128-bit, stored little-endian for NimBLE).
+ * Service:  14839ac4-7d7e-415c-9a42-167340cf2339
+ * Write:    8b00ace7-eb0b-49b0-bbe9-9aee0a26e1a3
+ * Notify:   0734594a-a8e7-4b1a-a6b1-cd5243059a57 */
+static const ble_uuid128_t LEGACY_SVC_UUID =
+    BLE_UUID128_INIT(0x39, 0x23, 0xcf, 0x40, 0x73, 0x16, 0x42, 0x9a,
+                     0x5c, 0x41, 0x7e, 0x7d, 0xc4, 0x9a, 0x83, 0x14);
+static const ble_uuid128_t LEGACY_WRITE_UUID =
+    BLE_UUID128_INIT(0xa3, 0xe1, 0x26, 0x0a, 0xee, 0x9a, 0xb0, 0x49,
+                     0x0b, 0xeb, 0xe7, 0xac, 0x00, 0x8b, 0x00, 0x00);
+static const ble_uuid128_t LEGACY_NOTIFY_UUID =
+    BLE_UUID128_INIT(0x57, 0x9a, 0x05, 0x43, 0x52, 0xcd, 0xb1, 0xa6,
+                     0x1a, 0x4b, 0xe7, 0xa8, 0x4a, 0x59, 0x34, 0x07);
 
-/* OxyII GATT UUIDs (128-bit, stored little-endian for NimBLE) */
-static const ble_uuid128_t OXYII_SVC_UUID =
-    BLE_UUID128_INIT(0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
-                     0xf9, 0x98, 0x4b, 0xa1, 0x01, 0x00, 0xfb, 0xe8);
-static const ble_uuid128_t OXYII_WRITE_UUID =
-    BLE_UUID128_INIT(0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
-                     0xf9, 0x98, 0x4b, 0xa1, 0x02, 0x00, 0xfb, 0xe8);
-static const ble_uuid128_t OXYII_NOTIFY_UUID =
-    BLE_UUID128_INIT(0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
-                     0xf9, 0x98, 0x4b, 0xa1, 0x03, 0x00, 0xfb, 0xe8);
-
-/* ── CRC8 (poly=0x07, init=0) ──────────────────────────────────────── */
-static uint8_t oxyii_crc8(const uint8_t *data, int len)
+/* ── CRC8 (poly=0x07, init=0) — same as OxyII ──────────────────────── */
+static uint8_t legacy_crc8(const uint8_t *data, int len)
 {
     uint8_t crc = 0;
     for (int i = 0; i < len; i++) {
@@ -132,126 +132,54 @@ static uint8_t oxyii_crc8(const uint8_t *data, int len)
 }
 
 /* ── Frame codec ───────────────────────────────────────────────────── */
-/* Encode an OxyII frame into buf.  Returns total frame length. */
-static int oxyii_encode(uint8_t *buf, int bufsz, uint8_t op,
-                         uint8_t flag, uint8_t seq,
+/* Encode a Legacy request frame into buf.  Returns total frame length.
+ * Request: 0xAA | cmd | cmd^0xFF | block(LE16) | len(LE16) | data | crc8 */
+static int legacy_encode(uint8_t *buf, int bufsz, uint8_t cmd,
+                         uint16_t block,
                          const uint8_t *payload, int payload_len)
 {
-    int total = OXYII_HEADER_LEN + payload_len + 1;
+    int total = LEGACY_HEADER_LEN + payload_len + 1;
     if (total > bufsz) return -1;
 
-    buf[0] = OXYII_LEAD;
-    buf[1] = op;
-    buf[2] = ~op;
-    buf[3] = flag;
-    buf[4] = seq;
+    buf[0] = LEGACY_REQ_LEAD;
+    buf[1] = cmd;
+    buf[2] = cmd ^ 0xFF;
+    buf[3] = block & 0xFF;
+    buf[4] = (block >> 8) & 0xFF;
     buf[5] = payload_len & 0xFF;
     buf[6] = (payload_len >> 8) & 0xFF;
     if (payload && payload_len > 0)
         memcpy(buf + 7, payload, payload_len);
-    buf[total - 1] = oxyii_crc8(buf, total - 1);
+    buf[total - 1] = legacy_crc8(buf, total - 1);
     return total;
 }
 
-/* Try to decode a frame from buf.  Returns total frame length on success,
- * -1 if incomplete (need more data), -2 if invalid (bad lead/crc). */
-static int oxyii_try_decode(const uint8_t *buf, int len,
-                             uint8_t *op, uint8_t *flag, uint8_t *seq,
-                             uint8_t *payload, int *payload_len,
-                             int payload_cap)
+/* Try to decode a Legacy response frame from buf.
+ * Response: 0x55 | status | status^0xFF | block(LE16) | len(LE16) | data | crc8
+ * Returns total frame length on success, -1 if incomplete, -2 if invalid. */
+static int legacy_try_decode(const uint8_t *buf, int len,
+                              uint8_t *status, uint16_t *block,
+                              uint8_t *payload, int *payload_len,
+                              int payload_cap)
 {
-    if (len < OXYII_HEADER_LEN) return -1;
-    if (buf[0] != OXYII_LEAD) return -2;
-    if ((uint8_t)(~buf[1]) != buf[2]) return -2;
+    if (len < LEGACY_HEADER_LEN) return -1;
+    if (buf[0] != LEGACY_RSP_LEAD) return -2;
+    if ((uint8_t)(buf[1] ^ 0xFF) != buf[2]) return -2;
 
     int plen = buf[5] | (buf[6] << 8);
-    int total = OXYII_HEADER_LEN + plen + 1;
+    int total = LEGACY_HEADER_LEN + plen + 1;
     if (len < total) return -1;
 
-    if (oxyii_crc8(buf, total - 1) != buf[total - 1]) return -2;
+    if (legacy_crc8(buf, total - 1) != buf[total - 1]) return -2;
 
-    if (op)   *op = buf[1];
-    if (flag) *flag = buf[3];
-    if (seq)  *seq = buf[4];
+    if (status) *status = buf[1];
+    if (block)  *block = buf[3] | (buf[4] << 8);
     if (payload && payload_cap > 0) {
         int n = plen < payload_cap ? plen : payload_cap;
         memcpy(payload, buf + 7, n);
     }
     if (payload_len) *payload_len = plen;
     return total;
-}
-
-/* ── Auth payload ──────────────────────────────────────────────────── */
-/* Derive session key and XOR with LEPUCLOUD_MD5 to produce auth payload. */
-static void oxyii_auth_payload(uint8_t *out16)
-{
-    uint8_t key[16];
-    /* key[0..7] = LEPUCLOUD_MD5 even-indexed bytes */
-    for (int i = 0; i < 8; i++)
-        key[i] = LEPUCLOUD_MD5[i * 2];
-    /* key[8..11] = "0000" (default serial prefix) */
-    memcpy(key + 8, "0000", 4);
-    /* key[12..15] = (ts >> 0), (ts >> 1), (ts >> 2), (ts >> 3) — not LE bytes */
-    time_t now = time(NULL);
-    for (int i = 0; i < 4; i++)
-        key[12 + i] = (now >> i) & 0xFF;
-    /* auth = key XOR LEPUCLOUD_MD5 */
-    for (int i = 0; i < 16; i++)
-        out16[i] = key[i] ^ LEPUCLOUD_MD5[i];
-}
-
-/* ── SET_UTC_TIME payload (8 bytes) ────────────────────────────────── */
-static void oxyii_time_payload(uint8_t *out8)
-{
-    time_t now = time(NULL);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    out8[0] = (tm.tm_year + 1900) & 0xFF;
-    out8[1] = ((tm.tm_year + 1900) >> 8) & 0xFF;
-    out8[2] = tm.tm_mon + 1;
-    out8[3] = tm.tm_mday;
-    out8[4] = tm.tm_hour;
-    out8[5] = tm.tm_min;
-    out8[6] = tm.tm_sec;
-    out8[7] = 0x00;
-}
-
-static int64_t oxyii_filename_epoch_ms(const char *name)
-{
-    if (!name || strlen(name) < 14) return 0;
-    for (int i = 0; i < 14; i++)
-        if (name[i] < '0' || name[i] > '9') return 0;
-    struct tm tm = {0};
-    int year, mon, day, hour, min, sec;
-    if (sscanf(name, "%4d%2d%2d%2d%2d%2d", &year, &mon, &day,
-               &hour, &min, &sec) != 6)
-        return 0;
-    tm.tm_year = year - 1900;
-    tm.tm_mon = mon - 1;
-    tm.tm_mday = day;
-    tm.tm_hour = hour;
-    tm.tm_min = min;
-    tm.tm_sec = sec;
-    tm.tm_isdst = -1;
-    time_t t = mktime(&tm);
-    return t == (time_t)-1 ? 0 : (int64_t)t * 1000;
-}
-
-/* ── READ_FILE_START payload (20 bytes) ────────────────────────────── */
-static void oxyii_file_start_payload(uint8_t *out20, const char *name)
-{
-    memset(out20, 0, 20);
-    strncpy((char *)out20, name, 16);
-    /* bytes 16..19: file type = 0 */
-}
-
-/* ── READ_FILE_DATA payload (4 bytes) ──────────────────────────────── */
-static void oxyii_file_data_payload(uint8_t *out4, uint32_t offset)
-{
-    out4[0] = offset & 0xFF;
-    out4[1] = (offset >> 8) & 0xFF;
-    out4[2] = (offset >> 16) & 0xFF;
-    out4[3] = (offset >> 24) & 0xFF;
 }
 
 /* ── Module state ──────────────────────────────────────────────────── */
@@ -261,14 +189,13 @@ struct ox_scan_result {
     ble_addr_t addr;
     char name[32];
     int rssi;
-    uint16_t mfg;
 };
 
 static SemaphoreHandle_t s_state_mtx;
-static SemaphoreHandle_t s_ops_mtx;     /* serialise BLE ops (scan/pair/pull) */
-static SemaphoreHandle_t s_op_sem;      /* GATT op completion */
-static SemaphoreHandle_t s_conn_sem;    /* connect completion */
-static SemaphoreHandle_t s_resp_sem;    /* notification response */
+static SemaphoreHandle_t s_ops_mtx;
+static SemaphoreHandle_t s_op_sem;
+static SemaphoreHandle_t s_conn_sem;
+static SemaphoreHandle_t s_resp_sem;
 static SemaphoreHandle_t s_scan_done;
 static volatile int s_op_status;
 static volatile int s_conn_status;
@@ -276,7 +203,6 @@ static volatile int s_conn_status;
 static char s_status[24] = OX_STATUS_IDLE;
 static char s_error[128];
 
-/* Paired ring info (loaded from NVS at init) */
 static char s_serial[32];
 static char s_firmware[16];
 static char s_name_prefix[16];
@@ -285,20 +211,6 @@ static bool s_paired = false;
 static bool s_presence_served = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
-static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
-static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
-
-/* Measured: END powers off ~120s after take-off IF no one connects.
- * Any GATT connection resets that timer. Pull happens inside the
- * window, so after a pull: never reconnect while the advert lasts.
- * Still advertising at pull+130s can only mean re-worn. */
-#define OX_END_WINDOW_MS  130000
-#define OX_WORN_PROBE_MS  60000  /* LIVE_B interval while worn; END lasts ~120s */
-#define OX_F1_MAX_RETRIES 3      /* give up on F1 after N consecutive timeouts */
-
-/* Persistent-mode polling: one held connection, unauthenticated LIVE_B.
- * See .ai/OXIMETRY2.md for the experiment that established this value. */
-#define OX_PERSISTENT_POLL_MS 30000
 
 /* BLE connection state */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -306,17 +218,17 @@ static uint16_t s_write_handle;
 static uint16_t s_notify_handle;
 static uint16_t s_cccd_handle;
 static uint16_t s_svc_start, s_svc_end;
-static uint8_t s_seq = 0;
 
 /* Scan state */
 static struct ox_scan_result s_scan[OX_SCAN_MAX];
 static int s_scan_count;
 
 /* Notification accumulation buffer */
-static uint8_t s_resp_buf[OXYII_MAX_FRAME];
+static uint8_t s_resp_buf[LEGACY_MAX_FRAME];
 static int s_resp_len;
-static uint8_t s_resp_opcode;
-static uint8_t s_resp_payload[OXYII_MAX_FRAME];
+static uint8_t s_resp_status;
+static uint16_t s_resp_block;
+static uint8_t s_resp_payload[LEGACY_MAX_FRAME];
 static int s_resp_payload_len;
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
@@ -350,7 +262,9 @@ static int wait_op(int timeout_ms)
     return s_op_status;
 }
 
-static bool name_is_oxyii(const char *name)
+/* Check if a BLE advert name matches a Gen1 O2 Ring / ViaTom device.
+ * Match: first token (space-separated) contains "O2", or is exactly "CMRing". */
+static bool name_is_legacy(const char *name)
 {
     if (!name || !name[0]) return false;
     char up[32];
@@ -358,8 +272,17 @@ static bool name_is_oxyii(const char *name)
     for (i = 0; i < 31 && name[i]; i++)
         up[i] = toupper((unsigned char)name[i]);
     up[i] = '\0';
-    return strncmp(up, "S8-AW", 5) == 0 ||
-           strncmp(up, "SHQO2PRO", 8) == 0;
+
+    /* Check first token only */
+    int tok_len = 0;
+    while (up[tok_len] && up[tok_len] != ' ' && tok_len < 31) tok_len++;
+    char first[32];
+    memcpy(first, up, tok_len);
+    first[tok_len] = '\0';
+
+    if (strcmp(first, "CMRING") == 0) return true;
+    if (strstr(first, "O2") != NULL) return true;
+    return false;
 }
 
 static void addr_to_str(const ble_addr_t *a, char *out, size_t outsz)
@@ -376,8 +299,6 @@ static bool parse_addr(const char *str, ble_addr_t *out)
     if (n != 6) return false;
     out->val[5] = v[0]; out->val[4] = v[1]; out->val[3] = v[2];
     out->val[2] = v[3]; out->val[1] = v[4]; out->val[0] = v[5];
-    /* Static random addresses have the top two bits of the most-significant
-     * byte set (0xC0 mask).  O2 Ring uses a static random address. */
     out->type = (v[0] & 0xC0) == 0xC0 ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
     return true;
 }
@@ -385,7 +306,6 @@ static bool parse_addr(const char *str, ble_addr_t *out)
 /* ── GAP event handler ─────────────────────────────────────────────── */
 static int gap_event(struct ble_gap_event *event, void *arg);
 
-/* Handle notification: accumulate and try to decode. */
 static void handle_notify_rx(const uint8_t *data, int len)
 {
     if (s_resp_len + len > (int)sizeof(s_resp_buf)) {
@@ -396,12 +316,14 @@ static void handle_notify_rx(const uint8_t *data, int len)
     memcpy(s_resp_buf + s_resp_len, data, len);
     s_resp_len += len;
 
-    uint8_t op, flag, seq;
+    uint8_t status;
+    uint16_t block;
     int plen;
-    int rc = oxyii_try_decode(s_resp_buf, s_resp_len, &op, &flag, &seq,
+    int rc = legacy_try_decode(s_resp_buf, s_resp_len, &status, &block,
                                s_resp_payload, &plen, sizeof(s_resp_payload));
     if (rc > 0) {
-        s_resp_opcode = op;
+        s_resp_status = status;
+        s_resp_block = block;
         s_resp_payload_len = plen;
         s_resp_len = 0;
         xSemaphoreGive(s_resp_sem);
@@ -409,7 +331,6 @@ static void handle_notify_rx(const uint8_t *data, int len)
         ESP_LOGW(TAG, "notify decode error, resetting buffer");
         s_resp_len = 0;
     }
-    /* rc == -1: incomplete, wait for more data */
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -420,7 +341,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         char addr_str[18];
         addr_to_str(&event->disc.addr, addr_str, sizeof(addr_str));
 
-        /* Parse name from adv data (with manual fallback) */
         struct ble_hs_adv_fields f;
         char name[32] = {0};
         const uint8_t *raw = event->disc.data;
@@ -438,9 +358,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                     int nl = ad_data_len < 31 ? ad_data_len : 31;
                     memcpy(name, ad_data, nl);
                     name[nl] = '\0';
-                } else if (ad_type == 0xFF && ad_data_len >= 2) {
-                    f.mfg_data = ad_data;
-                    f.mfg_data_len = ad_data_len;
                 }
                 off += 1 + ad_len;
             }
@@ -452,16 +369,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
         }
 
-        uint16_t cid = 0;
-        if (f.mfg_data && f.mfg_data_len >= 2)
-            cid = f.mfg_data[0] | (f.mfg_data[1] << 8);
-
-        /* Recording-mode advert (on-finger): never a pull candidate. */
-        if (cid == MFG_RECORDING)
-            return 0;
-
-        bool match = name_is_oxyii(name) || cid == MFG_OXYII;
-        if (!match) return 0;
+        if (!name_is_legacy(name)) return 0;
         if (name[0] == '\0')
             strlcpy(name, "O2Ring", sizeof(name));
 
@@ -470,8 +378,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             if (memcmp(&s_scan[i].addr, &event->disc.addr,
                        sizeof(ble_addr_t)) == 0) {
                 s_scan[i].rssi = event->disc.rssi;
-                s_scan[i].mfg = cid;
-                if (name[0] && strncmp(name, "O2Ring", 6) != 0)
+                if (name[0])
                     strlcpy(s_scan[i].name, name, sizeof(s_scan[i].name));
                 return 0;
             }
@@ -481,10 +388,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             strlcpy(s_scan[s_scan_count].name, name,
                     sizeof(s_scan[s_scan_count].name));
             s_scan[s_scan_count].rssi = event->disc.rssi;
-            s_scan[s_scan_count].mfg = cid;
             s_scan_count++;
-            ESP_LOGD(TAG, "scan: '%s' rssi=%d addr=%s mfg=0x%04x",
-                     name, event->disc.rssi, addr_str, cid);
+            ESP_LOGD(TAG, "scan: '%s' rssi=%d addr=%s",
+                     name, event->disc.rssi, addr_str);
         }
         return 0;
     }
@@ -502,7 +408,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "disconnected (reason=%d)",
                  event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        /* Unblock any waiting request */
         xSemaphoreGive(s_resp_sem);
         xSemaphoreGive(s_conn_sem);
         return 0;
@@ -528,15 +433,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 }
 
 /* ── GATT discovery callbacks ──────────────────────────────────────── */
-static int on_mtu(uint16_t conn, const struct ble_gatt_error *err,
-                  uint16_t mtu, void *arg)
-{
-    (void)conn; (void)arg; (void)mtu;
-    s_op_status = err ? err->status : 0;
-    xSemaphoreGive(s_op_sem);
-    return 0;
-}
-
 static int on_disc_svc(uint16_t conn, const struct ble_gatt_error *err,
                        const struct ble_gatt_svc *svc, void *arg)
 {
@@ -557,9 +453,9 @@ static int on_disc_chr(uint16_t conn, const struct ble_gatt_error *err,
 {
     (void)conn; (void)arg;
     if (err && err->status == 0 && chr) {
-        if (ble_uuid_cmp(&chr->uuid.u, &OXYII_WRITE_UUID.u) == 0)
+        if (ble_uuid_cmp(&chr->uuid.u, &LEGACY_WRITE_UUID.u) == 0)
             s_write_handle = chr->val_handle;
-        else if (ble_uuid_cmp(&chr->uuid.u, &OXYII_NOTIFY_UUID.u) == 0)
+        else if (ble_uuid_cmp(&chr->uuid.u, &LEGACY_NOTIFY_UUID.u) == 0)
             s_notify_handle = chr->val_handle;
     }
     if (err && (err->status == BLE_HS_EDONE || err->status != 0)) {
@@ -596,16 +492,12 @@ static int on_write_done(uint16_t conn, const struct ble_gatt_error *err,
 }
 
 /* ── Connect and discover GATT services ────────────────────────────── */
-/* do_mtu=false skips MTU exchange (persistent-mode contact polling uses
- * only tiny LIVE_B frames that fit in the default 23-byte ATT MTU). */
-static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
+static esp_err_t do_connect_and_discover(ble_addr_t *target)
 {
     s_write_handle = s_notify_handle = s_cccd_handle = 0;
     s_svc_start = s_svc_end = 0;
     s_resp_len = 0;
 
-    /* Connect — infer own address type based on peer address type
-     * (random peer requires random own address). */
     uint8_t own_addr_type;
     int rc = ble_hs_id_infer_auto(target->type, &own_addr_type);
     if (rc != 0) {
@@ -624,19 +516,14 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     }
     ESP_LOGI(TAG, "connected, handle=%d", s_conn_handle);
 
-    /* MTU exchange (skipped in persistent contact-polling mode) */
-    if (do_mtu) {
-        clear_op_sem();
-        ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
-        wait_op(2000);
-    }
+    /* No MTU exchange needed for Legacy (20-byte writes are default). */
 
-    /* Discover OxyII service by UUID */
+    /* Discover Legacy service by UUID */
     clear_op_sem();
-    rc = ble_gattc_disc_svc_by_uuid(s_conn_handle, &OXYII_SVC_UUID.u,
+    rc = ble_gattc_disc_svc_by_uuid(s_conn_handle, &LEGACY_SVC_UUID.u,
                                      on_disc_svc, NULL);
     if (rc != 0 || wait_op(10000) != 0) {
-        set_error("OxyII service not found"); return ESP_FAIL;
+        set_error("Legacy service not found"); return ESP_FAIL;
     }
     if (s_svc_start == 0) { set_error("service range empty"); return ESP_FAIL; }
     ESP_LOGI(TAG, "service: 0x%04x-0x%04x", s_svc_start, s_svc_end);
@@ -683,12 +570,16 @@ static void do_disconnect(void)
 }
 
 /* ── Protocol request/response ─────────────────────────────────────── */
-static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
-                                bool expect_reply, int timeout_ms)
+/* Send a Legacy request and optionally wait for a response.
+ * Uses write-with-response (Legacy protocol uses WRITE_REQ, not WRITE_CMD).
+ * Frames larger than 20 bytes are split into multiple writes. */
+static esp_err_t legacy_request(uint8_t cmd, uint16_t block,
+                                 const uint8_t *payload, int plen,
+                                 bool expect_reply, int timeout_ms)
 {
-    uint8_t frame[OXYII_MAX_FRAME];
-    int flen = oxyii_encode(frame, sizeof(frame), op, 0, s_seq++,
-                             payload, plen);
+    uint8_t frame[LEGACY_MAX_FRAME];
+    int flen = legacy_encode(frame, sizeof(frame), cmd, block,
+                              payload, plen);
     if (flen < 0) return ESP_FAIL;
 
     if (expect_reply) {
@@ -696,13 +587,33 @@ static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
         s_resp_len = 0;
     }
 
-    /* Use write-without-response (OxyII protocol uses WRITE_CMD, not WRITE_REQ).
-     * This eliminates one BLE round-trip per request, roughly doubling throughput. */
-    int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_handle,
-                                          frame, flen);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "write failed op=0x%02x rc=%d", op, rc);
-        return ESP_FAIL;
+    /* Write the frame in 20-byte chunks.  The first chunk uses
+     * write-with-response; subsequent chunks use write-without-response
+     * to avoid excessive round-trips. */
+    int offset = 0;
+    while (offset < flen) {
+        int chunk = flen - offset;
+        if (chunk > LEGACY_BLE_CHUNK) chunk = LEGACY_BLE_CHUNK;
+
+        if (offset == 0) {
+            clear_op_sem();
+            int rc = ble_gattc_write_flat(s_conn_handle, s_write_handle,
+                                           frame + offset, chunk,
+                                           on_write_done, NULL);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "write failed cmd=0x%02x rc=%d", cmd, rc);
+                return ESP_FAIL;
+            }
+            wait_op(5000);
+        } else {
+            int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_handle,
+                                                  frame + offset, chunk);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "write chunk failed cmd=0x%02x rc=%d", cmd, rc);
+                return ESP_FAIL;
+            }
+        }
+        offset += chunk;
     }
 
     if (!expect_reply) return ESP_OK;
@@ -711,171 +622,142 @@ static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
     while (true) {
         TickType_t now = xTaskGetTickCount();
         if ((int32_t)(deadline - now) <= 0) {
-            ESP_LOGE(TAG, "response timeout op=0x%02x", op);
+            ESP_LOGE(TAG, "response timeout cmd=0x%02x", cmd);
             return ESP_ERR_TIMEOUT;
         }
         if (xSemaphoreTake(s_resp_sem, deadline - now) != pdTRUE) {
-            ESP_LOGE(TAG, "response timeout op=0x%02x", op);
+            ESP_LOGE(TAG, "response timeout cmd=0x%02x", cmd);
             return ESP_ERR_TIMEOUT;
         }
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
             return ESP_FAIL;
-        if (s_resp_opcode == op)
+        /* Legacy protocol: any response with status 0 is accepted.
+         * The status byte indicates success (0) or failure. */
+        if (s_resp_status == 0)
             return ESP_OK;
-        ESP_LOGW(TAG, "ignoring leftover notify op=0x%02x (want 0x%02x, %d B)",
-                 s_resp_opcode, op, s_resp_payload_len);
+        ESP_LOGW(TAG, "response status=%d for cmd=0x%02x", s_resp_status, cmd);
+        return ESP_FAIL;
     }
 }
 
-/* AUTH + SETUP only. Enough for GET_INFO / LIVE_B. Do not send F4
- * here — that closes a recording handle. Measured (SHQO2Pro 2D010003):
- * LIVE_B replies even with no AUTH; GET_INFO needs this prefix. */
-static esp_err_t oxyii_session_open(void)
+/* ── CMD_INFO: get device info as JSON ─────────────────────────────── */
+static esp_err_t legacy_get_info(char *serial, size_t serial_sz,
+                                  char *firmware, size_t fw_sz,
+                                  char *file_list, size_t file_list_sz)
 {
-    s_seq = 0;
-    uint8_t auth[16];
-    oxyii_auth_payload(auth);
-    if (oxyii_request(OP_AUTH, auth, 16, false, 0) != ESP_OK)
+    if (legacy_request(CMD_INFO, 0, NULL, 0, true, 5000) != ESP_OK)
         return ESP_FAIL;
-    vTaskDelay(pdMS_TO_TICKS(200));
 
-    uint8_t setup = 0x00;
-    if (oxyii_request(OP_SETUP, &setup, 1, true, 5000) != ESP_OK)
+    /* Response is ASCII JSON.  Parse it. */
+    if (s_resp_payload_len <= 0) return ESP_FAIL;
+
+    /* Ensure null-terminated */
+    char *json_str = heap_caps_malloc(s_resp_payload_len + 1, MALLOC_CAP_SPIRAM);
+    if (!json_str) json_str = malloc(s_resp_payload_len + 1);
+    if (!json_str) return ESP_ERR_NO_MEM;
+    memcpy(json_str, s_resp_payload, s_resp_payload_len);
+    json_str[s_resp_payload_len] = '\0';
+
+    cJSON *j = cJSON_Parse(json_str);
+    free(json_str);
+    if (!j) {
+        ESP_LOGE(TAG, "CMD_INFO: JSON parse failed");
         return ESP_FAIL;
-    return ESP_OK;
+    }
+
+    esp_err_t ret = ESP_FAIL;
+    cJSON *sn = cJSON_GetObjectItem(j, "SN");
+    if (sn && cJSON_IsString(sn) && serial) {
+        strlcpy(serial, sn->valuestring, serial_sz);
+        ret = ESP_OK;
+    }
+    cJSON *fw = cJSON_GetObjectItem(j, "SoftwareVer");
+    if (fw && cJSON_IsString(fw) && firmware)
+        strlcpy(firmware, fw->valuestring, fw_sz);
+    cJSON *fl = cJSON_GetObjectItem(j, "FileList");
+    if (fl && cJSON_IsString(fl) && file_list)
+        strlcpy(file_list, fl->valuestring, file_list_sz);
+
+    cJSON_Delete(j);
+    return ret;
 }
 
-/* File-session prep. Only after LIVE_B says off-finger.
- * Documented order: SET_UTC → GET_CONFIG → F4. F4 clears a leftover
- * recording handle; without it, F1 is silently dropped (the F1 wedge). */
-static esp_err_t oxyii_prepare_files(void)
+/* ── CMD_READ_SENSORS: check worn status ───────────────────────────── */
+/* Returns: 1 = off-finger (pull allowed), 0 = on-finger, -1 = error. */
+static int legacy_off_finger(void)
+{
+    if (legacy_request(CMD_READ_SENSORS, 0, NULL, 0, true, 3000) != ESP_OK)
+        return -1;
+    if (s_resp_payload_len < 12) return -1;
+
+    uint8_t spo2  = s_resp_payload[0];
+    uint8_t hr    = s_resp_payload[1];
+    uint8_t worn  = s_resp_payload[11];
+    ESP_LOGI(TAG, "sensors: spo2=%u hr=%u worn=%u", spo2, hr, worn);
+
+    if (worn == 0) return 1;
+    /* worn==1 but spo2==0xFF and hr==0 → calibrating (still on finger) */
+    return 0;
+}
+
+/* ── CMD_CONFIG: set device time ───────────────────────────────────── */
+static esp_err_t legacy_set_time(void)
 {
     if (!time_is_usable()) {
         ESP_LOGW(TAG, "not setting ring clock: host time is unusable");
         return ESP_ERR_INVALID_STATE;
     }
-    uint8_t tp[8];
-    oxyii_time_payload(tp);
-    if (oxyii_request(OP_SET_UTC_TIME, tp, 8, true, 5000) != ESP_OK)
-        return ESP_FAIL;
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char time_str[24];
+    snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d,%02d:%02d:%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
 
-    if (oxyii_request(OP_GET_CONFIG, NULL, 0, true, 5000) != ESP_OK)
-        return ESP_FAIL;
+    /* Build JSON config: {"SetTIME":"YYYY-MM-DD,HH:MM:SS"} */
+    char json[64];
+    snprintf(json, sizeof(json), "{\"SetTIME\":\"%s\"}", time_str);
 
-    /* F4 acks. Must consume it or the next F1 sees this frame. */
-    if (oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000) != ESP_OK)
-        ESP_LOGW(TAG, "F4 ack missing — continuing");
-    return ESP_OK;
+    return legacy_request(CMD_CONFIG, 0, (uint8_t *)json, strlen(json),
+                          true, 5000);
 }
 
-/* ── GET_INFO: extract firmware + serial ───────────────────────────── */
-static esp_err_t oxyii_get_info(char *serial, size_t serial_sz,
-                                 char *firmware, size_t fw_sz)
+/* ── File download: FILE_OPEN / FILE_READ / FILE_CLOSE ─────────────── */
+
+/* Parse the FileList from CMD_INFO into individual filenames.
+ * Returns the number of filenames parsed. */
+static int parse_file_list(const char *file_list,
+                            char names[][32], int max_count)
 {
-    if (oxyii_request(OP_GET_INFO, NULL, 0, true, 5000) != ESP_OK)
-        return ESP_FAIL;
-
-    /* Payload layout (from protocol study):
-     *   bytes 9..16: firmware (8 chars, null-padded)
-     *   byte 37: serial length
-     *   bytes 38..: serial string */
-    if (s_resp_payload_len < 38) return ESP_FAIL;
-
-    if (firmware && fw_sz > 0) {
-        int fl = s_resp_payload_len - 9 < 8 ? s_resp_payload_len - 9 : 8;
-        if (fl < 0) fl = 0;
-        memcpy(firmware, s_resp_payload + 9, fl);
-        firmware[fl] = '\0';
-        /* Trim trailing nulls */
-        for (int i = fl - 1; i >= 0 && firmware[i] == 0; i--)
-            firmware[i] = '\0';
-    }
-
-    if (serial && serial_sz > 0) {
-        int slen = s_resp_payload[37];
-        if (slen > 0 && 38 + slen <= s_resp_payload_len) {
-            int n = slen < (int)serial_sz - 1 ? slen : (int)serial_sz - 1;
-            memcpy(serial, s_resp_payload + 38, n);
-            serial[n] = '\0';
-        } else {
-            serial[0] = '\0';
+    if (!file_list || !file_list[0]) return 0;
+    int count = 0;
+    const char *p = file_list;
+    while (count < max_count && *p) {
+        const char *comma = strchr(p, ',');
+        int len = comma ? (int)(comma - p) : (int)strlen(p);
+        if (len > 0 && len < 32) {
+            memcpy(names[count], p, len);
+            names[count][len] = '\0';
+            count++;
         }
-    }
-    return ESP_OK;
-}
-
-/* LIVE_B contact. Returns:
- *   1  off-finger / END window (state 0x00) — pull is allowed
- *   0  on-finger or file handle open — do not pull
- *  -1  no usable reply — do not pull (fail closed)
- *
- * README: [5] 0x00 = no finger, 0x01 = finger present, 0x03 = file open. */
-static int oxyii_off_finger(void)
-{
-    if (oxyii_request(OP_LIVE_B, NULL, 0, true, 2000) != ESP_OK)
-        return -1;
-    if (s_resp_payload_len < 9) return -1;
-    uint8_t state = s_resp_payload[5];
-    uint8_t spo2  = s_resp_payload[6];
-    uint8_t hr    = s_resp_payload[8];
-    ESP_LOGI(TAG, "live_b: state=0x%02x spo2=%u hr=%u", state, spo2, hr);
-
-    /* 0x03 = leftover file handle from the ring's own recording
-     * (README "F1 wedge": F1 silently hangs until F4). Closing it is
-     * safe and lets END report its true contact state. */
-    if (state == 0x03) {
-        ESP_LOGI(TAG, "live_b: file handle open — clearing wedge with F4");
-        oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000);
-        if (oxyii_request(OP_LIVE_B, NULL, 0, true, 2000) != ESP_OK)
-            return -1;
-        if (s_resp_payload_len < 9) return -1;
-        state = s_resp_payload[5];
-        spo2  = s_resp_payload[6];
-        hr    = s_resp_payload[8];
-        ESP_LOGI(TAG, "live_b after F4: state=0x%02x spo2=%u hr=%u",
-                 state, spo2, hr);
-    }
-
-    if (state == 0x00) return 1;
-    return 0;
-}
-
-/* ── GET_FILE_LIST: return count + names ───────────────────────────── */
-static int oxyii_get_file_list(char names[][17], int max_count)
-{
-    int rc = oxyii_request(OP_GET_FILE_LIST, NULL, 0, true, 5000);
-    if (rc != ESP_OK) {
-        /* Spec 4.7: F1 timeout → F4, retry once on this link, then fail. */
-        ESP_LOGW(TAG, "F1 timed out (rc=%d) — F4 then retry once", rc);
-        oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000);
-        if (oxyii_request(OP_GET_FILE_LIST, NULL, 0, true, 5000) != ESP_OK)
-            return -1;
-    }
-
-    if (s_resp_payload_len < 1) return -1;
-    int count = s_resp_payload[0];
-    if (count > max_count) count = max_count;
-
-    int pos = 1;
-    for (int i = 0; i < count; i++) {
-        if (pos + 16 > s_resp_payload_len) break;
-        memcpy(names[i], s_resp_payload + pos, 16);
-        names[i][16] = '\0';
-        /* Trim trailing nulls */
-        for (int j = 15; j >= 0 && names[i][j] == 0; j--)
-            names[i][j] = '\0';
-        pos += 16;
+        if (!comma) break;
+        p = comma + 1;
     }
     return count;
 }
 
-/* ── Pull a single file ────────────────────────────────────────────── */
-static esp_err_t oxyii_pull_file(const char *name)
+static esp_err_t legacy_pull_file(const char *name)
 {
-    /* READ_FILE_START */
-    uint8_t start_pl[20];
-    oxyii_file_start_payload(start_pl, name);
-    if (oxyii_request(OP_READ_FILE_START, start_pl, 20, true, 5000) != ESP_OK)
+    /* FILE_OPEN: payload = filename + null terminator */
+    uint8_t open_pl[32];
+    int name_len = strlen(name);
+    if (name_len > 30) return ESP_FAIL;
+    memcpy(open_pl, name, name_len);
+    open_pl[name_len] = '\0';
+    int open_pl_len = name_len + 1;
+
+    if (legacy_request(CMD_FILE_OPEN, 0, open_pl, open_pl_len, true, 5000) != ESP_OK)
         return ESP_FAIL;
 
     uint32_t file_size = 0;
@@ -884,68 +766,81 @@ static esp_err_t oxyii_pull_file(const char *name)
                     (s_resp_payload[2] << 16) | (s_resp_payload[3] << 24);
     ESP_LOGI(TAG, "pulling '%s' (%lu bytes)", name, (unsigned long)file_size);
 
-    /* Resume from the durable partial length.  The device's reported size is
-     * not completion evidence; the decoder validates the trailer later. */
-    long prior = ox_store_part_size(name);
-    if (prior < 0 || (file_size > 0 && (uint32_t)prior > file_size)) {
-        ox_store_part_remove(name);
-        prior = 0;
+    if (file_size == 0) {
+        ESP_LOGW(TAG, "file '%s' has zero size", name);
+        legacy_request(CMD_FILE_CLOSE, 0, NULL, 0, true, 2000);
+        return ESP_FAIL;
     }
-    uint32_t offset = (uint32_t)prior;
+
+    /* Gen1 FILE_READ is sequential (no random access by offset).
+     * If a .part exists, we must re-download from scratch.
+     * Files are small (~10-15KB for 8h at 4s/sample), so this is acceptable. */
+    long prior = ox_store_part_size(name);
+    if (prior > 0) {
+        ESP_LOGI(TAG, "discarding %ld bytes of .part (Gen1 has no resume)", prior);
+        ox_store_part_remove(name);
+    }
+
+    uint32_t offset = 0;
+    uint16_t block = 0;
     int empty_count = 0;
-    bool transfer_complete = (file_size > 0 && offset == file_size);
-    while (!transfer_complete) {
-        uint8_t off_pl[4];
-        oxyii_file_data_payload(off_pl, offset);
-        if (oxyii_request(OP_READ_FILE_DATA, off_pl, 4, true, 10000) != ESP_OK) {
-            ESP_LOGW(TAG, "file data timeout at offset=%lu", (unsigned long)offset);
+
+    while (offset < file_size) {
+        if (legacy_request(CMD_FILE_READ, block, NULL, 0, true, 10000) != ESP_OK) {
+            ESP_LOGW(TAG, "file read timeout at block=%u offset=%lu",
+                     block, (unsigned long)offset);
             break;
         }
 
-        /* Payload is the file data chunk */
+        /* Verify block number matches (documented framing collision issue) */
+        if (s_resp_block != block) {
+            ESP_LOGW(TAG, "block mismatch: got %u, expected %u — retrying",
+                     s_resp_block, block);
+            if (++empty_count > 3) break;
+            continue;
+        }
+
         int chunk_len = s_resp_payload_len;
         if (chunk_len <= 0) {
-            if (++empty_count > 2) break;
+            if (++empty_count > 3) break;
             continue;
         }
         empty_count = 0;
 
-        if (file_size > 0 && (uint64_t)offset + chunk_len > file_size) {
-            ESP_LOGW(TAG, "device returned data past file size at offset=%lu",
+        if ((uint64_t)offset + chunk_len > file_size) {
+            ESP_LOGW(TAG, "data past file size at offset=%lu",
                      (unsigned long)offset);
-            break;
+            /* Truncate to file_size */
+            chunk_len = file_size - offset;
         }
+
         if (ox_store_part_append(name, s_resp_payload, chunk_len) != ESP_OK) {
             ESP_LOGE(TAG, "SD write failed at offset=%lu", (unsigned long)offset);
             break;
         }
         offset += chunk_len;
-
-        if (file_size > 0 && offset == file_size) {
-            transfer_complete = true;
-        }
+        block++;
     }
 
-    /* READ_FILE_END */
-    if (oxyii_request(OP_READ_FILE_END, NULL, 0, true, 2000) != ESP_OK)
-        ESP_LOGW(TAG, "F4 ack missing after '%s'", name);
+    /* FILE_CLOSE — always, even on error */
+    legacy_request(CMD_FILE_CLOSE, 0, NULL, 0, true, 2000);
 
-    /* Completion requires both an exact transfer and the O2 Ring S trailer. */
-    if (!transfer_complete || file_size == 0) {
+    if (offset != file_size) {
         ESP_LOGW(TAG, "incomplete '%s': %lu/%lu bytes; retaining .part",
                  name, (unsigned long)offset, (unsigned long)file_size);
         return ESP_FAIL;
     }
-    bool finalised = ox_store_promote(s_serial, name);
+
+    bool finalised = ox_store_promote_vld3(s_serial, name);
     ESP_LOGI(TAG, "pulled '%s': %lu bytes, finalised=%d",
              name, (unsigned long)offset, finalised);
     if (!finalised) return ESP_FAIL;
 
+    /* Convert to canonical SNT v3 format */
     char source_path[640];
-    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s.bin",
+    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s.vld",
              s_serial, name);
-    if (oximetry_canonical_convert_format_a(s_serial, name, source_path,
-                                            oxyii_filename_epoch_ms(name)) != ESP_OK) {
+    if (oximetry_canonical_convert_vld3(s_serial, name, source_path) != ESP_OK) {
         ESP_LOGW(TAG, "canonical conversion pending for '%s'", name);
         return ESP_FAIL;
     }
@@ -974,7 +869,7 @@ static esp_err_t do_save_nvs(void *arg)
     nvs_set_str(h, "firmware", local.firmware);
     nvs_set_str(h, "name_prefix", local.name_prefix);
     nvs_set_str(h, "last_addr", local.last_addr);
-    nvs_set_u8(h, "driver", (uint8_t)OX_DRIVER_OXYII);
+    nvs_set_u8(h, "driver", (uint8_t)OX_DRIVER_LEGACY);
     e = nvs_commit(h);
     nvs_close(h);
     return e;
@@ -1009,6 +904,8 @@ static esp_err_t do_save_probe_mode(void *arg)
     return e;
 }
 
+static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
+
 static void load_paired_from_nvs(void)
 {
     nvs_handle_t h;
@@ -1018,10 +915,10 @@ static void load_paired_from_nvs(void)
 
     len = sizeof(s_serial);
     if (nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
-        /* Check driver type — only load if this is an OxyII device */
+        /* Check driver type — only load if this is a Legacy device */
         uint8_t drv = OX_DRIVER_OXYII;
         nvs_get_u8(h, "driver", &drv);
-        if (drv != OX_DRIVER_OXYII) {
+        if (drv != OX_DRIVER_LEGACY) {
             /* Not our device — don't load */
             s_serial[0] = '\0';
             nvs_close(h);
@@ -1050,7 +947,7 @@ static void load_paired_from_nvs(void)
                                  prefix, sizeof(prefix),
                                  addr, sizeof(addr),
                                  drv, sizeof(drv))) {
-            if (strcmp(drv, "wellue_oxyii") == 0 || drv[0] == '\0') {
+            if (strcmp(drv, "wellue_legacy") == 0) {
                 strlcpy(s_serial, serial, sizeof(s_serial));
                 strlcpy(s_firmware, fw, sizeof(s_firmware));
                 strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
@@ -1078,7 +975,7 @@ static void pair_task(void *arg)
         return;
     }
 
-    if (do_connect_and_discover(&target, true) != ESP_OK) {
+    if (do_connect_and_discover(&target) != ESP_OK) {
         do_disconnect();
         free(addr_str);
         xSemaphoreGive(s_ops_mtx);
@@ -1086,17 +983,10 @@ static void pair_task(void *arg)
         return;
     }
 
-    if (oxyii_session_open() != ESP_OK) {
-        set_error("session open failed");
-        do_disconnect();
-        free(addr_str);
-        xSemaphoreGive(s_ops_mtx);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    char serial[32] = {0}, firmware[16] = {0};
-    if (oxyii_get_info(serial, sizeof(serial), firmware, sizeof(firmware)) != ESP_OK) {
+    /* No AUTH/SETUP needed for Legacy — just CMD_INFO */
+    char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0};
+    if (legacy_get_info(serial, sizeof(serial), firmware, sizeof(firmware),
+                        file_list, sizeof(file_list)) != ESP_OK) {
         set_error("get_info failed");
         do_disconnect();
         free(addr_str);
@@ -1114,10 +1004,17 @@ static void pair_task(void *arg)
         return;
     }
 
-    /* Derive name_prefix from serial (first 4 chars) */
-    char prefix[5];
-    memcpy(prefix, serial, 4);
-    prefix[4] = '\0';
+    /* Derive name_prefix from model name in serial (first 6 chars typically) */
+    char prefix[16];
+    /* Use the model name from the serial if possible (e.g. "O2Ring") */
+    strlcpy(prefix, serial, sizeof(prefix));
+    /* If serial starts with a known pattern, use a shorter prefix */
+    if (strncmp(serial, "O2Ring", 6) == 0)
+        strlcpy(prefix, "O2Ring", sizeof(prefix));
+    else if (strncmp(serial, "KidsO2", 6) == 0)
+        strlcpy(prefix, "KidsO2", sizeof(prefix));
+    else
+        strlcpy(prefix, "O2Ring", sizeof(prefix));
 
     /* Save to NVS */
     struct ox_nvs_arg nvs_arg;
@@ -1128,7 +1025,7 @@ static void pair_task(void *arg)
     nvs_writer_run(do_save_nvs, &nvs_arg);
 
     /* Save to paired.json on SD */
-    ox_store_save_paired(serial, firmware, prefix, addr_str, "wellue_oxyii");
+    ox_store_save_paired(serial, firmware, prefix, addr_str, "wellue_legacy");
 
     /* Update in-RAM state */
     strlcpy(s_serial, serial, sizeof(s_serial));
@@ -1147,17 +1044,17 @@ static void pair_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* ── Low-duty OxyII scan (caller holds s_ops_mtx) ──────────────────── */
+/* ── Low-duty scan (caller holds s_ops_mtx) ─────────────────────────── */
 static esp_err_t do_scan(int timeout_sec)
 {
     s_scan_count = 0;
 
     struct ble_gap_disc_params dp = {
-        .itvl = 160,   /* 100 ms */
-        .window = 48,  /* 30 ms  — low duty; pairing scan uses 96/96 */
+        .itvl = 160,
+        .window = 48,
         .filter_policy = 0,
         .limited = 0,
-        .passive = 1,  /* watch is listen-only; no scan requests */
+        .passive = 1,
     };
 
     uint8_t own_addr_type;
@@ -1180,8 +1077,7 @@ static esp_err_t do_scan(int timeout_sec)
 static void canonical_migration_task(void *arg)
 {
     (void)arg;
-    /* Do not block app_main while AS11 and its notification worker start. */
-    vTaskDelay(pdMS_TO_TICKS(30000));
+    vTaskDelay(pdMS_TO_TICKS(35000));
     while (sd_storage_recording_active())
         vTaskDelay(pdMS_TO_TICKS(5000));
     if (sd_storage_is_ready()) {
@@ -1191,55 +1087,51 @@ static void canonical_migration_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* ── File pull helper (shared by legacy and persistent paths) ─────── */
-/* Caller must be connected with session opened and files prepared.
- * Sets OX_STATUS_PULLING, runs F1 → file list → per-file pull.
- * On F1 exhaustion, marks served so the watch stops reconnecting.
- * Returns true if all files pulled (or none to pull), false on failure.
- * *pulled_any is set to true if at least one file was actually downloaded
- * and finalised (as opposed to all files being already in the index).
- * s_presence_served may be set inside on F1 exhaustion. */
+/* ── File pull helper ──────────────────────────────────────────────── */
 static bool do_pull_and_mark(bool *pulled_any)
 {
     if (pulled_any) *pulled_any = false;
     set_state(OX_STATUS_PULLING);
 
-    char names[32][17];
-    int count = oxyii_get_file_list(names, 32);
-    if (count < 0) {
-        s_f1_fail_count++;
-        ESP_LOGW(TAG, "file list failed (op=0x%02x len=%d), attempt %d/%d",
-                 s_resp_opcode, s_resp_payload_len,
-                 s_f1_fail_count, OX_F1_MAX_RETRIES);
-        if (s_f1_fail_count >= OX_F1_MAX_RETRIES) {
-            /* F1 never responds on this ring (firmware quirk).
-             * Mark served so we stop reconnecting — each connection
-             * resets the ring's power-off timer.  Next sync window
-             * (next take-off) will try again fresh. */
-            s_presence_served = true;
-            s_served_at = xTaskGetTickCount();
-            ESP_LOGW(TAG, "F1 unreachable after %d attempts — treating as served, ring can sleep",
-                     OX_F1_MAX_RETRIES);
-        }
+    /* Get device info with file list */
+    char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0};
+    if (legacy_get_info(serial, sizeof(serial), firmware, sizeof(firmware),
+                        file_list, sizeof(file_list)) != ESP_OK) {
+        ESP_LOGW(TAG, "CMD_INFO failed during pull");
         return false;
     }
-    s_f1_fail_count = 0;
+
+    /* Verify serial matches paired device */
+    if (serial[0] == '\0' || strcmp(serial, s_serial) != 0) {
+        ESP_LOGW(TAG, "serial mismatch (got '%s', want '%s')",
+                 serial, s_serial);
+        return false;
+    }
+
+    /* Parse file list */
+    char names[32][32];
+    int count = parse_file_list(file_list, names, 32);
     ESP_LOGI(TAG, "file list: %d files", count);
 
     bool pull_ok = true;
     for (int i = 0; i < count; i++) {
         if (names[i][0] == '\0') continue;
 
-        int idx = ox_store_index_check(s_serial, names[i]);
+        /* Strip .vld extension for index check */
+        char base_name[32];
+        strlcpy(base_name, names[i], sizeof(base_name));
+        char *dot = strrchr(base_name, '.');
+        if (dot) *dot = '\0';
+
+        int idx = ox_store_index_check(s_serial, base_name);
         if (idx == 1) {
             ESP_LOGD(TAG, "skip '%s' (already finalised)", names[i]);
             continue;
         }
 
         ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
-        if (oxyii_pull_file(names[i]) != ESP_OK) {
+        if (legacy_pull_file(names[i]) != ESP_OK) {
             ESP_LOGW(TAG, "pull failed for '%s'", names[i]);
-            if (sd_storage_is_ready()) oximetry_canonical_migrate_legacy(s_serial);
             pull_ok = false;
             break;
         }
@@ -1248,7 +1140,10 @@ static bool do_pull_and_mark(bool *pulled_any)
     return pull_ok;
 }
 
-/* ── Background watch: scan-only, connect only in the END window ──── */
+/* ── Background watch task ─────────────────────────────────────────── */
+#define OX_END_WINDOW_MS  130000
+#define OX_WORN_PROBE_MS  60000
+
 static void pull_task(void *arg)
 {
     (void)arg;
@@ -1290,7 +1185,6 @@ static void pull_task(void *arg)
             s_ring_present = false;
             if (s_presence_served)
                 s_presence_served = false;
-            s_f1_fail_count = 0;
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
@@ -1301,135 +1195,21 @@ static void pull_task(void *arg)
             s_ring_present = true;
         }
 
-        /* Remember last seen addr (hint; MAC can rotate on factory reset). */
         addr_to_str(&s_scan[0].addr, s_paired_addr, sizeof(s_paired_addr));
 
         if (s_presence_served) {
-            /* Never reconnect during END — a connection resets the
-             * ring's power-off timer (measured). Passive scans only.
-             * Still advertising past the longest possible END window
-             * (take-off + ~120s; pull ran inside it) ⇒ back on a
-             * finger ⇒ clear served so the next take-off pulls. */
             if ((xTaskGetTickCount() - s_served_at) < pdMS_TO_TICKS(OX_END_WINDOW_MS)) {
                 xSemaphoreGive(s_ops_mtx);
                 continue;
             }
             ESP_LOGI(TAG, "watch: still advertising past END window — re-worn, resuming probes");
             s_presence_served = false;
-            s_f1_fail_count = 0;
         }
 
-        if (s_probe_mode == OX_PROBE_PERSISTENT) {
-            /* ── Persistent mode ───────────────────────────────────────
-             * Hold one GATT connection, poll unauthenticated LIVE_B
-             * every OX_PERSISTENT_POLL_MS. AUTH/SETUP/GET_INFO and
-             * file transfer are deferred until off-finger is detected.
-             * See .ai/OXIMETRY2.md for the experiment that validated
-             * this approach. */
-            set_state(OX_STATUS_CONNECTING);
-
-            if (do_connect_and_discover(&s_scan[0].addr, false) != ESP_OK) {
-                ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
-                do_disconnect();
-                set_state(OX_STATUS_PAIRED);
-                xSemaphoreGive(s_ops_mtx);
-                continue;
-            }
-
-            /* Poll loop: LIVE_B every 30 s while on-finger. */
-            bool pulled = false;
-            while (s_probe_mode == OX_PROBE_PERSISTENT && !pulled) {
-                int off = oxyii_off_finger();
-                if (off == 1) {
-                    /* Off-finger: upgrade to full session for pull. */
-                    ESP_LOGI(TAG, "watch: off-finger detected — upgrading to full session");
-                    /* MTU exchange now for file-transfer throughput. */
-                    clear_op_sem();
-                    ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
-                    wait_op(2000);
-
-                    if (oxyii_session_open() != ESP_OK) {
-                        ESP_LOGW(TAG, "watch: session open failed after off-finger");
-                        break;
-                    }
-
-                    char serial[32] = {0}, firmware[16] = {0};
-                    if (oxyii_get_info(serial, sizeof(serial),
-                                       firmware, sizeof(firmware)) != ESP_OK
-                        || serial[0] == '\0'
-                        || strcmp(serial, s_serial) != 0) {
-                        ESP_LOGW(TAG, "watch: serial mismatch (got '%s', want '%s')",
-                                 serial, s_serial);
-                        break;
-                    }
-
-                    if (oxyii_prepare_files() != ESP_OK) {
-                        ESP_LOGW(TAG, "watch: file prep failed");
-                        break;
-                    }
-
-                    /* Give the ring time to flush the just-finished
-                     * recording to its internal flash before we query
-                     * the file list.  Without this delay the new file
-                     * may not appear yet, causing a missed pull. */
-                    ESP_LOGI(TAG, "watch: off-finger — waiting 3s for ring to finalize recording");
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
-                        break;
-
-                    bool pulled_any = false;
-                    bool pull_ok = do_pull_and_mark(&pulled_any);
-
-                    /* If the first check found no new files, the ring
-                     * may still be finalizing.  Wait once more and retry
-                     * before giving up on this sync window. */
-                    if (pull_ok && !pulled_any &&
-                        s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-                        ESP_LOGI(TAG, "watch: no new files yet — waiting 5s for ring to finalize");
-                        vTaskDelay(pdMS_TO_TICKS(5000));
-                        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
-                            pull_ok = do_pull_and_mark(&pulled_any);
-                    }
-
-                    do_disconnect();
-
-                    if (pull_ok) {
-                        s_presence_served = true;
-                        s_served_at = xTaskGetTickCount();
-                        ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
-                    } else if (!s_presence_served) {
-                        ESP_LOGW(TAG, "sync incomplete — will retry this presence");
-                    }
-                    pulled = true;
-                } else if (off == 0) {
-                    /* On-finger: hold connection, wait before next poll. */
-                    set_state(OX_STATUS_MONITORING);
-                    vTaskDelay(pdMS_TO_TICKS(OX_PERSISTENT_POLL_MS));
-                    /* Connection may have dropped during the delay. */
-                    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-                        ESP_LOGI(TAG, "watch: persistent connection dropped — will reconnect");
-                        break;
-                    }
-                } else {
-                    /* LIVE_B error (-1): connection may be stale. */
-                    ESP_LOGW(TAG, "watch: LIVE_B error — dropping connection");
-                    break;
-                }
-            }
-
-            /* If we broke out without pulling, clean up the connection. */
-            if (!pulled) {
-                do_disconnect();
-                set_state(OX_STATUS_PAIRED);
-            }
-            xSemaphoreGive(s_ops_mtx);
-            continue;
-        }
-
-        /* ── Legacy mode (reconnect + full handshake each cycle) ─────── */
+        /* Connect and probe */
         set_state(OX_STATUS_CONNECTING);
 
-        if (do_connect_and_discover(&s_scan[0].addr, true) != ESP_OK) {
+        if (do_connect_and_discover(&s_scan[0].addr) != ESP_OK) {
             ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
@@ -1437,33 +1217,10 @@ static void pull_task(void *arg)
             continue;
         }
 
-        /* Probe only: AUTH+SETUP. Never F4 while we may still be recording. */
-        if (oxyii_session_open() != ESP_OK) {
-            ESP_LOGW(TAG, "watch: session open failed");
-            do_disconnect();
-            set_state(OX_STATUS_PAIRED);
-            xSemaphoreGive(s_ops_mtx);
-            continue;
-        }
-
-        char serial[32] = {0}, firmware[16] = {0};
-        if (oxyii_get_info(serial, sizeof(serial), firmware, sizeof(firmware)) != ESP_OK
-            || serial[0] == '\0' || strcmp(serial, s_serial) != 0) {
-            ESP_LOGW(TAG, "watch: serial mismatch (got '%s', want '%s')",
-                     serial, s_serial);
-            do_disconnect();
-            set_state(OX_STATUS_PAIRED);
-            xSemaphoreGive(s_ops_mtx);
-            continue;
-        }
-
-        /* Pull only in the documented no-contact END window
-         * (LIVE_B [5] == 0x00). On-finger / unknown / F1-wedge: drop
-         * the link immediately so the ring can keep recording or
-         * finish countdown and sleep. Do not mark served. */
-        int off = oxyii_off_finger();
+        /* Check worn status */
+        int off = legacy_off_finger();
         if (off != 1) {
-            ESP_LOGI(TAG, "watch: not off-finger (live_b=%d) — disconnect, retry in %ds",
+            ESP_LOGI(TAG, "watch: not off-finger (sensors=%d) — disconnect, retry in %ds",
                      off, OX_WORN_PROBE_MS / 1000);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
@@ -1472,16 +1229,33 @@ static void pull_task(void *arg)
             continue;
         }
 
-        if (oxyii_prepare_files() != ESP_OK) {
-            ESP_LOGW(TAG, "watch: file prep failed");
+        /* Off-finger: sync time, then pull files */
+        if (legacy_set_time() != ESP_OK)
+            ESP_LOGW(TAG, "watch: time sync failed — continuing");
+
+        /* Give the ring time to flush the recording */
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
 
-        bool pull_ok = do_pull_and_mark(NULL);
+        bool pulled_any = false;
+        bool pull_ok = do_pull_and_mark(&pulled_any);
+
+        /* If no new files, wait and retry once */
+        if (pull_ok && !pulled_any &&
+            s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ESP_LOGI(TAG, "watch: no new files — waiting 5s for ring to finalize");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+                pull_ok = do_pull_and_mark(&pulled_any);
+        }
+
         do_disconnect();
+
         if (pull_ok) {
             s_presence_served = true;
             s_served_at = xTaskGetTickCount();
@@ -1495,8 +1269,8 @@ static void pull_task(void *arg)
     }
 }
 
-/* ── Public API (driver vtable) ───────────────────────────────────── */
-static esp_err_t oxyii_init(void)
+/* ── Public API (driver vtable) ────────────────────────────────────── */
+static esp_err_t legacy_init(void)
 {
     s_state_mtx = xSemaphoreCreateMutex();
     s_ops_mtx   = xSemaphoreCreateMutex();
@@ -1515,19 +1289,19 @@ static esp_err_t oxyii_init(void)
     if (s_paired)
         set_state(OX_STATUS_PAIRED);
 
-    TaskHandle_t h = psram_task_create(pull_task, "ox_pull", 8192, NULL, 3,
+    TaskHandle_t h = psram_task_create(pull_task, "ox_leg_pull", 8192, NULL, 3,
                                        tskNO_AFFINITY, NULL, NULL);
     if (!h) {
         ESP_LOGW(TAG, "failed to create pull task");
     }
     TaskHandle_t migration = psram_task_create(canonical_migration_task,
-                                               "ox_migrate", 12288, NULL, 1,
+                                               "ox_leg_mig", 12288, NULL, 1,
                                                0, NULL, NULL);
     if (!migration) ESP_LOGW(TAG, "failed to create canonical migration task");
     return ESP_OK;
 }
 
-static esp_err_t oxyii_scan(int timeout_sec)
+static esp_err_t legacy_scan(int timeout_sec)
 {
     if (!as11_ble_is_host_ready())
         return ESP_ERR_INVALID_STATE;
@@ -1568,7 +1342,7 @@ static esp_err_t oxyii_scan(int timeout_sec)
     return ESP_OK;
 }
 
-static cJSON *oxyii_get_scan_results(void)
+static cJSON *legacy_get_scan_results(void)
 {
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < s_scan_count; i++) {
@@ -1578,13 +1352,13 @@ static cJSON *oxyii_get_scan_results(void)
         cJSON_AddStringToObject(e, "addr", addr_str);
         cJSON_AddStringToObject(e, "name", s_scan[i].name);
         cJSON_AddNumberToObject(e, "rssi", s_scan[i].rssi);
-        cJSON_AddStringToObject(e, "type", "oxyii");
+        cJSON_AddStringToObject(e, "type", "legacy");
         cJSON_AddItemToArray(arr, e);
     }
     return arr;
 }
 
-static esp_err_t oxyii_pair(const char *addr_str)
+static esp_err_t legacy_pair(const char *addr_str)
 {
     if (!as11_ble_is_host_ready())
         return ESP_ERR_INVALID_STATE;
@@ -1592,7 +1366,7 @@ static esp_err_t oxyii_pair(const char *addr_str)
     char *addr_copy = strdup(addr_str);
     if (!addr_copy) return ESP_ERR_NO_MEM;
 
-    TaskHandle_t h = psram_task_create(pair_task, "ox_pair", 8192, addr_copy, 5,
+    TaskHandle_t h = psram_task_create(pair_task, "ox_leg_pair", 8192, addr_copy, 5,
                                        tskNO_AFFINITY, NULL, NULL);
     if (!h) {
         free(addr_copy);
@@ -1601,7 +1375,7 @@ static esp_err_t oxyii_pair(const char *addr_str)
     return ESP_OK;
 }
 
-static void oxyii_forget(void)
+static void legacy_forget(void)
 {
     s_paired = false;
     s_presence_served = false;
@@ -1614,25 +1388,24 @@ static void oxyii_forget(void)
     ox_store_delete_paired();
 
     set_state(OX_STATUS_IDLE);
-    return ESP_OK;
 }
 
-static const char *oxyii_get_status(void)
+static const char *legacy_get_status(void)
 {
     return s_status;
 }
 
-static const char *oxyii_get_error(void)
+static const char *legacy_get_error(void)
 {
     return s_error;
 }
 
-static bool oxyii_is_paired(void)
+static bool legacy_is_paired(void)
 {
     return s_paired;
 }
 
-static cJSON *oxyii_get_paired_info(void)
+static cJSON *legacy_get_paired_info(void)
 {
     if (!s_paired) return NULL;
     cJSON *info = cJSON_CreateObject();
@@ -1640,39 +1413,38 @@ static cJSON *oxyii_get_paired_info(void)
     if (s_firmware[0]) cJSON_AddStringToObject(info, "firmware", s_firmware);
     if (s_name_prefix[0]) cJSON_AddStringToObject(info, "name_prefix", s_name_prefix);
     if (s_paired_addr[0]) cJSON_AddStringToObject(info, "addr", s_paired_addr);
-    cJSON_AddStringToObject(info, "driver", "wellue_oxyii");
+    cJSON_AddStringToObject(info, "driver", "wellue_legacy");
     return info;
 }
 
-static ox_probe_mode_t oxyii_get_probe_mode(void)
+static ox_probe_mode_t legacy_get_probe_mode(void)
 {
     return s_probe_mode;
 }
 
-static esp_err_t oxyii_set_probe_mode(ox_probe_mode_t mode)
+static esp_err_t legacy_set_probe_mode(ox_probe_mode_t mode)
 {
     if (mode != OX_PROBE_LEGACY && mode != OX_PROBE_PERSISTENT)
         return ESP_ERR_INVALID_ARG;
     if (mode == s_probe_mode)
         return ESP_OK;
     s_probe_mode = mode;
-    /* Persist to NVS (fire-and-forget; nvs_writer_run handles flash safety). */
     nvs_writer_run(do_save_probe_mode, (void *)(intptr_t)mode);
     ESP_LOGI(TAG, "probe mode set to %s",
              mode == OX_PROBE_PERSISTENT ? "persistent" : "legacy");
     return ESP_OK;
 }
 
-const ox_driver_ops_t oxyii_driver_ops = {
-    .init             = oxyii_init,
-    .scan             = oxyii_scan,
-    .get_scan_results = oxyii_get_scan_results,
-    .pair             = oxyii_pair,
-    .forget           = oxyii_forget,
-    .get_status       = oxyii_get_status,
-    .get_error        = oxyii_get_error,
-    .is_paired        = oxyii_is_paired,
-    .get_paired_info  = oxyii_get_paired_info,
-    .get_probe_mode   = oxyii_get_probe_mode,
-    .set_probe_mode   = oxyii_set_probe_mode,
+const ox_driver_ops_t legacy_driver_ops = {
+    .init             = legacy_init,
+    .scan             = legacy_scan,
+    .get_scan_results = legacy_get_scan_results,
+    .pair             = legacy_pair,
+    .forget           = legacy_forget,
+    .get_status       = legacy_get_status,
+    .get_error        = legacy_get_error,
+    .is_paired        = legacy_is_paired,
+    .get_paired_info  = legacy_get_paired_info,
+    .get_probe_mode   = legacy_get_probe_mode,
+    .set_probe_mode   = legacy_set_probe_mode,
 };

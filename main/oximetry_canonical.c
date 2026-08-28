@@ -418,6 +418,420 @@ static bool source_complete_format_a(const char *path)
     return ok;
 }
 
+/* Path-buffer pool for convert_format_a / convert_vld3.  16 × 512 = 8 KB on
+ * the stack was overflowing the 8 KB PSRAM task stack of ox_migrate.
+ * Heap-allocating this block from PSRAM eliminates ~8 KB of stack pressure. */
+typedef struct {
+    char final_dir[OXIMETRY_CANONICAL_MAX_PATH];
+    char final_pointer[OXIMETRY_CANONICAL_MAX_PATH];
+    char day_dir[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_dir[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_source_dir[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_gen_dir[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_data_dir[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_source[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_track_tmp[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_track[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_gen_manifest[OXIMETRY_CANONICAL_MAX_PATH];
+    char gen_parent[OXIMETRY_CANONICAL_MAX_PATH];
+    char stage_pointer[OXIMETRY_CANONICAL_MAX_PATH];
+} convert_ctx_t;
+
+/* ── VLD3 (Gen1 Legacy) source validation and conversion ──────────── */
+#define VLD3_HEADER_LEN   40
+#define VLD3_RECORD_LEN   5
+#define VLD3_VERSION      3
+
+static bool source_complete_vld3(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < VLD3_HEADER_LEN + VLD3_RECORD_LEN)
+        return false;
+    long body_len = st.st_size - VLD3_HEADER_LEN;
+    if (body_len % VLD3_RECORD_LEN != 0) return false;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    uint8_t header[VLD3_HEADER_LEN];
+    bool ok = fread(header, 1, sizeof(header), f) == sizeof(header);
+    fclose(f);
+    if (!ok) return false;
+
+    if (header[0] != VLD3_VERSION) return false;
+
+    uint32_t duration_seconds = header[13] | (header[14] << 8) |
+                                (header[15] << 16) | (header[16] << 24);
+    uint32_t record_count = body_len / VLD3_RECORD_LEN;
+    if (record_count == 0 || duration_seconds == 0) return false;
+    uint32_t resolution_x10 = (duration_seconds * 10) / record_count;
+    if (resolution_x10 != 20 && resolution_x10 != 40) return false;
+
+    return true;
+}
+
+/* Extract the start timestamp from a VLD3 header.
+ * Bytes 5-10 encode year(offset from 2000), month, day, hour, minute, second.
+ * Bytes 11-12 are day-of-week and reserved.
+ * Returns epoch ms (local time), or 0 on failure. */
+static int64_t vld3_start_epoch_ms(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t header[VLD3_HEADER_LEN];
+    if (fread(header, 1, sizeof(header), f) != sizeof(header)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    int year = header[5] + 2000;
+    int month = header[6];
+    int day = header[7];
+    int hour = header[8];
+    int minute = header[9];
+    int second = header[10];
+
+    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour > 23 || minute > 59 || second > 59)
+        return 0;
+
+    struct tm tm = {0};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
+    tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    return t == (time_t)-1 ? 0 : (int64_t)t * 1000;
+}
+
+/* Get the sample period in microseconds from a VLD3 file. */
+static uint32_t vld3_period_us(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 4000000; /* default 4s */
+    long body_len = st.st_size - VLD3_HEADER_LEN;
+    if (body_len <= 0) return 4000000;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return 4000000;
+    uint8_t header[VLD3_HEADER_LEN];
+    if (fread(header, 1, sizeof(header), f) != sizeof(header)) {
+        fclose(f);
+        return 4000000;
+    }
+    fclose(f);
+
+    uint32_t duration_seconds = header[13] | (header[14] << 8) |
+                                (header[15] << 16) | (header[16] << 24);
+    uint32_t record_count = body_len / VLD3_RECORD_LEN;
+    if (record_count == 0 || duration_seconds == 0) return 4000000;
+
+    /* period = duration / count, in microseconds */
+    return (duration_seconds * 1000000) / record_count;
+}
+
+/* Convert VLD3 to SNT v3.  VLD3 records are 5 bytes:
+ *   byte 0: SpO2 (0xFF = no finger / invalid)
+ *   byte 1: Pulse rate (0xFF = no finger / invalid)
+ *   byte 2: Motion / activity flags
+ *   bytes 3-4: PI (perfusion index, LE16, scaled) — not used in SNT v3
+ * Returns true on success. */
+static bool write_snt3_vld3(const char *src, const char *dst,
+                             int64_t start_ms, uint32_t period_us,
+                             uint32_t *out_count, uint32_t *out_crc)
+{
+    struct stat st;
+    if (stat(src, &st) != 0 || st.st_size < VLD3_HEADER_LEN + VLD3_RECORD_LEN)
+        return false;
+    long body_len = st.st_size - VLD3_HEADER_LEN;
+    if (body_len % VLD3_RECORD_LEN != 0) return false;
+    uint32_t sample_count = body_len / VLD3_RECORD_LEN;
+    if (sample_count == 0 || sample_count > UINT32_MAX) return false;
+
+    FILE *in = fopen(src, "rb");
+    FILE *out = fopen(dst, "wb");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return false;
+    }
+
+    ox_snt3_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = OXIMETRY_CANONICAL_SNT_MAGIC;
+    hdr.version = OXIMETRY_CANONICAL_SNT_VERSION;
+    hdr.tier = 0;
+    hdr.timing = 0;
+    hdr.n_channels = OXIMETRY_CANONICAL_VITALS_CHANNELS;
+    hdr.sample_bytes = sizeof(int16_t);
+    hdr.header_bytes = OX_SNT_HEADER_BYTES;
+    hdr.period_num_us = period_us;
+    hdr.period_den = 1;
+    hdr.start_epoch_ms = start_ms;
+    hdr.sample_count = sample_count;
+    hdr.data_bytes = sample_count * hdr.n_channels * hdr.sample_bytes;
+    if (fwrite(&hdr, 1, sizeof(hdr), out) != sizeof(hdr)) goto fail;
+
+    if (fseek(in, VLD3_HEADER_LEN, SEEK_SET) != 0) goto fail;
+    uint32_t crc = 0;
+    for (uint32_t i = 0; i < sample_count; i++) {
+        uint8_t raw[5];
+        int16_t rec[OXIMETRY_CANONICAL_VITALS_CHANNELS];
+        if (fread(raw, 1, sizeof(raw), in) != sizeof(raw)) goto fail;
+        bool spo2_missing = raw[0] == 0 || raw[0] == 0xff;
+        bool pulse_missing = raw[1] == 0 || raw[1] == 0xff;
+        rec[OXIMETRY_CANONICAL_VITALS_SPO2] = spo2_missing
+            ? OXIMETRY_CANONICAL_SNT_MISSING : (int16_t)raw[0] * 100;
+        rec[OXIMETRY_CANONICAL_VITALS_PULSE] = pulse_missing
+            ? OXIMETRY_CANONICAL_SNT_MISSING : (int16_t)raw[1] * 100;
+        rec[OXIMETRY_CANONICAL_VITALS_MOTION_FLAGS] = raw[2];
+        uint16_t status = (spo2_missing ? OX_STATUS_SPO2_MISSING : 0) |
+                          (pulse_missing ? OX_STATUS_PULSE_MISSING : 0);
+        rec[OXIMETRY_CANONICAL_VITALS_STATUS] = (int16_t)status;
+        rec[OXIMETRY_CANONICAL_VITALS_SOURCE_STATUS] = (int16_t)raw[2];
+        if (fwrite(rec, sizeof(rec), 1, out) != 1) goto fail;
+        crc = esp_rom_crc32_le(crc, (const uint8_t *)rec, sizeof(rec));
+    }
+
+    hdr.data_crc32 = crc;
+    if (fseek(out, 0, SEEK_SET) != 0 ||
+        fwrite(&hdr, 1, sizeof(hdr), out) != sizeof(hdr) ||
+        fflush(out) != 0 || fsync(fileno(out)) != 0)
+        goto fail;
+    fclose(in);
+    if (fclose(out) != 0) return false;
+    if (out_count) *out_count = sample_count;
+    if (out_crc) *out_crc = crc;
+    return true;
+
+fail:
+    fclose(in);
+    fclose(out);
+    unlink(dst);
+    return false;
+}
+
+static esp_err_t build_generation_manifest_vld3(const char *path,
+                                                  const char *device_id,
+                                                  const char *recording_id,
+                                                  const char *source_name,
+                                                  int64_t start_ms,
+                                                  int64_t end_ms,
+                                                  uint32_t source_size,
+                                                  uint32_t source_crc,
+                                                  uint32_t sample_count,
+                                                  uint32_t data_crc,
+                                                  uint32_t period_us)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+    cJSON_AddStringToObject(root, "schema", "somnotrace.oximetry.generation/1");
+    cJSON_AddStringToObject(root, "recording_id", recording_id);
+    cJSON_AddNumberToObject(root, "generation", 1);
+    cJSON_AddStringToObject(root, "state", "ready");
+    cJSON_AddStringToObject(root, "terminal_reason", "completed");
+
+    cJSON *device = cJSON_AddObjectToObject(root, "device");
+    cJSON_AddStringToObject(device, "device_key", device_id);
+    cJSON_AddStringToObject(device, "driver_id", "wellue_legacy");
+    cJSON_AddStringToObject(device, "format_id", "wellue_vld_v3");
+
+    cJSON *source = cJSON_AddArrayToObject(root, "source");
+    cJSON *src = cJSON_CreateObject();
+    char original_name[OXIMETRY_CANONICAL_MAX_COMPONENT];
+    strlcpy(original_name, source_name, sizeof(original_name));
+    size_t original_len = strlen(original_name);
+    if (original_len > 4 && strcmp(original_name + original_len - 4, ".vld") == 0)
+        original_name[original_len - 4] = '\0';
+    cJSON_AddStringToObject(src, "original_name", original_name);
+    cJSON_AddStringToObject(src, "stored_path", "source/source.vld");
+    cJSON_AddStringToObject(src, "format_id", "wellue_vld_v3");
+    cJSON_AddNumberToObject(src, "size", source_size);
+    cJSON_AddNumberToObject(src, "crc32", source_crc);
+    cJSON_AddItemToArray(source, src);
+    cJSON *exports = cJSON_AddArrayToObject(root, "exports");
+    cJSON *vld = cJSON_CreateObject();
+    cJSON_AddStringToObject(vld, "id", "sleephq_vld3");
+    cJSON_AddStringToObject(vld, "path", "exports/sleephq/recording.vld");
+    cJSON_AddStringToObject(vld, "format_id", "wellue_vld_v3");
+    cJSON_AddItemToArray(exports, vld);
+
+    cJSON *time = cJSON_AddObjectToObject(root, "time");
+    char tz_name[64] = "UTC";
+    time_sync_get_tz_name(tz_name, sizeof(tz_name));
+    cJSON_AddStringToObject(time, "timezone", tz_name);
+    cJSON_AddStringToObject(time, "device_clock_basis", "local_wall");
+    cJSON_AddNumberToObject(time, "start_epoch_ms", (double)start_ms);
+    cJSON_AddNumberToObject(time, "end_epoch_ms", (double)end_ms);
+    cJSON_AddStringToObject(time, "source", "vld3_header");
+    cJSON_AddStringToObject(time, "confidence", "device");
+
+    cJSON *tracks = cJSON_AddArrayToObject(root, "tracks");
+    cJSON *track = cJSON_CreateObject();
+    cJSON_AddStringToObject(track, "id", "vitals");
+    cJSON_AddStringToObject(track, "path", "data/vitals.snt");
+    cJSON_AddStringToObject(track, "timing", "uniform");
+    cJSON_AddNumberToObject(track, "period_num_us", period_us);
+    cJSON_AddNumberToObject(track, "period_den", 1);
+    cJSON_AddNumberToObject(track, "sample_count", sample_count);
+    cJSON_AddNumberToObject(track, "data_crc32", data_crc);
+    cJSON *channels = cJSON_AddArrayToObject(track, "channels");
+    const char *semantics[] = { "spo2", "pulse_rate", "motion", "sample_status", "source_status" };
+    const char *units[] = { "%", "bpm", "source_index", "bitset", "bitset" };
+    for (size_t i = 0; i < 5; i++) {
+        cJSON *ch = cJSON_CreateObject();
+        cJSON_AddStringToObject(ch, "semantic", semantics[i]);
+        cJSON_AddStringToObject(ch, "storage", "i16");
+        cJSON_AddNumberToObject(ch, "scale", i < 2 ? 0.01 : 1);
+        cJSON_AddStringToObject(ch, "unit", units[i]);
+        cJSON_AddItemToArray(channels, ch);
+    }
+    cJSON_AddItemToArray(tracks, track);
+
+    cJSON *integrity = cJSON_AddObjectToObject(root, "integrity");
+    cJSON_AddBoolToObject(integrity, "verified", true);
+    cJSON_AddStringToObject(integrity, "source_validator", "vld3_header");
+
+    esp_err_t e = write_json_atomic(path, root);
+    cJSON_Delete(root);
+    return e;
+}
+
+esp_err_t oximetry_canonical_convert_vld3(const char *device_id,
+                                           const char *recording_id,
+                                           const char *source_path)
+{
+    if (!sd_storage_is_ready() || !safe_component(device_id, OXIMETRY_CANONICAL_MAX_COMPONENT) ||
+        !valid_recording_id(recording_id) || !source_path ||
+        !source_complete_vld3(source_path))
+        return ESP_ERR_INVALID_ARG;
+    if (oximetry_canonical_ensure_dirs() != ESP_OK) return ESP_FAIL;
+
+    int64_t start_ms = vld3_start_epoch_ms(source_path);
+    if (!start_ms) {
+        ESP_LOGW(TAG, "vld3 convert: cannot extract start time from header");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t period_us = vld3_period_us(source_path);
+
+    char day[9];
+    if (!day_for_epoch(start_ms, day)) return ESP_ERR_INVALID_ARG;
+
+    struct stat st;
+    if (stat(source_path, &st) != 0 || st.st_size > OXIMETRY_CANONICAL_MAX_SOURCE_BYTES)
+        return ESP_ERR_INVALID_SIZE;
+    uint32_t count = (uint32_t)((st.st_size - VLD3_HEADER_LEN) / VLD3_RECORD_LEN);
+    int64_t end_ms = start_ms + (int64_t)(count - 1) * (int64_t)(period_us / 1000);
+
+    convert_ctx_t *p = heap_caps_malloc(sizeof(*p), MALLOC_CAP_SPIRAM);
+    if (!p) p = malloc(sizeof(*p));
+    if (!p) return ESP_ERR_NO_MEM;
+
+    esp_err_t ret = ESP_FAIL;
+
+    if (!path_join3(p->final_dir, sizeof(p->final_dir), OX_RECORDINGS, day, recording_id) ||
+        !path_join2(p->final_pointer, sizeof(p->final_pointer), p->final_dir, "recording.json")) {
+        free(p);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    cJSON *existing = read_json_file(p->final_pointer);
+    if (existing) {
+        cJSON_Delete(existing);
+        free(p);
+        return ESP_OK;
+    }
+
+    if (!path_join2(p->day_dir, sizeof(p->day_dir), OX_RECORDINGS, day) ||
+        !path_join2(p->stage_dir, sizeof(p->stage_dir), OX_STAGING, recording_id) ||
+        !path_join2(p->stage_source_dir, sizeof(p->stage_source_dir), p->stage_dir, "source") ||
+        !path_join3(p->stage_gen_dir, sizeof(p->stage_gen_dir), p->stage_dir, OX_GEN, "1") ||
+        !path_join2(p->stage_data_dir, sizeof(p->stage_data_dir), p->stage_gen_dir, "data") ||
+        !path_join2(p->stage_source, sizeof(p->stage_source), p->stage_source_dir, "source.vld") ||
+        !path_join2(p->stage_track_tmp, sizeof(p->stage_track_tmp), p->stage_data_dir, "vitals.snt.tmp") ||
+        !path_join2(p->stage_track, sizeof(p->stage_track), p->stage_data_dir, "vitals.snt") ||
+        !path_join2(p->stage_gen_manifest, sizeof(p->stage_gen_manifest), p->stage_gen_dir, "manifest.json")) {
+        free(p);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    mkdir_one(p->day_dir);
+    mkdir_one(p->stage_dir);
+    mkdir_one(p->stage_source_dir);
+    if (!path_join2(p->gen_parent, sizeof(p->gen_parent), p->stage_dir, OX_GEN)) {
+        free(p);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    mkdir_one(p->gen_parent);
+    mkdir_one(p->stage_gen_dir);
+    mkdir_one(p->stage_data_dir);
+
+    if (!path_join2(p->stage_pointer, sizeof(p->stage_pointer), p->stage_dir, "recording.json")) {
+        free(p);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    cJSON *pending = cJSON_CreateObject();
+    if (!pending) { free(p); return ESP_ERR_NO_MEM; }
+    cJSON_AddStringToObject(pending, "schema", "somnotrace.oximetry.recording/1");
+    cJSON_AddStringToObject(pending, "recording_id", recording_id);
+    cJSON_AddNumberToObject(pending, "active_generation", 1);
+    cJSON_AddStringToObject(pending, "state", "converting");
+    cJSON_AddStringToObject(pending, "device_key", device_id);
+    cJSON_AddStringToObject(pending, "input_path", source_path);
+    cJSON_AddNumberToObject(pending, "start_epoch_ms", (double)start_ms);
+    esp_err_t pending_err = write_json_atomic(p->stage_pointer, pending);
+    cJSON_Delete(pending);
+    if (pending_err != ESP_OK) { free(p); return pending_err; }
+
+    uint32_t source_crc = 0;
+    uint32_t track_crc = 0;
+    uint64_t source_size = 0;
+    bool source_ok;
+    if (strcmp(source_path, p->stage_source) == 0)
+        source_ok = file_crc_size(source_path, &source_crc, &source_size);
+    else
+        source_ok = copy_file_crc(source_path, p->stage_source, &source_crc, &source_size);
+    if (!source_ok || source_size != (uint64_t)st.st_size ||
+        !write_snt3_vld3(source_path, p->stage_track_tmp, start_ms, period_us, &count, &track_crc) ||
+        (unlink(p->stage_track), rename(p->stage_track_tmp, p->stage_track) != 0) ||
+        build_generation_manifest_vld3(p->stage_gen_manifest, device_id, recording_id,
+                                       basename_safe(source_path), start_ms, end_ms,
+                                       (uint32_t)source_size, source_crc, count, track_crc,
+                                       period_us) != ESP_OK) {
+        ESP_LOGW(TAG, "convert_vld3 %s: conversion step failed", recording_id);
+        unlink(p->stage_track_tmp);
+        free(p);
+        return ESP_FAIL;
+    }
+
+    cJSON *pointer = cJSON_CreateObject();
+    if (!pointer) { free(p); return ESP_ERR_NO_MEM; }
+    cJSON_AddStringToObject(pointer, "schema", "somnotrace.oximetry.recording/1");
+    cJSON_AddStringToObject(pointer, "recording_id", recording_id);
+    cJSON_AddNumberToObject(pointer, "active_generation", 1);
+    cJSON_AddStringToObject(pointer, "state", "ready");
+    cJSON_AddStringToObject(pointer, "device_key", device_id);
+    cJSON_AddStringToObject(pointer, "noon_day", day);
+    cJSON_AddNumberToObject(pointer, "start_epoch_ms", (double)start_ms);
+    cJSON_AddNumberToObject(pointer, "end_epoch_ms", (double)end_ms);
+    esp_err_t pe = write_json_atomic(p->stage_pointer, pointer);
+    cJSON_Delete(pointer);
+    if (pe != ESP_OK) { free(p); return pe; }
+
+    if (rename(p->stage_dir, p->final_dir) != 0) {
+        ESP_LOGW(TAG, "publish %s -> %s failed: %s", p->stage_dir, p->final_dir, strerror(errno));
+        free(p);
+        return ESP_FAIL;
+    }
+    ret = ESP_OK;
+    free(p);
+    return ret;
+}
+
 static bool valid_recording_id(const char *id)
 {
     return safe_component(id, OXIMETRY_CANONICAL_MAX_COMPONENT);
@@ -506,25 +920,6 @@ static esp_err_t build_generation_manifest(const char *path, const char *device_
     return e;
 }
 
-
-/* Path-buffer pool for convert_format_a.  16 × 512 = 8 KB on the stack was
- * overflowing the 8 KB PSRAM task stack of ox_migrate.  Heap-allocating this
- * block from PSRAM eliminates ~8 KB of stack pressure. */
-typedef struct {
-    char final_dir[OXIMETRY_CANONICAL_MAX_PATH];
-    char final_pointer[OXIMETRY_CANONICAL_MAX_PATH];
-    char day_dir[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_dir[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_source_dir[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_gen_dir[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_data_dir[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_source[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_track_tmp[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_track[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_gen_manifest[OXIMETRY_CANONICAL_MAX_PATH];
-    char gen_parent[OXIMETRY_CANONICAL_MAX_PATH];
-    char stage_pointer[OXIMETRY_CANONICAL_MAX_PATH];
-} convert_ctx_t;
 
 esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
                                                const char *recording_id,
@@ -708,6 +1103,24 @@ esp_err_t oximetry_canonical_migrate_legacy(const char *device_id)
         }
         if (oximetry_canonical_convert_format_a(device_id, name, source, start) != ESP_OK)
             ESP_LOGW(TAG, "legacy migration failed %s (source retained)", source);
+        vTaskDelay(1);
+    }
+    /* Also migrate VLD3 (.vld) files from Gen1 O2 Ring */
+    rewinddir(d);
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        if (len < 8 || strcmp(e->d_name + len - 4, ".vld") != 0) continue;
+        char name[OXIMETRY_CANONICAL_MAX_COMPONENT];
+        if (len - 4 >= sizeof(name)) continue;
+        memcpy(name, e->d_name, len - 4); name[len - 4] = '\0';
+        char source[OXIMETRY_CANONICAL_MAX_PATH];
+        if (!path_join2(source, sizeof(source), dir, e->d_name)) continue;
+        if (!source_complete_vld3(source)) {
+            ESP_LOGI(TAG, "vld3 migration skipped %s (not a complete VLD3 file; retained)", source);
+            continue;
+        }
+        if (oximetry_canonical_convert_vld3(device_id, name, source) != ESP_OK)
+            ESP_LOGW(TAG, "vld3 migration failed %s (source retained)", source);
         vTaskDelay(1);
     }
     closedir(d);

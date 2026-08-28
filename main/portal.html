@@ -2078,8 +2078,10 @@ function oxScan() {
     d.sort(function(a, b) { return b.rssi - a.rssi; });
     d.forEach(function(n) {
       var o = document.createElement('option');
-      o.value = n.addr;
-      o.textContent = n.name + ' (' + n.rssi + ' dBm)';
+      o.value = n.addr + '|' + (n.type || 'oxyii');
+      var label = n.name + ' (' + n.rssi + ' dBm)';
+      if (n.type === 'legacy') label += ' — Gen1';
+      o.textContent = label;
       sel.appendChild(o);
     });
     sel.selectedIndex = 0;
@@ -2090,10 +2092,13 @@ function oxScan() {
 }
 
 function oxPair() {
-  var addr = document.getElementById('ox-dev').value;
-  if (!addr) { oxStatusMsg('Select a device first'); return; }
+  var sel = document.getElementById('ox-dev');
+  if (!sel || !sel.value) { oxStatusMsg('Select a device first'); return; }
+  var parts = sel.value.split('|');
+  var addr = parts[0];
+  var type = parts[1] || 'oxyii';
   oxStatusMsg('Connecting…');
-  fetch('/api/ox/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: addr }) })
+  fetch('/api/ox/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: addr, type: type }) })
     .then(function(r){ return r.json(); }).then(function() { oxPoll(); }).catch(function() { oxStatusMsg('Pair failed'); });
 }
 
@@ -2132,7 +2137,11 @@ function updateOxUI(ox) {
     var dn = document.getElementById('ox-dev-name');
     var di = document.getElementById('ox-dev-info');
     if (dn) dn.textContent = (ox.device && ox.device.name_prefix) ? (ox.device.name_prefix + ' O2 Ring') : 'O2 Ring';
-    if (di && ox.device) di.textContent = 'S/N: ' + (ox.device.serial || '--') + '  FW: ' + (ox.device.firmware || '--');
+    if (di && ox.device) {
+      var info = 'S/N: ' + (ox.device.serial || '--') + '  FW: ' + (ox.device.firmware || '--');
+      if (ox.device.driver === 'wellue_legacy') info += '  (Gen1)';
+      di.textContent = info;
+    }
     if (ox.state === 'connecting') { oxStatusMsg('Syncing…'); }
     else if (ox.state === 'pulling') { oxStatusMsg('Syncing…'); }
     else if (ox.state === 'scanning') { oxStatusMsg('Scanning…'); }

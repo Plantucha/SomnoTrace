@@ -268,12 +268,13 @@ static int scan_day(const char *day, upload_ox_ref_t *out, int max_out)
             if (gm) cJSON_Delete(gm);
         }
         if (!r->source_name[0]) strlcpy(r->source_name, "source.bin", sizeof(r->source_name));
-        const char *rels[] = { "recording.json", "source/source.bin" };
+        const char *rels[] = { "recording.json", "source/source.bin", "source/source.vld" };
         char gen_dir[32]; snprintf(gen_dir, sizeof(gen_dir), "generations/%u", (unsigned)r->generation);
         char rel_manifest[UPLOAD_OX_REL_LEN];
         snprintf(rel_manifest, sizeof(rel_manifest), "%s/manifest.json", gen_dir);
-        const char *all[] = { rels[0], rels[1], rel_manifest };
-        for (int i = 0; i < 3; i++) {
+        const char *all[] = { rels[0], rels[1], rels[2], rel_manifest };
+        for (int i = 0; i < 4; i++) {
+            if (!all[i]) continue;
             char local[UPLOAD_OX_PATH_LEN]; if (!join2(local, sizeof(local), root, all[i])) continue;
             struct stat st; if (stat(local, &st) != 0 || !S_ISREG(st.st_mode)) continue;
             strlcpy(r->local_paths[r->n_files], local, sizeof(r->local_paths[r->n_files]));

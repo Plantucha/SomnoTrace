@@ -1,5 +1,5 @@
 /*
- * SomnoTrace - O2 Ring (OxyII) oximeter BLE sync — public API
+ * SomnoTrace - Oximeter BLE sync — public API (multi-driver dispatcher)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  *
  * This file is part of SomnoTrace.
@@ -22,7 +22,8 @@
  * (https://github.com/ilyakruchinin)." See the NOTICE file for details.
  *
  * Clean-room implementation of the OxyII BLE protocol for Wellue O2 Ring S
- * and SleepHQ O2 Ring Pro. Protocol studied from published documentation;
+ * and SleepHQ O2 Ring Pro, and the Legacy BLE protocol for Wellue O2 Ring
+ * (Gen1) / ViaTom rings. Protocol studied from published documentation;
  * no third-party source code copied. See spec/0003-o2ring-ble-sync.md.
  */
 
@@ -31,6 +32,12 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "cJSON.h"
+
+/* Driver type — determines which BLE protocol to use for the paired ring. */
+typedef enum {
+    OX_DRIVER_OXYII  = 0,  /* Gen2: O2 Ring S / SHQO2Pro (OxyII protocol) */
+    OX_DRIVER_LEGACY = 1,  /* Gen1: O2 Ring / ViaTom (Legacy protocol) */
+} ox_driver_t;
 
 /* Oximeter state machine states (returned by oximeter_get_status). */
 #define OX_STATUS_IDLE       "idle"
@@ -60,20 +67,21 @@ typedef enum {
  * from NVS and starts the background watch task. */
 esp_err_t oximeter_init(void);
 
-/* Start a BLE scan for OxyII rings (SHQO2Pro / S8-AW, mfg 0xF34E).
+/* Start a BLE scan for oximeter rings (both OxyII and Legacy protocols).
  * Blocks until scan completes.  AS11 connection stays up.
  * Results retrieved via oximeter_get_scan_results(). */
 esp_err_t oximeter_scan(int timeout_sec);
 
-/* Return a cJSON array of discovered OxyII rings.
- * Each element: {"addr":"AA:BB:...","name":"SHQO2Pro ...","rssi":-65}
+/* Return a cJSON array of discovered rings.
+ * Each element: {"addr":"AA:BB:...","name":"...","rssi":-65,"type":"oxyii"|"legacy"}
  * Caller must cJSON_Delete(). */
 cJSON *oximeter_get_scan_results(void);
 
 /* Pair with the ring at the given BLE address.  Connects, runs GET_INFO,
- * stores the serial in NVS + paired.json, disconnects.  Replaces any
- * previously paired ring.  Non-blocking — runs in a background task. */
-esp_err_t oximeter_pair(const char *addr_str);
+ * stores the serial + driver type in NVS + paired.json, disconnects.
+ * Replaces any previously paired ring.  Non-blocking — runs in a background task.
+ * driver selects the BLE protocol to use (OxyII for Gen2, Legacy for Gen1). */
+esp_err_t oximeter_pair(const char *addr_str, ox_driver_t driver);
 
 /* Forget the paired ring: erase NVS + paired.json.  Keeps files/. */
 esp_err_t oximeter_forget(void);
@@ -88,8 +96,12 @@ const char *oximeter_get_error(void);
 bool oximeter_is_paired(void);
 
 /* Return a cJSON object with paired ring info: serial, firmware,
- * name_prefix, last_addr.  NULL if not paired.  Caller cJSON_Delete(). */
+ * name_prefix, last_addr, driver.  NULL if not paired.  Caller cJSON_Delete(). */
 cJSON *oximeter_get_paired_info(void);
+
+/* Return the driver type of the currently paired ring.
+ * Returns OX_DRIVER_OXYII if not paired (default). */
+ox_driver_t oximeter_get_driver(void);
 
 /* Get/set the probe mode (see ox_probe_mode_t).  Persists to NVS.
  * The watch task picks up the new mode on its next iteration. */

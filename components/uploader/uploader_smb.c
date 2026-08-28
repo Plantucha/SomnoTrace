@@ -366,10 +366,13 @@ static upload_result_t smb_put_oximetry(const upload_ox_ref_t *ref)
 {
     if (!s_smb || !ref || !ref->recording_id[0]) return UPLOAD_ERR_TRANSIENT;
     for (int i = 0; i < ref->n_files; i++) {
-        if (strcmp(ref->relative_paths[i], "source/source.bin") != 0) continue;
+        const char *rel = ref->relative_paths[i];
+        if (strcmp(rel, "source/source.bin") != 0 &&
+            strcmp(rel, "source/source.vld") != 0) continue;
+        const char *ext = strstr(rel, ".vld") ? ".vld" : ".bin";
         char path[760];
-        snprintf(path, sizeof(path), "%s/OXYMETRY/%s/%s.bin", s_remote_base,
-                 ref->day, ref->recording_id);
+        snprintf(path, sizeof(path), "%s/OXYMETRY/%s/%s%s", s_remote_base,
+                 ref->day, ref->recording_id, ext);
         return smb_upload_file(s_smb, ref->local_paths[i], path);
     }
     return UPLOAD_ERR_PERMANENT;

@@ -45,9 +45,15 @@ static const char *TAG = "ox_store";
 #define OXY_PAIRED_JSON OXY_BASE "/paired.json"
 #define OXY_INDEX_JSON  OXY_BASE "/index.json"
 
-/* Trailer magic at file_size - 44 (offset 4 within the 48-byte trailer). */
+/* Trailer magic at file_size - 44 (offset 4 within the 48-byte trailer).
+ * Used for OxyII Format A files. */
 static const uint8_t TRAILER_MAGIC[4] = { 0x48, 0x12, 0x5A, 0xDA };
 #define TRAILER_LEN  48
+
+/* VLD3 header constants (Gen1 Legacy files). */
+#define VLD3_HEADER_LEN   40
+#define VLD3_RECORD_LEN   5
+#define VLD3_VERSION      3
 
 /* ── Directory helpers ─────────────────────────────────────────────── */
 
@@ -63,7 +69,8 @@ void ox_store_ensure_dirs(void)
 bool ox_store_load_paired(char *serial, size_t serial_sz,
                           char *firmware, size_t fw_sz,
                           char *name_prefix, size_t prefix_sz,
-                          char *last_addr, size_t addr_sz)
+                          char *last_addr, size_t addr_sz,
+                          char *driver, size_t driver_sz)
 {
     FILE *f = fopen(OXY_PAIRED_JSON, "r");
     if (!f) return false;
@@ -87,7 +94,8 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
     bool ok = false;
     cJSON *s = cJSON_GetObjectItem(j, "serial");
     if (cJSON_IsString(s) && s->valuestring[0]) {
-        strlcpy(serial, s->valuestring, serial_sz);
+        if (serial && serial_sz > 0)
+            strlcpy(serial, s->valuestring, serial_sz);
         ok = true;
     }
     cJSON *fw = cJSON_GetObjectItem(j, "firmware");
@@ -99,13 +107,17 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
     cJSON *la = cJSON_GetObjectItem(j, "last_addr");
     if (la && cJSON_IsString(la) && last_addr)
         strlcpy(last_addr, la->valuestring, addr_sz);
+    cJSON *drv = cJSON_GetObjectItem(j, "driver");
+    if (drv && cJSON_IsString(drv) && driver)
+        strlcpy(driver, drv->valuestring, driver_sz);
 
     cJSON_Delete(j);
     return ok;
 }
 
 void ox_store_save_paired(const char *serial, const char *firmware,
-                          const char *name_prefix, const char *last_addr)
+                          const char *name_prefix, const char *last_addr,
+                          const char *driver)
 {
     ox_store_ensure_dirs();
     cJSON *j = cJSON_CreateObject();
@@ -113,6 +125,7 @@ void ox_store_save_paired(const char *serial, const char *firmware,
     if (firmware) cJSON_AddStringToObject(j, "firmware", firmware);
     if (name_prefix) cJSON_AddStringToObject(j, "name_prefix", name_prefix);
     if (last_addr) cJSON_AddStringToObject(j, "last_addr", last_addr);
+    if (driver) cJSON_AddStringToObject(j, "driver", driver);
     char *json = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
     if (!json) return;
@@ -361,4 +374,118 @@ void ox_store_part_remove(const char *name)
     char path[128];
     snprintf(path, sizeof(path), "%s/%s.part", OXY_INBOX, name);
     remove(path);
+}
+
+/* Promote a .part file to files/<serial>/<name>.vld if VLD3 header is valid.
+ * Validation: version==3, body_len % 5 == 0, resolution is 2.0 or 4.0.
+ * Returns true if promoted (finalised), false otherwise. */
+bool ox_store_promote_vld3(const char *serial, const char *name)
+{
+    char part_path[128];
+    snprintf(part_path, sizeof(part_path), "%s/%s.part", OXY_INBOX, name);
+
+    FILE *f = fopen(part_path, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize < VLD3_HEADER_LEN) {
+        fclose(f);
+        ESP_LOGW(TAG, "vld3 promote: file too small (%ld bytes)", fsize);
+        return false;
+    }
+
+    /* Read and validate the VLD3 header */
+    uint8_t header[VLD3_HEADER_LEN];
+    if (fread(header, 1, VLD3_HEADER_LEN, f) != VLD3_HEADER_LEN) {
+        fclose(f);
+        return false;
+    }
+
+    /* Check version */
+    if (header[0] != VLD3_VERSION) {
+        fclose(f);
+        ESP_LOGW(TAG, "vld3 promote: version %u != %d", header[0], VLD3_VERSION);
+        return false;
+    }
+
+    /* Check body length is a multiple of record size */
+    long body_len = fsize - VLD3_HEADER_LEN;
+    if (body_len % VLD3_RECORD_LEN != 0) {
+        fclose(f);
+        ESP_LOGW(TAG, "vld3 promote: body_len %ld not multiple of %d",
+                 body_len, VLD3_RECORD_LEN);
+        return false;
+    }
+
+    /* Check resolution: duration_seconds / record_count must be 2.0 or 4.0 */
+    uint32_t duration_seconds = header[13] | (header[14] << 8) |
+                                (header[15] << 16) | (header[16] << 24);
+    uint32_t record_count = body_len / VLD3_RECORD_LEN;
+    if (record_count == 0 || duration_seconds == 0) {
+        fclose(f);
+        ESP_LOGW(TAG, "vld3 promote: zero records or duration");
+        return false;
+    }
+    uint32_t resolution_x10 = (duration_seconds * 10) / record_count;
+    if (resolution_x10 != 20 && resolution_x10 != 40) {
+        fclose(f);
+        ESP_LOGW(TAG, "vld3 promote: resolution %u.%us not 2.0 or 4.0",
+                 resolution_x10 / 10, resolution_x10 % 10);
+        return false;
+    }
+
+    /* Read the whole file into memory */
+    fseek(f, 0, SEEK_SET);
+    uint8_t *data = heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM);
+    if (!data) data = malloc(fsize);
+    if (!data) {
+        fclose(f);
+        ESP_LOGE(TAG, "vld3 promote: OOM %ld bytes", fsize);
+        return false;
+    }
+    int n = fread(data, 1, fsize, f);
+    fclose(f);
+    if (n != fsize) {
+        free(data);
+        return false;
+    }
+
+    /* Create files/<serial>/ directory */
+    char serial_dir[160];
+    snprintf(serial_dir, sizeof(serial_dir), "%s/%s", OXY_FILES, serial);
+    mkdir(OXY_FILES, 0775);
+    mkdir(serial_dir, 0775);
+
+    /* Write the final .vld file atomically */
+    char vld_path[256];
+    char tmp_path[260];
+    snprintf(vld_path, sizeof(vld_path), "%s/%s/%s.vld", OXY_FILES, serial, name);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", vld_path);
+    f = fopen(tmp_path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "vld3 promote: cannot create %s", tmp_path);
+        free(data);
+        return false;
+    }
+    bool written = fwrite(data, 1, fsize, f) == (size_t)fsize &&
+                   fflush(f) == 0 && fsync(fileno(f)) == 0;
+    fclose(f);
+    free(data);
+    if (!written || rename(tmp_path, vld_path) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
+
+    /* Remove the .part file */
+    remove(part_path);
+
+    /* Update index */
+    ox_store_index_add(serial, name, (uint32_t)fsize, true);
+
+    ESP_LOGI(TAG, "vld3 promoted %s (%ld bytes, %u records, %u.%us/sample)",
+             vld_path, fsize, record_count,
+             resolution_x10 / 10, resolution_x10 % 10);
+    return true;
 }
