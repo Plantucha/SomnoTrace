@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/svg/logo-full.svg" alt="SomnoTrace" width="480" />
+</p>
+
 # SomnoTrace
 
 > A plug-and-play wireless bridge that pulls CPAP therapy and pulse oximetry data over Bluetooth, automatically saves standard European Data Format (EDF) files, and uploads them to your home network (NAS/SMB) or SleepHQ — **no SD card swapping or Wi-Fi SD cards required**.
@@ -36,13 +40,34 @@ SomnoTrace is the **first and only** open-source project that delivers:
 
 SomnoTrace runs on a compact, affordable, all-in-one development board:
 
-- **Recommended Board:** **[Waveshare ESP32-S3-Touch-LCD-1.54](https://www.waveshare.com/esp32-s3-lcd-1.54.htm?sku=33869)**  
+- **Hardware Board:** **[Waveshare ESP32-S3-Touch-LCD-1.54](https://www.waveshare.com/esp32-s3-lcd-1.54.htm?sku=33869)**  
   *(The **touch variant with battery** is strongly recommended for portable bedside use).*
 - **Display:** 1.54" round-corner color screen with touch control.
 - **Storage:** MicroSD card slot for saving high-resolution sleep data and EDF files.
 - **Audio:** Onboard speaker for therapy alerts and status tones.
 - **Power:** USB Type-C or internal rechargeable battery with smart charging.
-- **Supported CPAP & Oximeters:** ResMed AirSense 11 (AutoSet / Elite), Wellue O2 Ring S, SleepHQ O2 Ring Pro.
+
+**Additional accessories required:**
+- micro-SDHC card (8 GB minimum, 16 GB+ recommended; U1 or U3 speed class)
+  - goes inside the WaveShare board for internal file storage
+- USB-C data cable (for initial flashing and charging)
+- USB-C charger (for overnight power)
+
+---
+
+## Supported Devices
+
+- **Supported CPAP Machines:**
+  - ResMed AirSense 11 (AutoSet / Elite)
+  - ResMed AirCurve 11 (VAuto / ASV)
+- **Supported Pulse Oximeters:**
+  - **O2 Ring S (Gen2)** — Viatom model PO2B (S8-AW). Also sold as: 
+    - Wellue O2Ring S
+    - SleepHQ O2 Ring Pro.
+  - **O2 Ring (Gen1, experimental)** — Viatom model PO2 (S9). Also sold as:
+    - Wellue O2Ring
+    - LOOKEE O2Ring
+    - SleepHQ O2 Ring (non-Pro)
 
 <br clear="right"/>
 
