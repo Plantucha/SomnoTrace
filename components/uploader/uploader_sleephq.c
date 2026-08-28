@@ -228,9 +228,51 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
         }
     }
 
+    /* De-chunk the body in-place if the response used chunked transfer encoding.
+     * Without this, chunk size prefixes (e.g. "409\r\n") corrupt the JSON body
+     * and cJSON_Parse misinterprets the hex chunk size as a JSON number. */
+    size_t body_total = buf_len - (body_start - buf);
+    if (chunked && body_total > 0) {
+        size_t rd = 0;          /* read position in raw body  */
+        size_t wr = 0;          /* write position (de-chunked) */
+        while (rd < body_total) {
+            /* Parse hex chunk size up to \r\n */
+            size_t chunk_sz = 0;
+            int hex_digits = 0;
+            while (rd < body_total && body_start[rd] != '\r') {
+                char c = body_start[rd];
+                int val;
+                if (c >= '0' && c <= '9') val = c - '0';
+                else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+                else break;
+                chunk_sz = chunk_sz * 16 + val;
+                hex_digits++;
+                rd++;
+            }
+            if (hex_digits == 0) break;
+            /* Skip \r\n after chunk size */
+            if (rd + 1 < body_total && body_start[rd] == '\r' && body_start[rd + 1] == '\n')
+                rd += 2;
+            else break;
+            /* Copy chunk data (if it fits) */
+            if (chunk_sz == 0) break;       /* terminal chunk */
+            size_t copy = chunk_sz;
+            if (rd + copy > body_total) copy = body_total - rd;
+            if (wr + copy > buf_cap - (body_start - buf)) break;
+            memmove(body_start + wr, body_start + rd, copy);
+            wr += copy;
+            rd += chunk_sz;
+            /* Skip trailing \r\n after chunk data */
+            if (rd + 1 < body_total && body_start[rd] == '\r' && body_start[rd + 1] == '\n')
+                rd += 2;
+        }
+        body_total = wr;
+        buf_len = (body_start - buf) + body_total;
+    }
+
     /* Extract body if requested */
     if (body_out) {
-        size_t body_total = buf_len - (body_start - buf);
         if (body_total > SHQ_RESP_CAP) body_total = SHQ_RESP_CAP;
         char *body = heap_caps_malloc(SHQ_RESP_CAP, MALLOC_CAP_SPIRAM);
         if (!body) body = malloc(SHQ_RESP_CAP);
@@ -242,7 +284,7 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
     }
 
     ESP_LOGI(TAG, "response: HTTP %d (%u bytes body)", status,
-             (unsigned)(buf_len - (body_start - buf)));
+             (unsigned)body_total);
 
     free(buf);
     return status;
