@@ -255,3 +255,6 @@ Any redistributed or derivative works must remain licensed under GPLv3 and prese
 
 SomnoTrace is an independent open-source project and is **not affiliated with, endorsed by, or associated with** ResMed, Wellue / Viatom, or SleepHQ. It is intended strictly for personal data portability and interoperability research. SomnoTrace is **not a medical device** and must not be used for clinical diagnosis, treatment decisions, or life-critical monitoring. Use entirely at your own risk.
 
+
+
+![Latest OTA Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Filyakruchinin%2FSomnoTrace%2Freleases%2Flatest&query=%24.assets%5B1%5D.download_count&label=latest%20OTA)
