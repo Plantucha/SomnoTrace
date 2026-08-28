@@ -1191,7 +1191,7 @@ static esp_err_t send_rpc_encrypted(const char *json)
         return ESP_ERR_INVALID_STATE;
     }
     int plen = (int)strlen(json);
-    uint8_t *enc = heap_caps_malloc(TX_PAYLOAD_MAX, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint8_t *enc = heap_caps_malloc(TX_PAYLOAD_MAX, MALLOC_CAP_SPIRAM);
     if (!enc) {
         enc = malloc(TX_PAYLOAD_MAX);
         if (!enc) return ESP_ERR_NO_MEM;

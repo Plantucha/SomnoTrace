@@ -309,14 +309,14 @@ static uint16_t s_svc_start, s_svc_end;
 static uint8_t s_seq = 0;
 
 /* Scan state */
-static struct ox_scan_result s_scan[OX_SCAN_MAX];
+static struct ox_scan_result *s_scan;
 static int s_scan_count;
 
-/* Notification accumulation buffer */
-static uint8_t s_resp_buf[OXYII_MAX_FRAME];
+/* Notification accumulation buffer — PSRAM-allocated at init */
+static uint8_t *s_resp_buf;
 static int s_resp_len;
 static uint8_t s_resp_opcode;
-static uint8_t s_resp_payload[OXYII_MAX_FRAME];
+static uint8_t *s_resp_payload;
 static int s_resp_payload_len;
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
@@ -388,9 +388,9 @@ static int gap_event(struct ble_gap_event *event, void *arg);
 /* Handle notification: accumulate and try to decode. */
 static void handle_notify_rx(const uint8_t *data, int len)
 {
-    if (s_resp_len + len > (int)sizeof(s_resp_buf)) {
+    if (s_resp_len + len > OXYII_MAX_FRAME) {
         ESP_LOGW(TAG, "notify overflow: resp_len=%d + %d > %d",
-                 s_resp_len, len, (int)sizeof(s_resp_buf));
+                 s_resp_len, len, OXYII_MAX_FRAME);
         s_resp_len = 0;
     }
     memcpy(s_resp_buf + s_resp_len, data, len);
@@ -399,7 +399,7 @@ static void handle_notify_rx(const uint8_t *data, int len)
     uint8_t op, flag, seq;
     int plen;
     int rc = oxyii_try_decode(s_resp_buf, s_resp_len, &op, &flag, &seq,
-                               s_resp_payload, &plen, sizeof(s_resp_payload));
+                               s_resp_payload, &plen, OXYII_MAX_FRAME);
     if (rc > 0) {
         s_resp_opcode = op;
         s_resp_payload_len = plen;
@@ -1496,7 +1496,7 @@ static void pull_task(void *arg)
 }
 
 /* ── Public API (driver vtable) ───────────────────────────────────── */
-static esp_err_t oxyii_init(void)
+static void oxyii_init(void)
 {
     s_state_mtx = xSemaphoreCreateMutex();
     s_ops_mtx   = xSemaphoreCreateMutex();
@@ -1506,7 +1506,16 @@ static esp_err_t oxyii_init(void)
     s_scan_done = xSemaphoreCreateBinary();
     if (!s_state_mtx || !s_ops_mtx || !s_op_sem || !s_conn_sem ||
         !s_resp_sem || !s_scan_done)
-        return ESP_ERR_NO_MEM;
+        return;
+
+    s_scan = heap_caps_malloc(sizeof(struct ox_scan_result) * OX_SCAN_MAX,
+                              MALLOC_CAP_SPIRAM);
+    s_resp_buf = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
+    s_resp_payload = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
+    if (!s_scan || !s_resp_buf || !s_resp_payload) {
+        ESP_LOGE(TAG, "init: failed to allocate PSRAM buffers");
+        return;
+    }
 
     load_paired_from_nvs();
     ox_store_ensure_dirs();
@@ -1524,7 +1533,6 @@ static esp_err_t oxyii_init(void)
                                                "ox_migrate", 12288, NULL, 1,
                                                0, NULL, NULL);
     if (!migration) ESP_LOGW(TAG, "failed to create canonical migration task");
-    return ESP_OK;
 }
 
 static esp_err_t oxyii_scan(int timeout_sec)
@@ -1614,7 +1622,6 @@ static void oxyii_forget(void)
     ox_store_delete_paired();
 
     set_state(OX_STATUS_IDLE);
-    return ESP_OK;
 }
 
 static const char *oxyii_get_status(void)

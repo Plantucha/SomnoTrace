@@ -220,15 +220,15 @@ static uint16_t s_cccd_handle;
 static uint16_t s_svc_start, s_svc_end;
 
 /* Scan state */
-static struct ox_scan_result s_scan[OX_SCAN_MAX];
+static struct ox_scan_result *s_scan;
 static int s_scan_count;
 
-/* Notification accumulation buffer */
-static uint8_t s_resp_buf[LEGACY_MAX_FRAME];
+/* Notification accumulation buffer — PSRAM-allocated at init */
+static uint8_t *s_resp_buf;
 static int s_resp_len;
 static uint8_t s_resp_status;
 static uint16_t s_resp_block;
-static uint8_t s_resp_payload[LEGACY_MAX_FRAME];
+static uint8_t *s_resp_payload;
 static int s_resp_payload_len;
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
@@ -308,9 +308,9 @@ static int gap_event(struct ble_gap_event *event, void *arg);
 
 static void handle_notify_rx(const uint8_t *data, int len)
 {
-    if (s_resp_len + len > (int)sizeof(s_resp_buf)) {
+    if (s_resp_len + len > LEGACY_MAX_FRAME) {
         ESP_LOGW(TAG, "notify overflow: resp_len=%d + %d > %d",
-                 s_resp_len, len, (int)sizeof(s_resp_buf));
+                 s_resp_len, len, LEGACY_MAX_FRAME);
         s_resp_len = 0;
     }
     memcpy(s_resp_buf + s_resp_len, data, len);
@@ -320,7 +320,7 @@ static void handle_notify_rx(const uint8_t *data, int len)
     uint16_t block;
     int plen;
     int rc = legacy_try_decode(s_resp_buf, s_resp_len, &status, &block,
-                               s_resp_payload, &plen, sizeof(s_resp_payload));
+                               s_resp_payload, &plen, LEGACY_MAX_FRAME);
     if (rc > 0) {
         s_resp_status = status;
         s_resp_block = block;
@@ -710,13 +710,13 @@ static esp_err_t legacy_set_time(void)
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
-    char time_str[24];
+    char time_str[80];
     snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d,%02d:%02d:%02d",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 
     /* Build JSON config: {"SetTIME":"YYYY-MM-DD,HH:MM:SS"} */
-    char json[64];
+    char json[128];
     snprintf(json, sizeof(json), "{\"SetTIME\":\"%s\"}", time_str);
 
     return legacy_request(CMD_CONFIG, 0, (uint8_t *)json, strlen(json),
@@ -1270,7 +1270,7 @@ static void pull_task(void *arg)
 }
 
 /* ── Public API (driver vtable) ────────────────────────────────────── */
-static esp_err_t legacy_init(void)
+static void legacy_init(void)
 {
     s_state_mtx = xSemaphoreCreateMutex();
     s_ops_mtx   = xSemaphoreCreateMutex();
@@ -1280,7 +1280,16 @@ static esp_err_t legacy_init(void)
     s_scan_done = xSemaphoreCreateBinary();
     if (!s_state_mtx || !s_ops_mtx || !s_op_sem || !s_conn_sem ||
         !s_resp_sem || !s_scan_done)
-        return ESP_ERR_NO_MEM;
+        return;
+
+    s_scan = heap_caps_malloc(sizeof(struct ox_scan_result) * OX_SCAN_MAX,
+                              MALLOC_CAP_SPIRAM);
+    s_resp_buf = heap_caps_malloc(LEGACY_MAX_FRAME, MALLOC_CAP_SPIRAM);
+    s_resp_payload = heap_caps_malloc(LEGACY_MAX_FRAME, MALLOC_CAP_SPIRAM);
+    if (!s_scan || !s_resp_buf || !s_resp_payload) {
+        ESP_LOGE(TAG, "init: failed to allocate PSRAM buffers");
+        return;
+    }
 
     load_paired_from_nvs();
     ox_store_ensure_dirs();
@@ -1298,7 +1307,6 @@ static esp_err_t legacy_init(void)
                                                "ox_leg_mig", 12288, NULL, 1,
                                                0, NULL, NULL);
     if (!migration) ESP_LOGW(TAG, "failed to create canonical migration task");
-    return ESP_OK;
 }
 
 static esp_err_t legacy_scan(int timeout_sec)

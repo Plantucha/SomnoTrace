@@ -86,6 +86,8 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(ox_snt3_header_t) == OX_SNT_HEADER_BYTES,
                "oximetry SNT v3 header must be 64 bytes");
 
+static bool valid_recording_id(const char *id);
+
 static bool safe_component(const char *s, size_t max_len)
 {
     if (!s || !s[0] || strlen(s) >= max_len) return false;

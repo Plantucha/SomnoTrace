@@ -32,6 +32,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
 
@@ -129,7 +130,7 @@ static uint8_t       s_evt_q_storage[ALERT_EVT_Q_LEN * sizeof(alert_evt_t)];
 static QueueHandle_t s_evt_q = NULL;
 
 static StaticTask_t  s_monitor_tcb;
-static StackType_t   s_monitor_stack[ALERT_MONITOR_STACK / sizeof(StackType_t)];
+static StackType_t  *s_monitor_stack;
 
 /* Forward declarations */
 static void cancel_alert_routine(void);
@@ -575,10 +576,14 @@ static void start_alert_routine(void)
     set_state(ALERT_PENDING);
 
     TaskHandle_t h = NULL;
-    BaseType_t ok = xTaskCreatePinnedToCore(alert_routine_task, "alert_routine",
-                                            4096, (void *)(uintptr_t)gen,
-                                            5, &h, 0);
-    if (ok != pdPASS || !h) {
+    StackType_t *stack = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    StaticTask_t *tcb  = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (stack && tcb) {
+        h = xTaskCreateStaticPinnedToCore(alert_routine_task, "alert_routine",
+                                          4096, (void *)(uintptr_t)gen, 5,
+                                          stack, tcb, 0);
+    }
+    if (!h) {
         /* Without the routine there will be no push and no buzzer, so say so
          * rather than sitting silently in PENDING for ever. */
         ESP_LOGE(TAG, "failed to create alert routine task — disarming");
@@ -827,9 +832,10 @@ esp_err_t therapy_alert_init(void)
     s_cfg_staged = s_cfg;
     s_state = ALERT_DISARMED;
 
-    /* Statically allocated: the event queue, its storage and the owner
-     * task's stack all live in .bss, so no synchronisation object in this
-     * component can be the heap neighbour of a task stack. */
+    /* The owner task's stack lives in PSRAM to save internal RAM.  The event
+     * queue and its storage remain in .bss, so no synchronisation object in
+     * this component can be the heap neighbour of a task stack — the PSRAM
+     * stack is in a completely separate memory region. */
     s_cfg_mtx = xSemaphoreCreateMutexStatic(&s_cfg_mtx_buf);
     if (!s_cfg_mtx) return ESP_ERR_NO_MEM;
 
@@ -837,8 +843,14 @@ esp_err_t therapy_alert_init(void)
                                  s_evt_q_storage, &s_evt_q_buf);
     if (!s_evt_q) return ESP_ERR_NO_MEM;
 
-    /* Start the owner task.  A failure here means no alerts at all, so it is
-     * reported instead of being discarded as it was before. */
+    /* Start the owner task with a PSRAM-allocated stack.  A failure here
+     * means no alerts at all, so it is reported instead of being discarded
+     * as it was before. */
+    s_monitor_stack = heap_caps_malloc(ALERT_MONITOR_STACK, MALLOC_CAP_SPIRAM);
+    if (!s_monitor_stack) {
+        ESP_LOGE(TAG, "failed to allocate alert monitor stack in PSRAM");
+        return ESP_ERR_NO_MEM;
+    }
     TaskHandle_t h = xTaskCreateStaticPinnedToCore(
             alert_owner_task, "alert_monitor",
             ALERT_MONITOR_STACK / sizeof(StackType_t), NULL, 2,

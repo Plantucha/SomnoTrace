@@ -1416,6 +1416,54 @@ static void reboot_task(void *arg)
     esp_restart();
 }
 
+static esp_err_t heap_stats_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    cJSON *root = cJSON_CreateObject();
+
+    cJSON *internal = cJSON_AddObjectToObject(root, "internal");
+    cJSON_AddNumberToObject(internal, "free", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(internal, "min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(internal, "lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    cJSON *psram = cJSON_AddObjectToObject(root, "psram");
+    cJSON_AddNumberToObject(psram, "free", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(psram, "min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(psram, "lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+
+    cJSON *dma = cJSON_AddObjectToObject(root, "dma");
+    cJSON_AddNumberToObject(dma, "free", (double)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    cJSON_AddNumberToObject(dma, "min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
+
+    cJSON_AddNumberToObject(root, "tasks", (double)uxTaskGetNumberOfTasks());
+
+    cJSON *tasks = cJSON_AddArrayToObject(root, "task_list");
+    TaskStatus_t *task_stats = heap_caps_malloc(uxTaskGetNumberOfTasks() * sizeof(TaskStatus_t),
+                                                MALLOC_CAP_SPIRAM);
+    if (task_stats) {
+        UBaseType_t n = uxTaskGetSystemState(task_stats, uxTaskGetNumberOfTasks(), NULL);
+        for (UBaseType_t i = 0; i < n; i++) {
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddStringToObject(t, "name", task_stats[i].pcTaskName);
+            cJSON_AddNumberToObject(t, "stack_hwm", (double)(task_stats[i].usStackHighWaterMark * sizeof(StackType_t)));
+            cJSON_AddNumberToObject(t, "prio", (double)task_stats[i].uxCurrentPriority);
+            cJSON_AddNumberToObject(t, "state", (double)task_stats[i].eCurrentState);
+            cJSON_AddItemToArray(tasks, t);
+        }
+        free(task_stats);
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    if (json) {
+        httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+        free(json);
+    } else {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -2957,6 +3005,10 @@ static esp_err_t start_webserver(void)
     /* Reboot endpoint */
     httpd_uri_t reboot_post = { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler };
     httpd_register_uri_handler(s_httpd, &reboot_post);
+
+    /* Heap stats endpoint (per-task stack HWM, internal/PSRAM/DMA breakdown) */
+    httpd_uri_t heap_stats = { .uri = "/api/heap", .method = HTTP_GET, .handler = heap_stats_handler };
+    httpd_register_uri_handler(s_httpd, &heap_stats);
 
     /* Consolidated actions endpoint */
     httpd_uri_t actions = { .uri = "/api/actions", .method = HTTP_POST, .handler = actions_handler };

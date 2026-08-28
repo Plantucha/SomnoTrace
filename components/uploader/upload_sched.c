@@ -679,11 +679,17 @@ esp_err_t upload_sched_init(void)
     int n = uploader_enabled_backends(bes, UPLOAD_MAX_BACKENDS);
     for (int i = 0; i < n; i++) rt_for(bes[i]);
 
-    BaseType_t ok = xTaskCreatePinnedToCore(sched_task, "up_sched",
-                                            SCHED_TASK_STACK, NULL, 4,
-                                            &s_task, 0);
-    if (ok != pdPASS) {
+    StackType_t *stack = heap_caps_malloc(SCHED_TASK_STACK, MALLOC_CAP_SPIRAM);
+    StaticTask_t *tcb  = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (stack && tcb) {
+        s_task = xTaskCreateStaticPinnedToCore(sched_task, "up_sched",
+                                               SCHED_TASK_STACK, NULL, 4,
+                                               stack, tcb, 0);
+    }
+    if (!s_task) {
         ESP_LOGE(TAG, "failed to create scheduler task");
+        free(stack);
+        free(tcb);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
