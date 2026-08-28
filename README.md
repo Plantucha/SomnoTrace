@@ -15,8 +15,8 @@ Spiritual successor to [CPAP-AutoSync](https://github.com/ilyakruchinin/CPAP-Aut
 
 SomnoTrace is the **first and only** open-source project that delivers:
 
-- 📡 **Wireless Therapy Data via BLE — No WiFi SD Card Needed:**  
-  SomnoTrace pulls detailed sleep therapy data directly from ResMed Series 11 machines (AirSense 11 / AirCurve 11) over Bluetooth Low Energy (BLE) — **no SD card required in the CPAP machine at all**. Your therapy data is captured wirelessly as you sleep, eliminating the daily ritual of swapping SD cards between your machine and computer.
+- 📡 **Wireless Therapy Data via BLE — No SD Card or WiFi SD Card Needed:**  
+  SomnoTrace pulls detailed sleep therapy data directly from ResMed Series 11 machines (AirSense 11 / AirCurve 11) over Bluetooth Low Energy (BLE) — **no SD card required in the CPAP machine at all**. This replaces both the daily ritual of physically swapping SD cards and the need for WiFi SD card adapters (such as EZShare). Your therapy data is captured wirelessly as you sleep.
 - ⏱️ **Zero Clock Drift (Perfect Pulse Oximeter Sync):**  
   The AirSense 11's built-in clock drifts over time (often by minutes), causing your CPAP graphs and pulse oximeter graphs to be misaligned in OSCAR and SleepHQ. SomnoTrace continuously aligns therapy records to exact internet time (NTP), delivering sample-accurate synchronization with your oximetry data (such as the Wellue O2 Ring).
 - 🚨 **Interrupted Therapy Alerts (Insurance Compliance & Safety):**  
