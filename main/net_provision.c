@@ -2879,7 +2879,7 @@ static esp_err_t start_webserver(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
     config.max_uri_handlers = 60;
-    config.stack_size = 8192;
+    config.stack_size = 12288;
     config.max_open_sockets = 20;
     config.recv_wait_timeout = 1;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
