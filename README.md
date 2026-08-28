@@ -257,4 +257,5 @@ SomnoTrace is an independent open-source project and is **not affiliated with, e
 
 
 
-![Latest OTA Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Filyakruchinin%2FSomnoTrace%2Freleases%2Flatest&query=%24.assets%5B1%5D.download_count&label=latest%20OTA)
+![GitHub Downloads (all assets, latest release)](https://img.shields.io/github/downloads/ilyakruchinin/somnotrace/latest/total)
+
