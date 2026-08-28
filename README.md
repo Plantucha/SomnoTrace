@@ -15,6 +15,8 @@ Spiritual successor to [CPAP-AutoSync](https://github.com/ilyakruchinin/CPAP-Aut
 
 SomnoTrace is the **first and only** open-source project that delivers:
 
+- 📡 **Wireless Therapy Data via BLE — No SD Card Needed:**  
+  SomnoTrace pulls detailed sleep therapy data directly from ResMed Series 11 machines (AirSense 11 / AirCurve 11) over Bluetooth Low Energy (BLE) — **no SD card required in the CPAP machine at all**. Your therapy data is captured wirelessly as you sleep, eliminating the daily ritual of swapping SD cards between your machine and computer.
 - ⏱️ **Zero Clock Drift (Perfect Pulse Oximeter Sync):**  
   The AirSense 11's built-in clock drifts over time (often by minutes), causing your CPAP graphs and pulse oximeter graphs to be misaligned in OSCAR and SleepHQ. SomnoTrace continuously aligns therapy records to exact internet time (NTP), delivering sample-accurate synchronization with your oximetry data (such as the Wellue O2 Ring).
 - 🚨 **Interrupted Therapy Alerts (Insurance Compliance & Safety):**  
@@ -26,7 +28,7 @@ SomnoTrace is the **first and only** open-source project that delivers:
 
 ## Key Benefits
 
-- **No more daily SD card swapping:** Your therapy data is captured wirelessly as you sleep and saved automatically to the onboard MicroSD card.
+- **No more daily SD card swapping:** Therapy data is pulled wirelessly from your CPAP machine over Bluetooth — **no SD card needed in the machine at all**. Files are saved automatically to SomnoTrace's onboard MicroSD card.
 - **Automatic uploads:** Sends your completed sleep sessions directly to your local computer / NAS share (SMB) and [SleepHQ](https://sleephq.com) as soon as therapy stops.
 - **Built-in color screen & live breathing graphs:** View real-time airflow graphs, Wi-Fi status, battery level, and clock directly on the bedside device.
 - **Easy-to-use Web Dashboard:** Connect from your phone, tablet, or computer browser to see interactive sleep charts, AHI metrics, leak rates, and device settings.
@@ -141,15 +143,15 @@ Camping mode is **not available out of the box**. The following must be true:
 
 ```mermaid
 flowchart LR
-    AS11["ResMed AirSense 11\n(Bluetooth)"] -->|Wireless Sync| ESP["SomnoTrace\n(Bedside Device)"]
-    O2["Wellue O2 Ring\n(Bluetooth)"] -.->|Oximetry Sync| ESP
+    AS11["ResMed Series 11\n(AirSense 11 / AirCurve 11)\n(Bluetooth)"] -->|Wireless Sync| ESP["SomnoTrace\n(Bedside Device)"]
+    O2["Viatom O2 Ring\n(Gen1 / Gen2)\n(Bluetooth)"] -.->|Oximetry Sync| ESP
     ESP -->|Saved Locally| SD["MicroSD Card\n(.edf files)"]
     ESP -->|Auto Upload| SMB["Home NAS / PC Share"]
     ESP -->|Auto Upload| SHQ["SleepHQ Cloud"]
     ESP -->|View in Browser| WEB["Web Dashboard & Charts"]
 ```
 
-1. **Pair Once:** [Pair SomnoTrace with your AirSense 11](docs/pairing.md) over Bluetooth in seconds using the on-screen menu.
+1. **Pair Once:** [Pair SomnoTrace with your ResMed Series 11 machine](docs/pairing.md) and O2 Ring over Bluetooth in seconds using the on-screen menu.
 2. **Sleep Normally:** While you sleep, SomnoTrace records airflow, pressure, leak, and respiratory events in real time.
 3. **Automatic Processing:** When you turn off your CPAP, SomnoTrace generates standard, bit-accurate EDF files matching native SD card layouts.
 4. **Immediate Upload:** Sessions upload automatically to your configured network storage (SMB/NAS) and SleepHQ account.
@@ -227,7 +229,7 @@ Connect with any FTP client (e.g., FileZilla) to `ftp://somnotrace.local`.
 
 | Feature | Status | Description |
 | :--- | :---: | :--- |
-| **AirSense 11 Wireless Sync** | ✅ Implemented | Secure Bluetooth connection, live stream recording, and summary data retrieval. |
+| **ResMed Series 11 Wireless Sync** | ✅ Implemented | Secure Bluetooth connection, live stream recording, and summary data retrieval. Supports AirSense 11 and AirCurve 11. |
 | **Standard EDF File Creation** | ✅ Implemented | Generates standard `STR.edf`, `BRP.edf`, `PLD.edf`, `EVE.edf`, and `CSL.edf` files compatible with OSCAR and SleepHQ. |
 | **SMB / NAS Network Upload** | ✅ Implemented | Direct file transfer to Windows, macOS, and Linux/Samba shared folders. |
 | **SleepHQ Cloud Upload** | ✅ Implemented | Direct HTTPS upload to SleepHQ with fast retry handling. |
@@ -237,7 +239,7 @@ Connect with any FTP client (e.g., FileZilla) to `ftp://somnotrace.local`.
 | **Therapy Interruption Alarm** | ✅ Implemented | Push notifications via ntfy (phone/smartwatch/bed shaker) and escalating audio buzzer. |
 | **BLE → Wi-Fi RPC Proxy** | ✅ Implemented | Local HTTP endpoint for remote machine queries and smart home control. |
 | **FTP File Server** | ✅ Implemented | Download EDF and session files directly from the MicroSD card using any FTP client (e.g., FileZilla). |
-| **O2 Ring Bluetooth Sync** | 🔄 In Progress | Downloads stored oximetry recordings from Wellue O2 Ring S / SleepHQ Pro over Bluetooth. Automatic upload to SMB/SleepHQ is not yet available — files can be accessed via FTP or the web dashboard. |
+| **O2 Ring Bluetooth Sync** | ✅ Implemented | Downloads stored oximetry recordings from Viatom O2 Ring (Gen1 & Gen2) over Bluetooth, with automatic upload to SMB and SleepHQ. |
 
 ---
 
@@ -255,7 +257,8 @@ Contributions and ideas are always welcome! Please review [`CONTRIBUTING.md`](CO
 SomnoTrace protocol understanding and interoperability research was informed by the following open-source projects (clean-room implemented — see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)):
 
 - [airbreak-plus](https://github.com/m-kozlowski/airbreak-plus) — ResMed AirSense 11 BLE protocol reference
-- [o2ring-s-protocol](https://github.com/nglessner/o2ring-s-protocol) — Wellue / O2 Ring S BLE protocol reference
+- [o2ring-s-protocol](https://github.com/nglessner/o2ring-s-protocol) — Wellue / O2 Ring S (Gen2) BLE protocol reference
+- [farolone/wellue-o2ring-protocol](https://github.com/farolone/wellue-o2ring-protocol) — O2 Ring (Gen1) BLE protocol reference
 - [OSCAR](https://gitlab.com/pholy/OSCAR-code) — European Data Format (EDF) interoperability and statistical metric reference
 - [libsmb2](https://github.com/sahlberg/libsmb2) — SMB2/SMB3 client library (LGPL-2.1)
 - [esp-idf-ftpServer](https://github.com/nopnop2002/esp-idf-ftpServer) — Embedded FTP server (MIT)
@@ -280,7 +283,4 @@ Any redistributed or derivative works must remain licensed under GPLv3 and prese
 
 SomnoTrace is an independent open-source project and is **not affiliated with, endorsed by, or associated with** ResMed, Wellue / Viatom, or SleepHQ. It is intended strictly for personal data portability and interoperability research. SomnoTrace is **not a medical device** and must not be used for clinical diagnosis, treatment decisions, or life-critical monitoring. Use entirely at your own risk.
 
-
-
 ![GitHub Downloads (all assets, latest release)](https://img.shields.io/github/downloads/ilyakruchinin/somnotrace/latest/total)
-
