@@ -32,8 +32,8 @@ copyrightable material is ever determined to have been incorporated.
 - **Project:** o2ring-s-protocol
 - **Source:** https://github.com/nglessner/o2ring-s-protocol
 - **Referenced for:** understanding of the Wellue / O2 Ring S BLE protocol
-  (Gen2, "OxyII").  Already credited above; listed here for context alongside
-  the Gen1 references below.
+  (Gen2, "OxyII").  Listed here for context alongside the Gen1 references
+  below.
 - **License:** MIT
 
 ## farolone/wellue-o2ring-protocol
