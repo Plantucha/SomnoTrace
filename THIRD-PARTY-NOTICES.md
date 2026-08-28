@@ -7,10 +7,15 @@ communication protocols. Protocol facts and ideas are not protected by
 copyright; only their original expression (source code) is. SomnoTrace's
 implementation was written independently.
 
-These acknowledgements are provided in good faith to credit the prior
-reverse-engineering work, and to record the MIT license terms of the
-reference projects in case any incidental, copyrightable material is ever
-determined to have been incorporated.
+These acknowledgements are provided voluntarily in good faith to credit
+the prior reverse-engineering work.  SomnoTrace is not a derivative work of
+any project listed below — no source code was copied, adapted, or included.
+Protocol facts (command codes, byte layouts, UUIDs, file-format structures)
+are not protected by copyright.  The listings below are therefore not
+required by any license obligation; they are provided for transparency and
+to credit the researchers whose work informed SomnoTrace's independent
+implementation.  License terms are recorded in case any incidental,
+copyrightable material is ever determined to have been incorporated.
 
 ---
 
@@ -26,8 +31,77 @@ determined to have been incorporated.
 
 - **Project:** o2ring-s-protocol
 - **Source:** https://github.com/nglessner/o2ring-s-protocol
-- **Referenced for:** understanding of the Wellue / O2 Ring S BLE protocol.
+- **Referenced for:** understanding of the Wellue / O2 Ring S BLE protocol
+  (Gen2, "OxyII").  Already credited above; listed here for context alongside
+  the Gen1 references below.
 - **License:** MIT
+
+## farolone/wellue-o2ring-protocol
+
+- **Project:** wellue-o2ring-protocol
+- **Source:** https://github.com/farolone/wellue-o2ring-protocol
+- **Referenced for:** understanding of the Gen1 Wellue O2 Ring BLE protocol.
+  This is a pure documentation project (no executable code) describing packet
+  framing, command codes, GATT UUIDs, and the VLD3 file format.
+- **License:** MIT
+- **Notes:** Clean-room reference only.  No source code was copied — the
+  repository contains only Markdown documentation.  Protocol facts (frame
+  structure, command codes, UUIDs, VLD3 header/record layouts) were used to
+  inform SomnoTrace's independent C implementation in `main/oximeter_legacy.c`.
+
+## home-health-hub/viatom-o2ring-ble
+
+- **Project:** viatom-o2ring-ble
+- **Source:** https://github.com/home-health-hub/viatom-o2ring-ble
+- **Referenced for:** understanding of the Gen1 Viatom/Wellue oxy-family BLE
+  protocol (frame codec, CRC-8, response assembly, file-transfer flow, VLD3
+  parsing, live-reading byte offsets, device discovery name-matching rules).
+- **License:** GPL-3.0
+- **Notes:** Clean-room reference only.  No source code was copied, adapted,
+  or included in SomnoTrace.  The project was studied to understand protocol
+  behaviour; SomnoTrace's implementation in `main/oximeter_legacy.c` was
+  written independently in C for ESP-IDF/NimBLE and does not derive from the
+  Python reference.  Listed here for transparency and to credit the
+  reverse-engineering work; this listing is not a license obligation.
+
+## MackeyStingray/o2r
+
+- **Project:** o2r
+- **Source:** https://github.com/MackeyStingray/o2r
+- **Referenced for:** understanding of CMD_CONFIG write commands and the full
+  VLD3 header field layout used by Gen1 O2 Ring devices.
+- **License:** GPL-3.0
+- **Notes:** Clean-room reference only.  No source code was copied, adapted,
+  or included in SomnoTrace.  Protocol facts (command payloads, header field
+  offsets) were used to inform SomnoTrace's independent implementation.
+  Listed here for transparency and to credit the original reverse-engineering
+  work; this listing is not a license obligation.
+
+## ecostech/viatom-ble
+
+- **Project:** viatom-ble
+- **Source:** https://github.com/ecostech/viatom-ble
+- **Referenced for:** understanding of Gen1 live-reading byte offsets and
+  client connection lifecycle behaviour (inactivity timeout/disconnect
+  patterns).
+- **License:** MIT
+- **Notes:** Clean-room reference only.  No source code was copied.  Protocol
+  facts (notification byte layout, sensor-reading offsets) were used to inform
+  SomnoTrace's independent implementation.
+
+## Viatom LepuBle / LepuDemo SDKs
+
+- **Project:** LepuBle / LepuDemo (Viatom official BLE SDKs)
+- **Source:** https://github.com/viatom-develop/LepuBle ,
+  https://github.com/viatom-develop/LepuDemo
+- **Referenced for:** confirming GATT UUIDs, the set of devices sharing the
+  Gen1 protocol family, and the incompatibility of O2Ring S (which uses the
+  Gen2 OxyII protocol).
+- **License:** Proprietary (vendor SDKs of unclear licence terms)
+- **Notes:** Clean-room reference only.  No source code was copied, adapted,
+  or included in SomnoTrace.  Only protocol facts (UUIDs, device compatibility
+  table) were used.  Listed here for transparency; this listing is not a
+  licence obligation.
 
 ## Roboto Font
 
@@ -152,8 +226,10 @@ SOFTWARE.
 SomnoTrace interoperates with third-party medical devices (e.g. ResMed
 AirSense 11, Wellue O2 Ring) over their wireless interfaces. It is intended
 for personal interoperability and data-portability purposes. The MIT-licensed
-reference projects impose no commercial restrictions. Reverse engineering for
-interoperability is recognised in many jurisdictions (e.g. the EU Software
-Directive, US DMCA s.1201(f), and interoperability provisions of Australia's
-Copyright Act 1968). This is not legal advice; obtain professional advice
-before any commercial distribution.
+reference projects impose no commercial restrictions. The GPLv3-licensed
+reference projects were studied for protocol understanding only; no source
+code was copied, adapted, or included, so GPLv3 copyleft obligations are not
+triggered. Reverse engineering for interoperability is recognised in many
+jurisdictions (e.g. the EU Software Directive, US DMCA s.1201(f), and
+interoperability provisions of Australia's Copyright Act 1968). This is not
+legal advice; obtain professional advice before any commercial distribution.
