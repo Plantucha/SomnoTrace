@@ -33,6 +33,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
@@ -81,6 +82,7 @@ static void fb_clear(uint16_t color);
 static int fb_draw_string_aa(int x, int y, const font_info_t *font, const char *str, uint16_t color);
 static void fb_draw_wifi_indicator(int x, int y, bool connected);
 static void render_graph(void);
+static void render_info(void);
 static void render_status(void);
 static void display_task(void *arg);
 static void apply_panel_rotation(uint8_t degrees);
@@ -116,6 +118,7 @@ static TaskHandle_t s_display_task = NULL;
 typedef enum {
     DISP_MODE_STATUS = 0,
     DISP_MODE_GRAPH,
+    DISP_MODE_INFO,
 } disp_mode_t;
 
 #define FLOW_BUF_SIZE      240   /* one flow sample per pixel column */
@@ -163,6 +166,10 @@ static float *s_flow_yf;      /* render-task y coordinates */
 static int    s_flow_head = 0;
 static int    s_flow_count = 0;
 
+/* Info panel state */
+static float    s_leak_lpm = 0.0f;     /* latest leak rate (L/min) */
+static int64_t  s_therapy_start_us = 0;  /* monotonic time of TherapyStart */
+
 /* ── Public state-mutating API (never draws; render task handles drawing) ── */
 
 void bsp_display_set_therapy_active(bool active)
@@ -175,30 +182,42 @@ void bsp_display_set_therapy_active(bool active)
 
     /* Check LCD therapy mode setting */
     const device_settings_t *dev = device_settings_get();
-    bool lcd_off_mode = (dev->lcd_therapy_mode != LCD_THERAPY_GRAPH);
+    bool lcd_off_mode = (dev->lcd_therapy_mode == LCD_THERAPY_OFF ||
+                         dev->lcd_therapy_mode == LCD_THERAPY_ALWAYS_OFF);
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    disp_mode_t new_mode = active ? DISP_MODE_GRAPH : DISP_MODE_STATUS;
+    disp_mode_t new_mode;
+    if (active) {
+        if (dev->lcd_therapy_mode == LCD_THERAPY_INFO)
+            new_mode = DISP_MODE_INFO;
+        else
+            new_mode = DISP_MODE_GRAPH;
+    } else {
+        new_mode = DISP_MODE_STATUS;
+    }
     if (s_mode != new_mode) {
         s_mode = new_mode;
         if (active) {
             s_flow_head = 0;
             s_flow_count = 0;
-            ESP_LOGI(TAG, "therapy graph mode enabled (display_task=%s)",
+            ESP_LOGI(TAG, "therapy %s mode enabled (display_task=%s)",
+                     new_mode == DISP_MODE_INFO ? "info" : "graph",
                      s_display_task ? "alive" : "NULL");
         } else {
             s_status_dirty = true;  /* force immediate status redraw */
-            ESP_LOGI(TAG, "therapy graph mode disabled");
+            ESP_LOGI(TAG, "therapy mode disabled");
         }
     } else {
         ESP_LOGD(TAG, "set_therapy_active(%s) — mode already %s, no-op",
                  active ? "true" : "false",
-                 s_mode == DISP_MODE_GRAPH ? "GRAPH" : "STATUS");
+                 s_mode == DISP_MODE_GRAPH ? "GRAPH" :
+                 s_mode == DISP_MODE_INFO ? "INFO" : "STATUS");
     }
     xSemaphoreGive(s_state_mutex);
 
     /* Backlight policy:
      *   LCD_THERAPY_GRAPH:      always on
+     *   LCD_THERAPY_INFO:       always on
      *   LCD_THERAPY_OFF:        off during therapy, on when therapy stops
      *   LCD_THERAPY_ALWAYS_OFF: off during therapy, stays off when therapy stops */
     if (lcd_off_mode) {
@@ -238,6 +257,24 @@ void bsp_display_push_flow(float flow_lpm)
     /* Wake the render task so the graph advances at the data rate. Multiple
      * notifications between renders coalesce into a single redraw. */
     if (notify && s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+void bsp_display_push_leak(float leak_lpm)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_leak_lpm = leak_lpm;
+    xSemaphoreGive(s_state_mutex);
+    if (s_mode == DISP_MODE_INFO && s_display_task)
+        xTaskNotifyGive(s_display_task);
+}
+
+void bsp_display_set_therapy_start_time(int64_t start_us)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_therapy_start_us = start_us;
+    xSemaphoreGive(s_state_mutex);
 }
 
 /* ── Framebuffer → panel blit ───────────────────────────────────────── */
@@ -541,11 +578,71 @@ static int str_width_aa(const font_info_t *font, const char *str)
         uint32_t cp = utf8_decode(&p);
         if (cp == 0) break;
         const font_glyph_t *glyph = find_glyph(font, cp);
-        if (glyph) {
+        if (glyph)
             width += glyph->advance;
-        }
     }
     return width;
+}
+
+/* ── 2× scaled text rendering for the info panel ────────────────────── */
+
+static void fb_draw_char_aa_2x(int x, int y, const font_info_t *font,
+                               const font_glyph_t *glyph, uint16_t color)
+{
+    if (glyph->width == 0 || glyph->height == 0) return;
+
+    uint32_t offset = glyph->bitmap_offset;
+
+    for (int row = 0; row < glyph->height; row++) {
+        int base_y = y + (glyph->bearing_y + row) * 2;
+        for (int col = 0; col < glyph->width; col++) {
+            int base_x = x + (glyph->bearing_x + col) * 2;
+
+            uint32_t pixel_idx = row * glyph->width + col;
+            uint32_t byte_idx = offset + (pixel_idx / 2);
+            uint8_t byte_val = font->bitmaps[byte_idx];
+            uint8_t alpha;
+            if (pixel_idx % 2 == 0)
+                alpha = byte_val >> 4;
+            else
+                alpha = byte_val & 0x0F;
+
+            if (alpha > 0) {
+                for (int dy = 0; dy < 2; dy++) {
+                    int ty = base_y + dy;
+                    if (ty < 0 || ty >= LCD_V_RES) continue;
+                    for (int dx = 0; dx < 2; dx++) {
+                        int tx = base_x + dx;
+                        if (tx < 0 || tx >= LCD_H_RES) continue;
+                        s_fb[ty * LCD_H_RES + tx] =
+                            blend_pixels(s_fb[ty * LCD_H_RES + tx], color, alpha);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static int fb_draw_string_aa_2x(int x, int y, const font_info_t *font,
+                                const char *str, uint16_t color)
+{
+    int cx = x;
+    const char *p = str;
+    while (*p) {
+        uint32_t cp = utf8_decode(&p);
+        if (cp == 0) break;
+        const font_glyph_t *glyph = find_glyph(font, cp);
+        if (glyph) {
+            fb_draw_char_aa_2x(cx, y, font, glyph, color);
+            cx += glyph->advance * 2;
+        }
+    }
+    return cx - x;
+}
+
+static int str_width_aa_2x(const font_info_t *font, const char *str)
+{
+    return str_width_aa(font, str) * 2;
 }
 
 esp_err_t bsp_display_init(void)
@@ -1021,6 +1118,101 @@ static void render_graph(void)
     lcd_flush();
 }
 
+/* ── Info panel: leak rate + session runtime ───────────────────────────
+ *
+ * Top half:  "Leak rate (L/min)" header in roboto_body, then the current
+ *             value in roboto_title rendered at 2× scale (~66px tall),
+ *             colour-coded by severity:
+ *               green  < 12 L/min   (low / good seal)
+ *               yellow < 24 L/min   (moderate)
+ *               orange < 36 L/min   (high)
+ *               red    ≥ 36 L/min   (excessive — large leak)
+ * Bottom half: "Session runtime" header in roboto_body, then elapsed
+ *               time "H:MM" in roboto_title at 2× scale, measured from
+ *               TherapyStart (not MaskOn).
+ */
+static void render_info(void)
+{
+    if (!s_panel || !s_fb) return;
+
+    float leak_lpm;
+    int64_t start_us;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    leak_lpm = s_leak_lpm;
+    start_us = s_therapy_start_us;
+    xSemaphoreGive(s_state_mutex);
+
+    const uint16_t bg       = rgb565(9, 11, 18);
+    const uint16_t hdr_col  = rgb565(122, 134, 158);
+    const uint16_t div_col  = rgb565(28, 32, 46);
+
+    fb_clear(bg);
+
+    /* ── Top half: Leak rate ─────────────────────────────────────────── */
+    const char *leak_hdr = "Leak rate (L/min)";
+    int hdr_w = str_width_aa(&roboto_body, leak_hdr);
+    int hdr_x = (LCD_H_RES - hdr_w) / 2;
+    if (hdr_x < 4) hdr_x = 4;
+    fb_draw_string_aa(hdr_x, 12, &roboto_body, leak_hdr, hdr_col);
+
+    /* Colour-code the leak value */
+    uint16_t val_col;
+    if (leak_lpm < 12.0f)
+        val_col = rgb565(80, 220, 100);    /* green */
+    else if (leak_lpm < 24.0f)
+        val_col = rgb565(255, 220, 0);     /* yellow */
+    else if (leak_lpm < 36.0f)
+        val_col = rgb565(255, 140, 0);     /* orange */
+    else
+        val_col = rgb565(255, 60, 60);     /* red */
+
+    char val_str[16];
+    snprintf(val_str, sizeof(val_str), "%.1f", leak_lpm);
+
+    /* Render the value 2× scaled (~66px tall), centred horizontally,
+     * vertically positioned in the top half between header and mid-line. */
+    int val_w = str_width_aa_2x(&roboto_title, val_str);
+    int val_x = (LCD_H_RES - val_w) / 2;
+    if (val_x < 4) val_x = 4;
+    int val_y = 44;
+    fb_draw_string_aa_2x(val_x, val_y, &roboto_title, val_str, val_col);
+
+    /* ── Divider line ────────────────────────────────────────────────── */
+    int mid_y = LCD_V_RES / 2;
+    for (int x = 16; x < LCD_H_RES - 16; x++)
+        s_fb[mid_y * LCD_H_RES + x] = div_col;
+
+    /* ── Bottom half: Session runtime ────────────────────────────────── */
+    const char *rt_hdr = "Session runtime";
+    int rt_hdr_w = str_width_aa(&roboto_body, rt_hdr);
+    int rt_hdr_x = (LCD_H_RES - rt_hdr_w) / 2;
+    if (rt_hdr_x < 4) rt_hdr_x = 4;
+    fb_draw_string_aa(rt_hdr_x, mid_y + 12, &roboto_body, rt_hdr, hdr_col);
+
+    /* Calculate elapsed time from TherapyStart (monotonic) */
+    int hours = 0, mins = 0;
+    if (start_us > 0) {
+        int64_t elapsed_us = esp_timer_get_time() - start_us;
+        if (elapsed_us < 0) elapsed_us = 0;
+        int64_t elapsed_sec = elapsed_us / 1000000;
+        hours = (int)(elapsed_sec / 3600);
+        mins = (int)((elapsed_sec % 3600) / 60);
+    }
+
+    char rt_str[16];
+    snprintf(rt_str, sizeof(rt_str), "%d:%02d", hours, mins);
+
+    int rt_w = str_width_aa_2x(&roboto_title, rt_str);
+    int rt_x = (LCD_H_RES - rt_w) / 2;
+    if (rt_x < 4) rt_x = 4;
+    int rt_y = mid_y + 44;
+    fb_draw_string_aa_2x(rt_x, rt_y, &roboto_title, rt_str,
+                         rgb565(200, 210, 225));
+
+    lcd_flush();
+}
+
 /* Draw battery percentage with a small outline icon and optional charging bolt.
  * Layout: [12×9px battery outline] [N% text]
  * x,y is the top-left of the battery outline. */
@@ -1227,6 +1419,14 @@ static void display_task(void *arg)
             /* Redraw on new data or when first entering graph mode. */
             if (notified || mode_changed) {
                 render_graph();
+                last_render = now;
+            }
+        } else if (mode == DISP_MODE_INFO) {
+            /* Redraw on new leak data, mode change, or every second for
+             * the session runtime clock. */
+            if (notified || mode_changed ||
+                (now - last_render) >= pdMS_TO_TICKS(1000)) {
+                render_info();
                 last_render = now;
             }
         } else {
