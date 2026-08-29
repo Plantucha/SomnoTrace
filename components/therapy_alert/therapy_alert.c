@@ -576,11 +576,11 @@ static void start_alert_routine(void)
     set_state(ALERT_PENDING);
 
     TaskHandle_t h = NULL;
-    StackType_t *stack = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    StackType_t *stack = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM);
     StaticTask_t *tcb  = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
     if (stack && tcb) {
         h = xTaskCreateStaticPinnedToCore(alert_routine_task, "alert_routine",
-                                          4096, (void *)(uintptr_t)gen, 5,
+                                          16384, (void *)(uintptr_t)gen, 5,
                                           stack, tcb, 0);
     }
     if (!h) {

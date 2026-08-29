@@ -43,6 +43,8 @@ void bsp_display_set_battery(int percent, bool charging);
 /* Therapy graph mode */
 void bsp_display_set_therapy_active(bool active);
 void bsp_display_push_flow(float flow_lpm);
+void bsp_display_push_leak(float leak_lpm);
+void bsp_display_set_therapy_start_time(int64_t start_us);
 bool bsp_display_is_therapy_active(void);
 
 /* Backlight control (LEDC PWM on GPIO 46).

@@ -2036,6 +2036,13 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         if (abs(flow_vals[j]) > 50) has_active_flow = true;
     }
 
+    /* Push leak rate to display for info panel mode.
+     * PLD channel 3 = Leak, stored as value*100 in L/s (same raw format
+     * as .snt files).  Convert to L/min: dig * 0.6f, matching
+     * pld_leak_phys() in session_graph.c. */
+    if (pld_found[3] && pld_vals[3] >= 0)
+        bsp_display_push_leak(pld_vals[3] * 0.6f);
+
     bool has_therapy_pressure = false;
     for (int j = 0; j < press_n; j++) {
         if (press_vals[j] > 200) has_therapy_pressure = true;
@@ -2047,6 +2054,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         && has_active_flow && has_therapy_pressure) {
         ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
         bsp_display_set_therapy_active(true);
+        bsp_display_set_therapy_start_time(esp_timer_get_time());
         s = session_writer_start();
         if (!s) {
             ESP_LOGW(TAG, "session_writer_start() failed — "
@@ -2263,6 +2271,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             s_therapy_stopped = false;
             therapy_alert_on_therapy_start();
             bsp_display_set_therapy_active(true);
+            bsp_display_set_therapy_start_time(esp_timer_get_time());
 
             int64_t now_us = esp_timer_get_time();
             bool duplicate = false;
