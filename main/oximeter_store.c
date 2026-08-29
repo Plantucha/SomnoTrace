@@ -489,3 +489,85 @@ bool ox_store_promote_vld3(const char *serial, const char *name)
              resolution_x10 / 10, resolution_x10 % 10);
     return true;
 }
+
+/* Promote a .part file to files/<serial>/<name> (no suffix) if its size
+ * exactly matches the declared size from FILE_OPEN.  This is used for Gen1
+ * Legacy recordings that may not have a VLD3 header to validate against.
+ * Returns true if promoted (finalised), false otherwise. */
+bool ox_store_finalize_native(const char *serial, const char *name,
+                              long declared_size)
+{
+    char part_path[128];
+    snprintf(part_path, sizeof(part_path), "%s/%s.part", OXY_INBOX, name);
+
+    FILE *f = fopen(part_path, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize != declared_size) {
+        fclose(f);
+        ESP_LOGW(TAG, "native promote: size mismatch %ld != %ld for '%s'",
+                 fsize, declared_size, name);
+        return false;
+    }
+
+    if (fsize <= 0) {
+        fclose(f);
+        ESP_LOGW(TAG, "native promote: empty file '%s'", name);
+        return false;
+    }
+
+    /* Read the whole file into memory (files are typically < 300 KB) */
+    uint8_t *data = heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM);
+    if (!data) data = malloc(fsize);
+    if (!data) {
+        fclose(f);
+        ESP_LOGE(TAG, "native promote: OOM %ld bytes", fsize);
+        return false;
+    }
+    int n = fread(data, 1, fsize, f);
+    fclose(f);
+    if (n != fsize) {
+        free(data);
+        return false;
+    }
+
+    /* Create files/<serial>/ directory */
+    char serial_dir[160];
+    snprintf(serial_dir, sizeof(serial_dir), "%s/%s", OXY_FILES, serial);
+    mkdir(OXY_FILES, 0775);
+    mkdir(serial_dir, 0775);
+
+    /* Write the final file atomically (no .bin or .vld suffix — preserve
+     * the original filename from the ring) */
+    char out_path[256];
+    char tmp_path[260];
+    snprintf(out_path, sizeof(out_path), "%s/%s/%s", OXY_FILES, serial, name);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", out_path);
+    f = fopen(tmp_path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "native promote: cannot create %s", tmp_path);
+        free(data);
+        return false;
+    }
+    bool written = fwrite(data, 1, fsize, f) == (size_t)fsize &&
+                   fflush(f) == 0 && fsync(fileno(f)) == 0;
+    fclose(f);
+    free(data);
+    if (!written || rename(tmp_path, out_path) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
+
+    /* Remove the .part file */
+    remove(part_path);
+
+    /* Update index */
+    ox_store_index_add(serial, name, (uint32_t)fsize, true);
+
+    ESP_LOGI(TAG, "native promoted %s (%ld bytes)", out_path, fsize);
+    return true;
+}

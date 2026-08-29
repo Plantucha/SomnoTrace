@@ -79,6 +79,8 @@ void ox_store_index_add(const char *serial, const char *name,
 long ox_store_part_size(const char *name);
 esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len);
 bool ox_store_promote_vld3(const char *serial, const char *name);
+bool ox_store_finalize_native(const char *serial, const char *name,
+                              long declared_size);
 void ox_store_part_remove(const char *name);
 
 /* ── Legacy protocol constants ──────────────────────────────────────── */
@@ -95,8 +97,6 @@ void ox_store_part_remove(const char *name);
 #define CMD_INFO            0x14
 #define CMD_PING            0x15
 #define CMD_CONFIG          0x16
-#define CMD_READ_SENSORS    0x17
-#define CMD_RT_DATA         0x1B
 
 /* VLD3 file format constants */
 #define VLD3_HEADER_LEN     40
@@ -111,8 +111,8 @@ static const ble_uuid128_t LEGACY_SVC_UUID =
     BLE_UUID128_INIT(0x39, 0x23, 0xcf, 0x40, 0x73, 0x16, 0x42, 0x9a,
                      0x5c, 0x41, 0x7e, 0x7d, 0xc4, 0x9a, 0x83, 0x14);
 static const ble_uuid128_t LEGACY_WRITE_UUID =
-    BLE_UUID128_INIT(0xa3, 0xe1, 0x26, 0x0a, 0xee, 0x9a, 0xb0, 0x49,
-                     0x0b, 0xeb, 0xe7, 0xac, 0x00, 0x8b, 0x00, 0x00);
+    BLE_UUID128_INIT(0xa3, 0xe1, 0x26, 0x0a, 0xee, 0x9a, 0xe9, 0xbb,
+                     0xb0, 0x49, 0x0b, 0xeb, 0xe7, 0xac, 0x00, 0x8b);
 static const ble_uuid128_t LEGACY_NOTIFY_UUID =
     BLE_UUID128_INIT(0x57, 0x9a, 0x05, 0x43, 0x52, 0xcd, 0xb1, 0xa6,
                      0x1a, 0x4b, 0xe7, 0xa8, 0x4a, 0x59, 0x34, 0x07);
@@ -285,6 +285,35 @@ static bool name_is_legacy(const char *name)
     return false;
 }
 
+/* Check if raw BLE advertisement data contains the Gen1 Legacy service UUID
+ * 14839ac4-7d7e-415c-9a42-167340cf2339.
+ * In BLE AD data, 128-bit service UUIDs are stored as 16-byte LE sequences
+ * under AD type 0x06 (incomplete) or 0x07 (complete). */
+static const uint8_t LEGACY_SVC_UUID_LE[16] = {
+    0xc4, 0x9a, 0x83, 0x14, 0x7e, 0x7d, 0x5c, 0x41,
+    0x42, 0x9a, 0x73, 0x16, 0xcf, 0x40, 0x23, 0x39
+};
+
+static bool adv_has_legacy_service_uuid(const uint8_t *raw, int raw_len)
+{
+    for (int off = 0; off + 1 < raw_len; ) {
+        uint8_t ad_len = raw[off];
+        if (ad_len == 0 || off + 1 + ad_len > raw_len) break;
+        uint8_t ad_type = raw[off + 1];
+        const uint8_t *ad_data = raw + off + 2;
+        int ad_data_len = ad_len - 1;
+
+        if ((ad_type == 0x06 || ad_type == 0x07) && ad_data_len >= 16) {
+            for (int i = 0; i + 16 <= ad_data_len; i += 16) {
+                if (memcmp(ad_data + i, LEGACY_SVC_UUID_LE, 16) == 0)
+                    return true;
+            }
+        }
+        off += 1 + ad_len;
+    }
+    return false;
+}
+
 static void addr_to_str(const ble_addr_t *a, char *out, size_t outsz)
 {
     snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -316,20 +345,36 @@ static void handle_notify_rx(const uint8_t *data, int len)
     memcpy(s_resp_buf + s_resp_len, data, len);
     s_resp_len += len;
 
-    uint8_t status;
-    uint16_t block;
-    int plen;
-    int rc = legacy_try_decode(s_resp_buf, s_resp_len, &status, &block,
-                               s_resp_payload, &plen, LEGACY_MAX_FRAME);
-    if (rc > 0) {
-        s_resp_status = status;
-        s_resp_block = block;
-        s_resp_payload_len = plen;
-        s_resp_len = 0;
-        xSemaphoreGive(s_resp_sem);
-    } else if (rc == -2) {
-        ESP_LOGW(TAG, "notify decode error, resetting buffer");
-        s_resp_len = 0;
+    /* Try to decode as many complete frames as are in the buffer. */
+    while (s_resp_len > 0) {
+        uint8_t status;
+        uint16_t block;
+        int plen;
+        int rc = legacy_try_decode(s_resp_buf, s_resp_len, &status, &block,
+                                   s_resp_payload, &plen, LEGACY_MAX_FRAME);
+        if (rc > 0) {
+            s_resp_status = status;
+            s_resp_block = block;
+            s_resp_payload_len = plen;
+            /* Shift leftover bytes to front */
+            int remaining = s_resp_len - rc;
+            if (remaining > 0)
+                memmove(s_resp_buf, s_resp_buf + rc, remaining);
+            s_resp_len = remaining;
+            xSemaphoreGive(s_resp_sem);
+            return;
+        }
+        if (rc == -1) {
+            /* Incomplete frame — wait for more data */
+            return;
+        }
+        /* rc == -2: invalid frame — drop one byte and try to resync
+         * on the next 0x55 lead byte */
+        ESP_LOGW(TAG, "notify decode error at offset 0, resyncing");
+        int remaining = s_resp_len - 1;
+        if (remaining > 0)
+            memmove(s_resp_buf, s_resp_buf + 1, remaining);
+        s_resp_len = remaining;
     }
 }
 
@@ -369,7 +414,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
         }
 
-        if (!name_is_legacy(name)) return 0;
+        /* Primary: match by service UUID in advertisement data.
+         * Fallback: match by device name (handles devices that don't
+         * advertise service UUIDs in their scan response). */
+        bool is_legacy = adv_has_legacy_service_uuid(raw, raw_len);
+        if (!is_legacy)
+            is_legacy = name_is_legacy(name);
+        if (!is_legacy) return 0;
         if (name[0] == '\0')
             strlcpy(name, "O2Ring", sizeof(name));
 
@@ -587,31 +638,27 @@ static esp_err_t legacy_request(uint8_t cmd, uint16_t block,
         s_resp_len = 0;
     }
 
-    /* Write the frame in 20-byte chunks.  The first chunk uses
-     * write-with-response; subsequent chunks use write-without-response
-     * to avoid excessive round-trips. */
+    /* Write the frame in 20-byte chunks using write-with-response for
+     * every chunk.  The Legacy protocol requires WRITE_REQUEST for each
+     * chunk; using WRITE_CMD for subsequent chunks can cause drops or
+     * ordering issues on rings with small ATT buffers. */
     int offset = 0;
     while (offset < flen) {
         int chunk = flen - offset;
         if (chunk > LEGACY_BLE_CHUNK) chunk = LEGACY_BLE_CHUNK;
 
-        if (offset == 0) {
-            clear_op_sem();
-            int rc = ble_gattc_write_flat(s_conn_handle, s_write_handle,
-                                           frame + offset, chunk,
-                                           on_write_done, NULL);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "write failed cmd=0x%02x rc=%d", cmd, rc);
-                return ESP_FAIL;
-            }
-            wait_op(5000);
-        } else {
-            int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_handle,
-                                                  frame + offset, chunk);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "write chunk failed cmd=0x%02x rc=%d", cmd, rc);
-                return ESP_FAIL;
-            }
+        clear_op_sem();
+        int rc = ble_gattc_write_flat(s_conn_handle, s_write_handle,
+                                       frame + offset, chunk,
+                                       on_write_done, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "write failed cmd=0x%02x offset=%d rc=%d",
+                     cmd, offset, rc);
+            return ESP_FAIL;
+        }
+        if (wait_op(5000) != 0) {
+            ESP_LOGE(TAG, "write timeout cmd=0x%02x offset=%d", cmd, offset);
+            return ESP_FAIL;
         }
         offset += chunk;
     }
@@ -671,7 +718,7 @@ static esp_err_t legacy_get_info(char *serial, size_t serial_sz,
         strlcpy(serial, sn->valuestring, serial_sz);
         ret = ESP_OK;
     }
-    cJSON *fw = cJSON_GetObjectItem(j, "SoftwareVer");
+    cJSON *fw = cJSON_GetObjectItem(j, "Model");
     if (fw && cJSON_IsString(fw) && firmware)
         strlcpy(firmware, fw->valuestring, fw_sz);
     cJSON *fl = cJSON_GetObjectItem(j, "FileList");
@@ -680,24 +727,6 @@ static esp_err_t legacy_get_info(char *serial, size_t serial_sz,
 
     cJSON_Delete(j);
     return ret;
-}
-
-/* ── CMD_READ_SENSORS: check worn status ───────────────────────────── */
-/* Returns: 1 = off-finger (pull allowed), 0 = on-finger, -1 = error. */
-static int legacy_off_finger(void)
-{
-    if (legacy_request(CMD_READ_SENSORS, 0, NULL, 0, true, 3000) != ESP_OK)
-        return -1;
-    if (s_resp_payload_len < 12) return -1;
-
-    uint8_t spo2  = s_resp_payload[0];
-    uint8_t hr    = s_resp_payload[1];
-    uint8_t worn  = s_resp_payload[11];
-    ESP_LOGI(TAG, "sensors: spo2=%u hr=%u worn=%u", spo2, hr, worn);
-
-    if (worn == 0) return 1;
-    /* worn==1 but spo2==0xFF and hr==0 → calibrating (still on finger) */
-    return 0;
 }
 
 /* ── CMD_CONFIG: set device time ───────────────────────────────────── */
@@ -831,14 +860,14 @@ static esp_err_t legacy_pull_file(const char *name)
         return ESP_FAIL;
     }
 
-    bool finalised = ox_store_promote_vld3(s_serial, name);
+    bool finalised = ox_store_finalize_native(s_serial, name, (long)file_size);
     ESP_LOGI(TAG, "pulled '%s': %lu bytes, finalised=%d",
              name, (unsigned long)offset, finalised);
     if (!finalised) return ESP_FAIL;
 
     /* Convert to canonical SNT v3 format */
     char source_path[640];
-    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s.vld",
+    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s",
              s_serial, name);
     if (oximetry_canonical_convert_vld3(s_serial, name, source_path) != ESP_OK) {
         ESP_LOGW(TAG, "canonical conversion pending for '%s'", name);
@@ -1142,7 +1171,6 @@ static bool do_pull_and_mark(bool *pulled_any)
 
 /* ── Background watch task ─────────────────────────────────────────── */
 #define OX_END_WINDOW_MS  130000
-#define OX_WORN_PROBE_MS  60000
 
 static void pull_task(void *arg)
 {
@@ -1217,19 +1245,17 @@ static void pull_task(void *arg)
             continue;
         }
 
-        /* Check worn status */
-        int off = legacy_off_finger();
-        if (off != 1) {
-            ESP_LOGI(TAG, "watch: not off-finger (sensors=%d) — disconnect, retry in %ds",
-                     off, OX_WORN_PROBE_MS / 1000);
-            do_disconnect();
-            set_state(OX_STATUS_PAIRED);
-            xSemaphoreGive(s_ops_mtx);
-            vTaskDelay(pdMS_TO_TICKS(OX_WORN_PROBE_MS));
-            continue;
-        }
+        /* Gen1 rings only advertise when in Standby Mode (off-finger,
+         * post-recording).  If the ring is visible during scan, it is
+         * already off-finger and ready for file download.  The curfew
+         * mechanism (130s no-reconnect after successful pull) ensures
+         * the ring can power off on its own (~2 min auto-off timeout).
+         * CMD_READ_SENSORS (0x17) returns live SpO2/HR data, not a
+         * reliable worn-state flag — its byte 11 interpretation is
+         * inconsistent across reference projects, so we skip the
+         * worn-state check entirely. */
 
-        /* Off-finger: sync time, then pull files */
+        /* Sync time, then pull files */
         if (legacy_set_time() != ESP_OK)
             ESP_LOGW(TAG, "watch: time sync failed — continuing");
 
