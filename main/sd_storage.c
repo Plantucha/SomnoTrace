@@ -65,25 +65,37 @@ static void lease_init_once(void)
     if (!s_export_sem) s_export_sem = xSemaphoreCreateRecursiveMutex();
 }
 
+/* Shared SDMMC host/slot configuration for the Waveshare ESP32-S3-Touch-LCD-1.54.
+ * Used by both sd_storage_init() and sd_storage_format() so pin assignments
+ * stay in sync. */
+static void sdmmc_config_default(sdmmc_host_t *host, sdmmc_slot_config_t *slot)
+{
+    sdmmc_host_t h = SDMMC_HOST_DEFAULT();
+    h.slot = SDMMC_HOST_SLOT_1;
+    h.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    *host = h;
+
+    sdmmc_slot_config_t s = SDMMC_SLOT_CONFIG_DEFAULT();
+    s.clk   = GPIO_NUM_16;
+    s.cmd   = GPIO_NUM_15;
+    s.d0    = GPIO_NUM_17;
+    s.d1    = GPIO_NUM_18;
+    s.d2    = GPIO_NUM_13;
+    s.d3    = GPIO_NUM_14;
+    s.width = 4;
+    /* Internal pull-ups are often too weak for SD cards.
+     * The Waveshare board should have external pull-ups on the SD lines. */
+    s.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+    *slot = s;
+}
+
 esp_err_t sd_storage_init(void)
 {
     ESP_LOGI(TAG, "initialising SDMMC 4-bit mode...");
 
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.slot = SDMMC_HOST_SLOT_1;
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  /* 40 MHz max; driver auto-negotiates down if card doesn't support it */
-
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.clk = GPIO_NUM_16;
-    slot_config.cmd = GPIO_NUM_15;
-    slot_config.d0  = GPIO_NUM_17;
-    slot_config.d1  = GPIO_NUM_18;
-    slot_config.d2  = GPIO_NUM_13;
-    slot_config.d3  = GPIO_NUM_14;
-    slot_config.width = 4;
-    /* Internal pull-ups are often too weak for SD cards.
-     * The Waveshare board should have external pull-ups on the SD lines. */
-    slot_config.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+    sdmmc_host_t host;
+    sdmmc_slot_config_t slot_config;
+    sdmmc_config_default(&host, &slot_config);
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
@@ -332,29 +344,25 @@ esp_err_t sd_storage_format(void)
          * exFAT.  ESP-IDF 5.5 builds FATFS with FF_FS_EXFAT=0, so the mount
          * in sd_storage_init() returns FR_NO_FILESYSTEM and s_card stays NULL.
          * Mount with format_if_mount_failed=true so the driver formats
-         * (FM_ANY → FAT32, 32 KB clusters) and remounts in one step. */
-        sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-        host.slot = SDMMC_HOST_SLOT_1;
-        host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
-
-        sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-        slot.clk   = GPIO_NUM_16;
-        slot.cmd   = GPIO_NUM_15;
-        slot.d0    = GPIO_NUM_17;
-        slot.d1    = GPIO_NUM_18;
-        slot.d2    = GPIO_NUM_13;
-        slot.d3    = GPIO_NUM_14;
-        slot.width = 4;
-        slot.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+         * (FM_ANY → FAT32) and remounts in one step. */
+        sdmmc_host_t host;
+        sdmmc_slot_config_t slot;
+        sdmmc_config_default(&host, &slot);
 
         esp_vfs_fat_sdmmc_mount_config_t cfg = {
             .format_if_mount_failed = true,
             .max_files              = 16,
-            .allocation_unit_size   = 32768,
+            .allocation_unit_size   = 0,
         };
 
         sdmmc_card_t *card = NULL;
         ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot, &cfg, &card);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "format: 4-bit mount+format failed (%s), trying 1-bit",
+                     esp_err_to_name(ret));
+            slot.width = 1;
+            ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot, &cfg, &card);
+        }
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "format: mount+format failed: %s", esp_err_to_name(ret));
             return ret;

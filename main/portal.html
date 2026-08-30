@@ -2585,6 +2585,11 @@ function execAction(action, confirmMsg) {
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (d.ok) {
+        if (action === 'format-sd') {
+          if (statusEl) { statusEl.textContent = 'SD card formatted. Rebooting…'; statusEl.className = 'status-msg success'; }
+          rebootCountdown(20, 'action-status');
+          return;
+        }
         if (statusEl) { statusEl.textContent = 'Action completed successfully.'; statusEl.className = 'status-msg success'; }
         if (action === 'reset-state' || action === 'recreate-edfs') { loadUploadStatus(); }
       } else {

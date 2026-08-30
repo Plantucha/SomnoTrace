@@ -2335,7 +2335,8 @@ static void format_sd_task(void *arg)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "format_sd_task: failed: %s", esp_err_to_name(ret));
     } else {
-        ESP_LOGI(TAG, "format_sd_task: SD card formatted successfully");
+        ESP_LOGI(TAG, "format_sd_task: SD card formatted successfully, rebooting");
+        psram_task_create(reboot_task, "format_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
     }
 
     vTaskDelete(NULL);
