@@ -32,6 +32,8 @@
 
 #include "esp_log.h"
 
+char *ox_store_conversion_diagnostics_json(void);
+
 static const char *TAG = "ox_http";
 
 static bool query(httpd_req_t *req, const char *key, char *out, size_t out_size)
@@ -72,6 +74,12 @@ static esp_err_t oximetry_uploads_handler(httpd_req_t *req)
 {
     (void)req;
     return json_send(req, upload_ox_status_json());
+}
+
+static esp_err_t oximetry_diagnostics_handler(httpd_req_t *req)
+{
+    (void)req;
+    return json_send(req, ox_store_conversion_diagnostics_json());
 }
 
 static esp_err_t oximetry_file_handler(httpd_req_t *req)
@@ -169,6 +177,10 @@ void oximetry_http_register_handlers(httpd_handle_t server)
         .uri = "/api/oximetry/uploads", .method = HTTP_GET,
         .handler = oximetry_uploads_handler,
     };
+    httpd_uri_t diagnostics = {
+        .uri = "/api/oximetry/diagnostics", .method = HTTP_GET,
+        .handler = oximetry_diagnostics_handler,
+    };
     httpd_uri_t file = {
         .uri = "/api/oximetry/file", .method = HTTP_GET,
         .handler = oximetry_file_handler,
@@ -180,6 +192,7 @@ void oximetry_http_register_handlers(httpd_handle_t server)
     httpd_register_uri_handler(server, &list);
     httpd_register_uri_handler(server, &recording);
     httpd_register_uri_handler(server, &uploads);
+    httpd_register_uri_handler(server, &diagnostics);
     httpd_register_uri_handler(server, &file);
     httpd_register_uri_handler(server, &file_head);
 }

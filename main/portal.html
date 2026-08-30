@@ -510,7 +510,7 @@ Scan for AirSense 11
 <div>
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
-Wellue/Viatom O2 Ring S Pulse Oximeter
+Wellue/Viatom O2 Ring Pulse Oximeter
 </div>
 <p class="card-desc">Pair over Bluetooth to sync pulse oximetry data (SpO₂, heart rate) recorded during sleep.</p>
 <div class="form-group">
@@ -3178,6 +3178,7 @@ var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
  * the browser. Vendor files are decoded on the device. */
 var oxLoadSeq = 0;
 var oxData = null;
+var oxDiagnostics = [];
 
 /* When true, the x-axis range is derived from CPAP therapy times only
  * (ignoring oximetry extents), and oximetry data is filtered to that range.
@@ -3213,24 +3214,45 @@ function parseOximetrySnt(buf) {
 function loadOximetryData(noonDay) {
   var seq = ++oxLoadSeq;
   var status = document.getElementById('oximetry-status');
-  fetch('/api/oximetry/recordings').then(function(r){
-    if (!r.ok) throw new Error('oximetry list ' + r.status);
-    return r.json();
-  }).then(function(list) {
+  Promise.all([
+    fetch('/api/oximetry/recordings').then(function(r){
+      if (!r.ok) throw new Error('oximetry list ' + r.status);
+      return r.json();
+    }),
+    fetch('/api/oximetry/diagnostics').then(function(r){ return r.ok ? r.json() : []; })
+  ]).then(function(result) {
     if (seq !== oxLoadSeq) return;
-    var selected = (list || []).filter(function(x){ return x.noon_day === noonDay && x.state === 'ready'; });
-    if (!selected.length) { if (status) status.textContent = ''; return; }
+    var list = result[0] || [];
+    oxDiagnostics = result[1] || [];
+    var selected = list.filter(function(x){ return x.noon_day === noonDay && x.state === 'ready'; });
+    if (!selected.length) return [];
     if (status) status.textContent = 'Loading oximetry...';
     return Promise.all(selected.map(function(item) {
       return fetch('/api/oximetry/file?id=' + encodeURIComponent(item.recording_id) + '&track=vitals')
         .then(function(r){ return r.ok ? r.arrayBuffer() : null; })
-        .then(function(buf){ var p = parseOximetrySnt(buf); if (p) p.device = item.device_key || ''; return p; });
+        .then(function(buf){
+          var p = parseOximetrySnt(buf);
+          if (!p) return {parseError:true, recordingId:item.recording_id};
+          p.device = item.device_key || '';
+          p.warning = item.warning || '';
+          p.uploadable = item.uploadable !== false;
+          return p;
+        });
     }));
   }).then(function(records) {
     if (!records || seq !== oxLoadSeq) return;
-    records = records.filter(Boolean);
+    var parseFailures = records.filter(function(r){ return r && r.parseError; }).length;
+    records = records.filter(function(r){ return r && !r.parseError; });
     oxData = records;
-    if (status) status.textContent = records.length ? (records.length + ' oximetry recording' + (records.length === 1 ? '' : 's')) : '';
+    if (status) {
+      var parts = [];
+      if (records.length) parts.push(records.length + ' oximetry recording' + (records.length === 1 ? '' : 's'));
+      var warnings = records.filter(function(r){ return r.warning; }).length;
+      if (warnings) parts.push(warnings + ' with time warning');
+      if (parseFailures) parts.push(parseFailures + ' canonical track parse failure' + (parseFailures === 1 ? '' : 's'));
+      if (oxDiagnostics.length) parts.push(oxDiagnostics.length + ' downloaded but awaiting conversion');
+      status.textContent = parts.join(' · ');
+    }
     /* If charts already exist and include oximetry panels, just push new data.
      * If no charts exist or oximetry panels aren't present yet (signal set
      * changed), rebuild from scratch to add them. */

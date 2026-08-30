@@ -37,6 +37,7 @@
 #include "nvs_writer.h"
 
 #include <string.h>
+#include <strings.h>
 
 static const char *TAG = "oximeter";
 
@@ -58,10 +59,9 @@ static void load_driver_type(void)
     nvs_handle_t h;
     nvs_writer_lock();
     if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        uint8_t drv = OX_DRIVER_OXYII;
-        if (nvs_get_u8(h, "driver", &drv) == ESP_OK) {
+        uint8_t drv;
+        if (nvs_get_u8(h, "driver", &drv) == ESP_OK && drv <= OX_DRIVER_LEGACY)
             s_driver_type = (ox_driver_t)drv;
-        }
         nvs_close(h);
     }
     nvs_writer_unlock();
@@ -89,23 +89,67 @@ static void load_driver_type(void)
 esp_err_t oximeter_init(void)
 {
     load_driver_type();
-    s_active->init();
+    oxyii_driver_ops.init();
+    legacy_driver_ops.init();
     return ESP_OK;
 }
 
-/* Scan runs only the active driver's scan.  Both drivers have their own
- * GAP event handlers and scan state, but only the active driver's
- * semaphores are initialised.  If the user switches device types, they
- * forget and re-pair, which loads the new driver type on next boot.
- * TODO: initialise both drivers and merge scan results. */
+/* Scan runs both drivers sequentially because each owns its GAP callback and
+ * result buffer.  Results are merged by address after both scans complete. */
 esp_err_t oximeter_scan(int timeout_sec)
 {
-    return s_active->scan(timeout_sec);
+    int each = timeout_sec > 1 ? timeout_sec / 2 : 1;
+    esp_err_t oxyii = oxyii_driver_ops.scan(each);
+    esp_err_t legacy = legacy_driver_ops.scan(each);
+    return oxyii == ESP_OK || legacy == ESP_OK ? ESP_OK : ESP_FAIL;
+}
+
+static bool explicit_oxyii_name(const char *name)
+{
+    return name && (strncasecmp(name, "S8-AW", 5) == 0 ||
+                    strncasecmp(name, "SHQO2PRO", 8) == 0);
 }
 
 cJSON *oximeter_get_scan_results(void)
 {
-    return s_active->get_scan_results();
+    cJSON *merged = cJSON_CreateArray();
+    cJSON *oxyii = oxyii_driver_ops.get_scan_results();
+    cJSON *legacy = legacy_driver_ops.get_scan_results();
+    if (!merged || !oxyii || !legacy) {
+        if (merged) cJSON_Delete(merged);
+        if (oxyii) cJSON_Delete(oxyii);
+        if (legacy) cJSON_Delete(legacy);
+        return cJSON_CreateArray();
+    }
+    cJSON *item;
+    cJSON_ArrayForEach(item, oxyii) {
+        cJSON *copy = cJSON_Duplicate(item, true);
+        if (copy) cJSON_AddItemToArray(merged, copy);
+    }
+    cJSON_ArrayForEach(item, legacy) {
+        cJSON *addr = cJSON_GetObjectItem(item, "addr");
+        cJSON *name = cJSON_GetObjectItem(item, "name");
+        int duplicate = -1;
+        for (int i = 0; i < cJSON_GetArraySize(merged); i++) {
+            cJSON *candidate = cJSON_GetArrayItem(merged, i);
+            cJSON *candidate_addr = cJSON_GetObjectItem(candidate, "addr");
+            if (cJSON_IsString(addr) && cJSON_IsString(candidate_addr) &&
+                strcmp(addr->valuestring, candidate_addr->valuestring) == 0) {
+                duplicate = i;
+                break;
+            }
+        }
+        if (duplicate >= 0 && !(cJSON_IsString(name) && explicit_oxyii_name(name->valuestring))) {
+            cJSON *copy = cJSON_Duplicate(item, true);
+            if (copy) cJSON_ReplaceItemInArray(merged, duplicate, copy);
+        } else if (duplicate < 0) {
+            cJSON *copy = cJSON_Duplicate(item, true);
+            if (copy) cJSON_AddItemToArray(merged, copy);
+        }
+    }
+    cJSON_Delete(oxyii);
+    cJSON_Delete(legacy);
+    return merged;
 }
 
 esp_err_t oximeter_pair(const char *addr_str, ox_driver_t driver)

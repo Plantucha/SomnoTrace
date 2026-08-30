@@ -4,7 +4,7 @@ idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provisio
                            "psram_task.c" "bsp_audio.c" "session_graph.c" "nvs_writer.c"
                            "as11_time.c"
                            "crash_diag.c"
-                           "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "oximeter_store.c" "oximetry_canonical.c" "oximetry_http.c"
+                           "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "oximeter_store.c" "oximetry_vld3.c" "oximetry_canonical.c" "oximetry_http.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json esp_app_format
                                 bt mbedtls esp_rom fatfs sdmmc esp-idf-ftpServer uploader esp_http_client

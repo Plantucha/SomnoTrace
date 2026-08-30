@@ -23,6 +23,7 @@
  */
 
 #include "oximeter.h"
+#include "oximetry_vld3.h"
 #include "sd_storage.h"
 
 #include <stdio.h>
@@ -52,9 +53,8 @@ static const uint8_t TRAILER_MAGIC[4] = { 0x48, 0x12, 0x5A, 0xDA };
 #define TRAILER_LEN  48
 
 /* VLD3 header constants (Gen1 Legacy files). */
-#define VLD3_HEADER_LEN   40
-#define VLD3_RECORD_LEN   5
-#define VLD3_VERSION      3
+#define VLD3_HEADER_LEN OX_VLD3_HEADER_LEN
+#define VLD3_RECORD_LEN OX_VLD3_RECORD_LEN
 
 /* ── Directory helpers ─────────────────────────────────────────────── */
 
@@ -146,11 +146,20 @@ void ox_store_delete_paired(void)
 
 /* ── index.json ───────────────────────────────────────────────────── */
 
+static FILE *open_index_read(void)
+{
+    FILE *f = fopen(OXY_INDEX_JSON, "r");
+    if (f) return f;
+    char backup[160];
+    snprintf(backup, sizeof(backup), "%s.bak", OXY_INDEX_JSON);
+    return fopen(backup, "r");
+}
+
 /* Check if a file name + serial is already in index.json and finalised.
  * Returns: 1 = finalised, 0 = present but not finalised, -1 = not found. */
 int ox_store_index_check(const char *serial, const char *name)
 {
-    FILE *f = fopen(OXY_INDEX_JSON, "r");
+    FILE *f = open_index_read();
     if (!f) return -1;
 
     fseek(f, 0, SEEK_END);
@@ -192,11 +201,42 @@ int ox_store_index_check(const char *serial, const char *name)
     return result;
 }
 
+static bool save_index(cJSON *arr)
+{
+    char *json = cJSON_PrintUnformatted(arr);
+    if (!json) return false;
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", OXY_INDEX_JSON);
+    FILE *f = fopen(tmp, "w");
+    bool ok = f && fputs(json, f) >= 0 && fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (f && fclose(f) != 0) ok = false;
+    cJSON_free(json);
+    if (!ok) {
+        unlink(tmp);
+        return false;
+    }
+    char backup[160];
+    snprintf(backup, sizeof(backup), "%s.bak", OXY_INDEX_JSON);
+    bool had_index = access(OXY_INDEX_JSON, F_OK) == 0;
+    if (had_index) unlink(backup);
+    if (had_index && rename(OXY_INDEX_JSON, backup) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    if (rename(tmp, OXY_INDEX_JSON) == 0) {
+        unlink(backup);
+        return true;
+    }
+    if (had_index) rename(backup, OXY_INDEX_JSON);
+    unlink(tmp);
+    return false;
+}
+
 /* Add or update an entry in index.json. */
 void ox_store_index_add(const char *serial, const char *name,
                         uint32_t bytes, bool finalised)
 {
-    FILE *f = fopen(OXY_INDEX_JSON, "r");
+    FILE *f = open_index_read();
     cJSON *arr = NULL;
     if (f) {
         fseek(f, 0, SEEK_END);
@@ -236,18 +276,106 @@ void ox_store_index_add(const char *serial, const char *name,
     cJSON_AddStringToObject(entry, "name", name);
     cJSON_AddNumberToObject(entry, "bytes", bytes);
     cJSON_AddBoolToObject(entry, "finalised", finalised);
+    cJSON_AddBoolToObject(entry, "converted", false);
     cJSON_AddItemToArray(arr, entry);
-
-    char *json = cJSON_PrintUnformatted(arr);
+    if (!save_index(arr)) ESP_LOGE(TAG, "cannot save oximetry index");
     cJSON_Delete(arr);
-    if (!json) return;
+}
 
-    f = fopen(OXY_INDEX_JSON, "w");
-    if (f) {
-        fputs(json, f);
+static cJSON *load_index_array(void)
+{
+    FILE *f = open_index_read();
+    if (!f) return cJSON_CreateArray();
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size >= 65536) {
         fclose(f);
+        return cJSON_CreateArray();
     }
-    cJSON_free(json);
+    char *buf = heap_caps_malloc((size_t)size + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[n] = '\0';
+    cJSON *arr = n == (size_t)size ? cJSON_Parse(buf) : NULL;
+    free(buf);
+    if (arr && cJSON_IsArray(arr)) return arr;
+    if (arr) cJSON_Delete(arr);
+    return cJSON_CreateArray();
+}
+
+int ox_store_index_conversion_check(const char *serial, const char *name)
+{
+    cJSON *arr = load_index_array();
+    if (!arr) return -1;
+    int result = -1;
+    cJSON *entry;
+    cJSON_ArrayForEach(entry, arr) {
+        cJSON *s = cJSON_GetObjectItem(entry, "serial");
+        cJSON *n = cJSON_GetObjectItem(entry, "name");
+        if (!cJSON_IsString(s) || !cJSON_IsString(n) ||
+            strcmp(s->valuestring, serial) != 0 || strcmp(n->valuestring, name) != 0)
+            continue;
+        cJSON *converted = cJSON_GetObjectItem(entry, "converted");
+        result = cJSON_IsTrue(converted) ? 1 : 0;
+        break;
+    }
+    cJSON_Delete(arr);
+    return result;
+}
+
+void ox_store_index_mark_converted(const char *serial, const char *name,
+                                   bool converted, const char *error)
+{
+    cJSON *arr = load_index_array();
+    if (!arr) return;
+    cJSON *entry;
+    cJSON_ArrayForEach(entry, arr) {
+        cJSON *s = cJSON_GetObjectItem(entry, "serial");
+        cJSON *n = cJSON_GetObjectItem(entry, "name");
+        if (!cJSON_IsString(s) || !cJSON_IsString(n) ||
+            strcmp(s->valuestring, serial) != 0 || strcmp(n->valuestring, name) != 0)
+            continue;
+        if (cJSON_HasObjectItem(entry, "converted"))
+            cJSON_ReplaceItemInObject(entry, "converted", cJSON_CreateBool(converted));
+        else
+            cJSON_AddBoolToObject(entry, "converted", converted);
+        cJSON_DeleteItemFromObject(entry, "conversion_error");
+        if (!converted && error && error[0])
+            cJSON_AddStringToObject(entry, "conversion_error", error);
+        if (!save_index(arr)) ESP_LOGE(TAG, "cannot update oximetry conversion state");
+        cJSON_Delete(arr);
+        return;
+    }
+    cJSON_Delete(arr);
+}
+
+char *ox_store_conversion_diagnostics_json(void)
+{
+    cJSON *index = load_index_array();
+    cJSON *out = cJSON_CreateArray();
+    if (!index || !out) {
+        if (index) cJSON_Delete(index);
+        if (out) cJSON_Delete(out);
+        return NULL;
+    }
+    cJSON *entry;
+    cJSON_ArrayForEach(entry, index) {
+        cJSON *finalised = cJSON_GetObjectItem(entry, "finalised");
+        cJSON *converted = cJSON_GetObjectItem(entry, "converted");
+        if (!cJSON_IsTrue(finalised) || cJSON_IsTrue(converted)) continue;
+        cJSON *copy = cJSON_Duplicate(entry, true);
+        if (copy) cJSON_AddItemToArray(out, copy);
+    }
+    char *json = cJSON_PrintUnformatted(out);
+    cJSON_Delete(out);
+    cJSON_Delete(index);
+    return json;
 }
 
 /* ── inbox / file management ───────────────────────────────────────── */
@@ -404,36 +532,10 @@ bool ox_store_promote_vld3(const char *serial, const char *name)
         return false;
     }
 
-    /* Check version */
-    if (header[0] != VLD3_VERSION) {
+    ox_vld3_header_t parsed;
+    if (!ox_vld3_parse_header(header, sizeof(header), (size_t)fsize, &parsed)) {
         fclose(f);
-        ESP_LOGW(TAG, "vld3 promote: version %u != %d", header[0], VLD3_VERSION);
-        return false;
-    }
-
-    /* Check body length is a multiple of record size */
-    long body_len = fsize - VLD3_HEADER_LEN;
-    if (body_len % VLD3_RECORD_LEN != 0) {
-        fclose(f);
-        ESP_LOGW(TAG, "vld3 promote: body_len %ld not multiple of %d",
-                 body_len, VLD3_RECORD_LEN);
-        return false;
-    }
-
-    /* Check resolution: duration_seconds / record_count must be 2.0 or 4.0 */
-    uint32_t duration_seconds = header[13] | (header[14] << 8) |
-                                (header[15] << 16) | (header[16] << 24);
-    uint32_t record_count = body_len / VLD3_RECORD_LEN;
-    if (record_count == 0 || duration_seconds == 0) {
-        fclose(f);
-        ESP_LOGW(TAG, "vld3 promote: zero records or duration");
-        return false;
-    }
-    uint32_t resolution_x10 = (duration_seconds * 10) / record_count;
-    if (resolution_x10 != 20 && resolution_x10 != 40) {
-        fclose(f);
-        ESP_LOGW(TAG, "vld3 promote: resolution %u.%us not 2.0 or 4.0",
-                 resolution_x10 / 10, resolution_x10 % 10);
+        ESP_LOGW(TAG, "vld3 promote: vendor-format validation failed");
         return false;
     }
 
@@ -485,9 +587,10 @@ bool ox_store_promote_vld3(const char *serial, const char *name)
     /* Update index */
     ox_store_index_add(serial, name, (uint32_t)fsize, true);
 
-    ESP_LOGI(TAG, "vld3 promoted %s (%ld bytes, %u records, %u.%us/sample)",
-             vld_path, fsize, record_count,
-             resolution_x10 / 10, resolution_x10 % 10);
+    ESP_LOGI(TAG, "vld3 promoted %s (%ld bytes, %lu records, %lu.%lus/sample)",
+             vld_path, fsize, (unsigned long)parsed.sample_count,
+             (unsigned long)(parsed.period_us / 1000000),
+             (unsigned long)((parsed.period_us % 1000000) / 100000));
     return true;
 }
 
@@ -495,6 +598,27 @@ bool ox_store_promote_vld3(const char *serial, const char *name)
  * exactly matches the declared size from FILE_OPEN.  This is used for Gen1
  * Legacy recordings that may not have a VLD3 header to validate against.
  * Returns true if promoted (finalised), false otherwise. */
+static bool file_matches_buffer(const char *path, const uint8_t *data, size_t size)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size != (off_t)size) return false;
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    uint8_t chunk[512];
+    size_t offset = 0;
+    bool equal = true;
+    while (offset < size) {
+        size_t want = size - offset > sizeof(chunk) ? sizeof(chunk) : size - offset;
+        if (fread(chunk, 1, want, f) != want || memcmp(chunk, data + offset, want) != 0) {
+            equal = false;
+            break;
+        }
+        offset += want;
+    }
+    fclose(f);
+    return equal;
+}
+
 bool ox_store_finalize_native(const char *serial, const char *name,
                               long declared_size)
 {
@@ -557,6 +681,27 @@ bool ox_store_finalize_native(const char *serial, const char *name,
     char tmp_path[260];
     snprintf(out_path, sizeof(out_path), "%s/%s/%s", OXY_FILES, serial, name);
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", out_path);
+    if (access(out_path, F_OK) == 0) {
+        if (file_matches_buffer(out_path, data, (size_t)fsize)) {
+            free(data);
+            remove(part_path);
+            ox_store_index_add(serial, name, (uint32_t)fsize, true);
+            ESP_LOGI(TAG, "native promote: existing source verified for '%s'", name);
+            return true;
+        }
+        char conflict_path[160] = {0};
+        for (int i = 0; i < 100; i++) {
+            snprintf(conflict_path, sizeof(conflict_path), "%s/%s.conflict.%d", OXY_INBOX, name, i);
+            if (access(conflict_path, F_OK) != 0) break;
+            conflict_path[0] = '\0';
+        }
+        if (!conflict_path[0] || rename(part_path, conflict_path) != 0)
+            ESP_LOGE(TAG, "native promote: retain differing source failed: %s", strerror(errno));
+        else
+            ESP_LOGE(TAG, "native promote: differing source retained as %s", conflict_path);
+        free(data);
+        return false;
+    }
     f = fopen(tmp_path, "wb");
     if (!f) {
         ESP_LOGE(TAG, "native promote: cannot create %s: %s", tmp_path, strerror(errno));
@@ -572,9 +717,6 @@ bool ox_store_finalize_native(const char *serial, const char *name,
         unlink(tmp_path);
         return false;
     }
-    /* FATFS does not support rename-over-existing (returns EEXIST),
-     * so unlink the destination first. */
-    unlink(out_path);
     if (rename(tmp_path, out_path) != 0) {
         ESP_LOGE(TAG, "native promote: rename %s -> %s failed: %s", tmp_path, out_path, strerror(errno));
         unlink(tmp_path);

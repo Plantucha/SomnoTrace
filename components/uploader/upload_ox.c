@@ -252,8 +252,10 @@ static int scan_day(const char *day, upload_ox_ref_t *out, int max_out)
         cJSON *state = cJSON_GetObjectItem(p, "state");
         cJSON *id = cJSON_GetObjectItem(p, "recording_id");
         cJSON *gen = cJSON_GetObjectItem(p, "active_generation");
+        cJSON *uploadable = cJSON_GetObjectItem(p, "uploadable");
         if (!cJSON_IsString(state) || strcmp(state->valuestring, "ready") != 0 ||
-            !cJSON_IsString(id) || !cJSON_IsNumber(gen) || !safe_component(id->valuestring, UPLOAD_OX_ID_LEN)) { cJSON_Delete(p); continue; }
+            cJSON_IsFalse(uploadable) || !cJSON_IsString(id) || !cJSON_IsNumber(gen) ||
+            !safe_component(id->valuestring, UPLOAD_OX_ID_LEN)) { cJSON_Delete(p); continue; }
         upload_ox_ref_t *r = &out[n]; memset(r, 0, sizeof(*r));
         strlcpy(r->day, day, sizeof(r->day)); strlcpy(r->recording_id, id->valuestring, sizeof(r->recording_id));
         r->generation = (uint32_t)gen->valuedouble; strlcpy(r->root_path, root, sizeof(r->root_path));

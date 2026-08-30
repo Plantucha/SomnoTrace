@@ -74,8 +74,11 @@ void ox_store_save_paired(const char *serial, const char *firmware,
                           const char *driver);
 void ox_store_delete_paired(void);
 int  ox_store_index_check(const char *serial, const char *name);
+int  ox_store_index_conversion_check(const char *serial, const char *name);
 void ox_store_index_add(const char *serial, const char *name,
                         uint32_t bytes, bool finalised);
+void ox_store_index_mark_converted(const char *serial, const char *name,
+                                   bool converted, const char *error);
 long ox_store_part_size(const char *name);
 esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len);
 bool ox_store_promote_vld3(const char *serial, const char *name);
@@ -130,9 +133,6 @@ static uint8_t legacy_crc8(const uint8_t *data, int len)
     }
     return crc;
 }
-
-/* Forward declaration for legacy_set_time (called from do_connect_and_discover) */
-static esp_err_t legacy_set_time(void);
 
 /* ── Frame codec ───────────────────────────────────────────────────── */
 /* Encode a Legacy request frame into buf.  Returns total frame length.
@@ -202,6 +202,7 @@ static SemaphoreHandle_t s_resp_sem;
 static SemaphoreHandle_t s_scan_done;
 static volatile int s_op_status;
 static volatile int s_conn_status;
+static bool s_initialized;
 
 static char s_status[24] = OX_STATUS_IDLE;
 static char s_error[128];
@@ -612,10 +613,6 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target)
         set_error("enable notify failed"); return ESP_FAIL;
     }
     ESP_LOGI(TAG, "notifications enabled (cccd=%d)", s_cccd_handle);
-
-    /* Sync ring clock so future recordings have valid header timestamps */
-    if (legacy_set_time() != ESP_OK)
-        ESP_LOGW(TAG, "time sync failed after connect — continuing");
     return ESP_OK;
 }
 
@@ -697,7 +694,8 @@ static esp_err_t legacy_request(uint8_t cmd, uint16_t block,
 /* ── CMD_INFO: get device info as JSON ─────────────────────────────── */
 static esp_err_t legacy_get_info(char *serial, size_t serial_sz,
                                   char *firmware, size_t fw_sz,
-                                  char *file_list, size_t file_list_sz)
+                                  char *file_list, size_t file_list_sz,
+                                  char *current_time, size_t current_time_sz)
 {
     if (legacy_request(CMD_INFO, 0, NULL, 0, true, 5000) != ESP_OK)
         return ESP_FAIL;
@@ -731,6 +729,9 @@ static esp_err_t legacy_get_info(char *serial, size_t serial_sz,
     cJSON *fl = cJSON_GetObjectItem(j, "FileList");
     if (fl && cJSON_IsString(fl) && file_list)
         strlcpy(file_list, fl->valuestring, file_list_sz);
+    cJSON *ct = cJSON_GetObjectItem(j, "CurTIME");
+    if (ct && cJSON_IsString(ct) && current_time)
+        strlcpy(current_time, ct->valuestring, current_time_sz);
 
     cJSON_Delete(j);
     return ret;
@@ -759,6 +760,51 @@ static esp_err_t legacy_set_time(void)
                           true, 5000);
 }
 
+static time_t legacy_time_value(const char *value)
+{
+    if (!value) return (time_t)-1;
+    int year, month, day, hour, minute, second;
+    if (sscanf(value, "%d-%d-%d,%d:%d:%d", &year, &month, &day,
+               &hour, &minute, &second) != 6)
+        return (time_t)-1;
+    struct tm tm = {0};
+    tm.tm_year = year - 1900; tm.tm_mon = month - 1; tm.tm_mday = day;
+    tm.tm_hour = hour; tm.tm_min = minute; tm.tm_sec = second; tm.tm_isdst = -1;
+    time_t result = mktime(&tm);
+    struct tm check;
+    if (result == (time_t)-1 || !localtime_r(&result, &check) ||
+        check.tm_year != year - 1900 || check.tm_mon != month - 1 ||
+        check.tm_mday != day || check.tm_hour != hour ||
+        check.tm_min != minute || check.tm_sec != second)
+        return (time_t)-1;
+    return result;
+}
+
+static esp_err_t legacy_sync_time_if_needed(const char *ring_time,
+                                             const char *expected_serial)
+{
+    if (!time_is_usable()) return ESP_ERR_INVALID_STATE;
+    time_t now = time(NULL);
+    time_t device = legacy_time_value(ring_time);
+    if (device != (time_t)-1 && llabs((long long)(now - device)) <= 2)
+        return ESP_OK;
+    if (legacy_set_time() != ESP_OK) return ESP_FAIL;
+
+    char serial[32] = {0}, verify_time[32] = {0};
+    if (legacy_get_info(serial, sizeof(serial), NULL, 0, NULL, 0,
+                        verify_time, sizeof(verify_time)) != ESP_OK ||
+        !expected_serial || strcmp(serial, expected_serial) != 0)
+        return ESP_FAIL;
+    device = legacy_time_value(verify_time);
+    now = time(NULL);
+    if (device == (time_t)-1 || llabs((long long)(now - device)) > 5) {
+        ESP_LOGW(TAG, "ring clock verification failed: '%s'", verify_time);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "ring clock synchronized and verified");
+    return ESP_OK;
+}
+
 /* ── File download: FILE_OPEN / FILE_READ / FILE_CLOSE ─────────────── */
 
 /* Parse the FileList from CMD_INFO into individual filenames.
@@ -781,6 +827,27 @@ static int parse_file_list(const char *file_list,
         p = comma + 1;
     }
     return count;
+}
+
+static esp_err_t legacy_convert_stored(const char *name)
+{
+    char source_path[640];
+    char recording_id[32];
+    strlcpy(recording_id, name, sizeof(recording_id));
+    char *dot = strrchr(recording_id, '.');
+    if (dot) *dot = '\0';
+    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s",
+             s_serial, name);
+    esp_err_t conversion = oximetry_canonical_convert_vld3(s_serial, recording_id, source_path);
+    if (conversion != ESP_OK) {
+        ESP_LOGW(TAG, "canonical conversion pending for '%s': %s", name,
+                 esp_err_to_name(conversion));
+        ox_store_index_mark_converted(s_serial, name, false, esp_err_to_name(conversion));
+        return ESP_ERR_INVALID_STATE;
+    }
+    ox_store_index_mark_converted(s_serial, name, true, NULL);
+    upload_sched_request_scan();
+    return ESP_OK;
 }
 
 static esp_err_t legacy_pull_file(const char *name)
@@ -873,15 +940,7 @@ static esp_err_t legacy_pull_file(const char *name)
     if (!finalised) return ESP_FAIL;
 
     /* Convert to canonical SNT v3 format */
-    char source_path[640];
-    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s",
-             s_serial, name);
-    if (oximetry_canonical_convert_vld3(s_serial, name, source_path) != ESP_OK) {
-        ESP_LOGW(TAG, "canonical conversion pending for '%s'", name);
-        return ESP_FAIL;
-    }
-    upload_sched_request_scan();
-    return ESP_OK;
+    return legacy_convert_stored(name);
 }
 
 /* ── NVS persistence ───────────────────────────────────────────────── */
@@ -949,18 +1008,10 @@ static void load_paired_from_nvs(void)
     if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) != ESP_OK) { nvs_writer_unlock(); return; }
     size_t len;
 
+    uint8_t drv;
+    bool driver_matches = nvs_get_u8(h, "driver", &drv) == ESP_OK && drv == OX_DRIVER_LEGACY;
     len = sizeof(s_serial);
-    if (nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
-        /* Check driver type — only load if this is a Legacy device */
-        uint8_t drv = OX_DRIVER_OXYII;
-        nvs_get_u8(h, "driver", &drv);
-        if (drv != OX_DRIVER_LEGACY) {
-            /* Not our device — don't load */
-            s_serial[0] = '\0';
-            nvs_close(h);
-            nvs_writer_unlock();
-            return;
-        }
+    if (driver_matches && nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
         s_paired = true;
         len = sizeof(s_firmware);
         nvs_get_str(h, "firmware", s_firmware, &len);
@@ -968,6 +1019,8 @@ static void load_paired_from_nvs(void)
         nvs_get_str(h, "name_prefix", s_name_prefix, &len);
         len = sizeof(s_paired_addr);
         nvs_get_str(h, "last_addr", s_paired_addr, &len);
+    } else {
+        s_serial[0] = '\0';
     }
     uint8_t pm;
     if (nvs_get_u8(h, "probe_mode", &pm) == ESP_OK && pm <= 1)
@@ -1020,9 +1073,9 @@ static void pair_task(void *arg)
     }
 
     /* No AUTH/SETUP needed for Legacy — just CMD_INFO */
-    char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0};
+    char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0}, ring_time[32] = {0};
     if (legacy_get_info(serial, sizeof(serial), firmware, sizeof(firmware),
-                        file_list, sizeof(file_list)) != ESP_OK) {
+                        file_list, sizeof(file_list), ring_time, sizeof(ring_time)) != ESP_OK) {
         set_error("get_info failed");
         do_disconnect();
         free(addr_str);
@@ -1039,6 +1092,9 @@ static void pair_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    if (legacy_sync_time_if_needed(ring_time, serial) != ESP_OK)
+        ESP_LOGW(TAG, "pairing completed but ring clock could not be verified");
 
     /* Derive name_prefix from model name in serial (first 6 chars typically) */
     char prefix[16];
@@ -1110,19 +1166,6 @@ static esp_err_t do_scan(int timeout_sec)
     return ESP_OK;
 }
 
-static void canonical_migration_task(void *arg)
-{
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(35000));
-    while (sd_storage_recording_active())
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    if (sd_storage_is_ready()) {
-        oximetry_canonical_reconcile();
-        oximetry_canonical_migrate_all_legacy();
-    }
-    vTaskDelete(NULL);
-}
-
 /* ── File pull helper ──────────────────────────────────────────────── */
 static bool do_pull_and_mark(bool *pulled_any)
 {
@@ -1130,9 +1173,9 @@ static bool do_pull_and_mark(bool *pulled_any)
     set_state(OX_STATUS_PULLING);
 
     /* Get device info with file list */
-    char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0};
+    char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0}, ring_time[32] = {0};
     if (legacy_get_info(serial, sizeof(serial), firmware, sizeof(firmware),
-                        file_list, sizeof(file_list)) != ESP_OK) {
+                        file_list, sizeof(file_list), ring_time, sizeof(ring_time)) != ESP_OK) {
         ESP_LOGW(TAG, "CMD_INFO failed during pull");
         return false;
     }
@@ -1143,6 +1186,8 @@ static bool do_pull_and_mark(bool *pulled_any)
                  serial, s_serial);
         return false;
     }
+    if (legacy_sync_time_if_needed(ring_time, serial) != ESP_OK)
+        ESP_LOGW(TAG, "ring clock sync unavailable — files will retain source time provenance");
 
     /* Parse file list */
     char names[32][32];
@@ -1160,16 +1205,29 @@ static bool do_pull_and_mark(bool *pulled_any)
         if (dot) *dot = '\0';
 
         int idx = ox_store_index_check(s_serial, base_name);
+        if (idx != 1) idx = ox_store_index_check(s_serial, names[i]);
         if (idx == 1) {
-            ESP_LOGD(TAG, "skip '%s' (already finalised)", names[i]);
+            if (ox_store_index_conversion_check(s_serial, names[i]) != 1 &&
+                legacy_convert_stored(names[i]) != ESP_OK) {
+                ESP_LOGW(TAG, "conversion still pending for '%s'", names[i]);
+                pull_ok = false;
+            } else {
+                ESP_LOGD(TAG, "skip '%s' (already finalised and converted)", names[i]);
+            }
             continue;
         }
 
         ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
-        if (legacy_pull_file(names[i]) != ESP_OK) {
-            ESP_LOGW(TAG, "pull failed for '%s' — continuing with next file", names[i]);
+        esp_err_t result = legacy_pull_file(names[i]);
+        if (result != ESP_OK) {
             pull_ok = false;
-            continue;
+            if (result == ESP_ERR_INVALID_STATE) {
+                if (pulled_any) *pulled_any = true;
+                ESP_LOGW(TAG, "downloaded '%s'; conversion deferred", names[i]);
+                continue;
+            }
+            ESP_LOGW(TAG, "transfer failed for '%s' — ending this sync attempt", names[i]);
+            break;
         }
         if (pulled_any) *pulled_any = true;
     }
@@ -1262,10 +1320,6 @@ static void pull_task(void *arg)
          * inconsistent across reference projects, so we skip the
          * worn-state check entirely. */
 
-        /* Sync time, then pull files */
-        if (legacy_set_time() != ESP_OK)
-            ESP_LOGW(TAG, "watch: time sync failed — continuing");
-
         /* Give the ring time to flush the recording */
         vTaskDelay(pdMS_TO_TICKS(3000));
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
@@ -1305,6 +1359,8 @@ static void pull_task(void *arg)
 /* ── Public API (driver vtable) ────────────────────────────────────── */
 static void legacy_init(void)
 {
+    if (s_initialized) return;
+    s_initialized = true;
     s_state_mtx = xSemaphoreCreateMutex();
     s_ops_mtx   = xSemaphoreCreateMutex();
     s_op_sem    = xSemaphoreCreateBinary();
@@ -1336,10 +1392,6 @@ static void legacy_init(void)
     if (!h) {
         ESP_LOGW(TAG, "failed to create pull task");
     }
-    TaskHandle_t migration = psram_task_create(canonical_migration_task,
-                                               "ox_leg_mig", 12288, NULL, 1,
-                                               0, NULL, NULL);
-    if (!migration) ESP_LOGW(TAG, "failed to create canonical migration task");
 }
 
 static esp_err_t legacy_scan(int timeout_sec)

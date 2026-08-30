@@ -73,8 +73,11 @@ void ox_store_save_paired(const char *serial, const char *firmware,
                           const char *driver);
 void ox_store_delete_paired(void);
 int  ox_store_index_check(const char *serial, const char *name);
+int  ox_store_index_conversion_check(const char *serial, const char *name);
 void ox_store_index_add(const char *serial, const char *name,
                         uint32_t bytes, bool finalised);
+void ox_store_index_mark_converted(const char *serial, const char *name,
+                                   bool converted, const char *error);
 long ox_store_part_size(const char *name);
 esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len);
 bool ox_store_promote(const char *serial, const char *name);
@@ -274,6 +277,7 @@ static SemaphoreHandle_t s_resp_sem;    /* notification response */
 static SemaphoreHandle_t s_scan_done;
 static volatile int s_op_status;
 static volatile int s_conn_status;
+static bool s_initialized;
 
 static char s_status[24] = OX_STATUS_IDLE;
 static char s_error[128];
@@ -872,6 +876,24 @@ static int oxyii_get_file_list(char names[][17], int max_count)
 }
 
 /* ── Pull a single file ────────────────────────────────────────────── */
+static esp_err_t oxyii_convert_stored(const char *name)
+{
+    char source_path[640];
+    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s.bin",
+             s_serial, name);
+    esp_err_t conversion = oximetry_canonical_convert_format_a(
+        s_serial, name, source_path, oxyii_filename_epoch_ms(name));
+    if (conversion != ESP_OK) {
+        ESP_LOGW(TAG, "canonical conversion pending for '%s': %s", name,
+                 esp_err_to_name(conversion));
+        ox_store_index_mark_converted(s_serial, name, false, esp_err_to_name(conversion));
+        return ESP_ERR_INVALID_STATE;
+    }
+    ox_store_index_mark_converted(s_serial, name, true, NULL);
+    upload_sched_request_scan();
+    return ESP_OK;
+}
+
 static esp_err_t oxyii_pull_file(const char *name)
 {
     /* READ_FILE_START */
@@ -943,16 +965,7 @@ static esp_err_t oxyii_pull_file(const char *name)
              name, (unsigned long)offset, finalised);
     if (!finalised) return ESP_FAIL;
 
-    char source_path[640];
-    snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s.bin",
-             s_serial, name);
-    if (oximetry_canonical_convert_format_a(s_serial, name, source_path,
-                                            oxyii_filename_epoch_ms(name)) != ESP_OK) {
-        ESP_LOGW(TAG, "canonical conversion pending for '%s'", name);
-        return ESP_FAIL;
-    }
-    upload_sched_request_scan();
-    return ESP_OK;
+    return oxyii_convert_stored(name);
 }
 
 /* ── NVS persistence ───────────────────────────────────────────────── */
@@ -1018,18 +1031,10 @@ static void load_paired_from_nvs(void)
     if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) != ESP_OK) { nvs_writer_unlock(); return; }
     size_t len;
 
+    uint8_t drv;
+    bool driver_matches = nvs_get_u8(h, "driver", &drv) == ESP_OK && drv == OX_DRIVER_OXYII;
     len = sizeof(s_serial);
-    if (nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
-        /* Check driver type — only load if this is an OxyII device */
-        uint8_t drv = OX_DRIVER_OXYII;
-        nvs_get_u8(h, "driver", &drv);
-        if (drv != OX_DRIVER_OXYII) {
-            /* Not our device — don't load */
-            s_serial[0] = '\0';
-            nvs_close(h);
-            nvs_writer_unlock();
-            return;
-        }
+    if (driver_matches && nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
         s_paired = true;
         len = sizeof(s_firmware);
         nvs_get_str(h, "firmware", s_firmware, &len);
@@ -1037,6 +1042,8 @@ static void load_paired_from_nvs(void)
         nvs_get_str(h, "name_prefix", s_name_prefix, &len);
         len = sizeof(s_paired_addr);
         nvs_get_str(h, "last_addr", s_paired_addr, &len);
+    } else {
+        s_serial[0] = '\0';
     }
     uint8_t pm;
     if (nvs_get_u8(h, "probe_mode", &pm) == ESP_OK && pm <= 1)
@@ -1052,7 +1059,7 @@ static void load_paired_from_nvs(void)
                                  prefix, sizeof(prefix),
                                  addr, sizeof(addr),
                                  drv, sizeof(drv))) {
-            if (strcmp(drv, "wellue_oxyii") == 0 || drv[0] == '\0') {
+            if (strcmp(drv, "wellue_oxyii") == 0) {
                 strlcpy(s_serial, serial, sizeof(s_serial));
                 strlcpy(s_firmware, fw, sizeof(s_firmware));
                 strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
@@ -1234,16 +1241,27 @@ static bool do_pull_and_mark(bool *pulled_any)
 
         int idx = ox_store_index_check(s_serial, names[i]);
         if (idx == 1) {
-            ESP_LOGD(TAG, "skip '%s' (already finalised)", names[i]);
+            if (ox_store_index_conversion_check(s_serial, names[i]) != 1 &&
+                oxyii_convert_stored(names[i]) != ESP_OK) {
+                ESP_LOGW(TAG, "conversion still pending for '%s'", names[i]);
+                pull_ok = false;
+            } else {
+                ESP_LOGD(TAG, "skip '%s' (already finalised and converted)", names[i]);
+            }
             continue;
         }
 
         ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
-        if (oxyii_pull_file(names[i]) != ESP_OK) {
-            ESP_LOGW(TAG, "pull failed for '%s' — continuing with next file", names[i]);
-            if (sd_storage_is_ready()) oximetry_canonical_migrate_legacy(s_serial);
+        esp_err_t result = oxyii_pull_file(names[i]);
+        if (result != ESP_OK) {
             pull_ok = false;
-            continue;
+            if (result == ESP_ERR_INVALID_STATE) {
+                if (pulled_any) *pulled_any = true;
+                ESP_LOGW(TAG, "downloaded '%s'; conversion deferred", names[i]);
+                continue;
+            }
+            ESP_LOGW(TAG, "transfer failed for '%s' — ending this sync attempt", names[i]);
+            break;
         }
         if (pulled_any) *pulled_any = true;
     }
@@ -1500,6 +1518,8 @@ static void pull_task(void *arg)
 /* ── Public API (driver vtable) ───────────────────────────────────── */
 static void oxyii_init(void)
 {
+    if (s_initialized) return;
+    s_initialized = true;
     s_state_mtx = xSemaphoreCreateMutex();
     s_ops_mtx   = xSemaphoreCreateMutex();
     s_op_sem    = xSemaphoreCreateBinary();

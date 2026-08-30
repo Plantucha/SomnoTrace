@@ -69,9 +69,9 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
                                                int64_t start_utc_ms);
 
 /* Convert one completed O2 Ring (Gen1) VLD3 file into a durable recording
- * package.  The VLD3 header provides the start timestamp and sample
- * resolution.  The source is copied byte-for-byte into the package.
- * device_id and recording_id are single safe path components. */
+ * package.  Vendor-layout metadata provides cadence; header and filename
+ * timestamps are validated independently with provenance retained.  The source
+ * is copied byte-for-byte. device_id and recording_id are safe path components. */
 esp_err_t oximetry_canonical_convert_vld3(const char *device_id,
                                            const char *recording_id,
                                            const char *source_path);

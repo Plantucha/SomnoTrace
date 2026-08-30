@@ -54,12 +54,13 @@ def synthetic_format_a(count=120):
 
 def synthetic_vld(count=120):
     header = bytearray(40)
-    header[0:2] = struct.pack("<H", 3)
+    header[0] = 3
+    header[1] = 0
     header[2:4] = struct.pack("<H", 2099)
     header[4:9] = bytes((1, 1, 0, 0, 0))
-    header[9:12] = struct.pack("<I", 40 + count * 5)[:3]
+    header[9:13] = struct.pack("<I", 40 + count * 5)
     header[13:15] = struct.pack("<H", count * 4)
-    records = b"".join(bytes((97, 70, 0, 1, 0)) for _ in range(count))
+    records = b"".join(struct.pack("<BHBB", 97, 70, 1, 0) for _ in range(count))
     return bytes(header) + records
 
 
