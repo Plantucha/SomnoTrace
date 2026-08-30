@@ -237,7 +237,7 @@ bool bsp_display_is_therapy_active(void)
 {
     if (!s_state_mutex) return false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    bool active = (s_mode == DISP_MODE_GRAPH);
+    bool active = (s_mode == DISP_MODE_GRAPH || s_mode == DISP_MODE_INFO);
     xSemaphoreGive(s_state_mutex);
     return active;
 }
