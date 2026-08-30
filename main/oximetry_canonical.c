@@ -714,8 +714,12 @@ esp_err_t oximetry_canonical_convert_vld3(const char *device_id,
 
     int64_t start_ms = vld3_start_epoch_ms(source_path);
     if (!start_ms) {
-        ESP_LOGW(TAG, "vld3 convert: cannot extract start time from header");
-        return ESP_ERR_INVALID_ARG;
+        start_ms = filename_epoch_ms(recording_id);
+        if (!start_ms) {
+            ESP_LOGW(TAG, "vld3 convert: cannot extract start time from header or filename");
+            return ESP_ERR_INVALID_ARG;
+        }
+        ESP_LOGI(TAG, "vld3 convert: start time from file name: %lld", (long long)start_ms);
     }
 
     uint32_t period_us = vld3_period_us(source_path);

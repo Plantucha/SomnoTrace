@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -531,6 +532,7 @@ bool ox_store_finalize_native(const char *serial, const char *name,
     int n = fread(data, 1, fsize, f);
     fclose(f);
     if (n != fsize) {
+        ESP_LOGE(TAG, "native promote: read %d/%ld bytes for '%s'", n, fsize, name);
         free(data);
         return false;
     }
@@ -538,8 +540,16 @@ bool ox_store_finalize_native(const char *serial, const char *name,
     /* Create files/<serial>/ directory */
     char serial_dir[160];
     snprintf(serial_dir, sizeof(serial_dir), "%s/%s", OXY_FILES, serial);
-    mkdir(OXY_FILES, 0775);
-    mkdir(serial_dir, 0775);
+    if (mkdir(OXY_FILES, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "native promote: mkdir %s failed: %s", OXY_FILES, strerror(errno));
+        free(data);
+        return false;
+    }
+    if (mkdir(serial_dir, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "native promote: mkdir %s failed: %s", serial_dir, strerror(errno));
+        free(data);
+        return false;
+    }
 
     /* Write the final file atomically (no .bin or .vld suffix — preserve
      * the original filename from the ring) */
@@ -549,7 +559,7 @@ bool ox_store_finalize_native(const char *serial, const char *name,
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", out_path);
     f = fopen(tmp_path, "wb");
     if (!f) {
-        ESP_LOGE(TAG, "native promote: cannot create %s", tmp_path);
+        ESP_LOGE(TAG, "native promote: cannot create %s: %s", tmp_path, strerror(errno));
         free(data);
         return false;
     }
@@ -557,7 +567,16 @@ bool ox_store_finalize_native(const char *serial, const char *name,
                    fflush(f) == 0 && fsync(fileno(f)) == 0;
     fclose(f);
     free(data);
-    if (!written || rename(tmp_path, out_path) != 0) {
+    if (!written) {
+        ESP_LOGE(TAG, "native promote: write/flush/sync failed for %s", tmp_path);
+        unlink(tmp_path);
+        return false;
+    }
+    /* FATFS does not support rename-over-existing (returns EEXIST),
+     * so unlink the destination first. */
+    unlink(out_path);
+    if (rename(tmp_path, out_path) != 0) {
+        ESP_LOGE(TAG, "native promote: rename %s -> %s failed: %s", tmp_path, out_path, strerror(errno));
         unlink(tmp_path);
         return false;
     }

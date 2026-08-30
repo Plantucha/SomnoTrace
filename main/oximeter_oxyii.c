@@ -241,7 +241,9 @@ static int64_t oxyii_filename_epoch_ms(const char *name)
 static void oxyii_file_start_payload(uint8_t *out20, const char *name)
 {
     memset(out20, 0, 20);
-    strncpy((char *)out20, name, 16);
+    size_t n = strlen(name);
+    if (n > 16) n = 16;
+    memcpy(out20, name, n);
     /* bytes 16..19: file type = 0 */
 }
 
@@ -1238,10 +1240,10 @@ static bool do_pull_and_mark(bool *pulled_any)
 
         ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
         if (oxyii_pull_file(names[i]) != ESP_OK) {
-            ESP_LOGW(TAG, "pull failed for '%s'", names[i]);
+            ESP_LOGW(TAG, "pull failed for '%s' — continuing with next file", names[i]);
             if (sd_storage_is_ready()) oximetry_canonical_migrate_legacy(s_serial);
             pull_ok = false;
-            break;
+            continue;
         }
         if (pulled_any) *pulled_any = true;
     }
