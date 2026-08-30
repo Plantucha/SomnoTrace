@@ -93,6 +93,8 @@ static uint16_t *s_fb = NULL;
 static bool s_wifi_connected = false;
 static bool s_as11_paired = false;
 static uint8_t s_rotation = 0;  /* current LCD rotation in degrees */
+static volatile bool s_rotation_pending = false;  /* set_rotation requested, deferred to render task */
+static uint8_t s_pending_rotation_deg = 0;        /* requested rotation (valid when s_rotation_pending) */
 
 /* Strip blit: the framebuffer lives in PSRAM (not DMA-capable), so it is
  * pushed to the panel in chunks via small internal DMA-capable buffers.
@@ -351,9 +353,24 @@ void bsp_display_set_rotation(uint8_t degrees)
             ESP_LOGW(TAG, "set_rotation: invalid %u", degrees);
             return;
     }
-    s_rotation = degrees;
-    apply_panel_rotation(degrees);
+
+    /* Defer the actual SPI panel write to the display task.  Calling
+     * apply_panel_rotation() from here (e.g. an HTTP handler thread) would
+     * race with lcd_flush() on the same esp_lcd_panel_io handle, corrupting
+     * the SPI transaction queue and permanently wedging the display. */
+    if (s_state_mutex) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        s_pending_rotation_deg = degrees;
+        s_rotation_pending = true;
+        xSemaphoreGive(s_state_mutex);
+    } else {
+        /* Init-time path (no task yet): apply directly. */
+        s_rotation = degrees;
+        apply_panel_rotation(degrees);
+    }
+
     ESP_LOGI(TAG, "rotation set to %u°", degrees);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
 static void lcd_flush(void)
@@ -1403,7 +1420,19 @@ static void display_task(void *arg)
         disp_mode_t mode = s_mode;
         bool dirty = s_status_dirty;
         s_status_dirty = false;
+        bool rot_pending = s_rotation_pending;
+        uint8_t rot_deg = s_pending_rotation_deg;
+        s_rotation_pending = false;
         xSemaphoreGive(s_state_mutex);
+
+        /* Apply deferred rotation before any render/flush so the SPI panel
+         * IO handle is only ever touched from this task. */
+        if (rot_pending) {
+            s_rotation = rot_deg;
+            apply_panel_rotation(rot_deg);
+            /* Force a full re-render after rotation change. */
+            last_mode = (disp_mode_t)-1;
+        }
 
         bool mode_changed = (mode != last_mode);
         TickType_t now = xTaskGetTickCount();
