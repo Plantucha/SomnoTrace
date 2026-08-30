@@ -301,20 +301,67 @@ void sd_storage_lease_release(sd_lease_t role)
 
 esp_err_t sd_storage_format(void)
 {
-    if (!s_mounted || !s_card) {
-        ESP_LOGE(TAG, "format: SD card not mounted");
-        return ESP_ERR_INVALID_STATE;
-    }
-
     ESP_LOGW(TAG, "format: formatting SD card — ALL DATA WILL BE LOST");
 
-    /* esp_vfs_fat_sdcard_format() unmounts, formats (f_mkfs), and remounts
-     * the filesystem at the same mount point.  The card handle remains valid. */
-    esp_err_t ret = esp_vfs_fat_sdcard_format(SD_MOUNT_POINT, s_card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "format: esp_vfs_fat_sdcard_format failed: %s", esp_err_to_name(ret));
-        s_mounted = false;
-        return ret;
+    esp_err_t ret;
+
+    if (s_mounted) {
+        /* Card is already mounted — pre-erase the first 8 sectors so any
+         * residual exFAT boot-sector signature in sector 0 cannot confuse
+         * f_mkfs on a future re-flash, then format in-place. */
+        uint8_t *zeros = calloc(8 * 512, 1);
+        if (zeros) {
+            if (sdmmc_write_sectors(s_card, zeros, 0, 8) == ESP_OK)
+                ESP_LOGI(TAG, "format: pre-erased first 8 sectors");
+            else
+                ESP_LOGW(TAG, "format: pre-erase failed, proceeding");
+            free(zeros);
+        }
+
+        /* esp_vfs_fat_sdcard_format() unmounts, formats (f_mkfs), and
+         * remounts at the same mount point.  The card handle remains valid. */
+        ret = esp_vfs_fat_sdcard_format(SD_MOUNT_POINT, s_card);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "format: esp_vfs_fat_sdcard_format failed: %s",
+                     esp_err_to_name(ret));
+            s_mounted = false;
+            return ret;
+        }
+    } else {
+        /* Card not mounted — common cause: factory 64 GB SDXC cards ship with
+         * exFAT.  ESP-IDF 5.5 builds FATFS with FF_FS_EXFAT=0, so the mount
+         * in sd_storage_init() returns FR_NO_FILESYSTEM and s_card stays NULL.
+         * Mount with format_if_mount_failed=true so the driver formats
+         * (FM_ANY → FAT32, 32 KB clusters) and remounts in one step. */
+        sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+        host.slot = SDMMC_HOST_SLOT_1;
+        host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+
+        sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+        slot.clk   = GPIO_NUM_16;
+        slot.cmd   = GPIO_NUM_15;
+        slot.d0    = GPIO_NUM_17;
+        slot.d1    = GPIO_NUM_18;
+        slot.d2    = GPIO_NUM_13;
+        slot.d3    = GPIO_NUM_14;
+        slot.width = 4;
+        slot.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+        esp_vfs_fat_sdmmc_mount_config_t cfg = {
+            .format_if_mount_failed = true,
+            .max_files              = 16,
+            .allocation_unit_size   = 32768,
+        };
+
+        sdmmc_card_t *card = NULL;
+        ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot, &cfg, &card);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "format: mount+format failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        s_card    = card;
+        s_mounted = true;
+        lease_init_once();
     }
 
     /* Recreate the SomnoTrace directory tree (format wipes everything). */
