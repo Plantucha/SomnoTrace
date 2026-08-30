@@ -131,6 +131,9 @@ static uint8_t legacy_crc8(const uint8_t *data, int len)
     return crc;
 }
 
+/* Forward declaration for legacy_set_time (called from do_connect_and_discover) */
+static esp_err_t legacy_set_time(void);
+
 /* ── Frame codec ───────────────────────────────────────────────────── */
 /* Encode a Legacy request frame into buf.  Returns total frame length.
  * Request: 0xAA | cmd | cmd^0xFF | block(LE16) | len(LE16) | data | crc8 */
@@ -609,6 +612,10 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target)
         set_error("enable notify failed"); return ESP_FAIL;
     }
     ESP_LOGI(TAG, "notifications enabled (cccd=%d)", s_cccd_handle);
+
+    /* Sync ring clock so future recordings have valid header timestamps */
+    if (legacy_set_time() != ESP_OK)
+        ESP_LOGW(TAG, "time sync failed after connect — continuing");
     return ESP_OK;
 }
 
@@ -1160,9 +1167,9 @@ static bool do_pull_and_mark(bool *pulled_any)
 
         ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
         if (legacy_pull_file(names[i]) != ESP_OK) {
-            ESP_LOGW(TAG, "pull failed for '%s'", names[i]);
+            ESP_LOGW(TAG, "pull failed for '%s' — continuing with next file", names[i]);
             pull_ok = false;
-            break;
+            continue;
         }
         if (pulled_any) *pulled_any = true;
     }
