@@ -40,7 +40,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <time.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -278,29 +277,6 @@ static int wait_op(int timeout_ms)
     return s_op_status;
 }
 
-/* Check if a BLE advert name matches a Gen1 O2 Ring / ViaTom device.
- * Match: first token (space-separated) contains "O2", or is exactly "CMRing". */
-static bool name_is_legacy(const char *name)
-{
-    if (!name || !name[0]) return false;
-    char up[32];
-    int i;
-    for (i = 0; i < 31 && name[i]; i++)
-        up[i] = toupper((unsigned char)name[i]);
-    up[i] = '\0';
-
-    /* Check first token only */
-    int tok_len = 0;
-    while (up[tok_len] && up[tok_len] != ' ' && tok_len < 31) tok_len++;
-    char first[32];
-    memcpy(first, up, tok_len);
-    first[tok_len] = '\0';
-
-    if (strcmp(first, "CMRING") == 0) return true;
-    if (strstr(first, "O2") != NULL) return true;
-    return false;
-}
-
 /* Check if raw BLE advertisement data contains the Gen1 Legacy service UUID
  * 14839ac4-7d7e-415c-9a42-167340cf2339.
  * In BLE AD data, 128-bit service UUIDs are stored as 16-byte LE sequences
@@ -346,6 +322,19 @@ static bool parse_addr(const char *str, ble_addr_t *out)
     out->val[2] = v[3]; out->val[1] = v[4]; out->val[0] = v[5];
     out->type = (v[0] & 0xC0) == 0xC0 ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
     return true;
+}
+
+/* Find the scan result whose address matches s_paired_addr.
+ * Returns the index, or -1 if not found. */
+static int find_paired_in_scan(void)
+{
+    for (int i = 0; i < s_scan_count; i++) {
+        char addr_str[18];
+        addr_to_str(&s_scan[i].addr, addr_str, sizeof(addr_str));
+        if (strcmp(addr_str, s_paired_addr) == 0)
+            return i;
+    }
+    return -1;
 }
 
 /* ── GAP event handler ─────────────────────────────────────────────── */
@@ -430,12 +419,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
         }
 
-        /* Primary: match by service UUID in advertisement data.
-         * Fallback: match by device name (handles devices that don't
-         * advertise service UUIDs in their scan response). */
+        /* Match Gen1 rings purely by the legacy service UUID in advertisement
+         * data (14839ac4-...).  This is more reliable than name matching:
+         * ecostech/viatom-ble confirms "some rings drop the name from ads
+         * after being connected once, but the service UUID stays."  It also
+         * avoids false positives: Gen2 names like "SHQO2Pro" contain "O2"
+         * and would match the old name-based fallback. */
         bool is_legacy = adv_has_legacy_service_uuid(raw, raw_len);
-        if (!is_legacy)
-            is_legacy = name_is_legacy(name);
         if (!is_legacy) return 0;
         if (name[0] == '\0')
             strlcpy(name, "O2Ring", sizeof(name));
@@ -1335,13 +1325,29 @@ static void pull_task(void *arg)
             continue;
         }
 
+        /* Select the paired device from scan results.  On first boot
+         * after pairing, s_paired_addr holds the address from the pair
+         * scan.  MAC can rotate on factory reset, so if the stored
+         * address isn't found, fall back to the first result (the
+         * serial check in do_pull_and_mark is the ultimate gate). */
+        int idx = find_paired_in_scan();
+        if (idx < 0) {
+            if (s_paired_addr[0] != '\0') {
+                ESP_LOGW(TAG, "paired addr %s not in scan results; "
+                         "using first device (serial will be verified)",
+                         s_paired_addr);
+            }
+            idx = 0;
+        }
+
         if (!s_ring_present) {
             ESP_LOGI(TAG, "ring present: '%s' rssi=%d",
-                     s_scan[0].name, s_scan[0].rssi);
+                     s_scan[idx].name, s_scan[idx].rssi);
             s_ring_present = true;
         }
 
-        addr_to_str(&s_scan[0].addr, s_paired_addr, sizeof(s_paired_addr));
+        /* Update paired addr hint from the selected device. */
+        addr_to_str(&s_scan[idx].addr, s_paired_addr, sizeof(s_paired_addr));
 
         if (s_presence_served) {
             if ((xTaskGetTickCount() - s_served_at) < pdMS_TO_TICKS(OX_END_WINDOW_MS)) {
@@ -1356,7 +1362,7 @@ static void pull_task(void *arg)
         /* Connect and probe */
         set_state(OX_STATUS_CONNECTING);
 
-        if (do_connect_and_discover(&s_scan[0].addr) != ESP_OK) {
+        if (do_connect_and_discover(&s_scan[idx].addr) != ESP_OK) {
             ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);

@@ -39,7 +39,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <time.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -368,18 +367,6 @@ static int wait_op(int timeout_ms)
     return s_op_status;
 }
 
-static bool name_is_oxyii(const char *name)
-{
-    if (!name || !name[0]) return false;
-    char up[32];
-    int i;
-    for (i = 0; i < 31 && name[i]; i++)
-        up[i] = toupper((unsigned char)name[i]);
-    up[i] = '\0';
-    return strncmp(up, "S8-AW", 5) == 0 ||
-           strncmp(up, "SHQO2PRO", 8) == 0;
-}
-
 static void addr_to_str(const ble_addr_t *a, char *out, size_t outsz)
 {
     snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -398,6 +385,19 @@ static bool parse_addr(const char *str, ble_addr_t *out)
      * byte set (0xC0 mask).  O2 Ring uses a static random address. */
     out->type = (v[0] & 0xC0) == 0xC0 ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
     return true;
+}
+
+/* Find the scan result whose address matches s_paired_addr.
+ * Returns the index, or -1 if not found. */
+static int find_paired_in_scan(void)
+{
+    for (int i = 0; i < s_scan_count; i++) {
+        char addr_str[18];
+        addr_to_str(&s_scan[i].addr, addr_str, sizeof(addr_str));
+        if (strcmp(addr_str, s_paired_addr) == 0)
+            return i;
+    }
+    return -1;
 }
 
 /* ── GAP event handler ─────────────────────────────────────────────── */
@@ -478,7 +478,14 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (cid == MFG_RECORDING)
             return 0;
 
-        bool match = name_is_oxyii(name) || cid == MFG_OXYII;
+        /* Match Gen2 rings purely by the OxyII manufacturer ID (0xF34E)
+         * in advertisement data.  The OxyII service UUID (e8fb0001-...)
+         * is NOT advertised — it's only in the GATT database.  The ring
+         * advertises the generic Heart Rate Service (0000180d-...) which
+         * is not unique.  Manufacturer ID is the reliable advertisement-
+         * level signal (confirmed by nglessner/o2ring-s-protocol and our
+         * own adv_deep.py measurements). */
+        bool match = (cid == MFG_OXYII);
         if (!match) return 0;
         if (name[0] == '\0')
             strlcpy(name, "O2Ring", sizeof(name));
@@ -1367,14 +1374,29 @@ static void pull_task(void *arg)
             continue;
         }
 
+        /* Select the paired device from scan results.  On first boot
+         * after pairing, s_paired_addr holds the address from the pair
+         * scan.  MAC can rotate on factory reset, so if the stored
+         * address isn't found, fall back to the first result (the
+         * serial check in do_pull_and_mark is the ultimate gate). */
+        int idx = find_paired_in_scan();
+        if (idx < 0) {
+            if (s_paired_addr[0] != '\0') {
+                ESP_LOGW(TAG, "paired addr %s not in scan results; "
+                         "using first device (serial will be verified)",
+                         s_paired_addr);
+            }
+            idx = 0;
+        }
+
         if (!s_ring_present) {
             ESP_LOGI(TAG, "ring present: '%s' rssi=%d",
-                     s_scan[0].name, s_scan[0].rssi);
+                     s_scan[idx].name, s_scan[idx].rssi);
             s_ring_present = true;
         }
 
         /* Remember last seen addr (hint; MAC can rotate on factory reset). */
-        addr_to_str(&s_scan[0].addr, s_paired_addr, sizeof(s_paired_addr));
+        addr_to_str(&s_scan[idx].addr, s_paired_addr, sizeof(s_paired_addr));
 
         if (s_presence_served) {
             /* Never reconnect during END — a connection resets the
@@ -1401,7 +1423,7 @@ static void pull_task(void *arg)
              * this approach. */
             set_state(OX_STATUS_CONNECTING);
 
-            if (do_connect_and_discover(&s_scan[0].addr, false) != ESP_OK) {
+            if (do_connect_and_discover(&s_scan[idx].addr, false) != ESP_OK) {
                 ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
                 do_disconnect();
                 set_state(OX_STATUS_PAIRED);
@@ -1519,7 +1541,7 @@ static void pull_task(void *arg)
         /* ── Legacy mode (reconnect + full handshake each cycle) ─────── */
         set_state(OX_STATUS_CONNECTING);
 
-        if (do_connect_and_discover(&s_scan[0].addr, true) != ESP_OK) {
+        if (do_connect_and_discover(&s_scan[idx].addr, true) != ESP_OK) {
             ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);

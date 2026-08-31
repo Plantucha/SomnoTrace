@@ -37,7 +37,6 @@
 #include "nvs_writer.h"
 
 #include <string.h>
-#include <strings.h>
 
 static const char *TAG = "oximeter";
 
@@ -105,12 +104,6 @@ esp_err_t oximeter_scan(int timeout_sec)
     return oxyii == ESP_OK || legacy == ESP_OK ? ESP_OK : ESP_FAIL;
 }
 
-static bool explicit_oxyii_name(const char *name)
-{
-    return name && (strncasecmp(name, "S8-AW", 5) == 0 ||
-                    strncasecmp(name, "SHQO2PRO", 8) == 0);
-}
-
 cJSON *oximeter_get_scan_results(void)
 {
     cJSON *merged = cJSON_CreateArray();
@@ -127,23 +120,23 @@ cJSON *oximeter_get_scan_results(void)
         cJSON *copy = cJSON_Duplicate(item, true);
         if (copy) cJSON_AddItemToArray(merged, copy);
     }
+    /* Add legacy entries, skipping any address already seen in the
+     * oxyii results.  With UUID/mfg-only detection the two drivers
+     * should never match the same device, but dedup is kept as a
+     * safety net. */
     cJSON_ArrayForEach(item, legacy) {
         cJSON *addr = cJSON_GetObjectItem(item, "addr");
-        cJSON *name = cJSON_GetObjectItem(item, "name");
-        int duplicate = -1;
+        bool dup = false;
         for (int i = 0; i < cJSON_GetArraySize(merged); i++) {
-            cJSON *candidate = cJSON_GetArrayItem(merged, i);
-            cJSON *candidate_addr = cJSON_GetObjectItem(candidate, "addr");
-            if (cJSON_IsString(addr) && cJSON_IsString(candidate_addr) &&
-                strcmp(addr->valuestring, candidate_addr->valuestring) == 0) {
-                duplicate = i;
+            cJSON *cand = cJSON_GetArrayItem(merged, i);
+            cJSON *cand_addr = cJSON_GetObjectItem(cand, "addr");
+            if (cJSON_IsString(addr) && cJSON_IsString(cand_addr) &&
+                strcmp(addr->valuestring, cand_addr->valuestring) == 0) {
+                dup = true;
                 break;
             }
         }
-        if (duplicate >= 0 && !(cJSON_IsString(name) && explicit_oxyii_name(name->valuestring))) {
-            cJSON *copy = cJSON_Duplicate(item, true);
-            if (copy) cJSON_ReplaceItemInArray(merged, duplicate, copy);
-        } else if (duplicate < 0) {
+        if (!dup) {
             cJSON *copy = cJSON_Duplicate(item, true);
             if (copy) cJSON_AddItemToArray(merged, copy);
         }
