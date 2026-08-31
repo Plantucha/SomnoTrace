@@ -85,16 +85,16 @@ static void render_graph(void);
 static void render_info(void);
 static void render_status(void);
 static void display_task(void *arg);
-static void apply_panel_rotation(uint8_t degrees);
+static void apply_panel_rotation(uint16_t degrees);
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_io = NULL;
 static uint16_t *s_fb = NULL;
 static bool s_wifi_connected = false;
 static bool s_as11_paired = false;
-static uint8_t s_rotation = 0;  /* current LCD rotation in degrees */
+static uint16_t s_rotation = 0;  /* current LCD rotation in degrees */
 static volatile bool s_rotation_pending = false;  /* set_rotation requested, deferred to render task */
-static uint8_t s_pending_rotation_deg = 0;        /* requested rotation (valid when s_rotation_pending) */
+static uint16_t s_pending_rotation_deg = 0;       /* requested rotation (valid when s_rotation_pending) */
 
 /* Strip blit: the framebuffer lives in PSRAM (not DMA-capable), so it is
  * pushed to the panel in chunks via small internal DMA-capable buffers.
@@ -316,14 +316,14 @@ static void lcd_panel_hw_recover(void)
         apply_panel_rotation(s_rotation);
     }
     esp_lcd_panel_disp_on_off(s_panel, true);
-    ESP_LOGI(TAG, "panel hardware reset + re-init (rot=%u)", s_rotation);
+    ESP_LOGI(TAG, "panel hardware reset + re-init (rot=%u)", (unsigned)s_rotation);
 }
 
 /* Apply rotation to the ST7789 panel via MADCTL (swap_xy + mirror).
  * Called after panel init/recover and when the user changes the setting.
  * The framebuffer layout (s_fb[y * 240 + x]) stays the same; the panel
  * remaps GRAM addressing so the physical pixels appear rotated. */
-static void apply_panel_rotation(uint8_t degrees)
+static void apply_panel_rotation(uint16_t degrees)
 {
     if (!s_panel) return;
     bool swap_xy = false;
@@ -336,6 +336,14 @@ static void apply_panel_rotation(uint8_t degrees)
             swap_xy = true;
             mirror_x = true;
             break;
+        case 180:
+            mirror_x = true;
+            mirror_y = true;
+            break;
+        case 270:  /* clockwise 270° */
+            swap_xy = true;
+            mirror_y = true;
+            break;
         default:
             return;
     }
@@ -344,13 +352,13 @@ static void apply_panel_rotation(uint8_t degrees)
     esp_lcd_panel_mirror(s_panel, mirror_x, mirror_y);
 }
 
-void bsp_display_set_rotation(uint8_t degrees)
+void bsp_display_set_rotation(uint16_t degrees)
 {
     switch (degrees) {
-        case 0: case 90:
+        case 0: case 90: case 180: case 270:
             break;
         default:
-            ESP_LOGW(TAG, "set_rotation: invalid %u", degrees);
+            ESP_LOGW(TAG, "set_rotation: invalid %u", (unsigned)degrees);
             return;
     }
 
@@ -369,7 +377,7 @@ void bsp_display_set_rotation(uint8_t degrees)
         apply_panel_rotation(degrees);
     }
 
-    ESP_LOGI(TAG, "rotation set to %u°", degrees);
+    ESP_LOGI(TAG, "rotation set to %u°", (unsigned)degrees);
     if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
@@ -1421,7 +1429,7 @@ static void display_task(void *arg)
         bool dirty = s_status_dirty;
         s_status_dirty = false;
         bool rot_pending = s_rotation_pending;
-        uint8_t rot_deg = s_pending_rotation_deg;
+        uint16_t rot_deg = s_pending_rotation_deg;
         s_rotation_pending = false;
         xSemaphoreGive(s_state_mutex);
 
