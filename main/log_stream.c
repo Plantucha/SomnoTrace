@@ -83,6 +83,7 @@ static bool s_sd_ready;              /* SD card is mounted and log dir created *
 typedef struct {
     httpd_handle_t hd;
     int fd;
+    bool paused;  /* per-client: when true, non-log pushes are skipped for this client */
 } ws_client_t;
 
 static ws_client_t       s_ws_clients[MAX_WS_CLIENTS];
@@ -333,7 +334,23 @@ void log_stream_init(void)
     s_ws_mutex = xSemaphoreCreateMutex();
 }
 
-static volatile bool s_ws_paused = false;
+/* Check if any non-paused WebSocket client is connected.
+ * Used by the forwarder loop to skip building JSON when all clients
+ * are paused (e.g. background tabs).  Log messages bypass this check. */
+static bool ws_has_active_client(void)
+{
+    bool active = false;
+    if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
+        for (int i = 0; i < s_ws_client_count; i++) {
+            if (!s_ws_clients[i].paused) {
+                active = true;
+                break;
+            }
+        }
+        xSemaphoreGive(s_ws_mutex);
+    }
+    return active;
+}
 
 /* Push-now flags — set by external event sources, consumed by the forwarder
  * task.  Volatile because they are written from other tasks/contexts. */
@@ -401,6 +418,7 @@ static void ws_add_client_locked(httpd_handle_t hd, int fd)
     }
     s_ws_clients[s_ws_client_count].hd = hd;
     s_ws_clients[s_ws_client_count].fd = fd;
+    s_ws_clients[s_ws_client_count].paused = false;
     s_ws_client_count++;
     ESP_LOGI(TAG, "ws: client connected (fd=%d, total=%d)", fd, s_ws_client_count);
 }
@@ -455,7 +473,8 @@ static esp_err_t ws_queue_send(httpd_handle_t hd, int fd, uint8_t type,
     return err;
 }
 
-static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
+static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len,
+                                        bool skip_paused)
 {
     ws_client_t clients[MAX_WS_CLIENTS];
     int count = 0;
@@ -470,6 +489,9 @@ static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
     if (count <= 0) return ESP_OK;
 
     for (int i = 0; i < count; i++) {
+        /* Skip paused clients for non-log messages (per-client pause). */
+        if (skip_paused && clients[i].paused)
+            continue;
         esp_err_t err = ws_queue_send(clients[i].hd, clients[i].fd,
                                       HTTPD_WS_TYPE_TEXT, payload_str, len);
         if (err != ESP_OK) {
@@ -488,10 +510,7 @@ static esp_err_t ws_send_frame_internal(const char *payload_str, size_t len)
 
 esp_err_t log_stream_ws_send_json(const char *type, cJSON *data_obj)
 {
-    if (s_ws_paused && strcmp(type, "log") != 0) {
-        if (data_obj) cJSON_Delete(data_obj);
-        return ESP_OK;
-    }
+    bool is_log = (strcmp(type, "log") == 0);
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         if (data_obj) cJSON_Delete(data_obj);
@@ -505,14 +524,14 @@ esp_err_t log_stream_ws_send_json(const char *type, cJSON *data_obj)
     cJSON_Delete(root);
     if (!str) return ESP_ERR_NO_MEM;
 
-    esp_err_t err = ws_send_frame_internal(str, strlen(str));
+    esp_err_t err = ws_send_frame_internal(str, strlen(str), !is_log);
     free(str);
     return err;
 }
 
 esp_err_t log_stream_ws_send_json_raw(const char *type, const char *data_json_str)
 {
-    if (s_ws_paused && strcmp(type, "log") != 0) return ESP_OK;
+    bool is_log = (strcmp(type, "log") == 0);
     size_t type_len = strlen(type);
     size_t data_len = data_json_str ? strlen(data_json_str) : 4;
     size_t total = type_len + data_len + 32;
@@ -521,7 +540,7 @@ esp_err_t log_stream_ws_send_json_raw(const char *type, const char *data_json_st
     if (!buf) return ESP_ERR_NO_MEM;
 
     int len = snprintf(buf, total, "{\"type\":\"%s\",\"data\":%s}", type, data_json_str ? data_json_str : "null");
-    esp_err_t err = ws_send_frame_internal(buf, len);
+    esp_err_t err = ws_send_frame_internal(buf, len, !is_log);
     free(buf);
     return err;
 }
@@ -573,7 +592,7 @@ static void ws_forwarder_task(void *arg)
 
         /* Status push: periodic (~3 s) or on-demand (resume). */
         TickType_t now = xTaskGetTickCount();
-        if (!s_ws_paused &&
+        if (ws_has_active_client() &&
             ((now - last_status_tick) >= status_interval || s_push_status_now)) {
             last_status_tick = now;
             s_push_status_now = false;
@@ -584,7 +603,7 @@ static void ws_forwarder_task(void *arg)
         }
 
         /* Upload progress push: periodic (~5 s) or on-demand (transition). */
-        if (!s_ws_paused &&
+        if (ws_has_active_client() &&
             ((now - last_upload_tick) >= upload_interval || s_push_upload_now)) {
             last_upload_tick = now;
             s_push_upload_now = false;
@@ -596,7 +615,7 @@ static void ws_forwarder_task(void *arg)
         }
 
         /* BLE state push: event-driven only (no periodic polling). */
-        if (!s_ws_paused && s_push_ble_now) {
+        if (ws_has_active_client() && s_push_ble_now) {
             s_push_ble_now = false;
             cJSON *ble = cJSON_CreateObject();
             if (ble) {
@@ -614,7 +633,7 @@ static void ws_forwarder_task(void *arg)
         }
 
         /* Oximeter state push: event-driven only (no periodic polling). */
-        if (!s_ws_paused && s_push_ox_now) {
+        if (ws_has_active_client() && s_push_ox_now) {
             s_push_ox_now = false;
             cJSON *ox = cJSON_CreateObject();
             if (ox) {
@@ -670,7 +689,6 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
     if (req->method == HTTP_GET) {
         if (xSemaphoreTake(s_ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             ws_add_client_locked(req->handle, httpd_req_to_sockfd(req));
-            s_ws_paused = false;
             xSemaphoreGive(s_ws_mutex);
         }
 
@@ -696,9 +714,25 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT && ws_pkt.len > 0) {
         buf[ws_pkt.len] = '\0';
         if (strncmp((char *)buf, "pause", 5) == 0) {
-            s_ws_paused = true;
+            if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
+                for (int i = 0; i < s_ws_client_count; i++) {
+                    if (s_ws_clients[i].fd == req_fd) {
+                        s_ws_clients[i].paused = true;
+                        break;
+                    }
+                }
+                xSemaphoreGive(s_ws_mutex);
+            }
         } else if (strncmp((char *)buf, "resume", 6) == 0) {
-            s_ws_paused = false;
+            if (xSemaphoreTake(s_ws_mutex, 0) == pdTRUE) {
+                for (int i = 0; i < s_ws_client_count; i++) {
+                    if (s_ws_clients[i].fd == req_fd) {
+                        s_ws_clients[i].paused = false;
+                        break;
+                    }
+                }
+                xSemaphoreGive(s_ws_mutex);
+            }
             /* Defer the status push to the forwarder task (single-writer model). */
             s_push_status_now = true;
         }

@@ -2111,9 +2111,12 @@ function oxForget() {
 
 function oxPoll() {
   if (oxPollTimer) clearInterval(oxPollTimer);
-  oxPollTimer = setInterval(function() {
-    if (!appWs || appWs.readyState !== WebSocket.OPEN) oxRefresh();
-  }, 5000);
+  /* Always poll via HTTP as a fallback, even when the WebSocket is open.
+   * WebSocket pushes can be dropped (e.g. per-client pause from a
+   * background tab, or send-queue backpressure), so this HTTP poll
+   * guarantees the UI catches up within 5 s.  The timer is cleared by
+   * updateOxUI once the paired state is confirmed. */
+  oxPollTimer = setInterval(oxRefresh, 5000);
   oxRefresh();
 }
 
