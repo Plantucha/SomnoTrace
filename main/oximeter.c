@@ -167,15 +167,35 @@ struct auto_pair_arg {
 static bool s_pair_in_progress = false;
 
 /* A pair attempt has "settled" only when the driver reports a definitive
- * PAIRED or ERROR state.  Other states (IDLE, MONITORING, PULLING) mean
- * the pair_task hasn't started yet, or a previous pairing's pull_task is
- * still active — keep waiting. */
+ * outcome that we can attribute to *our* pair_task, not to the background
+ * pull_task.  This is tricky because both tasks write the state string:
+ *
+ *  - pull_task sets PAIRED after each monitoring/pull cycle (line ~1638
+ *    in oximeter_oxyii.c, multiple places in oximeter_legacy.c)
+ *  - pair_task sets PAIRED after a successful pair (line ~1295/1301)
+ *  - pair_task sets ERROR via set_error() on failure
+ *
+ * The key insight: s_paired (the bool, returned by is_paired()) is only
+ * set to true by pair_task (or load_paired_from_nvs at boot).  The
+ * pull_task NEVER sets s_paired = true — it only sets the state string.
+ * So:
+ *
+ *  - PAIRED + is_paired()=true  → pair_task succeeded → settled
+ *  - PAIRED + is_paired()=false → pull_task set PAIRED, pair_task
+ *                                  hasn't run yet → NOT settled
+ *  - ERROR                      → pair_task failed → settled
+ *    (pull_task can briefly set ERROR via do_connect_and_discover, but
+ *    it immediately overwrites it with PAIRED, so the window is ~0)
+ *  - other states               → not settled */
 static bool pair_settled(const char **state_out)
 {
     const char *st = s_active->get_status();
     if (state_out) *state_out = st;
-    return strcmp(st, OX_STATUS_PAIRED) == 0 ||
-           strcmp(st, OX_STATUS_ERROR) == 0;
+    if (strcmp(st, OX_STATUS_ERROR) == 0)
+        return true;
+    if (strcmp(st, OX_STATUS_PAIRED) == 0)
+        return s_active->is_paired();
+    return false;
 }
 
 static esp_err_t try_pair(const char *addr, ox_driver_t driver)
@@ -226,8 +246,12 @@ static void auto_pair_task(void *arg)
         }
     }
 
+    /* Wait for the pair_task to settle.  Timeout is 60 s to account for
+     * the case where the background pull_task is holding s_ops_mtx in a
+     * MONITORING loop (polls every 30 s) — the pair_task blocks on the
+     * mutex until the pull_task releases it. */
     const char *st = NULL;
-    for (int i = 0; i < 150 && !pair_settled(&st); i++)
+    for (int i = 0; i < 300 && !pair_settled(&st); i++)
         vTaskDelay(pdMS_TO_TICKS(200));
 
     if (st && strcmp(st, OX_STATUS_PAIRED) == 0) {
@@ -254,8 +278,14 @@ static void auto_pair_task(void *arg)
     /* OxyII failed.  Check if the failure indicates "wrong protocol"
      * (MTU=23 or service not found) rather than a transient error
      * (connect timeout, ring not present, etc.).  Only retry with
-     * Legacy if the error is protocol-related. */
-    const char *err = s_active->get_error();
+     * Legacy if the error is protocol-related.
+     *
+     * Only trust the error string if the state is actually ERROR —
+     * otherwise we might see a stale error from a previous operation
+     * (forget() doesn't clear s_error), or the poll timed out without
+     * the pair_task ever running (pull_task was holding the mutex). */
+    const char *err = (st && strcmp(st, OX_STATUS_ERROR) == 0)
+        ? s_active->get_error() : NULL;
     bool protocol_mismatch = err && (
         strstr(err, "MTU=23") ||
         strstr(err, "OxyII service not found") ||
@@ -263,8 +293,8 @@ static void auto_pair_task(void *arg)
         strstr(err, "write/notify char not found"));
 
     if (!protocol_mismatch) {
-        ESP_LOGI(TAG, "auto-pair: OxyII failed (%s) — not a protocol mismatch, giving up",
-                 err ? err : "unknown");
+        ESP_LOGI(TAG, "auto-pair: OxyII failed (state=%s, err=%s) — not a protocol mismatch, giving up",
+                 st ? st : "null", err ? err : "none");
         s_pair_in_progress = false;
         free(pa);
         vTaskDelete(NULL);
@@ -284,7 +314,7 @@ static void auto_pair_task(void *arg)
     }
 
     st = NULL;
-    for (int i = 0; i < 150 && !pair_settled(&st); i++)
+    for (int i = 0; i < 300 && !pair_settled(&st); i++)
         vTaskDelay(pdMS_TO_TICKS(200));
 
     if (st && strcmp(st, OX_STATUS_PAIRED) == 0) {
