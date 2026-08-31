@@ -554,6 +554,20 @@ static void run_pass(void)
 
 /* ── Task ─────────────────────────────────────────────────────────── */
 
+/* Reconcile one day's exported files against the index.  Holds the storage
+ * lease: the reconcile walks the card with opendir()/readdir(), and without
+ * the lease it can run while sd_storage_format() is calling f_mkfs on the same
+ * volume, which corrupts the SDMMC driver and panics this task. */
+static void reconcile_day_leased(uint32_t day)
+{
+    if (!uploader_lease_take(LEASE_WAIT_MS)) {
+        ESP_LOGD(TAG, "reconcile deferred: storage busy");
+        return;
+    }
+    upload_scan_reconcile_day(day);
+    uploader_lease_give();
+}
+
 static void do_scan(void)
 {
     int max_days = uploader_max_days();
@@ -572,6 +586,13 @@ static void do_scan(void)
         return;
     }
 
+    /* Same lease the upload pass takes — see reconcile_day_leased(). */
+    if (!uploader_lease_take(LEASE_WAIT_MS)) {
+        ESP_LOGD(TAG, "scan deferred: storage busy");
+        s_next_scan_us = now_us() + (int64_t)SCAN_INTERVAL_MS * 1000;
+        return;
+    }
+
     s_scanning = true;
     set_status("Scanning for new data");
     upload_scan_reconcile_all(max_days, slots, n_slots);
@@ -581,6 +602,7 @@ static void do_scan(void)
         free(ox_refs);
     }
     s_scanning = false;
+    uploader_lease_give();
     s_next_scan_us = now_us() + (int64_t)SCAN_INTERVAL_MS * 1000;
 }
 
@@ -612,7 +634,7 @@ static void sched_task(void *arg)
             switch (ev.type) {
             case EV_EXPORT:
                 ESP_LOGI(TAG, "export complete for %08u", (unsigned)ev.day);
-                upload_scan_reconcile_day(ev.day);
+                reconcile_day_leased(ev.day);
                 run_pass();
                 break;
 
@@ -620,7 +642,7 @@ static void sched_task(void *arg)
                 ESP_LOGI(TAG, "day %08u invalidated — will re-upload",
                          (unsigned)ev.day);
                 upload_index_forget_day(ev.day);
-                upload_scan_reconcile_day(ev.day);
+                reconcile_day_leased(ev.day);
                 run_pass();
                 break;
 
