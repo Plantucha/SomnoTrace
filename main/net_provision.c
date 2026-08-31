@@ -2332,6 +2332,7 @@ typedef struct {
     char error[64];         /* failure reason when !ok      */
 } format_progress_t;
 static format_progress_t s_format_progress;
+static SemaphoreHandle_t s_format_mtx;  /* guards s_format_progress reads/writes across tasks */
 
 /* Background task for the destructive SD format.  PSRAM-backed because the
  * format is slow and must not block the HTTP handler.  Holds the destructive
@@ -2342,9 +2343,11 @@ static void format_sd_task(void *arg)
     ESP_LOGW(TAG, "format_sd_task: starting destructive format");
 
     if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 5000)) {
+        xSemaphoreTake(s_format_mtx, portMAX_DELAY);
         strlcpy(s_format_progress.error,
                 "SD busy — a recording, export or upload is using the card",
                 sizeof(s_format_progress.error));
+        xSemaphoreGive(s_format_mtx);
     } else {
         /* No uploader_reset_state() here: on success the reboot re-inits the
          * uploader against the now-empty state dir, and on failure the old
@@ -2353,9 +2356,11 @@ static void format_sd_task(void *arg)
         esp_err_t ret = sd_storage_format();
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "format_sd_task: formatted OK, rebooting for clean remount");
+            xSemaphoreTake(s_format_mtx, portMAX_DELAY);
             s_format_progress.ok = true;
             s_format_progress.done = true;
             s_format_progress.active = false;
+            xSemaphoreGive(s_format_mtx);
             /* Give the browser poll (2 s interval) time to read the result,
              * then flush the fresh filesystem and reboot. */
             vTaskDelay(pdMS_TO_TICKS(2500));
@@ -2363,27 +2368,47 @@ static void format_sd_task(void *arg)
             esp_restart();
         }
         ESP_LOGE(TAG, "format_sd_task: failed: %s", esp_err_to_name(ret));
+        xSemaphoreTake(s_format_mtx, portMAX_DELAY);
         strlcpy(s_format_progress.error, esp_err_to_name(ret),
                 sizeof(s_format_progress.error));
+        xSemaphoreGive(s_format_mtx);
         sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
     }
 
+    xSemaphoreTake(s_format_mtx, portMAX_DELAY);
     s_format_progress.done = true;
     s_format_progress.active = false;
+    xSemaphoreGive(s_format_mtx);
     vTaskDelete(NULL);
 }
 
 static esp_err_t format_progress_handler(httpd_req_t *req)
 {
-    char resp[128];
-    snprintf(resp, sizeof(resp),
-             "{\"active\":%s,\"done\":%s,\"ok\":%s,\"error\":\"%s\"}",
-             s_format_progress.active ? "true" : "false",
-             s_format_progress.done ? "true" : "false",
-             s_format_progress.ok ? "true" : "false",
-             s_format_progress.error);
+    bool active, done, ok;
+    char error[64];
+
+    xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+    active = s_format_progress.active;
+    done   = s_format_progress.done;
+    ok     = s_format_progress.ok;
+    strlcpy(error, s_format_progress.error, sizeof(error));
+    xSemaphoreGive(s_format_mtx);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "active", active);
+    cJSON_AddBoolToObject(root, "done", done);
+    cJSON_AddBoolToObject(root, "ok", ok);
+    cJSON_AddStringToObject(root, "error", error);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json_str) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, resp);
+    httpd_resp_sendstr(req, json_str);
+    cJSON_free(json_str);
     return ESP_OK;
 }
 
@@ -2877,7 +2902,10 @@ static esp_err_t actions_handler(httpd_req_t *req)
             cJSON_Delete(root);
             return send_busy(req, "therapy recording in progress");
         }
+        if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
+        xSemaphoreTake(s_format_mtx, portMAX_DELAY);
         if (s_format_progress.active) {
+            xSemaphoreGive(s_format_mtx);
             cJSON_Delete(root);
             return send_busy(req, "format already in progress");
         }
@@ -2885,9 +2913,12 @@ static esp_err_t actions_handler(httpd_req_t *req)
         /* Clear any previous result so /api/format-progress reports this run. */
         memset((void *)&s_format_progress, 0, sizeof(s_format_progress));
         s_format_progress.active = true;
+        xSemaphoreGive(s_format_mtx);
         TaskHandle_t h = psram_task_create(format_sd_task, "format_sd", 16384, NULL, 5, 1, NULL, NULL);
         if (!h) {
+            xSemaphoreTake(s_format_mtx, portMAX_DELAY);
             s_format_progress.active = false;
+            xSemaphoreGive(s_format_mtx);
             err = ESP_ERR_NO_MEM;
         }
     } else {
