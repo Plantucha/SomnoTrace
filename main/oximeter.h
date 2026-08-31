@@ -37,6 +37,7 @@
 typedef enum {
     OX_DRIVER_OXYII  = 0,  /* Gen2: O2 Ring S / SHQO2Pro (OxyII protocol) */
     OX_DRIVER_LEGACY = 1,  /* Gen1: O2 Ring / ViaTom (Legacy protocol) */
+    OX_DRIVER_AUTO   = 2,  /* Auto-detect: try OxyII first, fall back to Legacy */
 } ox_driver_t;
 
 /* Oximeter state machine states (returned by oximeter_get_status). */

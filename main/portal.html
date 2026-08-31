@@ -2078,12 +2078,12 @@ function oxScan() {
     sel.innerHTML = '';
     if (!d.length) { oxStatusMsg('No O2 Ring devices found'); return; }
     d.sort(function(a, b) { return b.rssi - a.rssi; });
+    /* Show each ring once.  The driver (Gen1/Gen2 protocol) is auto-detected
+     * during pairing — the user picks a ring, not a protocol. */
     d.forEach(function(n) {
       var o = document.createElement('option');
-      o.value = n.addr + '|' + (n.type || 'oxyii');
-      var label = n.name + ' (' + n.rssi + ' dBm)';
-      if (n.type === 'legacy') label += ' — Gen1';
-      o.textContent = label;
+      o.value = n.addr;
+      o.textContent = n.name + ' (' + n.rssi + ' dBm)';
       sel.appendChild(o);
     });
     sel.selectedIndex = 0;
@@ -2096,11 +2096,8 @@ function oxScan() {
 function oxPair() {
   var sel = document.getElementById('ox-dev');
   if (!sel || !sel.value) { oxStatusMsg('Select a device first'); return; }
-  var parts = sel.value.split('|');
-  var addr = parts[0];
-  var type = parts[1] || 'oxyii';
   oxStatusMsg('Connecting…');
-  fetch('/api/ox/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: addr, type: type }) })
+  fetch('/api/ox/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: sel.value, type: 'auto' }) })
     .then(function(r){ return r.json(); }).then(function() { oxPoll(); }).catch(function() { oxStatusMsg('Pair failed'); });
 }
 

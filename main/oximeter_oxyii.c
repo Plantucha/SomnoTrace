@@ -741,12 +741,16 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
         }
         /* MTU=23 (default) after a successful exchange suggests the ring
          * is in recording mode and its GATT layout is stripped — the OxyII
-         * service won't be discoverable.  Abort early with a clear message
-         * instead of failing later with "service range empty". */
+         * service won't be discoverable.  It can also mean this is a Gen1
+         * O2 Ring (which does not support the OxyII protocol and never
+         * negotiates a larger MTU); Gen1 rings must be paired with the
+         * legacy driver.  Abort early with a clear message instead of
+         * failing later with "service range empty". */
         if (s_negotiated_mtu <= 23) {
             ESP_LOGW(TAG, "MTU=%d after exchange — ring may be in recording mode",
                      s_negotiated_mtu);
-            set_error("MTU=%d — ring may be in recording mode; remove from finger and retry",
+            set_error("MTU=%d — ring may be in recording mode; remove from finger and retry. "
+                      "If this is a Gen1 O2 Ring, pair as Gen1 (legacy)",
                       s_negotiated_mtu);
             return ESP_FAIL;
         }

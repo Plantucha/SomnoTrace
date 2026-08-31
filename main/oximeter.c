@@ -35,6 +35,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "nvs_writer.h"
+#include "psram_task.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <string.h>
 
@@ -116,15 +119,20 @@ cJSON *oximeter_get_scan_results(void)
         return cJSON_CreateArray();
     }
     cJSON *item;
-    cJSON_ArrayForEach(item, oxyii) {
+    /* Both Gen1 and Gen2 rings advertise both the legacy service UUID
+     * (14839ac4-...) and manufacturer ID 0xF34E, so both drivers match
+     * both generations.  Dedup by address — keep the first entry (legacy
+     * driver's, which has the device name) and skip duplicates.  The
+     * "type" field is kept for the API but the web UI ignores it: pairing
+     * always uses auto-detection (OX_DRIVER_AUTO), which tries OxyII first
+     * and falls back to Legacy.  The detected driver is persisted to NVS
+     * by the winning driver's pair_task, so subsequent boots use the
+     * correct protocol without user intervention. */
+    cJSON_ArrayForEach(item, legacy) {
         cJSON *copy = cJSON_Duplicate(item, true);
         if (copy) cJSON_AddItemToArray(merged, copy);
     }
-    /* Add legacy entries, skipping any address already seen in the
-     * oxyii results.  With UUID/mfg-only detection the two drivers
-     * should never match the same device, but dedup is kept as a
-     * safety net. */
-    cJSON_ArrayForEach(item, legacy) {
+    cJSON_ArrayForEach(item, oxyii) {
         cJSON *addr = cJSON_GetObjectItem(item, "addr");
         bool dup = false;
         for (int i = 0; i < cJSON_GetArraySize(merged); i++) {
@@ -146,8 +154,111 @@ cJSON *oximeter_get_scan_results(void)
     return merged;
 }
 
+/* ── Auto-detect pair task ─────────────────────────────────────────── */
+/* Tries OxyII first (fast MTU=23 failure on Gen1), falls back to Legacy.
+ * Each driver's pair_task is async, so we poll the state string to detect
+ * completion.  Pairing is a rare, user-initiated event, so the polling
+ * overhead (every 200 ms for ~30 s max) is negligible. */
+struct auto_pair_arg {
+    char addr[24];
+};
+
+static bool pair_settled(const char **state_out)
+{
+    const char *st = s_active->get_status();
+    if (state_out) *state_out = st;
+    return strcmp(st, OX_STATUS_CONNECTING) != 0 &&
+           strcmp(st, OX_STATUS_SCANNING) != 0;
+}
+
+static esp_err_t try_pair(const char *addr, ox_driver_t driver)
+{
+    if (driver != s_driver_type) {
+        s_active->forget();
+        s_driver_type = driver;
+        s_active = (driver == OX_DRIVER_LEGACY)
+            ? &legacy_driver_ops
+            : &oxyii_driver_ops;
+        s_active->init();
+        ESP_LOGI(TAG, "switched to driver: %s",
+                 driver == OX_DRIVER_LEGACY ? "legacy" : "oxyii");
+    }
+    return s_active->pair(addr);
+}
+
+static void auto_pair_task(void *arg)
+{
+    struct auto_pair_arg *pa = (struct auto_pair_arg *)arg;
+    const char *addr = pa->addr;
+
+    /* Phase 1: try OxyII (Gen2).  Gen1 rings fail fast — the MTU=23
+     * check aborts within ~2 s of connect.  Gen2 rings succeed in
+     * ~5-10 s (connect + MTU + service discovery + GET_INFO). */
+    ESP_LOGI(TAG, "auto-pair: trying OxyII (Gen2) for %s", addr);
+    try_pair(addr, OX_DRIVER_OXYII);
+
+    const char *st = NULL;
+    for (int i = 0; i < 150 && !pair_settled(&st); i++)
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+    if (st && strcmp(st, OX_STATUS_PAIRED) == 0) {
+        ESP_LOGI(TAG, "auto-pair: OxyII succeeded — device is Gen2");
+        free(pa);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* OxyII failed.  Check if the failure indicates "wrong protocol"
+     * (MTU=23 or service not found) rather than a transient error
+     * (connect timeout, ring not present, etc.).  Only retry with
+     * Legacy if the error is protocol-related. */
+    const char *err = s_active->get_error();
+    bool protocol_mismatch = err && (
+        strstr(err, "MTU=23") ||
+        strstr(err, "OxyII service not found") ||
+        strstr(err, "service range empty") ||
+        strstr(err, "write/notify char not found"));
+
+    if (!protocol_mismatch) {
+        ESP_LOGI(TAG, "auto-pair: OxyII failed (%s) — not a protocol mismatch, giving up",
+                 err ? err : "unknown");
+        free(pa);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Phase 2: fall back to Legacy (Gen1). */
+    ESP_LOGI(TAG, "auto-pair: OxyII protocol mismatch — retrying as Legacy (Gen1)");
+    try_pair(addr, OX_DRIVER_LEGACY);
+
+    st = NULL;
+    for (int i = 0; i < 150 && !pair_settled(&st); i++)
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+    if (st && strcmp(st, OX_STATUS_PAIRED) == 0) {
+        ESP_LOGI(TAG, "auto-pair: Legacy succeeded — device is Gen1");
+    } else {
+        const char *lerr = s_active->get_error();
+        ESP_LOGW(TAG, "auto-pair: Legacy also failed (%s)",
+                 lerr ? lerr : "unknown");
+    }
+
+    free(pa);
+    vTaskDelete(NULL);
+}
+
 esp_err_t oximeter_pair(const char *addr_str, ox_driver_t driver)
 {
+    if (driver == OX_DRIVER_AUTO) {
+        struct auto_pair_arg *pa = calloc(1, sizeof(*pa));
+        if (!pa) return ESP_ERR_NO_MEM;
+        strlcpy(pa->addr, addr_str, sizeof(pa->addr));
+        TaskHandle_t h = psram_task_create(auto_pair_task, "ox_auto_pair",
+                                           8192, pa, 5, tskNO_AFFINITY, NULL, NULL);
+        if (!h) { free(pa); return ESP_ERR_NO_MEM; }
+        return ESP_OK;
+    }
+
     /* If pairing with a different driver type, switch active driver */
     if (driver != s_driver_type) {
         /* Forget the current driver's state */

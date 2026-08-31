@@ -1301,12 +1301,14 @@ static esp_err_t ox_pair_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing addr");
         return ESP_FAIL;
     }
-    ox_driver_t driver = OX_DRIVER_OXYII;
+    ox_driver_t driver = OX_DRIVER_AUTO;
     if (cJSON_IsString(type)) {
         if (strcmp(type->valuestring, "legacy") == 0)
             driver = OX_DRIVER_LEGACY;
         else if (strcmp(type->valuestring, "oxyii") == 0)
             driver = OX_DRIVER_OXYII;
+        else if (strcmp(type->valuestring, "auto") == 0)
+            driver = OX_DRIVER_AUTO;
     }
     esp_err_t e = oximeter_pair(addr->valuestring, driver);
     cJSON_Delete(j);
