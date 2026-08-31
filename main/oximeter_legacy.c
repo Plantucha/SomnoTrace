@@ -224,10 +224,13 @@ static bool s_presence_served = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
 static int s_pull_fail_count = 0;   /* consecutive failed pulls in this presence */
+static int s_connect_fail_count = 0; /* consecutive connect failures in this presence */
 #define OX_PULL_MAX_FAST_RETRIES 3  /* quick retries before applying curfew */
+#define OX_CONNECT_MAX_RETRIES 3   /* connect failures before cooldown curfew */
 
 /* BLE connection state */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_connect_event_handle = BLE_HS_CONN_HANDLE_NONE; /* saved in CONNECT event before DISCONNECT can overwrite */
 static uint16_t s_write_handle;
 static uint16_t s_notify_handle;
 static uint16_t s_cccd_handle;
@@ -383,6 +386,22 @@ static void handle_notify_rx(const uint8_t *data, int len)
     }
 }
 
+/* Decode HCI disconnect reason to a human-readable string for logging.
+ * NimBLE wraps HCI error codes with BLE_HS_EHCI (0x200), so we mask. */
+static const char *hci_err_str(int reason)
+{
+    switch (reason & 0xFF) {
+    case 0x08: return "Conn Already Exists";
+    case 0x13: return "Remote User Terminated";
+    case 0x16: return "Supervision Timeout";
+    case 0x22: return "LMP Response Timeout";
+    case 0x28: return "Instant Passed";
+    case 0x3B: return "Unacceptable Connection Parameters";
+    case 0x44: return "Conn Fail to Be Established";
+    default:   return "Unknown";
+    }
+}
+
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -456,18 +475,38 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_CONNECT:
+        s_connect_event_handle = event->connect.conn_handle;
         s_conn_handle = event->connect.conn_handle;
         s_conn_status = event->connect.status;
+        ESP_LOGD(TAG, "gap CONNECT: handle=%d status=%d",
+                 event->connect.conn_handle, event->connect.status);
         xSemaphoreGive(s_conn_sem);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "disconnected (reason=%d)",
-                 event->disconnect.reason);
+        ESP_LOGI(TAG, "disconnected (reason=%d / 0x%02X %s)",
+                 event->disconnect.reason,
+                 event->disconnect.reason & 0xFF,
+                 hci_err_str(event->disconnect.reason));
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         xSemaphoreGive(s_resp_sem);
         xSemaphoreGive(s_conn_sem);
         return 0;
+
+    case BLE_GAP_EVENT_L2CAP_UPDATE_REQ:
+        ESP_LOGD(TAG, "accepting L2CAP connection parameter update request");
+        return 0;  /* 0 = accept */
+
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+            ESP_LOGI(TAG, "conn params updated: itvl=%d (%.1fms) latency=%d timeout=%d (%dms)",
+                     desc.conn_itvl, desc.conn_itvl * 1.25f,
+                     desc.conn_latency,
+                     desc.supervision_timeout, desc.supervision_timeout * 10);
+        }
+        return 0;
+    }
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
         if (event->notify_rx.conn_handle != s_conn_handle)
@@ -563,6 +602,7 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target)
     while (xSemaphoreTake(s_conn_sem, 0) == pdTRUE) { }
     s_conn_status = -1;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_connect_event_handle = BLE_HS_CONN_HANDLE_NONE;
 
     uint8_t own_addr_type;
     int rc = ble_hs_id_infer_auto(target->type, &own_addr_type);
@@ -577,10 +617,33 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target)
     if (xSemaphoreTake(s_conn_sem, pdMS_TO_TICKS(16000)) != pdTRUE) {
         set_error("connect timeout"); return ESP_FAIL;
     }
-    if (s_conn_status != 0) {
-        set_error("connect failed: %d", s_conn_status); return ESP_FAIL;
+    if (s_conn_status != 0 || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        /* Race: the ring connected and immediately disconnected (e.g.
+         * 0x3B "Unacceptable Connection Parameters") before we woke up.
+         * s_conn_handle was overwritten to NONE by the DISCONNECT event.
+         * Terminate the orphaned connection using the handle saved in
+         * the CONNECT event, so it doesn't linger for ~98s until the
+         * ring's internal timeout fires. */
+        if (s_conn_status == 0 && s_connect_event_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ESP_LOGW(TAG, "connect/disconnect race — terminating orphaned handle=%d",
+                     s_connect_event_handle);
+            ble_gap_terminate(s_connect_event_handle, BLE_ERR_REM_USER_CONN_TERM);
+            xSemaphoreTake(s_conn_sem, pdMS_TO_TICKS(2000));
+        }
+        set_error("connect failed: status=%d handle=%d",
+                  s_conn_status, s_conn_handle);
+        return ESP_FAIL;
     }
     ESP_LOGI(TAG, "connected, handle=%d", s_conn_handle);
+
+    /* Log negotiated connection parameters for diagnostics. */
+    struct ble_gap_conn_desc cdesc;
+    if (ble_gap_conn_find(s_conn_handle, &cdesc) == 0) {
+        ESP_LOGI(TAG, "conn params: itvl=%d (%.1fms) latency=%d timeout=%d (%dms)",
+                 cdesc.conn_itvl, cdesc.conn_itvl * 1.25f,
+                 cdesc.conn_latency,
+                 cdesc.supervision_timeout, cdesc.supervision_timeout * 10);
+    }
 
     /* No MTU exchange needed for Legacy (20-byte writes are default). */
 
@@ -1168,6 +1231,7 @@ static void pair_task(void *arg)
     s_paired = true;
     s_presence_served = false;
     s_pull_fail_count = 0;
+    s_connect_fail_count = 0;
 
     do_disconnect();
     set_state(OX_STATUS_PAIRED);
@@ -1321,6 +1385,7 @@ static void pull_task(void *arg)
             if (s_presence_served)
                 s_presence_served = false;
             s_pull_fail_count = 0;
+            s_connect_fail_count = 0;
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
@@ -1357,6 +1422,7 @@ static void pull_task(void *arg)
             ESP_LOGI(TAG, "watch: still advertising past END window — re-worn, resuming probes");
             s_presence_served = false;
             s_pull_fail_count = 0;
+            s_connect_fail_count = 0;
         }
 
         /* Connect and probe */
@@ -1365,10 +1431,22 @@ static void pull_task(void *arg)
         if (do_connect_and_discover(&s_scan[idx].addr) != ESP_OK) {
             ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
             do_disconnect();
+            /* After repeated connect failures, apply a cooldown curfew
+             * so the ring can power off and reset its BLE state.  Without
+             * this, we hammer the ring every ~15s, keeping it awake and
+             * stuck in a bad state indefinitely. */
+            if (++s_connect_fail_count >= OX_CONNECT_MAX_RETRIES) {
+                ESP_LOGW(TAG, "connect failed %d times — curfew %ds (let ring reset)",
+                         s_connect_fail_count, OX_END_WINDOW_MS / 1000);
+                s_presence_served = true;
+                s_served_at = xTaskGetTickCount();
+                s_connect_fail_count = 0;
+            }
             set_state(OX_STATUS_PAIRED);
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
+        s_connect_fail_count = 0;
 
         /* Gen1 rings only advertise when in Standby Mode (off-finger,
          * post-recording).  If the ring is visible during scan, it is
@@ -1557,6 +1635,7 @@ static void legacy_forget(void)
     s_paired = false;
     s_presence_served = false;
     s_pull_fail_count = 0;
+    s_connect_fail_count = 0;
     s_serial[0] = '\0';
     s_firmware[0] = '\0';
     s_name_prefix[0] = '\0';
