@@ -33,6 +33,7 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 :root{
 --bg:#0f172a;--card-bg:#1e293b;--card-border:#334155;--text:#f8fafc;--text-muted:#94a3b8;
 --primary:#38bdf8;--primary-hover:#0ea5e9;--primary-glow:rgba(56,189,248,0.15);--btn-primary-text:#0f172a;
+--selected-day-bg:#2d5a87;
 --border-color:#334155;--input-bg:#0f172a;--input-focus:#38bdf8;
 --danger:#f87171;--danger-hover:#ef4444;--success:#34d399;--warning:#fbbf24;
 --color-airflow:#38bdf8;--color-pressure:#fb923c;--color-leak:#c084fc;
@@ -47,6 +48,7 @@ attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
 [data-theme="day"]{
 --bg:#f8fafc;--card-bg:#ffffff;--card-border:#e2e8f0;--text:#0f172a;--text-muted:#64748b;
 --primary:#0284c7;--primary-hover:#0369a1;--primary-glow:rgba(2,132,199,0.12);--btn-primary-text:#ffffff;
+--selected-day-bg:#dbeafe;
 --border-color:#cbd5e1;--input-bg:#f1f5f9;--input-focus:#0284c7;
 --danger:#dc2626;--danger-hover:#b91c1c;--success:#10b981;--warning:#f59e0b;
 --color-airflow:#0284c7;--color-pressure:#ea580c;--color-leak:#7c3aed;
@@ -235,9 +237,13 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .dash-cal-day.has-data{color:var(--text);cursor:pointer;font-weight:600}
 .dash-cal-day.has-data:hover{background:rgba(59,130,246,0.15)}
 .dash-cal-day.today{outline:1px solid var(--primary);outline-offset:-1px}
-.dash-cal-day.selected{background:var(--primary);color:var(--btn-primary-text)}
+.dash-cal-day.selected{background:var(--selected-day-bg);color:var(--text)}
 .dash-cal-day .dot{position:absolute;left:50%;bottom:4px;transform:translateX(-50%);width:5px;height:5px;border-radius:50%;background:var(--primary)}
-.dash-cal-day.selected .dot{background:var(--btn-primary-text)}
+.dash-cal-day .dot-spo2{position:absolute;left:50%;bottom:4px;transform:translateX(-50%);width:5px;height:5px;border-radius:50%;background:#f97316}
+.dash-cal-day.has-both .dot{left:calc(50% - 6px);transform:none}
+.dash-cal-day.has-both .dot-spo2{left:calc(50% + 1px);transform:none}
+.dash-cal-day.selected .dot{background:var(--primary)}
+.dash-cal-day.selected .dot-spo2{background:#f97316}
 /* Loading progress bar */
 .dash-progress-wrap{margin:12px 0;display:none}
 .dash-progress-track{height:6px;background:var(--input-bg);border-radius:3px;overflow:hidden;position:relative}
@@ -3025,6 +3031,7 @@ function updateDateDisplayLabel(dateIsoStr) {
  * (YYYY-MM-DD); its digits-only form is the streams folder name. */
 var dashDays = [];
 var dashDaySet = {};       /* "YYYYMMDD" -> true, for O(1) marker lookup */
+var spo2DaySet = {};       /* "YYYYMMDD" -> true, for O(1) SpO2 marker lookup */
 var dashCalYear = 0, dashCalMonth = 0;  /* month shown in the popover (0-based month) */
 
 function isoToDay(iso) { return iso ? iso.replace(/-/g, '') : ''; }
@@ -3038,6 +3045,19 @@ function fetchDays() {
       dashDays.forEach(function(d){ dashDaySet[d.day] = true; });
       return dashDays;
     }).catch(function(){ dashDays = []; dashDaySet = {}; return []; });
+}
+
+function fetchSpo2Days() {
+  return fetch('/api/oximetry/recordings').then(function(r){ return r.ok ? r.json() : []; })
+    .then(function(arr){
+      spo2DaySet = {};
+      if (Array.isArray(arr)) {
+        arr.forEach(function(rec){
+          if (rec.noon_day && rec.state === 'ready') spo2DaySet[rec.noon_day] = true;
+        });
+      }
+      return Object.keys(spo2DaySet);
+    }).catch(function(){ spo2DaySet = {}; return []; });
 }
 
 function handleDateChange(val) { updateDateDisplayLabel(val); loadSessionData(); }
@@ -3115,11 +3135,17 @@ function renderCalendar() {
     var d8 = isoToDay(iso);
     var cls = 'dash-cal-day';
     var hasData = !!dashDaySet[d8];
+    var hasSpo2 = !!spo2DaySet[d8];
     if (hasData) cls += ' has-data';
+    if (hasSpo2) cls += ' has-spo2';
+    if (hasData && hasSpo2) cls += ' has-both';
     if (iso === selIso) cls += ' selected';
     if (y === todayD.getFullYear() && m === todayD.getMonth() && day === todayD.getDate()) cls += ' today';
-    var click = hasData ? (' onclick="selectDay(\'' + iso + '\')"') : '';
-    html += '<div class="' + cls + '"' + click + '>' + day + (hasData ? '<span class="dot"></span>' : '') + '</div>';
+    var click = (hasData || hasSpo2) ? (' onclick="selectDay(\'' + iso + '\')"') : '';
+    var dots = '';
+    if (hasData) dots += '<span class="dot" title="CPAP data"></span>';
+    if (hasSpo2) dots += '<span class="dot-spo2" title="SpO₂ data"></span>';
+    html += '<div class="' + cls + '"' + click + '>' + day + dots + '</div>';
   }
   html += '</div>';
   el.innerHTML = html;
@@ -5136,7 +5162,8 @@ window.onload = function() {
   var todayIso = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
   if (!PORTAL_MODE) {
     switchTab('dashboard');
-    fetchDays().then(function(days) {
+    Promise.all([fetchDays(), fetchSpo2Days()]).then(function(results) {
+      var days = results[0];
       if (days.length) {
         var latestDay = days[days.length - 1].day;
         var latestIso = dayToIso(latestDay);
