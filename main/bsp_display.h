@@ -62,5 +62,6 @@ uint8_t bsp_display_get_brightness(void);
 void bsp_display_apply_backlight_policy(bool force_on);
 
 /* Set LCD rotation in degrees (0, 90, 180, 270). Applied by the display task
- * via ST7789 MADCTL and re-applied after panel reset. */
+ * using the ST7789's reliable 0°/90° paths plus a software half-turn for
+ * 180°/270°, and re-applied after panel reset. */
 void bsp_display_set_rotation(uint16_t degrees);

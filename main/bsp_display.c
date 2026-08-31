@@ -319,37 +319,37 @@ static void lcd_panel_hw_recover(void)
     ESP_LOGI(TAG, "panel hardware reset + re-init (rot=%u)", (unsigned)s_rotation);
 }
 
-/* Apply rotation to the ST7789 panel via MADCTL (swap_xy + mirror).
- * Called after panel init/recover and when the user changes the setting.
- * The framebuffer layout (s_fb[y * 240 + x]) stays the same; the panel
- * remaps GRAM addressing so the physical pixels appear rotated. */
+/* Apply the hardware portion of the requested rotation.
+ *
+ * The panel's 0° and 90° MADCTL paths are reliable, but mirror_y (needed for
+ * a direct 180°/270° hardware rotation) leaves a split frame on this module.
+ * Keep mirror_y disabled and implement the missing half-turn while packing
+ * the DMA strips in lcd_flush():
+ *
+ *   0°   = panel 0°
+ *   90°  = panel 90°
+ *   180° = panel 0°  + software 180°
+ *   270° = panel 90° + software 180°
+ */
 static void apply_panel_rotation(uint16_t degrees)
 {
     if (!s_panel) return;
-    bool swap_xy = false;
-    bool mirror_x = false, mirror_y = false;
+    bool quarter_turn = false;
 
     switch (degrees) {
         case 0:
+        case 180:
             break;
         case 90:   /* clockwise 90° */
-            swap_xy = true;
-            mirror_x = true;
-            break;
-        case 180:
-            mirror_x = true;
-            mirror_y = true;
-            break;
         case 270:  /* clockwise 270° */
-            swap_xy = true;
-            mirror_y = true;
+            quarter_turn = true;
             break;
         default:
             return;
     }
 
-    esp_lcd_panel_swap_xy(s_panel, swap_xy);
-    esp_lcd_panel_mirror(s_panel, mirror_x, mirror_y);
+    esp_lcd_panel_swap_xy(s_panel, quarter_turn);
+    esp_lcd_panel_mirror(s_panel, quarter_turn, false);
 }
 
 void bsp_display_set_rotation(uint16_t degrees)
@@ -415,8 +415,23 @@ static void lcd_flush(void)
 
         uint16_t *buf = s_strip[bi];
         bi = (bi + 1) % LCD_STRIP_BUFS;
-        memcpy(buf, &s_fb[y0 * LCD_H_RES],
-               (size_t)rows * LCD_H_RES * sizeof(uint16_t));
+        if (s_rotation == 180 || s_rotation == 270) {
+            /* Rotate the framebuffer by 180° while copying it out of PSRAM.
+             * For 270°, the panel applies the remaining known-good 90° turn.
+             * Destination pixels stay contiguous so the DMA transfer format
+             * and strip address windows are unchanged. */
+            for (int dy = 0; dy < rows; dy++) {
+                int src_y = LCD_V_RES - 1 - (y0 + dy);
+                const uint16_t *src = &s_fb[src_y * LCD_H_RES + LCD_H_RES - 1];
+                uint16_t *dst = &buf[dy * LCD_H_RES];
+                for (int x = 0; x < LCD_H_RES; x++) {
+                    dst[x] = src[-x];
+                }
+            }
+        } else {
+            memcpy(buf, &s_fb[y0 * LCD_H_RES],
+                   (size_t)rows * LCD_H_RES * sizeof(uint16_t));
+        }
         /* Queue asynchronously; the DMA of this strip overlaps the memcpy of
          * the next one (the completion callback gives s_flush_done). */
         esp_lcd_panel_draw_bitmap(s_panel, 0, y0, LCD_H_RES, y0 + rows, buf);
