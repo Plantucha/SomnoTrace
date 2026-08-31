@@ -292,6 +292,8 @@ static bool s_presence_served = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
 static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
+static int s_pull_fail_count = 0;   /* consecutive failed pulls in this presence */
+#define OX_PULL_MAX_FAST_RETRIES 3  /* quick retries before applying curfew */
 static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
 
 /* Measured: END powers off ~120s after take-off IF no one connects.
@@ -609,6 +611,15 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     s_write_handle = s_notify_handle = s_cccd_handle = 0;
     s_svc_start = s_svc_end = 0;
     s_resp_len = 0;
+
+    /* Drain any stale s_conn_sem token left by a previous remote
+     * disconnect.  Without this, xSemaphoreTake below returns
+     * immediately on the stale token and we proceed with a dead
+     * handle (BLE_HS_CONN_HANDLE_NONE), causing every subsequent
+     * GATT operation to fail. */
+    while (xSemaphoreTake(s_conn_sem, 0) == pdTRUE) { }
+    s_conn_status = -1;
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
     /* Connect — infer own address type based on peer address type
      * (random peer requires random own address). */
@@ -1146,6 +1157,7 @@ static void pair_task(void *arg)
     strlcpy(s_paired_addr, addr_str, sizeof(s_paired_addr));
     s_paired = true;
     s_presence_served = false;
+    s_pull_fail_count = 0;
 
     do_disconnect();
     set_state(OX_STATUS_PAIRED);
@@ -1311,6 +1323,7 @@ static void pull_task(void *arg)
             if (s_presence_served)
                 s_presence_served = false;
             s_f1_fail_count = 0;
+            s_pull_fail_count = 0;
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
@@ -1337,6 +1350,7 @@ static void pull_task(void *arg)
             ESP_LOGI(TAG, "watch: still advertising past END window — re-worn, resuming probes");
             s_presence_served = false;
             s_f1_fail_count = 0;
+            s_pull_fail_count = 0;
         }
 
         if (s_probe_mode == OX_PROBE_PERSISTENT) {
@@ -1416,9 +1430,22 @@ static void pull_task(void *arg)
                     if (pull_ok) {
                         s_presence_served = true;
                         s_served_at = xTaskGetTickCount();
+                        s_pull_fail_count = 0;
                         ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
                     } else if (!s_presence_served) {
-                        ESP_LOGW(TAG, "sync incomplete — will retry this presence");
+                        /* Pull failed.  Retry quickly while the ring is still
+                         * advertising.  After OX_PULL_MAX_FAST_RETRIES, apply
+                         * the curfew so the ring can power off and conserve
+                         * battery between advertising cycles. */
+                        if (++s_pull_fail_count < OX_PULL_MAX_FAST_RETRIES) {
+                            ESP_LOGW(TAG, "sync incomplete — fast retry %d/%d (ring still advertising)",
+                                     s_pull_fail_count, OX_PULL_MAX_FAST_RETRIES);
+                        } else {
+                            s_presence_served = true;
+                            s_served_at = xTaskGetTickCount();
+                            ESP_LOGW(TAG, "sync incomplete after %d retries — curfew %ds (let ring rest)",
+                                     s_pull_fail_count, OX_END_WINDOW_MS / 1000);
+                        }
                     }
                     pulled = true;
                 } else if (off == 0) {
@@ -1505,9 +1532,22 @@ static void pull_task(void *arg)
         if (pull_ok) {
             s_presence_served = true;
             s_served_at = xTaskGetTickCount();
+            s_pull_fail_count = 0;
             ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
         } else if (!s_presence_served) {
-            ESP_LOGW(TAG, "sync incomplete — will retry this presence");
+            /* Pull failed.  Retry quickly while the ring is still
+             * advertising.  After OX_PULL_MAX_FAST_RETRIES, apply
+             * the curfew so the ring can power off and conserve
+             * battery between advertising cycles. */
+            if (++s_pull_fail_count < OX_PULL_MAX_FAST_RETRIES) {
+                ESP_LOGW(TAG, "sync incomplete — fast retry %d/%d (ring still advertising)",
+                         s_pull_fail_count, OX_PULL_MAX_FAST_RETRIES);
+            } else {
+                s_presence_served = true;
+                s_served_at = xTaskGetTickCount();
+                ESP_LOGW(TAG, "sync incomplete after %d retries — curfew %ds (let ring rest)",
+                         s_pull_fail_count, OX_END_WINDOW_MS / 1000);
+            }
         }
         set_state(OX_STATUS_PAIRED);
 
@@ -1635,6 +1675,7 @@ static void oxyii_forget(void)
 {
     s_paired = false;
     s_presence_served = false;
+    s_pull_fail_count = 0;
     s_serial[0] = '\0';
     s_firmware[0] = '\0';
     s_name_prefix[0] = '\0';
