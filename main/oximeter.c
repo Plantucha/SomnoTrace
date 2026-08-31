@@ -163,12 +163,19 @@ struct auto_pair_arg {
     char addr[24];
 };
 
+/* Guard against concurrent pair calls (user clicks "Pair" twice). */
+static bool s_pair_in_progress = false;
+
+/* A pair attempt has "settled" only when the driver reports a definitive
+ * PAIRED or ERROR state.  Other states (IDLE, MONITORING, PULLING) mean
+ * the pair_task hasn't started yet, or a previous pairing's pull_task is
+ * still active — keep waiting. */
 static bool pair_settled(const char **state_out)
 {
     const char *st = s_active->get_status();
     if (state_out) *state_out = st;
-    return strcmp(st, OX_STATUS_CONNECTING) != 0 &&
-           strcmp(st, OX_STATUS_SCANNING) != 0;
+    return strcmp(st, OX_STATUS_PAIRED) == 0 ||
+           strcmp(st, OX_STATUS_ERROR) == 0;
 }
 
 static esp_err_t try_pair(const char *addr, ox_driver_t driver)
@@ -182,6 +189,12 @@ static esp_err_t try_pair(const char *addr, ox_driver_t driver)
         s_active->init();
         ESP_LOGI(TAG, "switched to driver: %s",
                  driver == OX_DRIVER_LEGACY ? "legacy" : "oxyii");
+    } else {
+        /* Same driver — still forget() to reset state to IDLE.
+         * Without this, a stale PAIRED state from a previous pairing
+         * would cause pair_settled() to return true immediately,
+         * making the poller think the new pair already succeeded. */
+        s_active->forget();
     }
     return s_active->pair(addr);
 }
@@ -195,14 +208,44 @@ static void auto_pair_task(void *arg)
      * check aborts within ~2 s of connect.  Gen2 rings succeed in
      * ~5-10 s (connect + MTU + service discovery + GET_INFO). */
     ESP_LOGI(TAG, "auto-pair: trying OxyII (Gen2) for %s", addr);
-    try_pair(addr, OX_DRIVER_OXYII);
+    esp_err_t rc = try_pair(addr, OX_DRIVER_OXYII);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "auto-pair: OxyII pair start failed (%s) — trying Legacy",
+                 esp_err_to_name(rc));
+        /* pair() failed to start the task (BLE host not ready, OOM).
+         * Try Legacy directly — it might succeed if the issue was
+         * driver-specific (unlikely, but worth a shot). */
+        rc = try_pair(addr, OX_DRIVER_LEGACY);
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "auto-pair: Legacy pair start also failed (%s)",
+                     esp_err_to_name(rc));
+            s_pair_in_progress = false;
+            free(pa);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
 
     const char *st = NULL;
     for (int i = 0; i < 150 && !pair_settled(&st); i++)
         vTaskDelay(pdMS_TO_TICKS(200));
 
     if (st && strcmp(st, OX_STATUS_PAIRED) == 0) {
-        ESP_LOGI(TAG, "auto-pair: OxyII succeeded — device is Gen2");
+        ESP_LOGI(TAG, "auto-pair: succeeded — device is %s",
+                 s_driver_type == OX_DRIVER_LEGACY ? "Gen1 (Legacy)" : "Gen2 (OxyII)");
+        s_pair_in_progress = false;
+        free(pa);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* If we already fell back to Legacy (because OxyII pair start failed),
+     * don't retry Legacy again. */
+    if (s_driver_type == OX_DRIVER_LEGACY) {
+        const char *lerr = s_active->get_error();
+        ESP_LOGW(TAG, "auto-pair: Legacy failed (%s)",
+                 lerr ? lerr : "unknown");
+        s_pair_in_progress = false;
         free(pa);
         vTaskDelete(NULL);
         return;
@@ -222,6 +265,7 @@ static void auto_pair_task(void *arg)
     if (!protocol_mismatch) {
         ESP_LOGI(TAG, "auto-pair: OxyII failed (%s) — not a protocol mismatch, giving up",
                  err ? err : "unknown");
+        s_pair_in_progress = false;
         free(pa);
         vTaskDelete(NULL);
         return;
@@ -229,7 +273,15 @@ static void auto_pair_task(void *arg)
 
     /* Phase 2: fall back to Legacy (Gen1). */
     ESP_LOGI(TAG, "auto-pair: OxyII protocol mismatch — retrying as Legacy (Gen1)");
-    try_pair(addr, OX_DRIVER_LEGACY);
+    rc = try_pair(addr, OX_DRIVER_LEGACY);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "auto-pair: Legacy pair start failed (%s)",
+                 esp_err_to_name(rc));
+        s_pair_in_progress = false;
+        free(pa);
+        vTaskDelete(NULL);
+        return;
+    }
 
     st = NULL;
     for (int i = 0; i < 150 && !pair_settled(&st); i++)
@@ -243,19 +295,26 @@ static void auto_pair_task(void *arg)
                  lerr ? lerr : "unknown");
     }
 
+    s_pair_in_progress = false;
     free(pa);
     vTaskDelete(NULL);
 }
 
 esp_err_t oximeter_pair(const char *addr_str, ox_driver_t driver)
 {
+    if (s_pair_in_progress) {
+        ESP_LOGW(TAG, "pair already in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (driver == OX_DRIVER_AUTO) {
         struct auto_pair_arg *pa = calloc(1, sizeof(*pa));
         if (!pa) return ESP_ERR_NO_MEM;
         strlcpy(pa->addr, addr_str, sizeof(pa->addr));
+        s_pair_in_progress = true;
         TaskHandle_t h = psram_task_create(auto_pair_task, "ox_auto_pair",
                                            8192, pa, 5, tskNO_AFFINITY, NULL, NULL);
-        if (!h) { free(pa); return ESP_ERR_NO_MEM; }
+        if (!h) { s_pair_in_progress = false; free(pa); return ESP_ERR_NO_MEM; }
         return ESP_OK;
     }
 
