@@ -214,7 +214,7 @@ esp_err_t device_settings_save_json(const char *json_str)
     if ((v = cJSON_GetObjectItem(root, "lcd_therapy_mode")) && cJSON_IsNumber(v)) {
         int val = v->valueint;
         if (val == LCD_THERAPY_OFF || val == LCD_THERAPY_ALWAYS_OFF ||
-            val == LCD_THERAPY_INFO) {
+            val == LCD_THERAPY_INFO || val == LCD_THERAPY_BUTTON) {
             cfg.lcd_therapy_mode = (lcd_therapy_mode_t)val;
         } else {
             cfg.lcd_therapy_mode = LCD_THERAPY_GRAPH;

@@ -36,6 +36,7 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "bsp_display.h"
+#include "device_settings.h"
 #include "as11_ble.h"
 #include "esp_sleep.h"
 #include "psram_task.h"
@@ -109,6 +110,8 @@ static void button_monitor_task(void *arg)
     (void)arg;
     const int poll_ms = 50;
     const int double_click_window_ms = 400;
+    const int pwr_short_min_ms = 100;
+    const int pwr_short_max_ms = 1000;
 
     /* Configure all three button GPIOs at once */
     gpio_config_t cfg = {
@@ -122,9 +125,22 @@ static void button_monitor_task(void *arg)
     };
     gpio_config(&cfg);
 
+    /* KEY_PWR may still be held from powering the board on.  Do not treat
+     * that initial release as a short press; arm short-press handling only
+     * after the monitor has observed the button released once. */
+    bool pwr_armed = gpio_get_level(BSP_PIN_KEY_PWR) != 0;
+    bool pwr_pressed = false;
+
     while (true) {
-        /* --- PWR button: long-press = power off --- */
-        if (gpio_get_level(BSP_PIN_KEY_PWR) == 0) {
+        /* --- PWR button: short press = optional backlight toggle,
+         *                  5 s hold = power off --- */
+        int pwr_level = gpio_get_level(BSP_PIN_KEY_PWR);
+        if (!pwr_armed) {
+            if (pwr_level != 0) pwr_armed = true;
+            s_btn.pwr_held_ms = 0;
+            pwr_pressed = false;
+        } else if (pwr_level == 0) {
+            pwr_pressed = true;
             s_btn.pwr_held_ms += poll_ms;
             if (s_btn.pwr_held_ms >= s_btn.pwr_hold_ms) {
                 ESP_LOGW(TAG, "power button long-press: shutting down");
@@ -138,7 +154,17 @@ static void button_monitor_task(void *arg)
                 s_btn.pwr_held_ms = 0;
             }
         } else {
+            if (pwr_pressed && s_btn.pwr_held_ms >= pwr_short_min_ms &&
+                s_btn.pwr_held_ms <= pwr_short_max_ms) {
+                const device_settings_t *dev = device_settings_get();
+                if (dev->lcd_therapy_mode == LCD_THERAPY_BUTTON) {
+                    bool on = bsp_display_toggle_backlight();
+                    ESP_LOGI(TAG, "POWER button short-press: backlight %s",
+                             on ? "on" : "off");
+                }
+            }
             s_btn.pwr_held_ms = 0;
+            pwr_pressed = false;
         }
 
         /* --- BOOT button: 5 s hold = SoftAP entry --- */

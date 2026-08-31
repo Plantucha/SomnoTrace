@@ -842,6 +842,19 @@ void bsp_display_set_backlight(bool on)
     }
 }
 
+bool bsp_display_toggle_backlight(void)
+{
+    /* SoftAP setup deliberately keeps its connection details visible. */
+    if (s_backlight_force_on) {
+        bsp_display_set_backlight(true);
+        return true;
+    }
+
+    bool on = !s_backlight_on;
+    bsp_display_set_backlight(on);
+    return on;
+}
+
 uint8_t bsp_display_get_brightness(void)
 {
     return s_brightness;
@@ -873,6 +886,9 @@ void bsp_display_apply_backlight_policy(bool force_on)
         break;
     case LCD_THERAPY_ALWAYS_OFF:
         bsp_display_set_backlight(false);
+        break;
+    case LCD_THERAPY_BUTTON:
+        /* A short PWR press owns the backlight state in this mode. */
         break;
     default:
         bsp_display_set_backlight(true);

@@ -99,7 +99,8 @@ The board has three physical buttons on the side. Here's what each one does:
 | Button | Action | What It Does |
 |---|---|---|
 | **BOOT** (left) | Hold 5 seconds | Enters Wi-Fi setup mode (AP hotspot) for initial configuration or network changes. |
-| **POWER** (middle) | Hold 10 seconds | Powers off the device. |
+| **POWER** (middle) | Single click | Toggles the backlight when **Backlight controlled by POWER button** is selected under Display & Sound. |
+| **POWER** (middle) | Hold 5 seconds | Powers off the device. |
 | **POWER** (middle) | Hold 2 seconds | Powers on the device (when off). |
 | **PLUS** (right) | Single click | Acknowledges and silences an interrupted therapy alert (if enabled). |
 | **PLUS** (right) | Double click | Starts or stops therapy on the AirSense 11 (toggle — same as pressing the machine's own button). |
