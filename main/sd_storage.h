@@ -117,3 +117,9 @@ void sd_storage_lease_release(sd_lease_t role);
  * Must NOT be called from the HTTP handler task — run via a background task.
  * Returns ESP_OK on success. */
 esp_err_t sd_storage_format(void);
+
+/* Flush and unmount FATFS.  Issues f_unmount (which syncs the FAT and the
+ * card's internal write buffer) and releases the card handle.  Intended to be
+ * called just before a deliberate reboot so a hard reset never lands on top of
+ * unflushed filesystem state.  Safe to call when nothing is mounted. */
+void sd_storage_deinit(void);

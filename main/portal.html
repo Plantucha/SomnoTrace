@@ -2591,18 +2591,46 @@ function execAction(action, confirmMsg) {
     .then(function(d) {
       if (d.ok) {
         if (action === 'format-sd') {
-          if (statusEl) { statusEl.textContent = 'SD card formatted. Rebooting…'; statusEl.className = 'status-msg success'; }
-          rebootCountdown(20, 'action-status');
+          /* Format runs in the background; poll for the real result. */
+          if (statusEl) { statusEl.textContent = 'Formatting SD card… this can take a minute. The device reboots when it finishes. Do not power off.'; statusEl.className = 'status-msg'; }
+          pollFormatProgress(0);
           return;
         }
         if (statusEl) { statusEl.textContent = 'Action completed successfully.'; statusEl.className = 'status-msg success'; }
         if (action === 'reset-state' || action === 'recreate-edfs') { loadUploadStatus(); }
       } else {
-        if (statusEl) { statusEl.textContent = 'Action failed.'; statusEl.className = 'status-msg error'; }
+        if (statusEl) { statusEl.textContent = d.error ? ('Action failed: ' + d.error) : 'Action failed.'; statusEl.className = 'status-msg error'; }
       }
     })
     .catch(function() {
       if (statusEl) { statusEl.textContent = 'Action failed — network error.'; statusEl.className = 'status-msg error'; }
+    });
+}
+
+function pollFormatProgress(fails) {
+  var statusEl = document.getElementById('action-status');
+  fetch('/api/format-progress', { cache: 'no-store' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.done && d.ok) {
+        if (statusEl) { statusEl.textContent = 'SD card formatted. Rebooting…'; statusEl.className = 'status-msg success'; }
+        rebootCountdown(20, 'action-status');
+        return;
+      }
+      if (d.done && !d.ok) {
+        if (statusEl) { statusEl.textContent = 'Format failed: ' + (d.error || 'unknown error') + '. The card may need a manual format on a computer.'; statusEl.className = 'status-msg error'; }
+        return;
+      }
+      setTimeout(function() { pollFormatProgress(0); }, 2000);
+    })
+    .catch(function() {
+      /* Device unreachable. Brief blips happen; only give up after a few. */
+      if (fails >= 4) {
+        if (statusEl) { statusEl.textContent = 'Lost connection during format — the device likely rebooted.'; statusEl.className = 'status-msg'; }
+        rebootCountdown(20, 'action-status');
+        return;
+      }
+      setTimeout(function() { pollFormatProgress(fails + 1); }, 2000);
     });
 }
 

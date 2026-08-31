@@ -50,6 +50,15 @@ static sdmmc_card_t *s_card = NULL;
 #define SD_RESERVE_BYTES   (24ULL * 1024 * 1024)   /* warn below 24 MB  */
 #define SD_FLOOR_BYTES     (8ULL * 1024 * 1024)    /* refuse below 8 MB */
 
+/* Explicit cluster size for f_mkfs.  This MUST be set: passing 0 lets ESP-IDF
+ * default it to the 512-byte sector size, and on a 32-64 GB card that means
+ * ~60-130M FAT32 clusters and a FAT table hundreds of MB wide, built through a
+ * 4 KB work buffer.  f_mkfs then either returns FR_MKFS_ABORTED or runs for
+ * minutes and trips the task watchdog, so "Format SD" appears to do nothing.
+ * 32 KB is the normal cluster size for this capacity and keeps the FAT small
+ * enough to write in a few seconds. */
+#define SD_FORMAT_ALLOC_UNIT  (32 * 1024)
+
 /* ── Arbitration state ────────────────────────────────────────────── */
 static SemaphoreHandle_t s_lease_mutex = NULL;   /* guards the counters  */
 static SemaphoreHandle_t s_export_sem = NULL;    /* EXPORT/DESTRUCTIVE   */
@@ -315,9 +324,16 @@ esp_err_t sd_storage_format(void)
 {
     ESP_LOGW(TAG, "format: formatting SD card — ALL DATA WILL BE LOST");
 
+    /* Report the card as unavailable for the whole operation: the volume is
+     * unmounted while f_mkfs runs, and other subsystems (log flush, oximetry
+     * dir creation) gate their SD writes on sd_storage_is_ready().  Restored
+     * to true on success below. */
+    bool was_mounted = s_mounted;
+    s_mounted = false;
+
     esp_err_t ret;
 
-    if (s_mounted) {
+    if (was_mounted) {
         /* Card is already mounted — pre-erase the first 8 sectors so any
          * residual exFAT boot-sector signature in sector 0 cannot confuse
          * f_mkfs on a future re-flash, then format in-place. */
@@ -330,21 +346,28 @@ esp_err_t sd_storage_format(void)
             free(zeros);
         }
 
-        /* esp_vfs_fat_sdcard_format() unmounts, formats (f_mkfs), and
-         * remounts at the same mount point.  The card handle remains valid. */
-        ret = esp_vfs_fat_sdcard_format(SD_MOUNT_POINT, s_card);
+        /* Unmounts, reformats, and remounts at the same point; the card handle
+         * stays valid.  The _cfg variant is required: the plain
+         * esp_vfs_fat_sdcard_format() reuses sd_storage_init()'s mount config,
+         * whose allocation_unit_size is 0 (see SD_FORMAT_ALLOC_UNIT). */
+        esp_vfs_fat_mount_config_t fmt_cfg = {
+            .format_if_mount_failed = false,
+            .max_files              = 16,
+            .allocation_unit_size   = SD_FORMAT_ALLOC_UNIT,
+        };
+        ret = esp_vfs_fat_sdcard_format_cfg(SD_MOUNT_POINT, s_card, &fmt_cfg);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "format: esp_vfs_fat_sdcard_format failed: %s",
+            ESP_LOGE(TAG, "format: esp_vfs_fat_sdcard_format_cfg failed: %s",
                      esp_err_to_name(ret));
-            s_mounted = false;
             return ret;
         }
+        s_mounted = true;
     } else {
         /* Card not mounted — common cause: factory 64 GB SDXC cards ship with
          * exFAT.  ESP-IDF 5.5 builds FATFS with FF_FS_EXFAT=0, so the mount
          * in sd_storage_init() returns FR_NO_FILESYSTEM and s_card stays NULL.
          * Mount with format_if_mount_failed=true so the driver formats
-         * (FM_ANY → FAT32) and remounts in one step. */
+         * (FM_ANY → FAT32, 32 KB clusters) and remounts in one step. */
         sdmmc_host_t host;
         sdmmc_slot_config_t slot;
         sdmmc_config_default(&host, &slot);
@@ -352,17 +375,15 @@ esp_err_t sd_storage_format(void)
         esp_vfs_fat_sdmmc_mount_config_t cfg = {
             .format_if_mount_failed = true,
             .max_files              = 16,
-            .allocation_unit_size   = 0,
+            .allocation_unit_size   = SD_FORMAT_ALLOC_UNIT,
         };
 
+        /* Single 4-bit attempt.  A 1-bit retry after this fails is a no-op:
+         * esp_vfs_fat_sdmmc_mount() leaves the VFS path registered on failure,
+         * so the retry just returns ESP_ERR_INVALID_STATE and hides the real
+         * error.  sd_storage_init() already handles 4->1-bit for normal mounts. */
         sdmmc_card_t *card = NULL;
         ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot, &cfg, &card);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "format: 4-bit mount+format failed (%s), trying 1-bit",
-                     esp_err_to_name(ret));
-            slot.width = 1;
-            ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot, &cfg, &card);
-        }
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "format: mount+format failed: %s", esp_err_to_name(ret));
             return ret;
@@ -386,4 +407,21 @@ esp_err_t sd_storage_format(void)
 
     ESP_LOGI(TAG, "format: SD card formatted and directory tree recreated");
     return ESP_OK;
+}
+
+void sd_storage_deinit(void)
+{
+    if (!s_mounted || !s_card) return;
+
+    /* The VFS unmount runs f_unmount, which syncs the FAT window and issues a
+     * final CTRL_SYNC so the card commits its own write buffer.  Without it a
+     * reboot right after a format or a write burst can beat the flush. */
+    esp_err_t ret = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
+    if (ret != ESP_OK)
+        ESP_LOGW(TAG, "deinit: unmount failed: %s", esp_err_to_name(ret));
+    else
+        ESP_LOGI(TAG, "deinit: SD flushed and unmounted");
+
+    s_mounted = false;
+    s_card = NULL;
 }

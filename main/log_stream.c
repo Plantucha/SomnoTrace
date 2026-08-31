@@ -206,6 +206,10 @@ static void log_flush_task(void *arg)
             ensure_log_dir();
             if (!s_sd_ready) continue;
         }
+        /* s_sd_ready is a latch; skip the flush while the card is actually
+         * away (e.g. a reformat in progress) so it does not log an error per
+         * tick against the unmounted volume. */
+        if (!sd_storage_is_ready()) continue;
 
         size_t avail;
         xSemaphoreTake(s_writebuf_mutex, portMAX_DELAY);
