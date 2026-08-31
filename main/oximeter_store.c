@@ -71,7 +71,8 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
                           char *firmware, size_t fw_sz,
                           char *name_prefix, size_t prefix_sz,
                           char *last_addr, size_t addr_sz,
-                          char *driver, size_t driver_sz)
+                          char *driver, size_t driver_sz,
+                          char *ble_name, size_t ble_name_sz)
 {
     FILE *f = fopen(OXY_PAIRED_JSON, "r");
     if (!f) return false;
@@ -111,6 +112,9 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
     cJSON *drv = cJSON_GetObjectItem(j, "driver");
     if (drv && cJSON_IsString(drv) && driver)
         strlcpy(driver, drv->valuestring, driver_sz);
+    cJSON *bn = cJSON_GetObjectItem(j, "ble_name");
+    if (bn && cJSON_IsString(bn) && ble_name)
+        strlcpy(ble_name, bn->valuestring, ble_name_sz);
 
     cJSON_Delete(j);
     return ok;
@@ -118,7 +122,7 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
 
 void ox_store_save_paired(const char *serial, const char *firmware,
                           const char *name_prefix, const char *last_addr,
-                          const char *driver)
+                          const char *driver, const char *ble_name)
 {
     ox_store_ensure_dirs();
     cJSON *j = cJSON_CreateObject();
@@ -127,6 +131,7 @@ void ox_store_save_paired(const char *serial, const char *firmware,
     if (name_prefix) cJSON_AddStringToObject(j, "name_prefix", name_prefix);
     if (last_addr) cJSON_AddStringToObject(j, "last_addr", last_addr);
     if (driver) cJSON_AddStringToObject(j, "driver", driver);
+    if (ble_name) cJSON_AddStringToObject(j, "ble_name", ble_name);
     char *json = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
     if (!json) return;

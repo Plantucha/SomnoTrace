@@ -45,6 +45,7 @@
 #include "net_provision.h"
 #include "uploader.h"
 #include "as11_ble.h"
+#include "oximeter.h"
 
 static const char *TAG = "log_stream";
 
@@ -339,6 +340,7 @@ static volatile bool s_ws_paused = false;
 static volatile bool s_push_status_now = false;
 static volatile bool s_push_upload_now = false;
 static volatile bool s_push_ble_now    = false;
+static volatile bool s_push_ox_now     = false;
 
 /* Request an immediate upload-progress push on the next forwarder cycle
  * (e.g. on a backend state transition).  Safe to call from any task. */
@@ -352,6 +354,13 @@ void log_stream_request_upload_push(void)
 void log_stream_request_ble_push(void)
 {
     s_push_ble_now = true;
+}
+
+/* Request an immediate oximeter-state push on the next forwarder cycle
+ * (e.g. on a pairing or sync state change).  Safe to call from any task. */
+void log_stream_request_ox_push(void)
+{
+    s_push_ox_now = true;
 }
 
 static esp_err_t ws_queue_send(httpd_handle_t hd, int fd, uint8_t type,
@@ -558,6 +567,7 @@ static void ws_forwarder_task(void *arg)
             s_push_status_now = false;
             s_push_upload_now = false;
             s_push_ble_now    = false;
+            s_push_ox_now     = false;
             continue;
         }
 
@@ -600,6 +610,24 @@ static void ws_forwarder_task(void *arg)
                     }
                 }
                 log_stream_ws_send_json("ble", ble);
+            }
+        }
+
+        /* Oximeter state push: event-driven only (no periodic polling). */
+        if (!s_ws_paused && s_push_ox_now) {
+            s_push_ox_now = false;
+            cJSON *ox = cJSON_CreateObject();
+            if (ox) {
+                cJSON_AddStringToObject(ox, "state", oximeter_get_status());
+                cJSON_AddStringToObject(ox, "error", oximeter_get_error());
+                cJSON_AddBoolToObject(ox, "paired", oximeter_is_paired());
+                if (oximeter_is_paired()) {
+                    cJSON *info = oximeter_get_paired_info();
+                    if (info) {
+                        cJSON_AddItemToObject(ox, "device", info);
+                    }
+                }
+                log_stream_ws_send_json("oximeter", ox);
             }
         }
 

@@ -84,6 +84,13 @@ void log_stream_request_upload_push(void);
  */
 void log_stream_request_ble_push(void);
 
+/**
+ * Request an immediate oximeter-state push on the next forwarder cycle.
+ * Called from the oximeter drivers on state changes (pairing, sync, etc.).
+ * Non-blocking — just sets a flag.
+ */
+void log_stream_request_ox_push(void);
+
 #ifdef __cplusplus
 }
 #endif

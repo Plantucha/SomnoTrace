@@ -1799,7 +1799,8 @@ function loadStatusTab(d) {
     var ost = ox.state || 'idle';
     var olabels = {
       'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
-      'pulling': 'Syncing…', 'paired': (ox.device && ox.device.serial) ? ox.device.serial : 'Paired', 'error': 'Error'
+      'pulling': 'Syncing…', 'paired': (ox.device && ox.device.ble_name) ? ox.device.ble_name
+                 : (ox.device && ox.device.serial) ? ox.device.serial : 'Paired', 'error': 'Error'
     };
     var ocolors = {
       'idle': 'var(--text-muted)', 'scanning': 'var(--warning)', 'connecting': 'var(--warning)',
@@ -2137,7 +2138,8 @@ function updateOxUI(ox) {
     if (fgt) fgt.style.display = '';
     var dn = document.getElementById('ox-dev-name');
     var di = document.getElementById('ox-dev-info');
-    if (dn) dn.textContent = (ox.device && ox.device.name_prefix) ? (ox.device.name_prefix + ' O2 Ring') : 'O2 Ring';
+    if (dn) dn.textContent = (ox.device && ox.device.ble_name) ? ox.device.ble_name
+               : (ox.device && ox.device.name_prefix) ? (ox.device.name_prefix + ' O2 Ring') : 'O2 Ring';
     if (di && ox.device) {
       var info = 'S/N: ' + (ox.device.serial || '--') + '  FW: ' + (ox.device.firmware || '--');
       if (ox.device.driver === 'wellue_legacy') info += '  (Gen1)';

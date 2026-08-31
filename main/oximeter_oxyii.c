@@ -34,6 +34,7 @@
 #include "oximetry_canonical.h"
 #include "time_sync.h"
 #include "upload_sched.h"
+#include "log_stream.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -67,10 +68,11 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
                           char *firmware, size_t fw_sz,
                           char *name_prefix, size_t prefix_sz,
                           char *last_addr, size_t addr_sz,
-                          char *driver, size_t driver_sz);
+                          char *driver, size_t driver_sz,
+                          char *ble_name, size_t ble_name_sz);
 void ox_store_save_paired(const char *serial, const char *firmware,
                           const char *name_prefix, const char *last_addr,
-                          const char *driver);
+                          const char *driver, const char *ble_name);
 void ox_store_delete_paired(void);
 int  ox_store_index_check(const char *serial, const char *name);
 int  ox_store_index_conversion_check(const char *serial, const char *name);
@@ -269,6 +271,12 @@ struct ox_scan_result {
     uint16_t mfg;
 };
 
+/* Argument passed to pair_task (must be freed by the task). */
+struct pair_arg {
+    char addr_str[24];
+    char ble_name[40];
+};
+
 static SemaphoreHandle_t s_state_mtx;
 static SemaphoreHandle_t s_ops_mtx;     /* serialise BLE ops (scan/pair/pull) */
 static SemaphoreHandle_t s_op_sem;      /* GATT op completion */
@@ -286,6 +294,7 @@ static char s_error[128];
 static char s_serial[32];
 static char s_firmware[16];
 static char s_name_prefix[16];
+static char s_ble_name[40];      /* BLE advertised name (e.g. "SHQO2Pro 0897") */
 static char s_paired_addr[18];
 static bool s_paired = false;
 static bool s_presence_served = false;
@@ -333,6 +342,7 @@ static void set_state(const char *st)
     xSemaphoreTake(s_state_mtx, portMAX_DELAY);
     strlcpy(s_status, st, sizeof(s_status));
     xSemaphoreGive(s_state_mtx);
+    log_stream_request_ox_push();
 }
 
 static void set_error(const char *fmt, ...)
@@ -986,6 +996,7 @@ struct ox_nvs_arg {
     char serial[32];
     char firmware[16];
     char name_prefix[16];
+    char ble_name[40];
     char last_addr[18];
 };
 
@@ -999,6 +1010,7 @@ static esp_err_t do_save_nvs(void *arg)
     nvs_set_str(h, "serial", local.serial);
     nvs_set_str(h, "firmware", local.firmware);
     nvs_set_str(h, "name_prefix", local.name_prefix);
+    nvs_set_str(h, "ble_name", local.ble_name);
     nvs_set_str(h, "last_addr", local.last_addr);
     nvs_set_u8(h, "driver", (uint8_t)OX_DRIVER_OXYII);
     e = nvs_commit(h);
@@ -1015,6 +1027,7 @@ static esp_err_t do_erase_nvs(void *arg)
     nvs_erase_key(h, "serial");
     nvs_erase_key(h, "firmware");
     nvs_erase_key(h, "name_prefix");
+    nvs_erase_key(h, "ble_name");
     nvs_erase_key(h, "last_addr");
     nvs_erase_key(h, "driver");
     nvs_erase_key(h, "probe_mode");
@@ -1051,6 +1064,8 @@ static void load_paired_from_nvs(void)
         nvs_get_str(h, "firmware", s_firmware, &len);
         len = sizeof(s_name_prefix);
         nvs_get_str(h, "name_prefix", s_name_prefix, &len);
+        len = sizeof(s_ble_name);
+        nvs_get_str(h, "ble_name", s_ble_name, &len);
         len = sizeof(s_paired_addr);
         nvs_get_str(h, "last_addr", s_paired_addr, &len);
     } else {
@@ -1064,16 +1079,18 @@ static void load_paired_from_nvs(void)
 
     /* Also try loading from paired.json (SD) as fallback */
     if (!s_paired) {
-        char serial[32], fw[16], prefix[16], addr[18], drv[16];
+        char serial[32], fw[16], prefix[16], addr[18], drv[16], bname[40];
         if (ox_store_load_paired(serial, sizeof(serial),
                                  fw, sizeof(fw),
                                  prefix, sizeof(prefix),
                                  addr, sizeof(addr),
-                                 drv, sizeof(drv))) {
+                                 drv, sizeof(drv),
+                                 bname, sizeof(bname))) {
             if (strcmp(drv, "wellue_oxyii") == 0) {
                 strlcpy(s_serial, serial, sizeof(s_serial));
                 strlcpy(s_firmware, fw, sizeof(s_firmware));
                 strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
+                strlcpy(s_ble_name, bname, sizeof(s_ble_name));
                 strlcpy(s_paired_addr, addr, sizeof(s_paired_addr));
                 s_paired = true;
             }
@@ -1084,7 +1101,9 @@ static void load_paired_from_nvs(void)
 /* ── Pair task ─────────────────────────────────────────────────────── */
 static void pair_task(void *arg)
 {
-    char *addr_str = (char *)arg;
+    struct pair_arg *pa = (struct pair_arg *)arg;
+    const char *addr_str = pa->addr_str;
+    const char *ble_name = pa->ble_name;
     ble_addr_t target;
 
     xSemaphoreTake(s_ops_mtx, portMAX_DELAY);
@@ -1092,7 +1111,7 @@ static void pair_task(void *arg)
 
     if (!parse_addr(addr_str, &target)) {
         set_error("invalid address: %s", addr_str);
-        free(addr_str);
+        free(pa);
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
         return;
@@ -1100,7 +1119,7 @@ static void pair_task(void *arg)
 
     if (do_connect_and_discover(&target, true) != ESP_OK) {
         do_disconnect();
-        free(addr_str);
+        free(pa);
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
         return;
@@ -1109,7 +1128,7 @@ static void pair_task(void *arg)
     if (oxyii_session_open() != ESP_OK) {
         set_error("session open failed");
         do_disconnect();
-        free(addr_str);
+        free(pa);
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
         return;
@@ -1119,7 +1138,7 @@ static void pair_task(void *arg)
     if (oxyii_get_info(serial, sizeof(serial), firmware, sizeof(firmware)) != ESP_OK) {
         set_error("get_info failed");
         do_disconnect();
-        free(addr_str);
+        free(pa);
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
         return;
@@ -1128,7 +1147,7 @@ static void pair_task(void *arg)
     if (serial[0] == '\0') {
         set_error("empty serial");
         do_disconnect();
-        free(addr_str);
+        free(pa);
         xSemaphoreGive(s_ops_mtx);
         vTaskDelete(NULL);
         return;
@@ -1139,21 +1158,41 @@ static void pair_task(void *arg)
     memcpy(prefix, serial, 4);
     prefix[4] = '\0';
 
+    /* Build a human-readable display name from the BLE advertised name
+     * (e.g. "SHQO2Pro 0897").  If the advertised name is unavailable,
+     * fall back to "O2Ring" + last 4 digits of serial. */
+    char display_name[40];
+    if (ble_name && ble_name[0] && strncmp(ble_name, "O2Ring", 6) != 0) {
+        strlcpy(display_name, ble_name, sizeof(display_name));
+    } else {
+        int slen = (int)strlen(serial);
+        char last4[5];
+        if (slen >= 4) {
+            memcpy(last4, serial + slen - 4, 4);
+            last4[4] = '\0';
+        } else {
+            strlcpy(last4, serial, sizeof(last4));
+        }
+        snprintf(display_name, sizeof(display_name), "O2Ring %s", last4);
+    }
+
     /* Save to NVS */
     struct ox_nvs_arg nvs_arg;
     strlcpy(nvs_arg.serial, serial, sizeof(nvs_arg.serial));
     strlcpy(nvs_arg.firmware, firmware, sizeof(nvs_arg.firmware));
     strlcpy(nvs_arg.name_prefix, prefix, sizeof(nvs_arg.name_prefix));
+    strlcpy(nvs_arg.ble_name, display_name, sizeof(nvs_arg.ble_name));
     strlcpy(nvs_arg.last_addr, addr_str, sizeof(nvs_arg.last_addr));
     nvs_writer_run(do_save_nvs, &nvs_arg);
 
     /* Save to paired.json on SD */
-    ox_store_save_paired(serial, firmware, prefix, addr_str, "wellue_oxyii");
+    ox_store_save_paired(serial, firmware, prefix, addr_str, "wellue_oxyii", display_name);
 
     /* Update in-RAM state */
     strlcpy(s_serial, serial, sizeof(s_serial));
     strlcpy(s_firmware, firmware, sizeof(s_firmware));
     strlcpy(s_name_prefix, prefix, sizeof(s_name_prefix));
+    strlcpy(s_ble_name, display_name, sizeof(s_ble_name));
     strlcpy(s_paired_addr, addr_str, sizeof(s_paired_addr));
     s_paired = true;
     s_presence_served = false;
@@ -1161,9 +1200,9 @@ static void pair_task(void *arg)
 
     do_disconnect();
     set_state(OX_STATUS_PAIRED);
-    ESP_LOGI(TAG, "paired: serial=%s fw=%s", serial, firmware);
+    ESP_LOGI(TAG, "paired: serial=%s fw=%s name=%s", serial, firmware, display_name);
 
-    free(addr_str);
+    free(pa);
     xSemaphoreGive(s_ops_mtx);
     vTaskDelete(NULL);
 }
@@ -1467,8 +1506,12 @@ static void pull_task(void *arg)
             /* If we broke out without pulling, clean up the connection. */
             if (!pulled) {
                 do_disconnect();
-                set_state(OX_STATUS_PAIRED);
             }
+            /* Always return to PAIRED after the persistent cycle, whether
+             * we pulled successfully or broke out early.  Without this,
+             * the state stays PULLING forever after a successful pull,
+             * and the web UI shows "Syncing…" until reboot. */
+            set_state(OX_STATUS_PAIRED);
             xSemaphoreGive(s_ops_mtx);
             continue;
         }
@@ -1659,13 +1702,24 @@ static esp_err_t oxyii_pair(const char *addr_str)
     if (!as11_ble_is_host_ready())
         return ESP_ERR_INVALID_STATE;
 
-    char *addr_copy = strdup(addr_str);
-    if (!addr_copy) return ESP_ERR_NO_MEM;
+    struct pair_arg *pa = calloc(1, sizeof(*pa));
+    if (!pa) return ESP_ERR_NO_MEM;
+    strlcpy(pa->addr_str, addr_str, sizeof(pa->addr_str));
 
-    TaskHandle_t h = psram_task_create(pair_task, "ox_pair", 8192, addr_copy, 5,
+    /* Look up the BLE advertised name from the last scan results. */
+    for (int i = 0; i < s_scan_count; i++) {
+        char scan_addr[24];
+        addr_to_str(&s_scan[i].addr, scan_addr, sizeof(scan_addr));
+        if (strcmp(scan_addr, addr_str) == 0) {
+            strlcpy(pa->ble_name, s_scan[i].name, sizeof(pa->ble_name));
+            break;
+        }
+    }
+
+    TaskHandle_t h = psram_task_create(pair_task, "ox_pair", 8192, pa, 5,
                                        tskNO_AFFINITY, NULL, NULL);
     if (!h) {
-        free(addr_copy);
+        free(pa);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -1679,6 +1733,7 @@ static void oxyii_forget(void)
     s_serial[0] = '\0';
     s_firmware[0] = '\0';
     s_name_prefix[0] = '\0';
+    s_ble_name[0] = '\0';
     s_paired_addr[0] = '\0';
 
     nvs_writer_run(do_erase_nvs, NULL);
@@ -1709,6 +1764,7 @@ static cJSON *oxyii_get_paired_info(void)
     cJSON_AddStringToObject(info, "serial", s_serial);
     if (s_firmware[0]) cJSON_AddStringToObject(info, "firmware", s_firmware);
     if (s_name_prefix[0]) cJSON_AddStringToObject(info, "name_prefix", s_name_prefix);
+    if (s_ble_name[0]) cJSON_AddStringToObject(info, "ble_name", s_ble_name);
     if (s_paired_addr[0]) cJSON_AddStringToObject(info, "addr", s_paired_addr);
     cJSON_AddStringToObject(info, "driver", "wellue_oxyii");
     return info;

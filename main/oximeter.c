@@ -51,7 +51,8 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
                           char *firmware, size_t fw_sz,
                           char *name_prefix, size_t prefix_sz,
                           char *last_addr, size_t addr_sz,
-                          char *driver, size_t driver_sz);
+                          char *driver, size_t driver_sz,
+                          char *ble_name, size_t ble_name_sz);
 
 static void load_driver_type(void)
 {
@@ -70,7 +71,7 @@ static void load_driver_type(void)
     if (s_driver_type == OX_DRIVER_OXYII) {
         char drv[16] = {0};
         if (ox_store_load_paired(NULL, 0, NULL, 0, NULL, 0, NULL, 0,
-                                 drv, sizeof(drv))) {
+                                 drv, sizeof(drv), NULL, 0)) {
             if (strcmp(drv, "wellue_legacy") == 0)
                 s_driver_type = OX_DRIVER_LEGACY;
         }
