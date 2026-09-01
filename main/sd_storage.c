@@ -359,14 +359,15 @@ esp_err_t sd_storage_format(void)
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "format: esp_vfs_fat_sdcard_format_cfg failed: %s",
                      esp_err_to_name(ret));
-            /* esp_vfs_fat_sdcard_format_cfg unmounts before formatting.  If
-             * f_mkfs failed, the volume may or may not have been remounted.
-             * Probe by trying a trivial VFS op; if it works, the card is
-             * still accessible and we should report it as mounted so other
-             * subsystems can continue.  If not, leave s_mounted=false and
-             * the user will need to reboot. */
-            FILE *f = fopen(SD_APP_DIR, "r");
-            if (f) { fclose(f); s_mounted = true; }
+            /* esp_vfs_fat_sdcard_format_cfg() unmounts, runs f_mkfs, then tries
+             * to remount.  On f_mkfs failure the remount may still have
+             * succeeded (card usable) or failed (driver has recycled s_card).
+             * opendir() on the mount root distinguishes the two: it only
+             * succeeds when the VFS is registered and the volume is mounted,
+             * which is exactly the case where s_card is still valid.  Otherwise
+             * leave s_mounted=false and the user reboots. */
+            DIR *d = opendir(SD_MOUNT_POINT);
+            if (d) { closedir(d); s_mounted = true; }
             return ret;
         }
         s_mounted = true;
