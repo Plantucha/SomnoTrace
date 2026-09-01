@@ -47,9 +47,22 @@ static const char *TAG = "dev_settings";
 #define MAX_BRIGHTNESS           200 /* 20.0% */
 #define DEFAULT_ALERT_VOLUME     65
 #define MIN_ALERT_VOLUME         50
-#define DEFAULT_LCD_ROTATION     0
+#define DEFAULT_LCD_ROTATION     LCD_ROTATION_0
 
 static device_settings_t s_settings;
+
+static bool lcd_rotation_is_valid(int degrees)
+{
+    switch (degrees) {
+        case LCD_ROTATION_0:
+        case LCD_ROTATION_90:
+        case LCD_ROTATION_180:
+        case LCD_ROTATION_270:
+            return true;
+        default:
+            return false;
+    }
+}
 
 esp_err_t device_settings_load(device_settings_t *cfg)
 {
@@ -80,15 +93,18 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     if (nvs_get_u8(h, NVS_KEY_ALERT_VOL, &u8val) == ESP_OK) {
         cfg->alert_volume = (u8val < MIN_ALERT_VOLUME) ? MIN_ALERT_VOLUME : u8val;
     }
-    if (nvs_get_u8(h, NVS_KEY_LCD_ROTATION, &u8val) == ESP_OK) {
-        switch (u8val) {
-            case 0: case 90:
-                cfg->lcd_rotation = u8val;
-                break;
-            default:
-                cfg->lcd_rotation = DEFAULT_LCD_ROTATION;
-                break;
-        }
+    uint16_t rotation;
+    esp_err_t rotation_err = nvs_get_u16(h, NVS_KEY_LCD_ROTATION, &rotation);
+    if (rotation_err == ESP_ERR_NVS_TYPE_MISMATCH) {
+        /* Firmware through v1.2.2 stored 0°/90° as uint8_t. Keep those
+         * settings readable until the next save migrates the key to uint16_t. */
+        uint8_t legacy_rotation;
+        rotation_err = nvs_get_u8(h, NVS_KEY_LCD_ROTATION, &legacy_rotation);
+        if (rotation_err == ESP_OK) rotation = legacy_rotation;
+    }
+    if (rotation_err == ESP_OK) {
+        cfg->lcd_rotation = lcd_rotation_is_valid(rotation) ?
+                            rotation : DEFAULT_LCD_ROTATION;
     }
 
     nvs_close(h);
@@ -97,7 +113,7 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u",
              s_settings.brightness, s_settings.brightness / 10.0,
              s_settings.lcd_therapy_mode, s_settings.alert_volume,
-             s_settings.lcd_rotation);
+             (unsigned)s_settings.lcd_rotation);
     return ESP_OK;
 }
 
@@ -111,7 +127,7 @@ static esp_err_t do_device_settings_save(void *arg)
     nvs_set_u8(h, NVS_KEY_BRIGHTNESS, cfg->brightness);
     nvs_set_u8(h, NVS_KEY_LCD_THERAPY, (uint8_t)cfg->lcd_therapy_mode);
     nvs_set_u8(h, NVS_KEY_ALERT_VOL, cfg->alert_volume);
-    nvs_set_u8(h, NVS_KEY_LCD_ROTATION, cfg->lcd_rotation);
+    nvs_set_u16(h, NVS_KEY_LCD_ROTATION, cfg->lcd_rotation);
     ret = nvs_commit(h);
     nvs_close(h);
     return ret;
@@ -128,7 +144,7 @@ esp_err_t device_settings_save(const device_settings_t *cfg)
         ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u",
                  s_settings.brightness, s_settings.brightness / 10.0,
                  s_settings.lcd_therapy_mode, s_settings.alert_volume,
-                 s_settings.lcd_rotation);
+                 (unsigned)s_settings.lcd_rotation);
     }
     return ret;
 }
@@ -163,14 +179,9 @@ esp_err_t device_settings_set_alert_volume(uint8_t percent)
     return ESP_OK;
 }
 
-esp_err_t device_settings_set_lcd_rotation(uint8_t degrees)
+esp_err_t device_settings_set_lcd_rotation(uint16_t degrees)
 {
-    switch (degrees) {
-        case 0: case 90:
-            break;
-        default:
-            return ESP_ERR_INVALID_ARG;
-    }
+    if (!lcd_rotation_is_valid(degrees)) return ESP_ERR_INVALID_ARG;
     s_settings.lcd_rotation = degrees;
     bsp_display_set_rotation(degrees);
     return ESP_OK;
@@ -228,14 +239,8 @@ esp_err_t device_settings_save_json(const char *json_str)
     }
     if ((v = cJSON_GetObjectItem(root, "lcd_rotation")) && cJSON_IsNumber(v)) {
         int val = v->valueint;
-        switch (val) {
-            case 0: case 90:
-                cfg.lcd_rotation = (uint8_t)val;
-                break;
-            default:
-                cfg.lcd_rotation = 0;
-                break;
-        }
+        cfg.lcd_rotation = lcd_rotation_is_valid(val) ?
+                           (uint16_t)val : DEFAULT_LCD_ROTATION;
     }
 
     cJSON_Delete(root);
