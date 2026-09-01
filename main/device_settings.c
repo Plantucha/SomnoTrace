@@ -167,6 +167,9 @@ esp_err_t device_settings_set_brightness(uint8_t percent)
 esp_err_t device_settings_set_lcd_therapy_mode(lcd_therapy_mode_t mode)
 {
     s_settings.lcd_therapy_mode = mode;
+    /* Re-evaluate display mode and backlight immediately */
+    bsp_display_set_therapy_active(bsp_display_is_therapy_active());
+    bsp_display_apply_backlight_policy(false);
     return ESP_OK;
 }
 
@@ -253,9 +256,10 @@ esp_err_t device_settings_save_json(const char *json_str)
     bsp_display_set_rotation(cfg.lcd_rotation);
 
     /* Persist first so device_settings_get() returns the new mode,
-     * then re-evaluate backlight based on the new mode.
+     * then re-evaluate therapy display mode and backlight based on the new mode.
      * If in SoftAP (force_on), backlight stays on regardless. */
     esp_err_t ret = device_settings_save(&cfg);
+    bsp_display_set_therapy_active(bsp_display_is_therapy_active());
     bsp_display_apply_backlight_policy(false);
 
     return ret;
