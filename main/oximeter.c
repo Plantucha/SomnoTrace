@@ -201,7 +201,6 @@ static bool pair_settled(const char **state_out)
 static esp_err_t try_pair(const char *addr, ox_driver_t driver)
 {
     if (driver != s_driver_type) {
-        s_active->forget();
         s_driver_type = driver;
         s_active = (driver == OX_DRIVER_LEGACY)
             ? &legacy_driver_ops
@@ -209,12 +208,6 @@ static esp_err_t try_pair(const char *addr, ox_driver_t driver)
         s_active->init();
         ESP_LOGI(TAG, "switched to driver: %s",
                  driver == OX_DRIVER_LEGACY ? "legacy" : "oxyii");
-    } else {
-        /* Same driver — still forget() to reset state to IDLE.
-         * Without this, a stale PAIRED state from a previous pairing
-         * would cause pair_settled() to return true immediately,
-         * making the poller think the new pair already succeeded. */
-        s_active->forget();
     }
     return s_active->pair(addr);
 }
@@ -301,6 +294,9 @@ static void auto_pair_task(void *arg)
         return;
     }
 
+    /* Allow the BLE controller to finish disconnecting before starting Phase 2. */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     /* Phase 2: fall back to Legacy (Gen1). */
     ESP_LOGI(TAG, "auto-pair: OxyII protocol mismatch — retrying as Legacy (Gen1)");
     rc = try_pair(addr, OX_DRIVER_LEGACY);
@@ -350,9 +346,6 @@ esp_err_t oximeter_pair(const char *addr_str, ox_driver_t driver)
 
     /* If pairing with a different driver type, switch active driver */
     if (driver != s_driver_type) {
-        /* Forget the current driver's state */
-        s_active->forget();
-
         /* Switch driver */
         s_driver_type = driver;
         s_active = (driver == OX_DRIVER_LEGACY)

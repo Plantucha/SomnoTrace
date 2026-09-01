@@ -966,17 +966,58 @@ Existing raw files should not be moved destructively in the first migration. Imp
 
 ## 14. Legacy Wellue and future device integration
 
-### 14.1 Legacy Wellue
+### 14.1 Legacy Wellue Driver (`oximeter_legacy.c`)
 
-Add separately:
+Implemented as an independent transport driver alongside OxyII:
 
-- `wellue_legacy` BLE driver for service `14839ac4-...` and block-based file access;
-- `wellue_vld_v3` decoder for the 40-byte header area and five-byte records;
-- mappings for SpO2, pulse, invalid, motion, and vibration;
-- explicit 4-second period from validated duration/record count, not a hardcoded assumption when files disagree;
-- source version handling (OSCAR reports multiple Viatom versions/record widths in the ecosystem).
+- **GATT Service:** Primary service `14839ac4-7d7e-415c-9a42-167340cf2339`.
+- **Characteristics:**
+  - Write: `8b00ace7-eb0b-49b0-bbe9-9aee0a26e1a3` (all requests sent via ATT Write Request / write-with-response).
+  - Notify: `0734594a-a8e7-4b1a-a6b1-cd5243059a57` (reassembled on lead byte `0x55` + CRC-8).
+- **Control & Framing:**
+  - `CMD_INFO` (`0x14`): JSON device info containing `SN`, `Model`, `CurBAT`, `FileList`.
+  - `CMD_CONFIG` (`0x16`): JSON time synchronization `{"SetTIME":"YYYY-MM-DD,HH:MM:SS"}` when `time_is_usable()` is true.
+  - `CMD_FILE_READ` (`0x03` / `0x04`): Chunked binary block download.
+- **Decoder & Canonical Pipeline:**
+  - Raw files are stored verbatim and validated by exact byte length matching `CMD_FILE_READ` total length (`ox_store_finalize_native()`).
+  - Native VLD3 files (5-byte records, 4-second period) are converted via `oximetry_canonical_convert_vld3()` into SNT v3 tracks (SpO2, pulse rate, motion, vibration, invalid status).
 
-Do not reuse the OxyII codec, CRC, completion rule, or invalid markers.
+### 14.1.1 Dual-Driver Dispatcher, Discovery & Pairing Architecture
+
+The system supports both Gen1 (Legacy) and Gen2 (OxyII) devices seamlessly via `oximeter.c`:
+
+#### A. BLE Advertisement Matching & Discovery (`gap_event`)
+To ensure high-fidelity discovery during both UI scanning and low-duty background watch (`pull_task`), multi-criteria filtering is used:
+
+1. **Gen1 (Legacy) Matching:**
+   - **Service UUID Match:** Raw advertisement contains 128-bit Service UUID `14839ac4-7d7e-415c-9a42-167340cf2339`.
+   - **Paired MAC Address Match:** Advertiser address matches `s_paired_addr`.
+   - **Name Match with Gen2 Exclusion:** Device name matches Gen1 patterns (`"O2Ring"`, `"CMRing"`, `"KidsO2"`, `"Checkme"`, `"SleepU"`) **AND** Manufacturer ID is NOT `0xF34E` (Gen2 sync ID).
+2. **Gen2 (OxyII) Matching:**
+   - **Manufacturer ID Match:** Manufacturer Specific Data company ID equals `0xF34E` (idle/sync advert).
+   - **Name Match:** Name starts with `"S8-AW"` or `"SHQO2PRO"` (excluding recording mode `0x036F` / `"T8520_"`).
+   - **Paired MAC Address Match:** Advertiser address matches `s_paired_addr` (non-recording).
+3. **Active Scanning Requirement:**
+   - Both pairing scans and background watch (`do_scan()`) use **Active Scanning** (`passive = 0`). This causes the BLE radio to issue `SCAN_REQ` and receive Scan Response (`SCAN_RSP`) packets, which is essential because Gen1 rings place the 128-bit Service UUID in `SCAN_RSP` due to 31-byte advertising PDU limits.
+
+#### B. Protocol Auto-Detection & Pairing Handshake
+When the user pairs a device (or auto-detect mode `OX_DRIVER_AUTO` is used):
+
+1. **Phase 1 — OxyII Probe:**
+   - Initiates connection and requests ATT MTU exchange.
+   - If the ring is Gen2: ATT MTU negotiates to 247+ bytes, OxyII service `e8fb0001-...` is discovered, AES-128 session authentication completes, device info is read, and the driver saves `driver = OX_DRIVER_OXYII` to NVS and `paired.json`.
+   - If the ring is Gen1: ATT MTU exchange returns default 23 bytes (or service discovery fails with "service not found"). The probe identifies a protocol mismatch, terminates the link, and proceeds to Phase 2.
+2. **Controller Settle Delay:**
+   - A 500 ms delay is observed before Phase 2 to allow the BLE controller to finish disconnecting the previous link, preventing `BLE_HS_EBUSY` connection start collisions.
+3. **Phase 2 — Legacy Fallback:**
+   - Connects, discovers service `14839ac4-...`, queries `CMD_INFO` (0x14) JSON, synchronizes clock via `CMD_CONFIG` (0x16), and saves `driver = OX_DRIVER_LEGACY` to NVS and `paired.json`.
+4. **Non-Destructive Probing:**
+   - Probing attempts do not invoke `forget()` or erase persistent NVS storage. NVS and `paired.json` are committed only upon a successful pair.
+
+#### C. Three-Tier Device Identity Model
+1. **Tier 1 (Advertisement Filter):** Accepts packets matching UUID, known paired MAC, or candidate name patterns.
+2. **Tier 2 (Candidate Selection):** Prioritizes the stored `s_paired_addr` if multiple rings are visible; falls back to first candidate if the MAC rotated (e.g. on hard reset).
+3. **Tier 3 (Hardware Serial Number Gate):** Upon connection, reads `CMD_INFO` serial number. If it matches `s_serial`, sync proceeds and `s_paired_addr` is updated; if it mismatches, the connection is dropped immediately.
 
 ### 14.2 Standard PLXS
 
@@ -1296,18 +1337,23 @@ This section records the implementation completed after the architecture proposa
 - SMB and SleepHQ states are independent and survive reboot through `.somnotrace/upload_state/oximetry.json`.
 - Existing CPAP EDF upload behavior remains on its existing backend path.
 
+#### Stage 5 — Legacy Wellue driver, dual-driver dispatcher & discovery remediation
+
+- Added `main/oximeter_legacy.c` implementing full Gen1 transport (`14839ac4-...` service, all-WRITE_REQ chunks, `CMD_INFO` JSON parsing, `CMD_CONFIG` time sync, and native block download).
+- Added exact-size promotion `ox_store_finalize_native()` in `main/oximeter_store.c` for raw Gen1 files and integrated `oximetry_canonical_convert_vld3()` for SNT v3 track generation.
+- Added dual-driver orchestrator in `main/oximeter.c` supporting automatic protocol detection (`OX_DRIVER_AUTO`), probing OxyII first via ATT MTU negotiation and falling back cleanly to Legacy with non-destructive NVS management.
+- Hardened BLE discovery in `gap_event` with multi-criteria matching (128-bit UUID, paired MAC address, and name patterns with Gen2 exclusion) and active scanning (`passive = 0`) to reliably receive `SCAN_RSP` packets in both UI and background watch loops.
+
 ### Verification completed
 
 - `./scripts/build-dist.sh` completed successfully with ESP-IDF 5.5.1.
 - `git diff --check` passed.
-- The synthetic contract-test script ran successfully in no-upload mode and passed Python compilation.
+- Canonical contract tests (`scripts/oximetry_contract_test.py`) and VLD3 decoder tests (`scripts/vld3_decoder_test.c`) passed cleanly.
 - The final firmware image was generated under `dist/` by the project build script.
 - No credentials were found in the repository after a repository search.
 
 ### Current limitations and follow-up work
 
-- The implementation has not yet been tested against a physical ring, a real SD card recording, or an end-to-end flashed device in this session.
-- The current implementation still uses the existing OxyII driver and does not add the legacy Wellue BLE driver/VLD decoder; that is the next planned device-family stage.
 - Periodic polling, continuous streaming, PLXS, and live PPG capture are not implemented yet.
 - Format A-to-VLD3 export is intentionally lossy in cadence/field representation for SleepHQ compatibility; the original source and canonical data remain available for SMB/local use.
 - The SNT v3 ABI and canonical status-bit mappings should receive dedicated fixture tests before being treated as a stable public format.

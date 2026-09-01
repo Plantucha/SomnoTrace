@@ -36,6 +36,7 @@
 #include "upload_sched.h"
 #include "log_stream.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -371,6 +372,18 @@ static int wait_op(int timeout_ms)
     return s_op_status;
 }
 
+static bool name_is_oxyii(const char *name)
+{
+    if (!name || !name[0]) return false;
+    char up[32];
+    int i;
+    for (i = 0; i < 31 && name[i]; i++)
+        up[i] = toupper((unsigned char)name[i]);
+    up[i] = '\0';
+    return strncmp(up, "S8-AW", 5) == 0 ||
+           strncmp(up, "SHQO2PRO", 8) == 0;
+}
+
 static void addr_to_str(const ble_addr_t *a, char *out, size_t outsz)
 {
     snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -498,14 +511,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (cid == MFG_RECORDING)
             return 0;
 
-        /* Match Gen2 rings purely by the OxyII manufacturer ID (0xF34E)
-         * in advertisement data.  The OxyII service UUID (e8fb0001-...)
-         * is NOT advertised — it's only in the GATT database.  The ring
-         * advertises the generic Heart Rate Service (0000180d-...) which
-         * is not unique.  Manufacturer ID is the reliable advertisement-
-         * level signal (confirmed by nglessner/o2ring-s-protocol and our
-         * own adv_deep.py measurements). */
-        bool match = (cid == MFG_OXYII);
+        /* Match Gen2 rings by:
+         * 1. Manufacturer ID 0xF34E (OxyII sync/idle advertisement)
+         * 2. Known paired MAC address match (non-recording)
+         * 3. Gen2 device name pattern (non-recording) */
+        bool match = (cid == MFG_OXYII) ||
+                     (name_is_oxyii(name) && cid != MFG_RECORDING) ||
+                     (s_paired && s_paired_addr[0] != '\0' && strcmp(addr_str, s_paired_addr) == 0 && cid != MFG_RECORDING);
         if (!match) return 0;
         if (name[0] == '\0')
             strlcpy(name, "O2Ring", sizeof(name));
@@ -1316,7 +1328,7 @@ static esp_err_t do_scan(int timeout_sec)
         .window = 48,  /* 30 ms  — low duty; pairing scan uses 96/96 */
         .filter_policy = 0,
         .limited = 0,
-        .passive = 1,  /* watch is listen-only; no scan requests */
+        .passive = 0,  /* Active scan: requests SCAN_RSP for complete name */
     };
 
     uint8_t own_addr_type;

@@ -37,6 +37,7 @@
 #include "upload_sched.h"
 #include "log_stream.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -309,6 +310,31 @@ static bool adv_has_legacy_service_uuid(const uint8_t *raw, int raw_len)
     return false;
 }
 
+static bool name_is_legacy(const char *name)
+{
+    if (!name || !name[0]) return false;
+    char up[32];
+    int i;
+    for (i = 0; i < 31 && name[i]; i++)
+        up[i] = toupper((unsigned char)name[i]);
+    up[i] = '\0';
+
+    /* Explicitly exclude Gen2 OxyII names */
+    if (strncmp(up, "S8-AW", 5) == 0 ||
+        strncmp(up, "SHQO2PRO", 8) == 0 ||
+        strncmp(up, "T8520", 5) == 0)
+        return false;
+
+    if (strstr(up, "O2") != NULL ||
+        strstr(up, "CMRING") != NULL ||
+        strstr(up, "KIDSO2") != NULL ||
+        strstr(up, "CHECKME") != NULL ||
+        strstr(up, "SLEEPU") != NULL)
+        return true;
+
+    return false;
+}
+
 static void addr_to_str(const ble_addr_t *a, char *out, size_t outsz)
 {
     snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -427,6 +453,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                     int nl = ad_data_len < 31 ? ad_data_len : 31;
                     memcpy(name, ad_data, nl);
                     name[nl] = '\0';
+                } else if (ad_type == 0xFF && ad_data_len >= 2) {
+                    f.mfg_data = ad_data;
+                    f.mfg_data_len = ad_data_len;
                 }
                 off += 1 + ad_len;
             }
@@ -438,13 +467,21 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
         }
 
-        /* Match Gen1 rings purely by the legacy service UUID in advertisement
-         * data (14839ac4-...).  This is more reliable than name matching:
-         * ecostech/viatom-ble confirms "some rings drop the name from ads
-         * after being connected once, but the service UUID stays."  It also
-         * avoids false positives: Gen2 names like "SHQO2Pro" contain "O2"
-         * and would match the old name-based fallback. */
-        bool is_legacy = adv_has_legacy_service_uuid(raw, raw_len);
+        uint16_t cid = 0;
+        if (f.mfg_data && f.mfg_data_len >= 2)
+            cid = f.mfg_data[0] | (f.mfg_data[1] << 8);
+
+        /* Explicitly exclude Gen2 OxyII sync advertisements (0xF34E) */
+        if (cid == 0xF34E)
+            return 0;
+
+        /* Match Gen1 rings using multi-criteria matching:
+         * 1. 128-bit Legacy Service UUID in advertisement data (14839ac4-...)
+         * 2. Known paired MAC address match (resilient across name/UUID variations)
+         * 3. Gen1 device name pattern (with Gen2 name/mfg exclusions) */
+        bool is_legacy = adv_has_legacy_service_uuid(raw, raw_len) ||
+                         (s_paired && s_paired_addr[0] != '\0' && strcmp(addr_str, s_paired_addr) == 0) ||
+                         name_is_legacy(name);
         if (!is_legacy) return 0;
         if (name[0] == '\0')
             strlcpy(name, "O2Ring", sizeof(name));
@@ -1252,7 +1289,7 @@ static esp_err_t do_scan(int timeout_sec)
         .window = 48,
         .filter_policy = 0,
         .limited = 0,
-        .passive = 1,
+        .passive = 0,  /* Active scan: requests SCAN_RSP for complete UUID/name */
     };
 
     uint8_t own_addr_type;
