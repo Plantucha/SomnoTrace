@@ -57,7 +57,7 @@
 
 #define LCD_H_RES           240
 #define LCD_V_RES           240
-#define LCD_PIXEL_CLOCK_HZ  (40 * 1000 * 1000)  /* ST7789 write timing: keep well within spec; 80 MHz caused overnight GRAM freeze */
+#define LCD_PIXEL_CLOCK_HZ  (26666667)  /* 26.66 MHz (80 MHz APB / 3): safe ST7789 write timing margin while sustaining 25 Hz flushes */
 #define LCD_SPI_HOST        SPI2_HOST
 #define LCD_CMD_BITS        8
 #define LCD_PARAM_BITS      8
@@ -307,6 +307,14 @@ static bool IRAM_ATTR lcd_color_done_cb(esp_lcd_panel_io_handle_t io,
 static void lcd_panel_hw_recover(void)
 {
     if (!s_panel) return;
+
+    /* Wait briefly for any in-flight SPI DMA transactions to finish before
+     * toggling the hardware reset pin, then drain the completion semaphore. */
+    vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_flush_done) {
+        while (xSemaphoreTake(s_flush_done, 0) == pdTRUE) { }
+    }
+
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
     esp_lcd_panel_invert_color(s_panel, LCD_INVERT_COLOR);
