@@ -196,10 +196,10 @@ static void oxyii_auth_payload(uint8_t *out16)
         key[i] = LEPUCLOUD_MD5[i * 2];
     /* key[8..11] = "0000" (default serial prefix) */
     memcpy(key + 8, "0000", 4);
-    /* key[12..15] = (ts >> 0), (ts >> 1), (ts >> 2), (ts >> 3) — not LE bytes */
+    /* key[12..15] = little-endian uint32 Unix timestamp (now >> (i * 8)) */
     time_t now = time(NULL);
     for (int i = 0; i < 4; i++)
-        key[12 + i] = (now >> i) & 0xFF;
+        key[12 + i] = (now >> (i * 8)) & 0xFF;
     /* auth = key XOR LEPUCLOUD_MD5 */
     for (int i = 0; i < 16; i++)
         out16[i] = key[i] ^ LEPUCLOUD_MD5[i];
