@@ -298,6 +298,7 @@ static char s_ble_name[40];      /* BLE advertised name (e.g. "SHQO2Pro 0897") *
 static char s_paired_addr[18];
 static bool s_paired = false;
 static bool s_presence_served = false;
+static bool s_synced_this_idle = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
 static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
@@ -1306,6 +1307,7 @@ static void pair_task(void *arg)
     strlcpy(s_paired_addr, addr_str, sizeof(s_paired_addr));
     s_paired = true;
     s_presence_served = false;
+    s_synced_this_idle = false;
     s_pull_fail_count = 0;
     s_connect_fail_count = 0;
 
@@ -1472,6 +1474,7 @@ static void pull_task(void *arg)
             s_ring_present = false;
             if (s_presence_served)
                 s_presence_served = false;
+            s_synced_this_idle = false;
             s_f1_fail_count = 0;
             s_pull_fail_count = 0;
             s_connect_fail_count = 0;
@@ -1550,6 +1553,15 @@ static void pull_task(void *arg)
             while (s_probe_mode == OX_PROBE_PERSISTENT && !pulled) {
                 int off = oxyii_off_finger();
                 if (off == 1) {
+                    if (s_synced_this_idle) {
+                        ESP_LOGI(TAG, "watch: ring off-finger / charging (already synced) — standby");
+                        do_disconnect();
+                        s_presence_served = true;
+                        s_served_at = xTaskGetTickCount();
+                        pulled = true;
+                        break;
+                    }
+
                     /* Off-finger: upgrade to full session for pull. */
                     ESP_LOGI(TAG, "watch: off-finger detected — upgrading to full session");
                     /* MTU exchange now for file-transfer throughput. */
@@ -1604,6 +1616,7 @@ static void pull_task(void *arg)
 
                     if (pull_ok) {
                         s_presence_served = true;
+                        s_synced_this_idle = true;
                         s_served_at = xTaskGetTickCount();
                         s_pull_fail_count = 0;
                         ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
@@ -1625,6 +1638,7 @@ static void pull_task(void *arg)
                     pulled = true;
                 } else if (off == 0) {
                     /* On-finger: hold connection, wait before next poll. */
+                    s_synced_this_idle = false;
                     set_state(OX_STATUS_MONITORING);
                     vTaskDelay(pdMS_TO_TICKS(OX_PERSISTENT_POLL_MS));
                     /* Connection may have dropped during the delay. */
@@ -1697,12 +1711,23 @@ static void pull_task(void *arg)
          * finish countdown and sleep. Do not mark served. */
         int off = oxyii_off_finger();
         if (off != 1) {
+            s_synced_this_idle = false;
             ESP_LOGI(TAG, "watch: not off-finger (live_b=%d) — disconnect, retry in %ds",
                      off, OX_WORN_PROBE_MS / 1000);
             do_disconnect();
             set_state(OX_STATUS_PAIRED);
             xSemaphoreGive(s_ops_mtx);
             vTaskDelay(pdMS_TO_TICKS(OX_WORN_PROBE_MS));
+            continue;
+        }
+
+        if (s_synced_this_idle) {
+            ESP_LOGI(TAG, "watch: ring off-finger / charging (already synced) — standby");
+            do_disconnect();
+            s_presence_served = true;
+            s_served_at = xTaskGetTickCount();
+            set_state(OX_STATUS_PAIRED);
+            xSemaphoreGive(s_ops_mtx);
             continue;
         }
 
@@ -1718,6 +1743,7 @@ static void pull_task(void *arg)
         do_disconnect();
         if (pull_ok) {
             s_presence_served = true;
+            s_synced_this_idle = true;
             s_served_at = xTaskGetTickCount();
             s_pull_fail_count = 0;
             ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
@@ -1873,6 +1899,7 @@ static void oxyii_forget(void)
 {
     s_paired = false;
     s_presence_served = false;
+    s_synced_this_idle = false;
     s_pull_fail_count = 0;
     s_connect_fail_count = 0;
     s_serial[0] = '\0';

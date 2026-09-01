@@ -222,6 +222,7 @@ static char s_ble_name[40];      /* BLE advertised name or constructed display n
 static char s_paired_addr[18];
 static bool s_paired = false;
 static bool s_presence_served = false;
+static bool s_synced_this_idle = false;
 static bool s_ring_present = false;
 static TickType_t s_served_at;
 static int s_pull_fail_count = 0;   /* consecutive failed pulls in this presence */
@@ -1267,6 +1268,7 @@ static void pair_task(void *arg)
     strlcpy(s_paired_addr, addr_str, sizeof(s_paired_addr));
     s_paired = true;
     s_presence_served = false;
+    s_synced_this_idle = false;
     s_pull_fail_count = 0;
     s_connect_fail_count = 0;
 
@@ -1421,6 +1423,7 @@ static void pull_task(void *arg)
             s_ring_present = false;
             if (s_presence_served)
                 s_presence_served = false;
+            s_synced_this_idle = false;
             s_pull_fail_count = 0;
             s_connect_fail_count = 0;
             xSemaphoreGive(s_ops_mtx);
@@ -1495,6 +1498,16 @@ static void pull_task(void *arg)
          * inconsistent across reference projects, so we skip the
          * worn-state check entirely. */
 
+        if (s_synced_this_idle) {
+            ESP_LOGI(TAG, "watch: ring off-finger / charging (already synced) — standby");
+            do_disconnect();
+            s_presence_served = true;
+            s_served_at = xTaskGetTickCount();
+            set_state(OX_STATUS_PAIRED);
+            xSemaphoreGive(s_ops_mtx);
+            continue;
+        }
+
         /* Give the ring time to flush the recording */
         vTaskDelay(pdMS_TO_TICKS(3000));
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
@@ -1520,6 +1533,7 @@ static void pull_task(void *arg)
 
         if (pull_ok) {
             s_presence_served = true;
+            s_synced_this_idle = true;
             s_served_at = xTaskGetTickCount();
             s_pull_fail_count = 0;
             ESP_LOGI(TAG, "sync window served — no reconnect; ring powers off on its own");
@@ -1671,6 +1685,7 @@ static void legacy_forget(void)
 {
     s_paired = false;
     s_presence_served = false;
+    s_synced_this_idle = false;
     s_pull_fail_count = 0;
     s_connect_fail_count = 0;
     s_serial[0] = '\0';
