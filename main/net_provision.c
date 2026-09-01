@@ -2904,7 +2904,6 @@ static esp_err_t actions_handler(httpd_req_t *req)
             cJSON_Delete(root);
             return send_busy(req, "therapy recording in progress");
         }
-        if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
         xSemaphoreTake(s_format_mtx, portMAX_DELAY);
         if (s_format_progress.active) {
             xSemaphoreGive(s_format_mtx);
@@ -2962,6 +2961,9 @@ static esp_err_t start_webserver(void)
     /* Periodic upload scans yield to a live therapy recording; event-driven
      * uploads still run, since they matter more than a housekeeping scan. */
     upload_sched_set_busy_fn(sd_storage_recording_active);
+    /* Guards s_format_progress between format_sd_task and the progress handler.
+     * Created here so it exists before any request can reach the handler. */
+    if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
