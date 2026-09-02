@@ -169,7 +169,9 @@ static int    s_flow_head = 0;
 static int    s_flow_count = 0;
 
 /* Info panel state */
-static float    s_leak_lpm = 0.0f;     /* latest leak rate (L/min) */
+static float    s_leak_lpm = 0.0f;       /* latest leak rate (L/min) */
+static double   s_leak_sum = 0.0;        /* accumulated leak sum for session average */
+static uint32_t s_leak_count = 0;        /* count of accumulated leak samples */
 static int64_t  s_therapy_start_us = 0;  /* monotonic time of TherapyStart */
 
 /* ── Public state-mutating API (never draws; render task handles drawing) ── */
@@ -202,6 +204,8 @@ void bsp_display_set_therapy_active(bool active)
         if (active) {
             s_flow_head = 0;
             s_flow_count = 0;
+            s_leak_sum = 0.0;
+            s_leak_count = 0;
             ESP_LOGI(TAG, "therapy %s mode enabled (display_task=%s)",
                      new_mode == DISP_MODE_INFO ? "info" : "graph",
                      s_display_task ? "alive" : "NULL");
@@ -266,6 +270,8 @@ void bsp_display_push_leak(float leak_lpm)
     if (!s_state_mutex) return;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_leak_lpm = leak_lpm;
+    s_leak_sum += leak_lpm;
+    s_leak_count++;
     xSemaphoreGive(s_state_mutex);
     if (s_mode == DISP_MODE_INFO && s_display_task)
         xTaskNotifyGive(s_display_task);
@@ -276,6 +282,8 @@ void bsp_display_set_therapy_start_time(int64_t start_us)
     if (!s_state_mutex) return;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_therapy_start_us = start_us;
+    s_leak_sum = 0.0;
+    s_leak_count = 0;
     xSemaphoreGive(s_state_mutex);
 }
 
@@ -1166,65 +1174,100 @@ static void render_graph(void)
     lcd_flush();
 }
 
-/* ── Info panel: leak rate + session runtime ───────────────────────────
+/* Helper to colour-code leak values by severity */
+static inline uint16_t leak_val_color(float leak)
+{
+    if (leak < 12.0f)
+        return rgb565(50, 245, 90);    /* green - low / good seal */
+    else if (leak < 24.0f)
+        return rgb565(255, 225, 0);    /* yellow - moderate */
+    else if (leak < 36.0f)
+        return rgb565(255, 135, 0);    /* orange - high */
+    else
+        return rgb565(255, 60, 60);     /* red - excessive / large leak */
+}
+
+/* ── Info panel: leak rates (CUR | AVG) + session runtime ─────────────
  *
- * Top half:  "Leak rate (L/min)" header in roboto_body, then the current
- *             value in roboto_title rendered at 2× scale (~66px tall),
- *             colour-coded by severity:
- *               green  < 12 L/min   (low / good seal)
- *               yellow < 24 L/min   (moderate)
- *               orange < 36 L/min   (high)
- *               red    ≥ 36 L/min   (excessive — large leak)
- * Bottom half: "Session runtime" header in roboto_body, then elapsed
- *               time "H:MM" in roboto_title at 2× scale, measured from
- *               TherapyStart (not MaskOn).
+ * Top half:   Single header line: "CUR" (left accent), "Leak (L/min)" (center gray), "AVG" (right accent)
+ *             Left column: Current leak in roboto_title 2× scale (~66px tall)
+ *             Right column: Session average leak in roboto_title 2× scale (~66px tall)
+ *             Vertical divider line at x = 120.
+ * Bottom half: "Session runtime" header in roboto_body (slate gray),
+ *              then elapsed time "H:MM" in roboto_title at 2× scale (~66px tall).
  */
 static void render_info(void)
 {
     if (!s_panel || !s_fb) return;
 
     float leak_lpm;
+    double leak_sum;
+    uint32_t leak_count;
     int64_t start_us;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     leak_lpm = s_leak_lpm;
+    leak_sum = s_leak_sum;
+    leak_count = s_leak_count;
     start_us = s_therapy_start_us;
     xSemaphoreGive(s_state_mutex);
 
-    const uint16_t bg       = rgb565(9, 11, 18);
-    const uint16_t hdr_col  = rgb565(122, 134, 158);
-    const uint16_t div_col  = rgb565(28, 32, 46);
+    const uint16_t bg        = rgb565(9, 11, 18);
+    const uint16_t hdr_col   = rgb565(122, 134, 158);
+    const uint16_t label_col = rgb565(100, 190, 240);  /* cyan accent for CUR & AVG */
+    const uint16_t div_col   = rgb565(28, 32, 46);
 
     fb_clear(bg);
 
-    /* ── Top half: Leak rate ─────────────────────────────────────────── */
-    const char *leak_hdr = "Leak rate (L/min)";
+    /* ── Top half: Header line ───────────────────────────────────────── */
+    /* "CUR" label above left column */
+    int cur_lbl_w = str_width_aa(&roboto_body, "CUR");
+    int cur_lbl_x = 58 - cur_lbl_w / 2;
+    if (cur_lbl_x < 4) cur_lbl_x = 4;
+    fb_draw_string_aa(cur_lbl_x, 10, &roboto_body, "CUR", label_col);
+
+    /* "Leak (L/min)" title in center */
+    const char *leak_hdr = "Leak (L/min)";
     int hdr_w = str_width_aa(&roboto_body, leak_hdr);
     int hdr_x = (LCD_H_RES - hdr_w) / 2;
     if (hdr_x < 4) hdr_x = 4;
-    fb_draw_string_aa(hdr_x, 12, &roboto_body, leak_hdr, hdr_col);
+    fb_draw_string_aa(hdr_x, 10, &roboto_body, leak_hdr, hdr_col);
 
-    /* Colour-code the leak value */
-    uint16_t val_col;
-    if (leak_lpm < 12.0f)
-        val_col = rgb565(80, 220, 100);    /* green */
-    else if (leak_lpm < 24.0f)
-        val_col = rgb565(255, 220, 0);     /* yellow */
-    else if (leak_lpm < 36.0f)
-        val_col = rgb565(255, 140, 0);     /* orange */
+    /* "AVG" label above right column */
+    int avg_lbl_w = str_width_aa(&roboto_body, "AVG");
+    int avg_lbl_x = 182 - avg_lbl_w / 2;
+    if (avg_lbl_x < 124) avg_lbl_x = 124;
+    fb_draw_string_aa(avg_lbl_x, 10, &roboto_body, "AVG", label_col);
+
+    /* ── Top half: Values (roboto_title 2× scaled, ~66px tall) ───────── */
+    /* Current leak */
+    char cur_str[16];
+    if (leak_lpm < 100.0f)
+        snprintf(cur_str, sizeof(cur_str), "%.1f", leak_lpm);
     else
-        val_col = rgb565(255, 60, 60);     /* red */
+        snprintf(cur_str, sizeof(cur_str), "%.0f", leak_lpm);
 
-    char val_str[16];
-    snprintf(val_str, sizeof(val_str), "%.1f", leak_lpm);
+    int cur_w = str_width_aa_2x(&roboto_title, cur_str);
+    int cur_x = 58 - cur_w / 2;
+    if (cur_x < 4) cur_x = 4;
+    fb_draw_string_aa_2x(cur_x, 42, &roboto_title, cur_str, leak_val_color(leak_lpm));
 
-    /* Render the value 2× scaled (~66px tall), centred horizontally,
-     * vertically positioned in the top half between header and mid-line. */
-    int val_w = str_width_aa_2x(&roboto_title, val_str);
-    int val_x = (LCD_H_RES - val_w) / 2;
-    if (val_x < 4) val_x = 4;
-    int val_y = 44;
-    fb_draw_string_aa_2x(val_x, val_y, &roboto_title, val_str, val_col);
+    /* Average leak */
+    float avg_lpm = (leak_count > 0) ? (float)(leak_sum / leak_count) : leak_lpm;
+    char avg_str[16];
+    if (avg_lpm < 100.0f)
+        snprintf(avg_str, sizeof(avg_str), "%.1f", avg_lpm);
+    else
+        snprintf(avg_str, sizeof(avg_str), "%.0f", avg_lpm);
+
+    int avg_w = str_width_aa_2x(&roboto_title, avg_str);
+    int avg_x = 182 - avg_w / 2;
+    if (avg_x < 124) avg_x = 124;
+    fb_draw_string_aa_2x(avg_x, 42, &roboto_title, avg_str, leak_val_color(avg_lpm));
+
+    /* Vertical divider tick between CUR and AVG columns */
+    for (int y = 36; y < 104; y++)
+        s_fb[y * LCD_H_RES + 120] = div_col;
 
     /* ── Divider line ────────────────────────────────────────────────── */
     int mid_y = LCD_V_RES / 2;
@@ -1236,7 +1279,7 @@ static void render_info(void)
     int rt_hdr_w = str_width_aa(&roboto_body, rt_hdr);
     int rt_hdr_x = (LCD_H_RES - rt_hdr_w) / 2;
     if (rt_hdr_x < 4) rt_hdr_x = 4;
-    fb_draw_string_aa(rt_hdr_x, mid_y + 12, &roboto_body, rt_hdr, hdr_col);
+    fb_draw_string_aa(rt_hdr_x, mid_y + 10, &roboto_body, rt_hdr, hdr_col);
 
     /* Calculate elapsed time from TherapyStart (monotonic) */
     int hours = 0, mins = 0;
@@ -1254,8 +1297,7 @@ static void render_info(void)
     int rt_w = str_width_aa_2x(&roboto_title, rt_str);
     int rt_x = (LCD_H_RES - rt_w) / 2;
     if (rt_x < 4) rt_x = 4;
-    int rt_y = mid_y + 44;
-    fb_draw_string_aa_2x(rt_x, rt_y, &roboto_title, rt_str,
+    fb_draw_string_aa_2x(rt_x, mid_y + 42, &roboto_title, rt_str,
                          rgb565(200, 210, 225));
 
     lcd_flush();
