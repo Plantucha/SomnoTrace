@@ -821,13 +821,22 @@ static void shq_session_end(void)
 
 static upload_result_t shq_day_begin(const char *day)
 {
-    if (!s_tls) return UPLOAD_ERR_TRANSIENT;
+    if (!s_tls) {
+        if (shq_session_begin() != UPLOAD_OK)
+            return UPLOAD_ERR_TRANSIENT;
+    }
     s_import_id[0] = '\0';
     s_day_files = 0;
 
     if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), false) != ESP_OK) {
-        ESP_LOGE(TAG, "import creation failed for day %s", day);
-        return UPLOAD_ERR_TRANSIENT;
+        /* TLS connection may have been closed by remote server. Try reconnecting once. */
+        ESP_LOGW(TAG, "import creation failed on existing TLS connection, reconnecting...");
+        shq_session_end();
+        if (shq_session_begin() != UPLOAD_OK ||
+            shq_create_import(s_tls, s_import_id, sizeof(s_import_id), false) != ESP_OK) {
+            ESP_LOGE(TAG, "import creation failed for day %s", day);
+            return UPLOAD_ERR_TRANSIENT;
+        }
     }
     ESP_LOGI(TAG, "day %s -> import %s", day, s_import_id);
     return UPLOAD_OK;
@@ -835,12 +844,21 @@ static upload_result_t shq_day_begin(const char *day)
 
 static upload_result_t shq_ox_day_begin(const char *day)
 {
-    if (!s_tls) return UPLOAD_ERR_TRANSIENT;
+    if (!s_tls) {
+        if (shq_session_begin() != UPLOAD_OK)
+            return UPLOAD_ERR_TRANSIENT;
+    }
     s_import_id[0] = '\0';
     s_day_files = 0;
     if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), true) != ESP_OK) {
-        ESP_LOGE(TAG, "O2 import creation failed for day %s", day);
-        return UPLOAD_ERR_TRANSIENT;
+        /* TLS connection may have been closed by remote server. Try reconnecting once. */
+        ESP_LOGW(TAG, "O2 import creation failed on existing TLS connection, reconnecting...");
+        shq_session_end();
+        if (shq_session_begin() != UPLOAD_OK ||
+            shq_create_import(s_tls, s_import_id, sizeof(s_import_id), true) != ESP_OK) {
+            ESP_LOGE(TAG, "O2 import creation failed for day %s", day);
+            return UPLOAD_ERR_TRANSIENT;
+        }
     }
     ESP_LOGI(TAG, "O2 day %s -> import %s", day, s_import_id);
     return UPLOAD_OK;
@@ -926,7 +944,8 @@ static upload_result_t shq_day_end(const char *day, bool any_uploaded)
     if (err == ESP_OK) err = shq_wait_import(s_tls, s_import_id);
     s_import_id[0] = '\0';
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "import processing failed for day %s", day);
+        ESP_LOGW(TAG, "import processing failed for day %s, resetting TLS connection", day);
+        shq_session_end();
         return UPLOAD_ERR_TRANSIENT;
     }
     ESP_LOGI(TAG, "day %s uploaded (%d file(s))", day, s_day_files);
