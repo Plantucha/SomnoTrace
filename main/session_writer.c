@@ -323,11 +323,18 @@ static TaskHandle_t      s_storage_task = NULL;
 static TaskHandle_t      s_post_task = NULL;
 static bool              s_ready = false;
 
-/* Set on TherapyStop, cleared on TherapyStart.  RAM-only, so it is false
+/* Set on TherapyStop/Cooldown, cleared on TherapyStart.  RAM-only, so it is false
  * after any reset — which is what arms mid-therapy auto-start.  The stale
  * watchdog deliberately does NOT set it (that would block auto-start on
  * reconnect). */
 static bool s_therapy_stopped = false;
+
+/* Non-therapy mode flags: Mask Fit and Cooldown/Drying mode blow air but
+ * are NOT therapy sessions.  These flags suppress the mid-therapy flow-detection
+ * auto-start so non-therapeutic airflow is never logged as therapy (issue #149). */
+static bool s_in_mask_fit = false;
+static bool s_in_cooldown = false;
+static bool s_started_from_event = false;
 
 /* TherapyStart de-duplication: an echoed start must not rotate a healthy
  * session, but a genuine one must (a missed TherapyStop otherwise glues
@@ -1804,19 +1811,28 @@ static void write_event(session_writer_t *s, const cJSON *msg)
 
 /* ── Notification parsing ─────────────────────────────────────────── */
 
-/* Check an EventNotification for therapy start/stop events. */
-static bool check_event_notification(const cJSON *msg, bool *out_start,
-                                     bool *out_stop, const char **out_report)
+/* Event types recognized in check_event_notification */
+typedef enum {
+    AS11_EV_NONE = 0,
+    AS11_EV_THERAPY_START,
+    AS11_EV_THERAPY_STOP,
+    AS11_EV_MASK_FIT_START,
+    AS11_EV_MASK_FIT_STOP,
+    AS11_EV_COOLDOWN_START,
+    AS11_EV_COOLDOWN_STOP,
+    AS11_EV_STANDBY_START,
+} as11_event_t;
+
+/* Check an EventNotification for therapy start/stop and lifecycle events. */
+static as11_event_t check_event_notification(const cJSON *msg, const char **out_report)
 {
-    *out_start = false;
-    *out_stop = false;
     if (out_report) *out_report = NULL;
 
     cJSON *params = cJSON_GetObjectItem(msg, "params");
-    if (!params) return false;
+    if (!params) return AS11_EV_NONE;
 
     cJSON *events = cJSON_GetObjectItem(params, "events");
-    if (!events || !cJSON_IsArray(events)) return false;
+    if (!events || !cJSON_IsArray(events)) return AS11_EV_NONE;
 
     int n = cJSON_GetArraySize(events);
     for (int i = 0; i < n; i++) {
@@ -1824,17 +1840,37 @@ static bool check_event_notification(const cJSON *msg, bool *out_start,
         if (!ev) continue;
         cJSON *event = cJSON_GetObjectItem(ev, "event");
         if (!event || !cJSON_IsString(event)) continue;
+        const char *name = event->valuestring;
 
-        if (strcmp(event->valuestring, "TherapyStart") == 0) {
-            *out_start = true;
+        if (strcmp(name, "TherapyStart") == 0) {
             cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
             if (out_report && rt && cJSON_IsString(rt))
                 *out_report = rt->valuestring;
-        } else if (strcmp(event->valuestring, "TherapyStop") == 0) {
-            *out_stop = true;
+            return AS11_EV_THERAPY_START;
+        }
+        if (strcmp(name, "TherapyStop") == 0) {
+            return AS11_EV_THERAPY_STOP;
+        }
+        if (strcmp(name, "MaskFitStart") == 0 ||
+            strcmp(name, "MaskfitStarted") == 0 ||
+            strcmp(name, "LearnTargetsStart") == 0) {
+            return AS11_EV_MASK_FIT_START;
+        }
+        if (strcmp(name, "MaskFitStop") == 0 ||
+            strcmp(name, "LearnTargetsStop") == 0) {
+            return AS11_EV_MASK_FIT_STOP;
+        }
+        if (strcmp(name, "CooldownStarted") == 0) {
+            return AS11_EV_COOLDOWN_START;
+        }
+        if (strcmp(name, "CooldownStopped") == 0) {
+            return AS11_EV_COOLDOWN_STOP;
+        }
+        if (strcmp(name, "StandbyStarted") == 0) {
+            return AS11_EV_STANDBY_START;
         }
     }
-    return *out_start || *out_stop;
+    return AS11_EV_NONE;
 }
 
 /* ── Fast-path StreamData parser (bypasses cJSON) ─────────────────── */
@@ -2049,14 +2085,19 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     }
 
     /* Edge case: auto-start session if flow and pressure indicate active
-     * therapy (reboot mid-therapy, or ESP powered on after the AS11). */
+     * therapy (reboot mid-therapy, or ESP powered on after the AS11).
+     * Gated against Mask Fit and Cooldown/Drying mode so non-therapeutic
+     * blower air never opens a phantom therapy session (issue #149). */
     if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped
+        && !s_in_mask_fit && !s_in_cooldown
         && has_active_flow && has_therapy_pressure) {
         ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
         bsp_display_set_therapy_active(true);
         bsp_display_set_therapy_start_time(esp_timer_get_time());
         s = session_writer_start();
-        if (!s) {
+        if (s) {
+            s_started_from_event = false;
+        } else {
             ESP_LOGW(TAG, "session_writer_start() failed — "
                      "graph active but NOT recording to SD");
         }
@@ -2248,14 +2289,14 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
     ESP_LOGD(TAG, "notification: %s", method_str);
 
     if (strcmp(method_str, "EventNotification") == 0) {
-        bool start = false, stop = false;
         const char *report = NULL;
-        check_event_notification(msg, &start, &stop, &report);
+        as11_event_t ev_type = check_event_notification(msg, &report);
 
-        if (stop) {
+        if (ev_type == AS11_EV_THERAPY_STOP) {
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
             crash_diag_note_activity("therapy_stop");
             s_therapy_stopped = true;
+            s_in_mask_fit = false;
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
             if (s && s->active) {
@@ -2264,11 +2305,14 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                                     (int64_t)time(NULL) * 1000, true);
                 s = NULL;
             }
+            return;
         }
-        if (start) {
+        if (ev_type == AS11_EV_THERAPY_START) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
             crash_diag_note_activity("therapy_start");
             s_therapy_stopped = false;
+            s_in_mask_fit = false;
+            s_in_cooldown = false;
             therapy_alert_on_therapy_start();
             bsp_display_set_therapy_active(true);
             bsp_display_set_therapy_start_time(esp_timer_get_time());
@@ -2303,13 +2347,72 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                 s = session_writer_start();
             }
             if (s) {
+                s_started_from_event = true;
                 write_event(s, msg);
             } else {
                 ESP_LOGW(TAG, "session_writer_start() failed — "
                          "graph active but NOT recording to SD");
             }
+            return;
         }
-        if (start || stop) return;
+        if (ev_type == AS11_EV_MASK_FIT_START) {
+            ESP_LOGI(TAG, ">>> MASK FIT / DIAGNOSTIC START detected (suppressing therapy)");
+            s_in_mask_fit = true;
+            bsp_display_set_therapy_active(false);
+            /* If a session was started by flow heuristic within the last 15 seconds
+             * before the MaskFit event arrived, abort the false session. */
+            if (s && s->active && !s_started_from_event) {
+                int64_t dur_ms = (esp_timer_get_time() - s->start_time_us) / 1000;
+                if (dur_ms < 15000) {
+                    ESP_LOGW(TAG, "aborting false session opened by Mask Fit airflow (%lld ms)",
+                             (long long)dur_ms);
+                    sw_request_finalize(s, "aborted_mask_fit",
+                                        (int64_t)time(NULL) * 1000, false);
+                    s = NULL;
+                }
+            }
+            return;
+        }
+        if (ev_type == AS11_EV_MASK_FIT_STOP) {
+            ESP_LOGI(TAG, ">>> MASK FIT / DIAGNOSTIC STOP detected");
+            s_in_mask_fit = false;
+            return;
+        }
+        if (ev_type == AS11_EV_COOLDOWN_START) {
+            ESP_LOGI(TAG, ">>> COOLDOWN (tube drying) STARTED");
+            s_in_cooldown = true;
+            s_therapy_stopped = true;
+            bsp_display_set_therapy_active(false);
+            therapy_alert_on_therapy_stop();
+            if (s && s->active) {
+                ESP_LOGI(TAG, "finalizing therapy session on CooldownStarted");
+                write_event(s, msg);
+                sw_request_finalize(s, "completed",
+                                    (int64_t)time(NULL) * 1000, true);
+                s = NULL;
+            }
+            return;
+        }
+        if (ev_type == AS11_EV_COOLDOWN_STOP) {
+            ESP_LOGI(TAG, ">>> COOLDOWN (tube drying) STOPPED");
+            s_in_cooldown = false;
+            return;
+        }
+        if (ev_type == AS11_EV_STANDBY_START) {
+            ESP_LOGD(TAG, ">>> STANDBY STARTED");
+            if (s && s->active) {
+                ESP_LOGI(TAG, "finalizing therapy session on StandbyStarted");
+                s_therapy_stopped = true;
+                bsp_display_set_therapy_active(false);
+                therapy_alert_on_therapy_stop();
+                write_event(s, msg);
+                sw_request_finalize(s, "completed",
+                                    (int64_t)time(NULL) * 1000, true);
+                s = NULL;
+            }
+            return;
+        }
+        if (ev_type != AS11_EV_NONE) return;
 
         cJSON *params = cJSON_GetObjectItem(msg, "params");
         if (params) {
