@@ -22,6 +22,8 @@
  * (https://github.com/ilyakruchinin)." See the NOTICE file for details.
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include "as11_time.h"
 
 #include <stdio.h>
@@ -111,7 +113,9 @@ void as11_time_set_offset(as11_offset_t offset_s, const char *src)
         ESP_LOGI(TAG, "AS11 UTC offset %s%02d:%02d (from %s)",
                  mins < 0 ? "-" : "+", abs(mins) / 60, abs(mins) % 60,
                  src ? src : "?");
+        (void)mins;
     }
+    (void)src;
     s_offset_s = offset_s;
     s_have_offset = true;
 }
