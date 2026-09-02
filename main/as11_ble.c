@@ -2759,8 +2759,17 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     if (xSemaphoreTake(coll.sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
         ESP_LOGE(TAG, "spool: fragment collection timeout (%d frags received)",
                  coll.frag_count);
-        vSemaphoreDelete(coll.sem);
+        /* Detach first: a SpoolFragment notification arriving late must not
+         * append to a collector that is being torn down. */
         s_spool_collector = NULL;
+        vSemaphoreDelete(coll.sem);
+        /* Fragments already received were malloc'd by the notification
+         * handler.  The success and out-of-memory paths free them; this one
+         * did not, leaking up to SPOOL_MAX_FRAGS x maxFragmentSize per
+         * timed-out round. */
+        for (int i = 0; i < coll.frag_count; i++) {
+            free(coll.frags[i].data);
+        }
         /* Clear any stale RPC response state so subsequent RPCs
          * don't pick up a leftover response from the timed-out pull. */
         clear_response();
