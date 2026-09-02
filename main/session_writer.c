@@ -2230,8 +2230,8 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     if (--s->sa2_countdown == 0) {
         s->sa2_countdown = 5;
         if (b->n_sa2 < SA2_CAP) {
-            b->sa2_hr[b->n_sa2] = hr_found ? hr_val : -1;
-            b->sa2_spo2[b->n_sa2] = spo2_found ? spo2_val : -1;
+            b->sa2_hr[b->n_sa2] = hr_found ? hr_val : SNT_MISSING;
+            b->sa2_spo2[b->n_sa2] = spo2_found ? spo2_val : SNT_MISSING;
             b->n_sa2++;
         } else {
             s->sa2_dropped++;
@@ -2254,7 +2254,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         if (any_found) {
             if (b->n_pld < PLD_CAP) {
                 for (int k = 0; k < 12; k++)
-                    b->pld[b->n_pld][k] = pld_found[k] ? pld_vals[k] : -1;
+                    b->pld[b->n_pld][k] = pld_found[k] ? pld_vals[k] : SNT_MISSING;
                 b->n_pld++;
                 for (int k = 0; k < 12; k++)
                     s->last_pld[k] = b->pld[b->n_pld - 1][k];
