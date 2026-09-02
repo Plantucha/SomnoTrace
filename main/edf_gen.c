@@ -2654,7 +2654,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
             if (records[k].period_start_as11 == period_start) { dup = true; break; }
         }
         if (dup) {
-            ESP_LOGI(TAG, "STR.edf: %s duplicates an already-parsed period "
+            ESP_LOGD(TAG, "STR.edf: %s duplicates an already-parsed period "
                      "(day %s) — skipping", nm, as11_day_label);
             continue;
         }
@@ -2709,7 +2709,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
         rec->period_start_as11 = period_start;  /* raw AS11 for day labelling */
         n_records++;
 
-        ESP_LOGI(TAG, "STR.edf: parsed %s (PeriodStart=%lld, drift=%lld, Duration=%d)",
+        ESP_LOGD(TAG, "STR.edf: parsed %s (PeriodStart=%lld, drift=%lld, Duration=%d)",
                  nm, (long long)period_start, (long long)record_drift_ms,
                  rec->values[4]);
     }

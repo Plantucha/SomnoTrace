@@ -164,7 +164,7 @@ static esp_err_t write_bin_atomic(const char *path, const uint8_t *data, size_t 
         remove(tmp_path);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)len);
+    ESP_LOGD(TAG, "wrote %s (%u bytes)", path, (unsigned)len);
     return ESP_OK;
 }
 
