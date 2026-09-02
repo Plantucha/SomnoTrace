@@ -957,11 +957,17 @@ static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
     while (true) {
         TickType_t now = xTaskGetTickCount();
         if ((int32_t)(deadline - now) <= 0) {
-            ESP_LOGE(TAG, "response timeout op=0x%02x", op);
+            if (op == OP_AUTH)
+                ESP_LOGD(TAG, "response timeout op=0x%02x (auth probe)", op);
+            else
+                ESP_LOGE(TAG, "response timeout op=0x%02x", op);
             return ESP_ERR_TIMEOUT;
         }
         if (xSemaphoreTake(s_resp_sem, deadline - now) != pdTRUE) {
-            ESP_LOGE(TAG, "response timeout op=0x%02x", op);
+            if (op == OP_AUTH)
+                ESP_LOGD(TAG, "response timeout op=0x%02x (auth probe)", op);
+            else
+                ESP_LOGE(TAG, "response timeout op=0x%02x", op);
             return ESP_ERR_TIMEOUT;
         }
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
