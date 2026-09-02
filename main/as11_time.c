@@ -42,6 +42,7 @@ static const char *TAG = "as11_time";
                                          * treated as a noon stamp */
 
 static bool          s_have_offset = false;
+static bool          s_offset_from_settings = false;
 static as11_offset_t s_offset_s = 0;
 
 /* ── Calendar helpers ─────────────────────────────────────────────────
@@ -152,6 +153,7 @@ bool as11_time_offset_from_settings(const cJSON *settings, as11_offset_t *out)
     as11_offset_t v = sign * (hh * 3600 + mm * 60);
     if (v < OFFSET_MIN_S || v > OFFSET_MAX_S) return false;
 
+    s_offset_from_settings = true;
     as11_time_set_offset(v, "settings");
     if (out) *out = v;
     return true;
@@ -167,14 +169,16 @@ bool as11_time_offset_from_period_start(int64_t period_start_ms,
     int64_t raw = 43200 - tod;                      /* noon - time-of-day */
 
     /* +13:00 noon and -11:00 noon land on the same UTC time-of-day, so pick
-     * whichever candidate sits closest to the ESP's own offset.  The two are
-     * in practice identical or a few hours apart, never 24 h. */
-    as11_offset_t esp = esp_utc_offset((time_t)secs);
+     * whichever candidate sits closest to the anchor offset (stored settings
+     * offset if known, otherwise the ESP's own offset). */
+    as11_offset_t anchor = (s_have_offset && s_offset_from_settings)
+                           ? s_offset_s
+                           : esp_utc_offset((time_t)secs);
     int64_t best = raw;
-    int64_t best_d = llabs(raw - esp);
+    int64_t best_d = llabs(raw - anchor);
     for (int k = -1; k <= 1; k += 2) {
         int64_t cand = raw + (int64_t)k * 86400;
-        int64_t dist = llabs(cand - esp);
+        int64_t dist = llabs(cand - anchor);
         if (dist < best_d) { best = cand; best_d = dist; }
     }
     if (best < OFFSET_MIN_S || best > OFFSET_MAX_S) return false;
@@ -192,27 +196,14 @@ bool as11_time_offset_from_period_start(int64_t period_start_ms,
     }
     if (snapped < OFFSET_MIN_S || snapped > OFFSET_MAX_S) return false;
 
-    as11_time_set_offset((as11_offset_t)snapped, "period_start");
+    if (!s_offset_from_settings) {
+        as11_time_set_offset((as11_offset_t)snapped, "period_start");
+    }
     if (out) *out = (as11_offset_t)snapped;
     return true;
 }
 
 /* ── Day labelling ────────────────────────────────────────────────── */
-
-/* Legacy behaviour: noon-day in ESP local time.  Used only when the AS11
- * offset is unknown. */
-static void noon_day_esp_local(int64_t epoch_ms, char *out, size_t out_len)
-{
-    time_t t = (time_t)floor_div(epoch_ms, 1000);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    if (tm.tm_hour < 12) {
-        t -= 86400;
-        localtime_r(&t, &tm);
-    }
-    snprintf(out, out_len, "%04d%02d%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-}
 
 static void noon_day_with_offset(int64_t as11_epoch_ms, as11_offset_t off,
                                  char *out, size_t out_len)
@@ -224,6 +215,14 @@ static void noon_day_with_offset(int64_t as11_epoch_ms, as11_offset_t off,
     int y, m, d;
     civil_from_days(days, &y, &m, &d);
     snprintf(out, out_len, "%04d%02d%02d", y, m, d);
+}
+
+/* Fallback behaviour: noon-day in ESP local time.  Used only when the AS11
+ * offset is unknown. */
+static void noon_day_esp_local(int64_t epoch_ms, char *out, size_t out_len)
+{
+    time_t t = (time_t)floor_div(epoch_ms, 1000);
+    noon_day_with_offset(epoch_ms, esp_utc_offset(t), out, out_len);
 }
 
 void as11_time_noon_day(int64_t as11_epoch_ms, char *out, size_t out_len)
