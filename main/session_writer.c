@@ -1556,17 +1556,25 @@ static void sw_post_task(void *arg)
          * at the exact moment a session needs exporting. */
         esp_err_t ret = edf_gen_generate(session_dir, session_id,
                                         start_epoch_ms, end_epoch_ms, drift_ms);
-        if (ret == ESP_OK) {
-            char day_folder[32];
+        char day_folder[32];
+        {
             time_t t = (time_t)(start_epoch_ms / 1000);
             struct tm tm;
             localtime_r(&t, &tm);
             if (tm.tm_hour < 12) { t -= 86400; localtime_r(&t, &tm); }
             snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        }
+        if (ret == ESP_OK) {
             uploader_on_export_complete(day_folder);
         } else {
-            ESP_LOGW(TAG, "post: EDF generation failed, not triggering upload");
+            /* Most often the export lease was held by a long upload run
+             * (edf_gen_generate gives up after 120 s).  Leave a pending-export
+             * marker so the idle worker rebuilds the day later instead of the
+             * session silently never being exported. */
+            ESP_LOGW(TAG, "post: EDF generation failed (%s), marking day %s "
+                     "for deferred export", esp_err_to_name(ret), day_folder);
+            pending_export_mark(day_folder);
         }
 
         UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
