@@ -1209,6 +1209,7 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
 
 /* Forward declarations — defined in Section 9. */
 static cJSON *read_json_file(const char *path);
+static esp_err_t write_json_file(const char *path, const cJSON *json);
 static uint8_t *read_bin_file(const char *path, size_t *out_len);
 /* Forward declaration — defined in Section 10. */
 static void noon_day_folder(int64_t epoch_ms, char *out, size_t out_len);
@@ -2575,11 +2576,14 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
      * the newest 30 names would let those duplicates crowd out genuinely
      * older days; selecting by distinct period keeps the window honest while
      * the stale names age out. */
-    #define STR_MAX_DAYS  30
+    #define STR_MAX_DAYS  365
 
-    str_day_record_t *records = calloc(31, sizeof(str_day_record_t));
-    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
-    edf_signal_def_t *str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
+    str_day_record_t *records = heap_caps_calloc(STR_MAX_DAYS + 1, sizeof(str_day_record_t), MALLOC_CAP_SPIRAM);
+    if (!records) records = calloc(STR_MAX_DAYS + 1, sizeof(str_day_record_t));
+    summary_ctx_t *ctx = heap_caps_calloc(1, sizeof(summary_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) ctx = calloc(1, sizeof(summary_ctx_t));
+    edf_signal_def_t *str_sigs = heap_caps_calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t), MALLOC_CAP_SPIRAM);
+    if (!str_sigs) str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
     if (!records || !ctx || !str_sigs) {
         ESP_LOGE(TAG, "STR.edf: malloc failed");
         free(records); free(ctx); free(str_sigs);
@@ -2661,7 +2665,46 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
                                                 clock_drift_ms);
         build_str_mask_events(ctx, rec->values, rec->mask_on_extra,
                               rec->mask_off_extra, period_start, record_drift_ms);
-        build_str_data_values(ctx, rec->values, settings_json);
+
+        /* Resolve settings for this specific day:
+         * 1. Check SD_SUMMARIES_DIR/<day>.settings.json.
+         * 2. Check SD_STREAMS_DIR/<day>/ settings files (and backfill).
+         * 3. Fallback to settings_json passed in (current session). */
+        cJSON *day_settings = NULL;
+        char sum_settings_path[300];
+        snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.settings.json",
+                 SD_SUMMARIES_DIR, as11_day_label);
+        day_settings = read_json_file(sum_settings_path);
+        if (!day_settings) {
+            char stream_day_dir[300];
+            snprintf(stream_day_dir, sizeof(stream_day_dir), "%s/%s",
+                     SD_STREAMS_DIR, as11_day_label);
+            DIR *sdd = opendir(stream_day_dir);
+            if (sdd) {
+                struct dirent *se;
+                while ((se = readdir(sdd)) != NULL) {
+                    size_t sel = strlen(se->d_name);
+                    if (sel > 14 && strcmp(se->d_name + sel - 14, "_settings.json") == 0) {
+                        char stream_set_path[600];
+                        snprintf(stream_set_path, sizeof(stream_set_path), "%s/%s",
+                                 stream_day_dir, se->d_name);
+                        day_settings = read_json_file(stream_set_path);
+                        if (day_settings) {
+                            write_json_file(sum_settings_path, day_settings);
+                            break;
+                        }
+                    }
+                }
+                closedir(sdd);
+            }
+        }
+
+        const cJSON *settings_to_use = day_settings ? day_settings : settings_json;
+        build_str_data_values(ctx, rec->values, settings_to_use);
+        if (day_settings) {
+            cJSON_Delete(day_settings);
+        }
+
         rec->period_start = period_start + record_drift_ms;
         rec->period_start_as11 = period_start;  /* raw AS11 for day labelling */
         n_records++;
@@ -2699,7 +2742,7 @@ static esp_err_t generate_str_edf(const char *sdcard_dir,
     }
     ESP_LOGI(TAG, "STR.edf: current_day_found=%d n_records=%d",
              current_day_found, n_records);
-    if (!current_day_found && n_records < 31) {
+    if (!current_day_found && n_records < STR_MAX_DAYS + 1) {
         ESP_LOGI(TAG, "STR.edf: synthesizing current day record (day=%s)",
                  current_day_label);
         build_current_day_record(&records[n_records], session_dir,
@@ -3479,6 +3522,23 @@ static cJSON *read_json_file(const char *path)
     cJSON *json = cJSON_Parse(buf);
     free(buf);
     return json;
+}
+
+/* Write a cJSON object to file. */
+static esp_err_t write_json_file(const char *path, const cJSON *json)
+{
+    char *str = cJSON_Print(json);
+    if (!str) return ESP_FAIL;
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        free(str);
+        return ESP_FAIL;
+    }
+    fputs(str, f);
+    fputc('\n', f);
+    fclose(f);
+    free(str);
+    return ESP_OK;
 }
 
 /* Read a binary file into a malloc'd buffer. */

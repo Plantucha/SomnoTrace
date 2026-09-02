@@ -378,6 +378,17 @@ static esp_err_t collect_settings(const char *dir, const char *prefix)
     char path[330];
     snprintf(path, sizeof(path), "%s/%s_settings.json", dir, prefix);
     write_json_file(path, settings);
+
+    /* Also save to summaries directory for fast O(1) STR.edf lookup */
+    const char *slash = strrchr(dir, '/');
+    const char *day_label = slash ? slash + 1 : dir;
+    if (day_label && strlen(day_label) == 8) {
+        char sum_settings_path[300];
+        snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.settings.json",
+                 SD_SUMMARIES_DIR, day_label);
+        write_json_file(sum_settings_path, settings);
+    }
+
     cJSON_Delete(settings);
     return ESP_OK;
 }
