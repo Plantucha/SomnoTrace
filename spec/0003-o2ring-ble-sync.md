@@ -201,9 +201,15 @@ Connect sequence (clean-room; match behaviour, do not paste POC):
 4. `0xFF` AUTH — 16-byte payload:
    `XOR(derive_session_key("0000", unix_ts), MD5("lepucloud"))`.
    Key layout: bytes 0–7 = even bytes of that MD5; 8–11 = ASCII
-   `"0000"`; 12–15 = `(ts>>0)&0xFF … (ts>>3)&0xFF` (not `>>8,16,24`).
-   No reply.
-5. `0x10` payload `00`.
+   `"0000"` (or device serial if known); 12–15 = little-endian uint32 timestamp `(ts>>(i*8))&0xFF`.
+   - On older firmware (`2D010002` / `2D010003`): no reply. Wait ~600ms timeout
+     and proceed in plaintext mode via step 5 (`0x10`).
+   - On newer firmware (`1.13.1.0` / BranchCode `2D010001`): ring replies with
+     a 20-byte payload. Decrypt via `XOR(payload, MD5("lepucloud"))`. Bytes 4..19
+     contain the 16-byte AES session key. Ring transitions to AES-128-ECB
+     (PKCS7-padded) encryption for subsequent command request/response payloads.
+     Step 5 (`0x10`) is skipped.
+5. `0x10` payload `00` (legacy plaintext rings only).
 6. `0xC0` SET_UTC_TIME: year LE16, mon, day, hour, min, sec, `0x00`.
    Send **local** wall clock. Ring stores fields verbatim; new
    filenames use that clock. Do not rewrite existing files.

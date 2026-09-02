@@ -94,14 +94,15 @@ copyrightable material is ever determined to have been incorporated.
 - **Project:** LepuBle / LepuDemo (Viatom official BLE SDKs)
 - **Source:** https://github.com/viatom-develop/LepuBle ,
   https://github.com/viatom-develop/LepuDemo
-- **Referenced for:** confirming GATT UUIDs, the set of devices sharing the
-  Gen1 protocol family, and the incompatibility of O2Ring S (which uses the
-  Gen2 OxyII protocol).
+- **Referenced for:** confirming GATT UUIDs, device protocol compatibility,
+  and understanding the OxyII (Gen2) AES-128 session key negotiation and
+  payload encryption mechanism.
 - **License:** Proprietary (vendor SDKs of unclear licence terms)
 - **Notes:** Clean-room reference only.  No source code was copied, adapted,
-  or included in SomnoTrace.  Only protocol facts (UUIDs, device compatibility
-  table) were used.  Listed here for transparency; this listing is not a
-  licence obligation.
+  or included in SomnoTrace.  Only protocol facts (command opcodes, XOR key
+  derivation, AES-128-ECB payload handling) were used to inform SomnoTrace's
+  independent C implementation.  Listed here for transparency; this listing is
+  not a licence obligation.
 
 ## Roboto Font
 

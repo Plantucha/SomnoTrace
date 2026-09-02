@@ -44,6 +44,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <mbedtls/aes.h>
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -186,6 +187,74 @@ static int oxyii_try_decode(const uint8_t *buf, int len,
     return total;
 }
 
+/* Forward declaration for auth payload derivation */
+static char s_serial[32];
+
+/* AES-128 session encryption state (OxyII Gen2 newer fw) */
+static bool s_encrypted = false;
+static uint8_t s_session_key[16];
+static mbedtls_aes_context s_aes_enc;
+static mbedtls_aes_context s_aes_dec;
+
+static void oxyii_crypto_reset(void)
+{
+    if (s_encrypted) {
+        mbedtls_aes_free(&s_aes_enc);
+        mbedtls_aes_free(&s_aes_dec);
+        s_encrypted = false;
+    }
+    memset(s_session_key, 0, sizeof(s_session_key));
+}
+
+/* Encrypt payload using AES-128-ECB with PKCS7 padding into out.
+ * out_cap must be at least ((in_len / 16) + 1) * 16.
+ * Returns padded ciphertext length on success, or -1 on error. */
+static int oxyii_aes_encrypt(const uint8_t *in, int in_len,
+                             uint8_t *out, int out_cap)
+{
+    if (!s_encrypted) return -1;
+    int pad = 16 - (in_len % 16);
+    int padded_len = in_len + pad;
+    if (padded_len > out_cap) return -1;
+
+    uint8_t block[16];
+    for (int off = 0; off < padded_len; off += 16) {
+        for (int i = 0; i < 16; i++) {
+            int src_idx = off + i;
+            if (src_idx < in_len)
+                block[i] = in[src_idx];
+            else
+                block[i] = (uint8_t)pad;
+        }
+        mbedtls_aes_crypt_ecb(&s_aes_enc, MBEDTLS_AES_ENCRYPT, block, out + off);
+    }
+    return padded_len;
+}
+
+/* Decrypt payload in-place using AES-128-ECB with PKCS7 unpadding.
+ * in_out buffer contains ciphertext of length in_len (multiple of 16).
+ * Decrypts in-place block-by-block and validates PKCS7 padding.
+ * Returns unpadded plaintext length on success, or -1 on error. */
+static int oxyii_aes_decrypt_inplace(uint8_t *in_out, int in_len)
+{
+    if (!s_encrypted || in_len <= 0 || (in_len % 16) != 0)
+        return -1;
+
+    for (int off = 0; off < in_len; off += 16) {
+        mbedtls_aes_crypt_ecb(&s_aes_dec, MBEDTLS_AES_DECRYPT,
+                              in_out + off, in_out + off);
+    }
+
+    uint8_t pad = in_out[in_len - 1];
+    if (pad < 1 || pad > 16 || pad > in_len)
+        return -1;
+    for (int i = 0; i < pad; i++) {
+        if (in_out[in_len - 1 - i] != pad)
+            return -1;
+    }
+    return in_len - pad;
+}
+
 /* ── Auth payload ──────────────────────────────────────────────────── */
 /* Derive session key and XOR with LEPUCLOUD_MD5 to produce auth payload. */
 static void oxyii_auth_payload(uint8_t *out16)
@@ -194,8 +263,12 @@ static void oxyii_auth_payload(uint8_t *out16)
     /* key[0..7] = LEPUCLOUD_MD5 even-indexed bytes */
     for (int i = 0; i < 8; i++)
         key[i] = LEPUCLOUD_MD5[i * 2];
-    /* key[8..11] = "0000" (default serial prefix) */
-    memcpy(key + 8, "0000", 4);
+    /* key[8..11] = first 4 chars of device SN if known, else "0000" */
+    if (s_serial[0] >= '0' && s_serial[0] <= '9' && strlen(s_serial) >= 4) {
+        memcpy(key + 8, s_serial, 4);
+    } else {
+        memcpy(key + 8, "0000", 4);
+    }
     /* key[12..15] = little-endian uint32 Unix timestamp (now >> (i * 8)) */
     time_t now = time(NULL);
     for (int i = 0; i < 4; i++)
@@ -291,7 +364,6 @@ static char s_status[24] = OX_STATUS_IDLE;
 static char s_error[128];
 
 /* Paired ring info (loaded from NVS at init) */
-static char s_serial[32];
 static char s_firmware[16];
 static char s_name_prefix[16];
 static char s_ble_name[40];      /* BLE advertised name (e.g. "SHQO2Pro 0897") */
@@ -359,6 +431,7 @@ static void set_error(const char *fmt, ...)
     strlcpy(s_status, OX_STATUS_ERROR, sizeof(s_status));
     xSemaphoreGive(s_state_mtx);
     va_end(ap);
+    ESP_LOGE(TAG, "error: %s", s_error);
 }
 
 static void clear_op_sem(void)
@@ -387,8 +460,14 @@ static bool name_is_oxyii(const char *name)
 
 static void addr_to_str(const ble_addr_t *a, char *out, size_t outsz)
 {
-    snprintf(out, outsz, "%02x:%02x:%02x:%02x:%02x:%02x",
-             a->val[5], a->val[4], a->val[3], a->val[2], a->val[1], a->val[0]);
+    static const char hex[] = "0123456789abcdef";
+    if (!a || !out || outsz < 18) return;
+    for (int i = 5, p = 0; i >= 0; i--) {
+        out[p++] = hex[(a->val[i] >> 4) & 0x0F];
+        out[p++] = hex[a->val[i] & 0x0F];
+        if (i > 0) out[p++] = ':';
+        else       out[p]   = '\0';
+    }
 }
 
 static bool parse_addr(const char *str, ble_addr_t *out)
@@ -440,6 +519,17 @@ static void handle_notify_rx(const uint8_t *data, int len)
         s_resp_opcode = op;
         s_resp_payload_len = plen;
         s_resp_len = 0;
+
+        /* Decrypt payload in-place if session encryption is active and opcode is encrypted */
+        if (s_encrypted && op != OP_AUTH && plen > 0 && (plen % 16) == 0) {
+            int plain_len = oxyii_aes_decrypt_inplace(s_resp_payload, plen);
+            if (plain_len >= 0) {
+                s_resp_payload_len = plain_len;
+            } else {
+                ESP_LOGW(TAG, "response decrypt failed op=0x%02x (len=%d)", op, plen);
+            }
+        }
+
         xSemaphoreGive(s_resp_sem);
     } else if (rc == -2) {
         ESP_LOGW(TAG, "notify decode error, resetting buffer");
@@ -453,9 +543,10 @@ static void handle_notify_rx(const uint8_t *data, int len)
 static const char *hci_err_str(int reason)
 {
     switch (reason & 0xFF) {
-    case 0x08: return "Conn Already Exists";
+    case 0x08: return "Connection Timeout";
+    case 0x0B: return "Conn Already Exists";
     case 0x13: return "Remote User Terminated";
-    case 0x16: return "Supervision Timeout";
+    case 0x16: return "Terminated by Local Host";
     case 0x22: return "LMP Response Timeout";
     case 0x28: return "Instant Passed";
     case 0x3B: return "Unacceptable Connection Parameters";
@@ -565,6 +656,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                  event->disconnect.reason & 0xFF,
                  hci_err_str(event->disconnect.reason));
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        oxyii_crypto_reset();
         /* Unblock any waiting request */
         xSemaphoreGive(s_resp_sem);
         xSemaphoreGive(s_conn_sem);
@@ -818,15 +910,31 @@ static void do_disconnect(void)
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         xSemaphoreTake(s_conn_sem, pdMS_TO_TICKS(3000));
     }
+    oxyii_crypto_reset();
 }
 
 /* ── Protocol request/response ─────────────────────────────────────── */
 static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
                                 bool expect_reply, int timeout_ms)
 {
+    uint8_t enc_buf[OXYII_MAX_FRAME];
+    const uint8_t *tx_payload = payload;
+    int tx_plen = plen;
+
+    if (s_encrypted && op != OP_AUTH) {
+        int enc_len = oxyii_aes_encrypt(payload ? payload : (const uint8_t *)"",
+                                        plen, enc_buf, sizeof(enc_buf));
+        if (enc_len < 0) {
+            ESP_LOGE(TAG, "payload encrypt failed op=0x%02x", op);
+            return ESP_FAIL;
+        }
+        tx_payload = enc_buf;
+        tx_plen = enc_len;
+    }
+
     uint8_t frame[OXYII_MAX_FRAME];
     int flen = oxyii_encode(frame, sizeof(frame), op, 0, s_seq++,
-                             payload, plen);
+                             tx_payload, tx_plen);
     if (flen < 0) return ESP_FAIL;
 
     if (expect_reply) {
@@ -871,15 +979,46 @@ static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
 static esp_err_t oxyii_session_open(void)
 {
     s_seq = 0;
+    oxyii_crypto_reset();
+
     uint8_t auth[16];
     oxyii_auth_payload(auth);
-    if (oxyii_request(OP_AUTH, auth, 16, false, 0) != ESP_OK)
-        return ESP_FAIL;
-    vTaskDelay(pdMS_TO_TICKS(200));
 
-    uint8_t setup = 0x00;
-    if (oxyii_request(OP_SETUP, &setup, 1, true, 5000) != ESP_OK)
-        return ESP_FAIL;
+    /* Step 1: send OP_AUTH.
+     * On newer firmware (1.13.1.0 / 2D010001), the ring replies with a 20-byte
+     * payload containing the AES-128 session key XOR-encrypted with LEPUCLOUD_MD5.
+     * On older firmware (2D010002 / 2D010003), the ring never replies to OP_AUTH.
+     * The vendor SDK waits with a 1000 ms timer; if no reply, we fall back to plaintext. */
+    esp_err_t rc = oxyii_request(OP_AUTH, auth, 16, true, 1000);
+    if (rc == ESP_OK && s_resp_payload_len >= 20) {
+        uint8_t dec[20];
+        for (int i = 0; i < 20; i++)
+            dec[i] = s_resp_payload[i] ^ LEPUCLOUD_MD5[i % 16];
+        /* dec[0] = type (0x01 AES), dec[1] = key_len (16), dec[4..19] = AES key */
+        if (dec[0] == 0x01 && dec[1] == 16) {
+            memcpy(s_session_key, dec + 4, 16);
+            mbedtls_aes_init(&s_aes_enc);
+            mbedtls_aes_init(&s_aes_dec);
+            mbedtls_aes_setkey_enc(&s_aes_enc, s_session_key, 128);
+            mbedtls_aes_setkey_dec(&s_aes_dec, s_session_key, 128);
+            s_encrypted = true;
+            ESP_LOGI(TAG, "auth: session key negotiated (AES-128-ECB enabled)");
+        } else {
+            ESP_LOGW(TAG, "auth: unexpected key format (type=0x%02x, len=%d, payload_len=%d)",
+                     dec[0], dec[1], s_resp_payload_len);
+        }
+    } else if (rc == ESP_OK) {
+        ESP_LOGW(TAG, "auth: OP_AUTH response too short (%d bytes, want >= 20)",
+                 s_resp_payload_len);
+    }
+
+    if (!s_encrypted) {
+        ESP_LOGI(TAG, "auth: no OP_AUTH reply — proceeding in plaintext mode (Gen2 legacy)");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        uint8_t setup = 0x00;
+        if (oxyii_request(OP_SETUP, &setup, 1, true, 5000) != ESP_OK)
+            return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -917,7 +1056,11 @@ static esp_err_t oxyii_get_info(char *serial, size_t serial_sz,
      *   bytes 9..16: firmware (8 chars, null-padded)
      *   byte 37: serial length
      *   bytes 38..: serial string */
-    if (s_resp_payload_len < 38) return ESP_FAIL;
+    if (s_resp_payload_len < 38) {
+        ESP_LOGW(TAG, "get_info: response payload too short (%d bytes, want >= 38, enc=%d)",
+                 s_resp_payload_len, s_encrypted);
+        return ESP_FAIL;
+    }
 
     if (firmware && fw_sz > 0) {
         int fl = s_resp_payload_len - 9 < 8 ? s_resp_payload_len - 9 : 8;
@@ -931,14 +1074,19 @@ static esp_err_t oxyii_get_info(char *serial, size_t serial_sz,
 
     if (serial && serial_sz > 0) {
         int slen = s_resp_payload[37];
+        if (slen > 18) slen = 18;
         if (slen > 0 && 38 + slen <= s_resp_payload_len) {
             int n = slen < (int)serial_sz - 1 ? slen : (int)serial_sz - 1;
             memcpy(serial, s_resp_payload + 38, n);
             serial[n] = '\0';
+            while (n > 0 && ((unsigned char)serial[n - 1] <= ' ' || serial[n - 1] == 0))
+                serial[--n] = '\0';
         } else {
             serial[0] = '\0';
         }
     }
+    ESP_LOGI(TAG, "device info: serial='%s' fw='%s' (encrypted=%d)",
+             serial ? serial : "", firmware ? firmware : "", s_encrypted);
     return ESP_OK;
 }
 
@@ -990,9 +1138,14 @@ static int oxyii_get_file_list(char names[][17], int max_count)
             return -1;
     }
 
-    if (s_resp_payload_len < 1) return -1;
+    if (s_resp_payload_len < 1) {
+        ESP_LOGW(TAG, "file list: empty response payload (len=%d, enc=%d)",
+                 s_resp_payload_len, s_encrypted);
+        return -1;
+    }
     int count = s_resp_payload[0];
     if (count > max_count) count = max_count;
+    ESP_LOGI(TAG, "file list: %d files on ring (enc=%d)", count, s_encrypted);
 
     int pos = 1;
     for (int i = 0; i < count; i++) {
@@ -1179,6 +1332,24 @@ static void load_paired_from_nvs(void)
         nvs_get_str(h, "ble_name", s_ble_name, &len);
         len = sizeof(s_paired_addr);
         nvs_get_str(h, "last_addr", s_paired_addr, &len);
+
+        /* Validate loaded serial format: if corrupted from pre-AES firmware, clear */
+        size_t slen = strlen(s_serial);
+        bool valid = (slen >= 4);
+        for (size_t i = 0; i < slen; i++) {
+            if ((unsigned char)s_serial[i] < 0x20 || (unsigned char)s_serial[i] > 0x7E) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            ESP_LOGW(TAG, "invalid or corrupted serial in NVS ('%s') — clearing paired state", s_serial);
+            s_paired = false;
+            s_serial[0] = '\0';
+        } else {
+            ESP_LOGI(TAG, "paired ring loaded: serial='%s' name='%s' addr='%s'",
+                     s_serial, s_ble_name, s_paired_addr);
+        }
     } else {
         s_serial[0] = '\0';
     }
