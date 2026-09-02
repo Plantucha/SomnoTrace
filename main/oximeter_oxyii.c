@@ -1264,6 +1264,32 @@ static void pair_task(void *arg)
         return;
     }
 
+    /* Validate serial format: must be at least 4 chars and printable ASCII */
+    size_t slen = strlen(serial);
+    bool valid_serial = (slen >= 4);
+    for (size_t i = 0; i < slen; i++) {
+        if ((unsigned char)serial[i] < 0x20 || (unsigned char)serial[i] > 0x7E) {
+            valid_serial = false;
+            break;
+        }
+    }
+    if (!valid_serial) {
+        set_error("invalid serial format");
+        do_disconnect();
+        free(pa);
+        xSemaphoreGive(s_ops_mtx);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Sanitize firmware string */
+    for (int i = 0; firmware[i] != '\0'; i++) {
+        if ((unsigned char)firmware[i] < 0x20 || (unsigned char)firmware[i] > 0x7E) {
+            firmware[i] = '\0';
+            break;
+        }
+    }
+
     /* Derive name_prefix from serial (first 4 chars) */
     char prefix[5];
     memcpy(prefix, serial, 4);
