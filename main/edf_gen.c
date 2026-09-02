@@ -33,11 +33,23 @@
 #include <time.h>
 #include <errno.h>
 #include <unistd.h>
+#include <math.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
+
+/* Settings are written at 50 digits per unit (see spec/0002-edf-export.md
+ * §4.3.4).  Round rather than truncate: therapy pressure moves in 0.2 cmH2O
+ * steps, so every settings pressure the AS11 writes is an exact multiple of
+ * ten digits -- 4.6 cmH2O is 230.  (int16_t)(4.6 * 50) yields 229, which is
+ * off that grid and one LSB low. */
+static inline int16_t settings_x50(double v)
+{
+    return (int16_t)lrint(v * 50.0);
+}
+
 
 static const char *TAG = "edf_gen";
 
@@ -1577,25 +1589,25 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             cJSON *v;
             if (cpap) {
                 if ((v = cJSON_GetObjectItem(cpap, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[6] = (int16_t)(v->valuedouble * 50);
+                    str_values[6] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(cpap, "SetPressure")) && cJSON_IsNumber(v))
-                    str_values[7] = (int16_t)(v->valuedouble * 50);
+                    str_values[7] = settings_x50(v->valuedouble);
             }
             if (autoset) {
                 if ((v = cJSON_GetObjectItem(autoset, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[8] = (int16_t)(v->valuedouble * 50);
+                    str_values[8] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(autoset, "MaxPressure")) && cJSON_IsNumber(v))
-                    str_values[9] = (int16_t)(v->valuedouble * 50);
+                    str_values[9] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(autoset, "MinPressure")) && cJSON_IsNumber(v))
-                    str_values[10] = (int16_t)(v->valuedouble * 50);
+                    str_values[10] = settings_x50(v->valuedouble);
             }
             if (her) {
                 if ((v = cJSON_GetObjectItem(her, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[11] = (int16_t)(v->valuedouble * 50);
+                    str_values[11] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(her, "MaxPressure")) && cJSON_IsNumber(v))
-                    str_values[12] = (int16_t)(v->valuedouble * 50);
+                    str_values[12] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(her, "MinPressure")) && cJSON_IsNumber(v))
-                    str_values[13] = (int16_t)(v->valuedouble * 50);
+                    str_values[13] = settings_x50(v->valuedouble);
             }
 
             /* VAuto settings [14-21]: pressures cmH2O × 50, Ti × 50,
@@ -1603,17 +1615,17 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             cJSON *vauto = cJSON_GetObjectItem(tp, "VAutoProfile");
             if (vauto) {
                 if ((v = cJSON_GetObjectItem(vauto, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[14] = (int16_t)(v->valuedouble * 50);
+                    str_values[14] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "MaxInspiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[15] = (int16_t)(v->valuedouble * 50);
+                    str_values[15] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "MinExpiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[16] = (int16_t)(v->valuedouble * 50);
+                    str_values[16] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "SetPressureSupport")) && cJSON_IsNumber(v))
-                    str_values[17] = (int16_t)(v->valuedouble * 50);
+                    str_values[17] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[18] = (int16_t)(v->valuedouble * 50);
+                    str_values[18] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[19] = (int16_t)(v->valuedouble * 50);
+                    str_values[19] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "TriggerSensitivity")) && cJSON_IsNumber(v))
                     str_values[20] = (int16_t)trigger_cycle_to_edf(v->valueint);
                 if ((v = cJSON_GetObjectItem(vauto, "CycleSensitivity")) && cJSON_IsNumber(v))
@@ -1626,19 +1638,19 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             cJSON *spont = cJSON_GetObjectItem(tp, "SpontProfile");
             if (spont) {
                 if ((v = cJSON_GetObjectItem(spont, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[22] = (int16_t)(v->valuedouble * 50);
+                    str_values[22] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(spont, "TargetInspiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[23] = (int16_t)(v->valuedouble * 50);
+                    str_values[23] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(spont, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[24] = (int16_t)(v->valuedouble * 50);
+                    str_values[24] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(spont, "EasyBreatheEnable")) && cJSON_IsString(v))
                     str_values[25] = (int16_t)easy_breathe_to_edf(v->valuestring);
                 if ((v = cJSON_GetObjectItem(spont, "RespiratoryRateEnable")) && cJSON_IsString(v))
                     str_values[26] = (int16_t)resp_rate_en_to_edf(v->valuestring);
                 if ((v = cJSON_GetObjectItem(spont, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[27] = (int16_t)(v->valuedouble * 50);
+                    str_values[27] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(spont, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[28] = (int16_t)(v->valuedouble * 50);
+                    str_values[28] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(spont, "RiseTimeEnable")) && cJSON_IsString(v))
                     str_values[29] = (int16_t)on_off_to_edf(v->valuestring);
                 if ((v = cJSON_GetObjectItem(spont, "RiseTime")) && cJSON_IsNumber(v))
@@ -1654,17 +1666,17 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             cJSON *st = cJSON_GetObjectItem(tp, "STProfile");
             if (st) {
                 if ((v = cJSON_GetObjectItem(st, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[33] = (int16_t)(v->valuedouble * 50);
+                    str_values[33] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(st, "TargetInspiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[34] = (int16_t)(v->valuedouble * 50);
+                    str_values[34] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(st, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[35] = (int16_t)(v->valuedouble * 50);
+                    str_values[35] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(st, "SetRespiratoryRate")) && cJSON_IsNumber(v))
                     str_values[36] = (int16_t)(v->valuedouble * 5);
                 if ((v = cJSON_GetObjectItem(st, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[37] = (int16_t)(v->valuedouble * 50);
+                    str_values[37] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(st, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[38] = (int16_t)(v->valuedouble * 50);
+                    str_values[38] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(st, "RiseTimeEnable")) && cJSON_IsString(v))
                     str_values[39] = (int16_t)on_off_to_edf(v->valuestring);
                 if ((v = cJSON_GetObjectItem(st, "RiseTime")) && cJSON_IsNumber(v))
@@ -1680,15 +1692,15 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             cJSON *timed = cJSON_GetObjectItem(tp, "TimedProfile");
             if (timed) {
                 if ((v = cJSON_GetObjectItem(timed, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[43] = (int16_t)(v->valuedouble * 50);
+                    str_values[43] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(timed, "TargetInspiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[44] = (int16_t)(v->valuedouble * 50);
+                    str_values[44] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(timed, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[45] = (int16_t)(v->valuedouble * 50);
+                    str_values[45] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(timed, "SetRespiratoryRate")) && cJSON_IsNumber(v))
                     str_values[46] = (int16_t)(v->valuedouble * 5);
                 if ((v = cJSON_GetObjectItem(timed, "SetInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[47] = (int16_t)(v->valuedouble * 50);
+                    str_values[47] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(timed, "RiseTimeEnable")) && cJSON_IsString(v))
                     str_values[48] = (int16_t)on_off_to_edf(v->valuestring);
                 if ((v = cJSON_GetObjectItem(timed, "RiseTime")) && cJSON_IsNumber(v))
@@ -1699,28 +1711,28 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             cJSON *asv = cJSON_GetObjectItem(tp, "ASVProfile");
             if (asv) {
                 if ((v = cJSON_GetObjectItem(asv, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[50] = (int16_t)(v->valuedouble * 50);
+                    str_values[50] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(asv, "TargetExpiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[51] = (int16_t)(v->valuedouble * 50);
+                    str_values[51] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(asv, "MaxPressureSupport")) && cJSON_IsNumber(v))
-                    str_values[52] = (int16_t)(v->valuedouble * 50);
+                    str_values[52] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(asv, "MinPressureSupport")) && cJSON_IsNumber(v))
-                    str_values[53] = (int16_t)(v->valuedouble * 50);
+                    str_values[53] = settings_x50(v->valuedouble);
             }
 
             /* ASVAuto settings [54-58]: pressures cmH2O × 50 */
             cJSON *asvauto = cJSON_GetObjectItem(tp, "ASVAutoProfile");
             if (asvauto) {
                 if ((v = cJSON_GetObjectItem(asvauto, "StartPressure")) && cJSON_IsNumber(v))
-                    str_values[54] = (int16_t)(v->valuedouble * 50);
+                    str_values[54] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(asvauto, "MaxExpiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[55] = (int16_t)(v->valuedouble * 50);
+                    str_values[55] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(asvauto, "MinExpiratoryPressure")) && cJSON_IsNumber(v))
-                    str_values[56] = (int16_t)(v->valuedouble * 50);
+                    str_values[56] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(asvauto, "MaxPressureSupport")) && cJSON_IsNumber(v))
-                    str_values[57] = (int16_t)(v->valuedouble * 50);
+                    str_values[57] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(asvauto, "MinPressureSupport")) && cJSON_IsNumber(v))
-                    str_values[58] = (int16_t)(v->valuedouble * 50);
+                    str_values[58] = settings_x50(v->valuedouble);
             }
         }
 
@@ -1760,7 +1772,7 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                 v = cJSON_GetObjectItem(epr, "EprEnable");
                 if (v && cJSON_IsString(v)) str_values[63] = (int16_t)on_off_to_edf(v->valuestring);
                 v = cJSON_GetObjectItem(epr, "EprPressure");
-                if (v && cJSON_IsNumber(v)) str_values[64] = (int16_t)(v->valuedouble * 50);
+                if (v && cJSON_IsNumber(v)) str_values[64] = settings_x50(v->valuedouble);
                 v = cJSON_GetObjectItem(epr, "EprType");
                 if (v && cJSON_IsString(v)) {
                     if (strcmp(v->valuestring, "RampOnly") == 0) str_values[65] = 1;
