@@ -3095,10 +3095,16 @@ static const char *event_label_map_str(const char *ev_name, bool csl_mode)
 {
     if (!ev_name) return NULL;
     if (csl_mode) {
-        if (strcmp(ev_name, "CsrStart") == 0 || strcmp(ev_name, "CsrEnd") == 0 ||
-            strcmp(ev_name, "CSRStart") == 0 || strcmp(ev_name, "CSREnd") == 0) {
-            return "CSR";
-        }
+        /* The AS11 writes the two edges as SEPARATE labels — "CSR Start" and
+         * "CSR End", each a zero-duration marker — and a reader pairs them to
+         * recover the episode.  Returning one label for both loses that: the
+         * two annotations become indistinguishable, and the dedup below (same
+         * onset_sec + same label) then merges a genuine pair that lands in the
+         * same second. */
+        if (strcmp(ev_name, "CsrStart") == 0 || strcmp(ev_name, "CSRStart") == 0)
+            return "CSR Start";
+        if (strcmp(ev_name, "CsrEnd") == 0 || strcmp(ev_name, "CSREnd") == 0)
+            return "CSR End";
         return NULL;
     }
     if (strcmp(ev_name, "HypopneaEnd") == 0)          return "Hypopnea";
