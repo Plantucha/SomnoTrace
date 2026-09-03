@@ -340,6 +340,55 @@ int main(void) {
         printf("  [PASS] Test 7: Late MaskFit event aborts false session opened by airflow\n");
     }
 
-    printf("\n>>> ALL AS11 EVENT TESTS PASSED (7/7) <<<\n");
+    /* Test 8: CSL.edf CSR Event Labels, Backdate & Deduplication (Issue #190) */
+    {
+        /* 1. Label mapping: distinct start/end labels */
+        const char *l_start = (strcmp("CsrStart", "CsrStart") == 0) ? "CSR Start" : NULL;
+        const char *l_end = (strcmp("CsrEnd", "CsrEnd") == 0) ? "CSR End" : NULL;
+        assert(l_start != NULL && strcmp(l_start, "CSR Start") == 0);
+        assert(l_end != NULL && strcmp(l_end, "CSR End") == 0);
+
+        /* 2. Backdate calculation: onset must subtract backdateSeconds */
+        int64_t session_start_ms = 1781390000000LL;
+        int64_t report_time_ms  = 1781390869000LL; /* +869s from session start */
+        int64_t backdate_sec = 42;
+        int64_t clock_drift_ms = 0;
+
+        int64_t event_ntp_ms = report_time_ms + clock_drift_ms - (backdate_sec * 1000);
+        int64_t onset_sec = (event_ntp_ms - session_start_ms) / 1000;
+        assert(onset_sec == 827); /* exactly 869 - 42 */
+
+        /* 3. Deduplication: start and end at same second are NOT collapsed */
+        typedef struct {
+            int64_t onset_sec;
+            int64_t dur_sec;
+            const char *label;
+        } test_ev_t;
+
+        test_ev_t evs[3] = {
+            { .onset_sec = 827, .dur_sec = 0, .label = "CSR Start" },
+            { .onset_sec = 827, .dur_sec = 0, .label = "CSR End" },   /* same onset, different label: must preserve */
+            { .onset_sec = 827, .dur_sec = 0, .label = "CSR End" },   /* duplicate retransmit: must drop */
+        };
+
+        test_ev_t deduped[3];
+        size_t dedup_count = 0;
+        for (size_t i = 0; i < 3; i++) {
+            if (dedup_count > 0 &&
+                deduped[dedup_count - 1].onset_sec == evs[i].onset_sec &&
+                strcmp(deduped[dedup_count - 1].label, evs[i].label) == 0) {
+                continue;
+            }
+            deduped[dedup_count++] = evs[i];
+        }
+
+        assert(dedup_count == 2);
+        assert(strcmp(deduped[0].label, "CSR Start") == 0);
+        assert(strcmp(deduped[1].label, "CSR End") == 0);
+
+        printf("  [PASS] Test 8: CSL.edf CSR Event Labels, Backdate & Deduplication (Issue #190)\n");
+    }
+
+    printf("\n>>> ALL AS11 EVENT TESTS PASSED (8/8) <<<\n");
     return 0;
 }

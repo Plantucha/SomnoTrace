@@ -29,9 +29,11 @@ static const char *event_label_map_str(const char *ev_name, bool csl_mode)
 {
     if (!ev_name) return NULL;
     if (csl_mode) {
-        if (strcmp(ev_name, "CsrStart") == 0 || strcmp(ev_name, "CsrEnd") == 0 ||
-            strcmp(ev_name, "CSRStart") == 0 || strcmp(ev_name, "CSREnd") == 0) {
-            return "CSR";
+        if (strcmp(ev_name, "CsrStart") == 0 || strcmp(ev_name, "CSRStart") == 0) {
+            return "CSR Start";
+        }
+        if (strcmp(ev_name, "CsrEnd") == 0 || strcmp(ev_name, "CSREnd") == 0) {
+            return "CSR End";
         }
         return NULL;
     }
@@ -97,16 +99,27 @@ static esp_err_t generate_annotation_edf(const char *edf_path,
                                 int64_t as11_ts_ms = as11_time_parse_iso8601_ms(rt_j->valuestring);
                                 if (as11_ts_ms < 0) continue;
 
-                                int64_t event_ntp_ms = as11_ts_ms + clock_drift_ms;
+                                int64_t dur_sec = 0;
+                                int64_t backdate_sec = 0;
+                                if (csl_mode) {
+                                    cJSON *bd_j = cJSON_GetObjectItem(ev, "backdateSeconds");
+                                    if (bd_j && cJSON_IsNumber(bd_j)) {
+                                        backdate_sec = (int64_t)bd_j->valuedouble;
+                                        if (backdate_sec < 0) backdate_sec = 0;
+                                    }
+                                    /* CSL.edf uses zero-duration boundary markers */
+                                    dur_sec = 0;
+                                } else {
+                                    cJSON *dur_j = cJSON_GetObjectItem(ev, "durationSeconds");
+                                    if (dur_j && cJSON_IsNumber(dur_j)) {
+                                        dur_sec = dur_j->valueint;
+                                        if (dur_sec < 0) dur_sec = 0;
+                                    }
+                                }
+
+                                int64_t event_ntp_ms = as11_ts_ms + clock_drift_ms - (backdate_sec * 1000);
                                 int64_t onset_sec = (event_ntp_ms - session_start_ms) / 1000;
                                 if (onset_sec < 0) onset_sec = 0;
-
-                                int64_t dur_sec = 0;
-                                cJSON *dur_j = cJSON_GetObjectItem(ev, "durationSeconds");
-                                if (dur_j && cJSON_IsNumber(dur_j)) {
-                                    dur_sec = dur_j->valueint;
-                                    if (dur_sec < 0) dur_sec = 0;
-                                }
 
                                 if (count >= capacity) {
                                     size_t new_cap = capacity * 2;
