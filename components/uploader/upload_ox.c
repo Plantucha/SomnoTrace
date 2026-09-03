@@ -293,12 +293,51 @@ int upload_ox_scan(upload_ox_ref_t *out, int max_out)
 {
     if (!out || max_out <= 0) return 0;
     upload_ox_init();
-    DIR *root = opendir(OX_RECORDINGS_DIR); if (!root) return 0;
-    char days[64][12]; int nd = 0; struct dirent *e;
-    while ((e = readdir(root)) && nd < 64) if (valid_day(e->d_name)) strlcpy(days[nd++], e->d_name, sizeof(days[0]));
+    DIR *root = opendir(OX_RECORDINGS_DIR);
+    if (!root) return 0;
+
+    char (*days)[12] = heap_caps_calloc(UPLOAD_MAX_DAYS_CAP, sizeof(*days), MALLOC_CAP_SPIRAM);
+    if (!days) {
+        closedir(root);
+        return 0;
+    }
+
+    int nd = 0;
+    struct dirent *e;
+    while ((e = readdir(root)) != NULL) {
+        if (!valid_day(e->d_name)) continue;
+
+        if (nd < UPLOAD_MAX_DAYS_CAP) {
+            /* Insertion sort descending into days[0..nd] */
+            int j = nd - 1;
+            while (j >= 0 && strcmp(days[j], e->d_name) < 0) {
+                memcpy(days[j + 1], days[j], sizeof(days[0]));
+                j--;
+            }
+            strlcpy(days[j + 1], e->d_name, sizeof(days[0]));
+            nd++;
+        } else {
+            /* Buffer full: days[UPLOAD_MAX_DAYS_CAP - 1] is the oldest kept day.
+             * If e->d_name is older than or equal to the oldest entry, skip. */
+            if (strcmp(e->d_name, days[UPLOAD_MAX_DAYS_CAP - 1]) <= 0) {
+                continue;
+            }
+            /* Replace the oldest entry and shift up to sorted position. */
+            int j = UPLOAD_MAX_DAYS_CAP - 2;
+            while (j >= 0 && strcmp(days[j], e->d_name) < 0) {
+                memcpy(days[j + 1], days[j], sizeof(days[0]));
+                j--;
+            }
+            strlcpy(days[j + 1], e->d_name, sizeof(days[0]));
+        }
+    }
     closedir(root);
-    for (int i = 1; i < nd; i++) { char tmp[12]; memcpy(tmp, days[i], sizeof(tmp)); int j = i - 1; while (j >= 0 && strcmp(days[j], tmp) < 0) { memcpy(days[j+1], days[j], sizeof(tmp)); j--; } memcpy(days[j+1], tmp, sizeof(tmp)); }
-    int n = 0; for (int i = 0; i < nd && n < max_out; i++) n += scan_day(days[i], &out[n], max_out - n);
+
+    int n = 0;
+    for (int i = 0; i < nd && n < max_out; i++) {
+        n += scan_day(days[i], &out[n], max_out - n);
+    }
+    free(days);
     return n;
 }
 

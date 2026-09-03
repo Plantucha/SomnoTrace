@@ -276,6 +276,9 @@ static void set_state(const char *st)
 {
     xSemaphoreTake(s_state_mtx, portMAX_DELAY);
     s_state = st;
+    if (strcmp(st, AS11_STATUS_PAIRED) == 0) {
+        s_error[0] = '\0';
+    }
     xSemaphoreGive(s_state_mtx);
     bsp_display_set_as11_paired(strcmp(st, AS11_STATUS_PAIRED) == 0);
     log_stream_request_ble_push();
@@ -1800,6 +1803,139 @@ static void confirm_task(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Encrypted session handshake helper                                */
+/* ------------------------------------------------------------------ */
+static esp_err_t do_setup_encrypted_session(const char *cid_str,
+                                            const char *pair_key_hex,
+                                            bool *out_hard_fail)
+{
+    if (out_hard_fail) *out_hard_fail = false;
+
+    /* ---- Encrypted session establishment ----
+     * 1. RequestSession(clientId) -> {challenge, nonce}  [plaintext RPC]
+     * 2. response = HMAC-SHA256(K, challenge)
+     * 3. CheckSessionIntegrity(response)                  [plaintext RPC]
+     * 4. session_key = SHA256(K || nonce)
+     */
+    uint8_t K_bytes[32];
+    if (hex_to_bytes(pair_key_hex, K_bytes, sizeof(K_bytes)) != 32) {
+        ESP_LOGE(TAG, "reconnect: bad pair key");
+        set_error("bad pair key in cache");
+        if (out_hard_fail) *out_hard_fail = true;
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 1. RequestSession */
+    char *rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    if (!rpc) rpc = malloc(512);
+    if (!rpc) return ESP_ERR_NO_MEM;
+    snprintf(rpc, 512,
+             "{\"id\":10,\"jsonrpc\":\"2.0\",\"method\":\"RequestSession\","
+             "\"params\":{\"clientId\":\"%s\"}}", cid_str);
+    clear_response();
+    esp_err_t se = send_fig(FIG_VCID_TX, rpc);
+    free(rpc);
+    if (se != ESP_OK) {
+        ESP_LOGW(TAG, "reconnect: RequestSession send failed");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = wait_response(10000);
+    if (!resp) {
+        ESP_LOGW(TAG, "reconnect: RequestSession timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    cJSON *challenge_j = result ? cJSON_GetObjectItem(result, "challenge") : NULL;
+    cJSON *nonce_j = result ? cJSON_GetObjectItem(result, "nonce") : NULL;
+    if (!cJSON_IsString(challenge_j) || !cJSON_IsString(nonce_j)) {
+        ESP_LOGE(TAG, "reconnect: RequestSession missing challenge/nonce");
+        cJSON_Delete(resp);
+        set_error("bad RequestSession response");
+        if (out_hard_fail) *out_hard_fail = true;
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* 2. HMAC-SHA256(K, challenge) */
+    uint8_t challenge_bytes[64];
+    int ch_len = hex_to_bytes(challenge_j->valuestring, challenge_bytes, sizeof(challenge_bytes));
+    if (ch_len <= 0) {
+        ESP_LOGE(TAG, "reconnect: bad challenge hex");
+        cJSON_Delete(resp);
+        set_error("bad challenge hex in session setup");
+        if (out_hard_fail) *out_hard_fail = true;
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    uint8_t hmac_out[32];
+    hmac_sha256(K_bytes, 32, challenge_bytes, ch_len, hmac_out);
+    char response_hex[65];
+    bytes_to_hex(hmac_out, 32, response_hex);
+
+    /* Save nonce before deleting resp (needed for key derivation later) */
+    char nonce_hex_saved[130];
+    strlcpy(nonce_hex_saved, nonce_j->valuestring, sizeof(nonce_hex_saved));
+
+    ESP_LOGI(TAG, "reconnect: challenge=%s... response=%s...",
+             challenge_j->valuestring, response_hex);
+
+    /* 3. CheckSessionIntegrity */
+    rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    if (!rpc) rpc = malloc(512);
+    if (!rpc) {
+        cJSON_Delete(resp);
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(rpc, 512,
+             "{\"id\":11,\"jsonrpc\":\"2.0\",\"method\":\"CheckSessionIntegrity\","
+             "\"params\":{\"response\":\"%s\"}}", response_hex);
+    clear_response();
+    se = send_fig(FIG_VCID_TX, rpc);
+    free(rpc);
+    cJSON_Delete(resp);
+    if (se != ESP_OK) {
+        ESP_LOGW(TAG, "reconnect: CheckSessionIntegrity send failed");
+        return ESP_FAIL;
+    }
+
+    resp = wait_response(10000);
+    if (!resp) {
+        ESP_LOGW(TAG, "reconnect: CheckSessionIntegrity timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    cJSON *err = cJSON_GetObjectItem(resp, "error");
+    if (err) {
+        ESP_LOGE(TAG, "reconnect: CheckSessionIntegrity error: %s",
+                 cJSON_PrintUnformatted(err));
+        cJSON_Delete(resp);
+        set_error("device rejected session integrity");
+        if (out_hard_fail) *out_hard_fail = true;
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ESP_LOGI(TAG, "reconnect: session integrity verified");
+    cJSON_Delete(resp);
+
+    /* 4. Derive session key = SHA256(K || nonce) */
+    uint8_t nonce_bytes[64];
+    int nonce_len = hex_to_bytes(nonce_hex_saved, nonce_bytes, sizeof(nonce_bytes));
+    if (nonce_len <= 0) {
+        ESP_LOGE(TAG, "reconnect: bad nonce hex");
+        set_error("bad nonce hex in session setup");
+        if (out_hard_fail) *out_hard_fail = true;
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    {
+        const uint8_t *segs[] = { K_bytes, nonce_bytes };
+        size_t lens[] = { 32, (size_t)nonce_len };
+        sha256_segs(segs, lens, 2, s_session_key);
+    }
+    s_session_encrypted = true;
+    ESP_LOGI(TAG, "reconnect: session key derived");
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Auto-reconnect (uses saved NVS pairing, no SRP needed)             */
 /* ------------------------------------------------------------------ */
 static void reconnect_task(void *arg)
@@ -1851,22 +1987,8 @@ static void reconnect_task(void *arg)
     }
     strlcpy(s_target_name, name_str, sizeof(s_target_name));
 
-    set_state(AS11_STATUS_CONNECTING);
-
-    /* Two-phase retry:
-     * Phase 1 — fast: 3 attempts with 2-4s backoff for transient disconnect
-     *   (AS11 needs a few seconds to restart advertising).
-     * Phase 2 — slow: retry every 60s indefinitely for when the AS11 is off
-     *   at boot and turned on later.  Without this, a single failed
-     *   reconnect_task at boot means the ST never connects to the AS11
-     *   until manually rebooted. */
-    bool connected = false;
-    for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
-        if (attempt > 1) {
-            int delay_s = attempt * 2;
-            ESP_LOGI(TAG, "reconnect: retry %d/3 in %ds", attempt, delay_s);
-            vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
-        }
+    int setup_failures = 0;
+    while (1) {
         if (!s_pair_cache.valid || s_manual_disconnect) {
             ESP_LOGI(TAG, "reconnect: aborted (pairing=%d manual=%d)",
                      s_pair_cache.valid, s_manual_disconnect);
@@ -1874,198 +1996,119 @@ static void reconnect_task(void *arg)
             vTaskDelete(NULL);
             return;
         }
-        if (do_connect_and_discover() == ESP_OK) {
-            connected = true;
-            break;
-        }
-        ESP_LOGW(TAG, "reconnect: connect/discover attempt %d/3 failed: %s",
-                 attempt, as11_ble_get_error());
-        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        }
-    }
 
-    /* Phase 2: slow retry loop — AS11 may not be powered yet. */
-    int slow_attempt = 0;
-    while (!connected) {
-        if (!s_pair_cache.valid || s_manual_disconnect) {
-            ESP_LOGI(TAG, "reconnect: aborted during slow retry "
-                         "(pairing=%d manual=%d)",
-                     s_pair_cache.valid, s_manual_disconnect);
+        set_state(AS11_STATUS_CONNECTING);
+
+        /* Two-phase retry:
+         * Phase 1 — fast: 3 attempts with 2-4s backoff for transient disconnect
+         *   (AS11 needs a few seconds to restart advertising).
+         * Phase 2 — slow: retry every 60s indefinitely for when the AS11 is off
+         *   at boot and turned on later.  Without this, a single failed
+         *   reconnect_task at boot means the ST never connects to the AS11
+         *   until manually rebooted. */
+        bool connected = false;
+        for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
+            if (attempt > 1) {
+                int delay_s = attempt * 2;
+                ESP_LOGI(TAG, "reconnect: retry %d/3 in %ds", attempt, delay_s);
+                vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+            }
+            if (!s_pair_cache.valid || s_manual_disconnect) {
+                ESP_LOGI(TAG, "reconnect: aborted (pairing=%d manual=%d)",
+                         s_pair_cache.valid, s_manual_disconnect);
+                set_state(AS11_STATUS_IDLE);
+                vTaskDelete(NULL);
+                return;
+            }
+            if (do_connect_and_discover() == ESP_OK) {
+                connected = true;
+                break;
+            }
+            ESP_LOGW(TAG, "reconnect: connect/discover attempt %d/3 failed: %s",
+                     attempt, as11_ble_get_error());
+            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            }
+        }
+
+        /* Phase 2: slow retry loop — AS11 may not be powered yet. */
+        int slow_attempt = 0;
+        while (!connected) {
+            if (!s_pair_cache.valid || s_manual_disconnect) {
+                ESP_LOGI(TAG, "reconnect: aborted during slow retry "
+                             "(pairing=%d manual=%d)",
+                         s_pair_cache.valid, s_manual_disconnect);
+                set_state(AS11_STATUS_IDLE);
+                vTaskDelete(NULL);
+                return;
+            }
+            slow_attempt++;
+            ESP_LOGI(TAG, "reconnect: slow retry %d in 60s...", slow_attempt);
+            for (int i = 0; i < 60; i++) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (!s_pair_cache.valid || s_manual_disconnect) break;
+            }
+            if (!s_pair_cache.valid || s_manual_disconnect) {
+                ESP_LOGI(TAG, "reconnect: aborted during slow retry wait");
+                set_state(AS11_STATUS_IDLE);
+                vTaskDelete(NULL);
+                return;
+            }
+            set_state(AS11_STATUS_CONNECTING);
+            if (do_connect_and_discover() == ESP_OK) {
+                connected = true;
+                break;
+            }
+            ESP_LOGW(TAG, "reconnect: slow retry %d failed: %s",
+                     slow_attempt, as11_ble_get_error());
+            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            }
+            set_state(AS11_STATUS_IDLE);
+        }
+        if (!connected) {
+            ESP_LOGE(TAG, "reconnect: all connect attempts failed");
             set_state(AS11_STATUS_IDLE);
             vTaskDelete(NULL);
             return;
         }
-        slow_attempt++;
-        ESP_LOGI(TAG, "reconnect: slow retry %d in 60s...", slow_attempt);
-        for (int i = 0; i < 60; i++) {
+
+        /* Set device info for session metadata */
+        session_writer_set_device_info(addr_str, cid_str);
+
+        /* ---- Encrypted session establishment ---- */
+        bool hard_fail = false;
+        esp_err_t err = do_setup_encrypted_session(cid_str, pair_key_hex, &hard_fail);
+        if (err == ESP_OK) {
+            break; /* Session established successfully, proceed to stream setup */
+        }
+
+        setup_failures++;
+        ESP_LOGE(TAG, "reconnect: session setup failed (%s, attempt %d, hard=%d)",
+                 esp_err_to_name(err), setup_failures, hard_fail);
+
+        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        }
+
+        if (hard_fail && setup_failures >= 3) {
+            ESP_LOGE(TAG, "reconnect: persistent session setup rejection, latching error state");
+            set_state(AS11_STATUS_ERROR);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        /* Transient failure: idle state so disconnect handler doesn't spawn auto_reconnect,
+         * wait a brief backoff (5s) for AS11 to resume advertising, then retry. */
+        set_state(AS11_STATUS_IDLE);
+        for (int i = 0; i < 5; i++) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             if (!s_pair_cache.valid || s_manual_disconnect) break;
         }
-        if (!s_pair_cache.valid || s_manual_disconnect) {
-            ESP_LOGI(TAG, "reconnect: aborted during slow retry wait");
-            set_state(AS11_STATUS_IDLE);
-            vTaskDelete(NULL);
-            return;
-        }
-        set_state(AS11_STATUS_CONNECTING);
-        if (do_connect_and_discover() == ESP_OK) {
-            connected = true;
-            break;
-        }
-        ESP_LOGW(TAG, "reconnect: slow retry %d failed: %s",
-                 slow_attempt, as11_ble_get_error());
-        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        }
-        set_state(AS11_STATUS_IDLE);
     }
-    if (!connected) {
-        ESP_LOGE(TAG, "reconnect: all connect attempts failed");
-        set_state(AS11_STATUS_IDLE);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /* Set device info for session metadata */
-    session_writer_set_device_info(addr_str, cid_str);
-
-    /* ---- Encrypted session establishment ----
-     * 1. RequestSession(clientId) -> {challenge, nonce}  [plaintext RPC]
-     * 2. response = HMAC-SHA256(K, challenge)
-     * 3. CheckSessionIntegrity(response)                  [plaintext RPC]
-     * 4. session_key = SHA256(K || nonce)
-     */
-    uint8_t K_bytes[32];
-    if (hex_to_bytes(pair_key_hex, K_bytes, sizeof(K_bytes)) != 32) {
-        ESP_LOGE(TAG, "reconnect: bad pair key");
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /* 1. RequestSession */
-    char *rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
-    if (!rpc) rpc = malloc(512);
-    snprintf(rpc, 512,
-             "{\"id\":10,\"jsonrpc\":\"2.0\",\"method\":\"RequestSession\","
-             "\"params\":{\"clientId\":\"%s\"}}", cid_str);
-    clear_response();
-    if (send_fig(FIG_VCID_TX, rpc) != ESP_OK) {
-        ESP_LOGE(TAG, "reconnect: RequestSession send failed");
-        free(rpc);
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-    free(rpc);
-
-    cJSON *resp = wait_response(10000);
-    if (!resp) {
-        ESP_LOGE(TAG, "reconnect: RequestSession timeout");
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-    cJSON *result = cJSON_GetObjectItem(resp, "result");
-    cJSON *challenge_j = result ? cJSON_GetObjectItem(result, "challenge") : NULL;
-    cJSON *nonce_j = result ? cJSON_GetObjectItem(result, "nonce") : NULL;
-    if (!cJSON_IsString(challenge_j) || !cJSON_IsString(nonce_j)) {
-        ESP_LOGE(TAG, "reconnect: RequestSession missing challenge/nonce");
-        cJSON_Delete(resp);
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /* 2. HMAC-SHA256(K, challenge) */
-    uint8_t challenge_bytes[64];
-    int ch_len = hex_to_bytes(challenge_j->valuestring, challenge_bytes, sizeof(challenge_bytes));
-    if (ch_len <= 0) {
-        ESP_LOGE(TAG, "reconnect: bad challenge hex");
-        cJSON_Delete(resp);
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint8_t hmac_out[32];
-    hmac_sha256(K_bytes, 32, challenge_bytes, ch_len, hmac_out);
-    char response_hex[65];
-    bytes_to_hex(hmac_out, 32, response_hex);
-
-    /* Save nonce before deleting resp (needed for key derivation later) */
-    char nonce_hex_saved[130];
-    strlcpy(nonce_hex_saved, nonce_j->valuestring, sizeof(nonce_hex_saved));
-
-    ESP_LOGI(TAG, "reconnect: challenge=%s... response=%s...",
-             challenge_j->valuestring, response_hex);
-
-    /* 3. CheckSessionIntegrity */
-    rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
-    if (!rpc) rpc = malloc(512);
-    snprintf(rpc, 512,
-             "{\"id\":11,\"jsonrpc\":\"2.0\",\"method\":\"CheckSessionIntegrity\","
-             "\"params\":{\"response\":\"%s\"}}", response_hex);
-    clear_response();
-    if (send_fig(FIG_VCID_TX, rpc) != ESP_OK) {
-        ESP_LOGE(TAG, "reconnect: CheckSessionIntegrity send failed");
-        free(rpc);
-        cJSON_Delete(resp);
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-    free(rpc);
-    cJSON_Delete(resp);
-
-    resp = wait_response(10000);
-    if (!resp) {
-        ESP_LOGE(TAG, "reconnect: CheckSessionIntegrity timeout");
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-    cJSON *err = cJSON_GetObjectItem(resp, "error");
-    if (err) {
-        ESP_LOGE(TAG, "reconnect: CheckSessionIntegrity error: %s",
-                 cJSON_PrintUnformatted(err));
-        cJSON_Delete(resp);
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG, "reconnect: session integrity verified");
-    cJSON_Delete(resp);
-
-    /* 4. Derive session key = SHA256(K || nonce) */
-    uint8_t nonce_bytes[64];
-    int nonce_len = hex_to_bytes(nonce_hex_saved, nonce_bytes, sizeof(nonce_bytes));
-    if (nonce_len <= 0) {
-        ESP_LOGE(TAG, "reconnect: bad nonce hex");
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        set_state(AS11_STATUS_ERROR);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    {
-        const uint8_t *segs[] = { K_bytes, nonce_bytes };
-        size_t lens[] = { 32, (size_t)nonce_len };
-        sha256_segs(segs, lens, 2, s_session_key);
-    }
-    s_session_encrypted = true;
-    ESP_LOGI(TAG, "reconnect: session key derived");
 
     /* Small delay to let the AS11 process the session establishment */
     vTaskDelay(pdMS_TO_TICKS(200));
