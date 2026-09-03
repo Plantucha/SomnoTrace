@@ -1357,15 +1357,40 @@ static void pending_export_service(void)
         return;
     }
 
+    /* Probe the export lease without waiting.  This runs on the post-therapy
+     * worker, which also services therapy-stop jobs; blocking here for the
+     * rebuild's own 120 s lease timeout would stall those behind it.  If the
+     * uploader still holds the lease, leave the marker and try again on the
+     * next idle pass — the marker is durable, and this path deliberately does
+     * not count as an attempt, since nothing was attempted.
+     *
+     * The lease is released again immediately: this is a "busy right now?"
+     * question, not a hand-off.  edf_gen_rebuild_day() acquires it properly.
+     * If another task takes it in between, the rebuild falls back to its own
+     * timeout, which is exactly today's behaviour. */
+    if (!sd_storage_lease_acquire(SD_LEASE_EXPORT, 0)) {
+        ESP_LOGI(TAG, "pending export: day %s left pending — export lease busy",
+                 day);
+        return;
+    }
+    sd_storage_lease_release(SD_LEASE_EXPORT);
+
     ESP_LOGW(TAG, "pending export: rebuilding day %s (attempt %d)",
              day, attempts + 1);
     crash_diag_note_activity("rebuild_day");
 
     esp_err_t ret = edf_gen_rebuild_day(day);
     if (ret == ESP_OK) {
-        /* The day's files were replaced, so whatever the backends hold for it
-         * is stale.  Re-offer it, then retire the marker. */
-        uploader_on_day_invalidated(day);
+        /* Re-offer the day, then retire the marker.
+         *
+         * Deliberately NOT uploader_on_day_invalidated(): that forgets the
+         * whole day's upload index, so every session group from the night is
+         * re-offered as new.  A backend that opens an import batch per offer
+         * (SleepHQ) would then import a second time any earlier session from
+         * that night which had already uploaded cleanly.
+         * uploader_on_export_complete() reconciles instead — it marks only new
+         * or changed groups pending and leaves finished ones alone. */
+        uploader_on_export_complete(day);
         unlink(path);
         ESP_LOGW(TAG, "pending export: day %s rebuilt and queued for upload",
                  day);
@@ -1567,14 +1592,22 @@ static void sw_post_task(void *arg)
         }
         if (ret == ESP_OK) {
             uploader_on_export_complete(day_folder);
-        } else {
-            /* Most often the export lease was held by a long upload run
-             * (edf_gen_generate gives up after 120 s).  Leave a pending-export
-             * marker so the idle worker rebuilds the day later instead of the
-             * session silently never being exported. */
-            ESP_LOGW(TAG, "post: EDF generation failed (%s), marking day %s "
-                     "for deferred export", esp_err_to_name(ret), day_folder);
+        } else if (ret == ESP_ERR_TIMEOUT) {
+            /* The export lease was held by a long upload run (edf_gen_generate
+             * gives up after 120 s).  Nothing is wrong with the session itself,
+             * so leave a pending-export marker and let the idle worker rebuild
+             * the day rather than losing the night.
+             *
+             * Only this error defers.  A malformed session or an invalid
+             * timestamp fails identically on every retry, so marking those
+             * would burn the attempt budget and end in a stalled marker that
+             * needs attention, having achieved nothing. */
+            ESP_LOGW(TAG, "post: export lease busy, marking day %s "
+                     "for deferred export", day_folder);
             pending_export_mark(day_folder);
+        } else {
+            ESP_LOGW(TAG, "post: EDF generation failed (%s), not triggering upload",
+                     esp_err_to_name(ret));
         }
 
         UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
