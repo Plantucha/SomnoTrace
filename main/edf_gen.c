@@ -481,6 +481,22 @@ static inline int16_t snt_missing_for(uint8_t version)
     return (version >= 2) ? SNT_MISSING_V2 : SNT_MISSING_V1;
 }
 
+static inline int16_t clamp_i16(int val, int16_t min_val, int16_t max_val)
+{
+    if (val > max_val) return max_val;
+    if (val < min_val) return min_val;
+    return (int16_t)val;
+}
+
+static inline bool is_channel_map_valid(const int *map, int n_signals, int snt_channels)
+{
+    if (!map) return (snt_channels == n_signals);
+    for (int i = 0; i < n_signals; i++) {
+        if (map[i] < 0 || map[i] >= snt_channels) return false;
+    }
+    return true;
+}
+
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint8_t  version;
@@ -706,8 +722,10 @@ static int64_t find_zle_edge_time(const char *events_snt_path, int want_value,
                 strcmp(data_id->valuestring, "_ZLE") == 0) {
                 cJSON *events = cJSON_GetObjectItem(params, "events");
                 if (events && cJSON_IsArray(events)) {
-                    cJSON *ev = cJSON_GetArrayItem(events, 0);
-                    if (ev) {
+                    int n = cJSON_GetArraySize(events);
+                    for (int i = 0; i < n; i++) {
+                        cJSON *ev = cJSON_GetArrayItem(events, i);
+                        if (!ev) continue;
                         cJSON *val = cJSON_GetObjectItem(ev, "value");
                         if (val && cJSON_IsNumber(val) &&
                             (int)val->valuedouble == want_value) {
@@ -848,18 +866,8 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
      * If channel_map is NULL, require .snt n_channels == n_signals (1:1). */
     int snt_channels = hdr.n_channels;
     int16_t snt_missing = snt_missing_for(hdr.version);
-    if (channel_map) {
-        for (int i = 0; i < n_signals; i++) {
-            if (channel_map[i] >= snt_channels) {
-                ESP_LOGE(TAG, "%s: channel_map[%d]=%d >= snt n_channels=%d",
-                         snt_path, i, channel_map[i], snt_channels);
-                fclose(snt);
-                if (snt2) fclose(snt2);
-                return ESP_FAIL;
-            }
-        }
-    } else if (snt_channels != n_signals) {
-        ESP_LOGE(TAG, "%s: channel count mismatch: snt=%d edf=%d",
+    if (!is_channel_map_valid(channel_map, n_signals, snt_channels)) {
+        ESP_LOGE(TAG, "%s: channel mapping invalid: snt_channels=%d n_signals=%d",
                  snt_path, snt_channels, n_signals);
         fclose(snt);
         if (snt2) fclose(snt2);
@@ -1158,8 +1166,6 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                     double phys = stored / 100.0;
                     double dig = dmin + (phys - pmin) * k;
                     int idig = (int)(dig < 0 ? dig - 0.5 : dig + 0.5);
-                    if (idig > INT16_MAX) idig = INT16_MAX;
-                    if (idig < INT16_MIN) idig = INT16_MIN;
                     /* Clamp to the signal's valid digital range when not
                      * in invalid-passthrough mode.  This prevents the
                      * BLE sentinel ("no data yet") from leaking through the
@@ -1168,8 +1174,9 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
                      * Signals that use the sentinel (FlowLim, SA2 SpO2/Pulse)
                      * have invalid_passthrough=true and bypass this clamp. */
                     if (!passthrough) {
-                        if (idig > sig[ch].dig_max) idig = sig[ch].dig_max;
-                        if (idig < sig[ch].dig_min) idig = sig[ch].dig_min;
+                        idig = clamp_i16(idig, sig[ch].dig_min, sig[ch].dig_max);
+                    } else {
+                        idig = clamp_i16(idig, INT16_MIN, INT16_MAX);
                     }
                     record_buf[ch * samples_per_record + s] = (int16_t)idig;
                 } else {
@@ -1223,8 +1230,6 @@ static esp_err_t convert_snt_to_edf(const char *snt_path, const char *edf_path,
 static cJSON *read_json_file(const char *path);
 static esp_err_t write_json_file(const char *path, const cJSON *json);
 static uint8_t *read_bin_file(const char *path, size_t *out_len);
-/* Forward declaration — defined in Section 10. */
-static void noon_day_folder(int64_t epoch_ms, char *out, size_t out_len);
 
 /* ════════════════════════════════════════════════════════════════════
  *  Section 6: STR.edf generation from Summary spool protobuf
@@ -1531,10 +1536,15 @@ static int profile_name_to_mop(const char *name)
  *   Indices (AHI etc)    logical_scale = 10    → num=1, den=10
  *   Duration/enums/SAU   logical_scale = 1     → no conversion needed
  */
-static int16_t spool_to_edf(int16_t raw, int num, int den)
+static inline int16_t spool_to_edf(int16_t raw, int num, int den)
 {
-    if (raw == -1) return -1;
-    return (int16_t)((int32_t)raw * num / den);
+    if (raw == -1 || den <= 0) return -1;
+    int32_t prod = (int32_t)raw * num;
+    int32_t half = den / 2;
+    int32_t rounded = (prod >= 0) ? (prod + half) / den : (prod - half) / den;
+    if (rounded > INT16_MAX) return INT16_MAX;
+    if (rounded < INT16_MIN) return INT16_MIN;
+    return (int16_t)rounded;
 }
 
 /* Build STR data values [4-132] from a summary context and settings JSON.
@@ -3626,23 +3636,6 @@ static void format_recording_id(char *out, size_t out_len,
              tm.tm_year + 1900, srn, mid, vid);
 }
 
-/* Compute the noon-based day folder (YYYYMMDD) for a session timestamp.
- * AS11 groups sessions by a day window that starts at noon, so sessions
- * before noon belong to the previous day's folder. */
-static void noon_day_folder(int64_t epoch_ms, char *out, size_t out_len)
-{
-    time_t t = (time_t)(epoch_ms / 1000);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    if (tm.tm_hour < 12) {
-        /* Before noon — belongs to previous day */
-        t -= 86400;
-        localtime_r(&t, &tm);
-    }
-    snprintf(out, out_len, "%04d%02d%02d",
-             (tm.tm_year + 1900) % 10000, (tm.tm_mon + 1) % 100, tm.tm_mday % 100);
-}
-
 /* Format a session timestamp prefix: YYYYMMDD_HHMMSS */
 static void session_timestamp(int64_t epoch_ms, char *out, size_t out_len)
 {
@@ -3752,10 +3745,10 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * filenames, EDF headers, STR session boundaries, and annotations must
      * agree so importers group sessions correctly and graphs show real time. */
 
-    /* Create date subdirectory inside DATALOG (noon-based NTP day).
+    /* Create date subdirectory inside DATALOG (noon-based day using AS11 offset).
      * Layout: DATALOG/YYYYMMDD/YYYYMMDD_HHMMSS_TYPE.edf */
     char day_folder[16];
-    noon_day_folder(start_epoch_ms, day_folder, sizeof(day_folder));
+    as11_time_noon_day(start_epoch_ms - clock_drift_ms, day_folder, sizeof(day_folder));
 
     char day_dir[240];
     snprintf(day_dir, sizeof(day_dir), "%s/%s", root_datalog, day_folder);
@@ -3989,21 +3982,6 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     session_timestamp(maskon_start_ms, maskon_ts_prefix,
                       sizeof(maskon_ts_prefix));
 
-    /* STR.edf uses the noon-based day date (sessions before noon belong
-     * to the previous day's STR.edf). */
-    char str_start_date[32];
-    {
-        time_t t = (time_t)(start_epoch_ms / 1000);
-        struct tm tm;
-        localtime_r(&t, &tm);
-        if (tm.tm_hour < 12) {
-            t -= 86400;
-            localtime_r(&t, &tm);
-        }
-        snprintf(str_start_date, sizeof(str_start_date), "%02d.%02d.%02d",
-                 tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
-    }
-
     /* Recording ID: TherapyStart for EVE/CSL, MaskOn for BRP/PLD/SA2. */
     char recording_id[128];       /* TherapyStart-based (EVE/CSL) */
     format_recording_id(recording_id, sizeof(recording_id),
@@ -4011,18 +3989,6 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     char maskon_recording_id[128]; /* MaskOn-based (BRP/PLD/SA2) */
     format_recording_id(maskon_recording_id, sizeof(maskon_recording_id),
                         maskon_start_ms, ident);
-
-    /* STR.edf recording_id uses the noon-based day date, not session start. */
-    char str_recording_id[128];
-    {
-        time_t t = (time_t)(start_epoch_ms / 1000);
-        struct tm tm;
-        localtime_r(&t, &tm);
-        if (tm.tm_hour < 12) t -= 86400;
-        int64_t noon_ms = (int64_t)t * 1000;
-        format_recording_id(str_recording_id, sizeof(str_recording_id),
-                           noon_ms, ident);
-    }
 
     /* Patient ID has CRC filled in by edf_write_header.
      * Initial value is the "X X X X" prefix with placeholder zeros. */
@@ -4170,8 +4136,8 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * STR.edf goes in the SDCARD root (not inside DATALOG/) — it is a
      * multi-day cumulative file with one record per day. */
     if ((flags & EDF_GEN_SHARED) &&
-        generate_str_edf(out_root, patient_id, str_recording_id,
-                         str_start_date, settings,
+        generate_str_edf(out_root, patient_id, recording_id,
+                         "", settings,
                          session_dir, session_id,
                          start_epoch_ms, end_epoch_ms, clock_drift_ms) != ESP_OK) {
         errors++;

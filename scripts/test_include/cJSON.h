@@ -36,9 +36,12 @@ typedef struct cJSON {
     struct cJSON *next;
     char *string;
     char *valuestring;
+    int valueint;
+    double valuedouble;
     int type;
 } cJSON;
 
+#define cJSON_Number 8
 #define cJSON_String 16
 #define cJSON_Array  32
 #define cJSON_Object 64
@@ -55,6 +58,11 @@ static inline cJSON *cJSON_GetObjectItem(const cJSON *o, const char *key)
 static inline bool cJSON_IsString(const cJSON *i)
 {
     return i && i->type == cJSON_String;
+}
+
+static inline bool cJSON_IsNumber(const cJSON *i)
+{
+    return i && i->type == cJSON_Number;
 }
 
 static inline bool cJSON_IsArray(const cJSON *i)
@@ -130,6 +138,18 @@ static inline void cJSON_AddStringToObject(cJSON *obj, const char *name, const c
     item->type = cJSON_String;
     if (name) item->string = _test_strdup(name);
     if (val) item->valuestring = _test_strdup(val);
+    cJSON_AddItemToArray(obj, item);
+}
+
+static inline void cJSON_AddNumberToObject(cJSON *obj, const char *name, double num)
+{
+    if (!obj) return;
+    cJSON *item = (cJSON *)calloc(1, sizeof(cJSON));
+    if (!item) return;
+    item->type = cJSON_Number;
+    item->valuedouble = num;
+    item->valueint = (int)num;
+    if (name) item->string = _test_strdup(name);
     cJSON_AddItemToArray(obj, item);
 }
 
