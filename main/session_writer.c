@@ -67,6 +67,7 @@
 #include "time_sync.h"
 #include "therapy_alert.h"
 #include "crash_diag.h"
+#include "snt_format.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -91,27 +92,6 @@
 #include "psram_task.h"
 
 static const char *TAG = "session";
-
-/* ── .snt file format ─────────────────────────────────────────────── */
-
-#define SNT_MAGIC       0x534E5442u   /* "SNTB" */
-#define SNT_VERSION     2
-#define SNT_MISSING     INT16_MIN      /* v2 unambiguous missing-data sentinel */
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;            /* 0x534E5442 "SNTB"                  */
-    uint8_t  version;          /* format version (2)                  */
-    uint8_t  tier;             /* 0 = L0 raw, 1 = L1 MinMax          */
-    uint8_t  n_channels;       /* channels per record                 */
-    uint8_t  sample_bytes;     /* 2 (int16)                           */
-    uint16_t sample_hz_x10;   /* rate × 10 (250 = 25 Hz)            */
-    uint16_t reserved;
-    int64_t  start_epoch_ms;  /* session start (NTP clock)           */
-    uint32_t sample_count;    /* records written (updated each flush) */
-    uint32_t reserved2;
-} snt_header_t;              /* 28 bytes (packed) */
-
-#define SNT_HEADER_SIZE  sizeof(snt_header_t)
 
 /* ── Recovery journal (.ckpt) ─────────────────────────────────────────
  * Fixed-size binary journal with two alternating slots.  A checkpoint is

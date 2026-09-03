@@ -102,3 +102,22 @@ int64_t as11_time_local_noon_epoch(const char *day_label);
 /* Days since the Unix epoch for a "YYYYMMDD" label — the STR.edf Date
  * signal.  Returns -1 if the label cannot be parsed. */
 int as11_time_day_number(const char *day_label);
+
+/* Parse an ISO 8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SS.mmmZ") into epoch ms.
+ * Returns -1 on parse failure. */
+int64_t as11_time_parse_iso8601_ms(const char *iso_str);
+
+/* Format date/time strings for EDF header from epoch ms.
+ * date_out receives "DD.MM.YY", time_out receives "HH.MM.SS". */
+void as11_time_format_edf_datetime(int64_t epoch_ms,
+                                   char *date_out, int date_len,
+                                   char *time_out, int time_len);
+
+/* Format recording ID string for EDF header.
+ * Format: "Startdate DD-MMM-YYYY X X X SRN=<srn> MID=<mid> VID=<vid>" */
+void as11_time_format_recording_id(char *out, size_t out_len,
+                                   int64_t epoch_ms,
+                                   const char *srn, const char *mid, const char *vid);
+
+/* Format a session timestamp prefix: "YYYYMMDD_HHMMSS" */
+void as11_time_format_session_prefix(int64_t epoch_ms, char *out, size_t out_len);

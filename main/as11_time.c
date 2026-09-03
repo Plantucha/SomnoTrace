@@ -294,3 +294,70 @@ int as11_time_day_number(const char *day_label)
     if (!parse_label(day_label, &y, &m, &d)) return -1;
     return (int)days_from_civil(y, m, d);
 }
+
+int64_t as11_time_parse_iso8601_ms(const char *iso_str)
+{
+    if (!iso_str) return -1;
+    struct tm ev_tm = {0};
+    int ms = 0;
+    int n = sscanf(iso_str, "%d-%d-%dT%d:%d:%d.%dZ",
+                   &ev_tm.tm_year, &ev_tm.tm_mon, &ev_tm.tm_mday,
+                   &ev_tm.tm_hour, &ev_tm.tm_min, &ev_tm.tm_sec, &ms);
+    if (n < 6) {
+        n = sscanf(iso_str, "%d-%d-%dT%d:%d:%dZ",
+                   &ev_tm.tm_year, &ev_tm.tm_mon, &ev_tm.tm_mday,
+                   &ev_tm.tm_hour, &ev_tm.tm_min, &ev_tm.tm_sec);
+        if (n < 6) return -1;
+        ms = 0;
+    }
+    int64_t days = days_from_civil(ev_tm.tm_year, ev_tm.tm_mon, ev_tm.tm_mday);
+    int64_t secs = days * 86400 + ev_tm.tm_hour * 3600 +
+                   ev_tm.tm_min * 60 + ev_tm.tm_sec;
+    return secs * 1000 + ms;
+}
+
+void as11_time_format_edf_datetime(int64_t epoch_ms,
+                                   char *date_out, int date_len,
+                                   char *time_out, int time_len)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    if (date_out && date_len > 0) {
+        snprintf(date_out, date_len, "%02d.%02d.%02d",
+                 tm.tm_mday % 100, (tm.tm_mon + 1) % 100, (tm.tm_year % 100 + 100) % 100);
+    }
+    if (time_out && time_len > 0) {
+        snprintf(time_out, time_len, "%02d.%02d.%02d",
+                 tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+}
+
+void as11_time_format_recording_id(char *out, size_t out_len,
+                                   int64_t epoch_ms,
+                                   const char *srn, const char *mid, const char *vid)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+
+    static const char *month_names[] = {
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+    };
+
+    snprintf(out, out_len,
+             "Startdate %02d-%s-%04d X X X SRN=%s MID=%s VID=%s",
+             tm.tm_mday, month_names[tm.tm_mon % 12],
+             tm.tm_year + 1900, srn ? srn : "", mid ? mid : "", vid ? vid : "");
+}
+
+void as11_time_format_session_prefix(int64_t epoch_ms, char *out, size_t out_len)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    snprintf(out, out_len, "%04d%02d%02d_%02d%02d%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
