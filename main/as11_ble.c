@@ -2114,7 +2114,8 @@ static void reconnect_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(200));
 
     /* ---- Test encrypted channel: Get device identity ---- */
-    rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    char *rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    cJSON *resp = NULL;
     if (!rpc) rpc = malloc(512);
     snprintf(rpc, 512,
              "{\"id\":12,\"jsonrpc\":\"1.0\",\"method\":\"Get\","
