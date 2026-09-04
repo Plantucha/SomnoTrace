@@ -310,7 +310,7 @@ static const adc_channel_t s_bat_adc_channel = ADC_CHANNEL_0;  /* GPIO1 = ADC1_C
 #define BAT_PERIOD_DISCHARGE_S  60
 #define BAT_PERIOD_CHARGE_S     20   /* users watch a charge bar */
 #define BAT_UNPLUG_SETTLE_S     30   /* let terminal voltage relax to OCV */
-#define BAT_DEBOUNCE_SEC        15   /* require stable CHG_STAT to debounce flapping/oscillation */
+#define BAT_DEBOUNCE_SEC        2    /* 2 s debounce to confirm physical plug/unplug edge */
 
 /* Above this voltage or burst spread the reading cannot be a real Li-ion cell.
  * A real chemical cell has massive capacitance, so voltage spread during a

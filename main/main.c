@@ -467,9 +467,17 @@ void app_main(void)
                 ESP_LOGW(TAG, "SoftAP 10-minute idle timeout: rebooting to retry connection");
                 esp_restart();
             }
-            /* Update battery indicator in SoftAP mode too */
-            if (++refresh_counter >= 3) {
-                refresh_counter = 0;
+            /* Update battery indicator in SoftAP mode */
+            bsp_battery_t batt;
+            bsp_power_battery_get(&batt);
+            if (batt.valid) {
+                bsp_display_set_battery(batt.percent, batt.charging);
+            } else {
+                bsp_display_set_battery(-1, false);
+            }
+        } else {
+            /* Update battery indicator every second (immediate redraw only on state change) */
+            if (!bsp_display_is_therapy_active()) {
                 bsp_battery_t batt;
                 bsp_power_battery_get(&batt);
                 if (batt.valid) {
@@ -478,7 +486,7 @@ void app_main(void)
                     bsp_display_set_battery(-1, false);
                 }
             }
-        } else {
+
             /* Connected mode: refresh status display every 3 s.
              * Skipped during therapy (graph mode owns the display). */
             if (++refresh_counter >= 3 && !bsp_display_is_therapy_active()) {
@@ -552,15 +560,6 @@ void app_main(void)
                         };
                         bsp_display_show_lines("SomnoTrace", lines, 4);
                     }
-                }
-
-                /* Update battery indicator */
-                bsp_battery_t batt;
-                bsp_power_battery_get(&batt);
-                if (batt.valid) {
-                    bsp_display_set_battery(batt.percent, batt.charging);
-                } else {
-                    bsp_display_set_battery(-1, false);
                 }
             }
         }

@@ -845,6 +845,10 @@ void bsp_display_set_battery(int percent, bool charging)
 {
     if (!s_state_mutex) return;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_batt_percent == percent && s_batt_charging == charging) {
+        xSemaphoreGive(s_state_mutex);
+        return;
+    }
     s_batt_percent = percent;
     s_batt_charging = charging;
     s_status_dirty = true;
