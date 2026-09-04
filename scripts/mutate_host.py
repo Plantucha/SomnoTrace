@@ -192,7 +192,9 @@ def executed_lines(outdir: str) -> dict[str, set[int]] | None:
                 ok_any = True
             except OSError:
                 return None
-    return cov if ok_any else None
+    # An empty dict is not "nothing is reached", it is "reach is unknown". Return None so
+    # every caller runs every mutant.
+    return cov if cov else None
 
 
 # ── mutants ─────────────────────────────────────────────────────────────────────────────────────
@@ -278,9 +280,28 @@ def canary_for(path: str, lines: list[str]) -> tuple[int, str, str] | None:
     return (best[0], best[1], best[2]) if best else None
 
 
+class MutationTargetMissing(RuntimeError):
+    """The text this mutation was meant to change is not in the file. Applying nothing and then
+    measuring the suite would report the UNMUTATED tree's result as the mutant's — which for
+    the selftest's planted-equivalent control means 'survived (correct)' on a control that
+    never ran."""
+
+
 def apply(path: str, old_text: str, new_text: str) -> None:
     s = open(path, encoding="utf-8").read()
+    if old_text not in s:
+        raise MutationTargetMissing(f"{os.path.relpath(path, ROOT)}: target text not present")
     open(path, "w", encoding="utf-8", newline="\n").write(s.replace(old_text, new_text, 1))
+
+
+def apply_line(path: str, lineno: int, orig: str, mut: str) -> None:
+    """Replace exactly line `lineno`. A text search would hit the first identical line in the
+    file, mutate that, and credit the kill (or survival) to a line that was never touched."""
+    lines = open(path, encoding="utf-8").readlines()
+    if lines[lineno - 1] != orig:
+        raise MutationTargetMissing(f"{os.path.relpath(path, ROOT)}:{lineno}: line text changed")
+    lines[lineno - 1] = mut
+    open(path, "w", encoding="utf-8", newline="\n").writelines(lines)
 
 
 def mutate_file(path: str, outdir: str, reach: dict | None, limit: int, equivs: set[str]) -> dict:
@@ -289,7 +310,7 @@ def mutate_file(path: str, outdir: str, reach: dict | None, limit: int, equivs: 
     shutil.copy(path, backup)
     lines = open(path, encoding="utf-8").readlines()
     res = {"file": rel, "killed": 0, "stillborn": 0, "unasserted": [], "unreached": [],
-           "equivalent": 0, "canary": None, "generated": 0}
+           "equivalent": 0, "canary": None, "generated": 0, "reach_unknown": False}
     try:
         # ── canary first: if it survives, nothing else this run means anything
         c = canary_for(path, lines)
@@ -310,6 +331,12 @@ def mutate_file(path: str, outdir: str, reach: dict | None, limit: int, equivs: 
 
         mutants = gen_mutants(path, limit)
         res["generated"] = len(mutants)
+        # ⚠️ Per-file, not just global: a file absent from the coverage report (its coverage build
+        # failed, its test timed out, gcov named it differently) is REACH UNKNOWN. Looking it up
+        # with a default of set() classified every mutant UNREACHED, compiled nothing, and exited
+        # 0 — the exact fail-open the module docstring promises does not exist.
+        file_reach = reach.get(os.path.abspath(path)) if reach is not None else None
+        res["reach_unknown"] = reach is not None and file_reach is None
         for ln, op, orig, mut in mutants:
             key = f"{rel}:{ln}:{op}"
             if key in equivs:
@@ -318,10 +345,10 @@ def mutate_file(path: str, outdir: str, reach: dict | None, limit: int, equivs: 
             # gcov marks a #define non-executable, but mutating one acts at every use site: never
             # let the reach filter skip it.
             is_macro = orig.lstrip().startswith("#define")
-            if reach is not None and not is_macro and ln not in reach.get(os.path.abspath(path), set()):
+            if file_reach is not None and not is_macro and ln not in file_reach:
                 res["unreached"].append((ln, op, orig.strip()[:70]))
                 continue
-            apply(path, orig, mut)
+            apply_line(path, ln, orig, mut)
             ok, why = suite_passes(outdir)
             shutil.copy(backup, path)
             if ok:
@@ -357,7 +384,12 @@ def selftest(outdir: str) -> int:
     rc = 0
     try:
         # must be caught: the noon rule inverted
-        apply(target, "if (tod < 43200) days -= 1;", "if (tod < 43200) days -= 0;")
+        try:
+            apply(target, "if (tod < 43200) days -= 1;", "if (tod < 43200) days -= 0;")
+        except MutationTargetMissing as e:
+            print(f"   planted KILLABLE mutant      TARGET MISSING — {e}")
+            print("   VERDICT: HARNESS UNSOUND — the control text is not in the source; nothing was tested")
+            return 2
         caught = not suite_passes(outdir)[0]
         shutil.copy(backup, target)
         print(f"   planted KILLABLE mutant      {'caught (correct)' if caught else 'MISSED — harness is blind'}")
@@ -365,7 +397,12 @@ def selftest(outdir: str) -> int:
 
         # must survive: floor_div's sign fix is unreachable for the positive inputs the suite uses…
         # …so a harness that reports this as a gap is flooding. It is recorded, not celebrated.
-        apply(target, "int64_t q = a / b;", "int64_t q = (a) / (b);")
+        try:
+            apply(target, "int64_t q = a / b;", "int64_t q = (a) / (b);")
+        except MutationTargetMissing as e:
+            print(f"   planted EQUIVALENT mutant    TARGET MISSING — {e}")
+            print("   VERDICT: HARNESS UNSOUND — an unapplied control would have read as 'survived (correct)'")
+            return 2
         survived = suite_passes(outdir)[0]
         shutil.copy(backup, target)
         print(f"   planted EQUIVALENT mutant    {'survived (correct)' if survived else 'KILLED — the harness is unstable'}")
@@ -443,6 +480,8 @@ def main() -> int:
                 print("   VOID: the harness is not running what it thinks it is. No other result here counts.")
                 return 2
             print(f"   canary: {c['fn']}() body emptied → killed")
+        if r["reach_unknown"]:
+            print("   ⚠️  REACH UNKNOWN for this file (not in the coverage report) — every mutant was run.")
         if r["generated"] == 0:
             print("   ⚠️  NO MUTANTS GENERATED — nothing below was tested. The canary is the only evidence.")
         print(f"   killed {r['killed']}   stillborn {r['stillborn']}   unasserted {len(r['unasserted'])}   "
