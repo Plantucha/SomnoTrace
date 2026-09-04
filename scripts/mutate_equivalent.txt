@@ -1,0 +1,14 @@
+# Mutants that NO input can distinguish from the original — unkillable by anyone, and therefore not
+# gaps. Recorded with the reasoning so the next run does not re-report them and the argument outlives
+# whoever worked it out.
+#
+# Format:  <path>:<line>:<operator>      # why it is equivalent
+#
+# ⚠️ An entry here SUPPRESSES a result. Add one only after showing the two versions cannot differ —
+# "I could not think of an input" is not the same claim. When in doubt, leave it out: a re-reported
+# survivor costs a minute, a wrongly suppressed one hides a defect for as long as the entry stands.
+
+main/edf_data_dict.h:49:equality:>=→>   # spool_to_edf's sign branch. The two forms differ only at
+#   prod == 0, where the true branch yields (0 + half)/den and the false branch (0 - half)/den. half
+#   is den/2, so |half| < den for every den >= 1, and C integer division truncates toward zero — both
+#   are 0. No (raw, num, den) triple separates them.
