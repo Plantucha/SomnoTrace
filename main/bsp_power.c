@@ -43,6 +43,7 @@
 #include "nvs.h"
 #include "nvs_writer.h"
 #include "therapy_alert.h"
+#include "device_settings.h"
 
 #define BSP_PIN_BAT_EN   2
 #define BSP_PIN_KEY_PWR  5
@@ -330,7 +331,7 @@ static TickType_t s_bat_last_ok_tick = 0;
  * cell's charge-termination voltage so the display reaches 100% when the
  * charger IC stops, rather than requiring an unrealistic 4200 mV. */
 static const struct { int mv; int pct; } s_ocv_curve[] = {
-    { 4200, 100 },
+    { 4160, 100 },
     { 4100,  90 },
     { 3950,  75 },
     { 3850,  60 },
@@ -342,13 +343,13 @@ static const struct { int mv; int pct; } s_ocv_curve[] = {
 };
 
 /* Adaptive 100% anchor: updated to the observed charge-termination voltage.
- * Defaults to the OCV curve's 4200 mV; replaced with the real value once the
+ * Defaults to the OCV curve's 4160 mV; replaced with the real value once the
  * charger IC stops for the first time.  Persisted in NVS so it survives reboots. */
 #define BAT_NVS_NS         "bat"
 #define BAT_NVS_KEY_FULL   "full_mv"
 #define BAT_ANCHOR_MIN_MV  4000
-#define BAT_ANCHOR_MAX_MV  4200
-static int s_full_charge_mv = 4200;
+#define BAT_ANCHOR_MAX_MV  4160
+static int s_full_charge_mv = 4160;
 
 /* NVS write callback — runs on the internal-stack nvs_writer task. */
 static esp_err_t do_save_bat_anchor(void *arg)
@@ -456,17 +457,17 @@ static int cmp_int(const void *a, const void *b)
 }
 
 /* Compensate charging IR rise.
- * Below 3900 mV (CC phase), full charge current causes ~100 mV IR rise.
- * Between 3900 mV and 4200 mV (CV phase), current tapers down to near zero,
- * so the IR rise tapers to 0 mV at 4200 mV. */
+ * Below 3900 mV (CC phase), full charge current causes ~60 mV IR rise.
+ * Between 3900 mV and 4160 mV (CV phase), current tapers down to near zero,
+ * so the IR rise tapers to 0 mV at 4160 mV. */
 static int bat_calc_ocv(int mv, bool charging)
 {
     if (!charging) return mv;
     int ir_offset = 0;
     if (mv < 3900) {
-        ir_offset = 100;
-    } else if (mv < 4200) {
-        ir_offset = (100 * (4200 - mv)) / 300;
+        ir_offset = 60;
+    } else if (mv < 4160) {
+        ir_offset = (60 * (4160 - mv)) / 260;
     } else {
         ir_offset = 0;
     }
@@ -553,24 +554,20 @@ static void battery_monitor_task(void *arg)
     int  charging_duration_s = 0;
 
     for (;;) {
+        if (!device_settings_battery_enabled()) {
+            bat_publish(-1, -1, debounced_charging, false);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
         int spread_mv = 0;
         int mv = bat_sample_burst(&spread_mv);
 
-        /* Detect battery presence:
-         * 1. If ADC voltage > BAT_NO_BATTERY_MV (5V rail directly on divider), or
-         * 2. If burst voltage spread > BAT_NO_BATTERY_SPREAD_MV (oscillating capacitor)
-         * Then no real chemical Li-ion cell is installed. */
         if (mv <= 0) {
             ESP_LOGW(TAG, "battery: sample burst failed");
             bat_publish(0, 0, debounced_charging, false);
-        } else if (mv > BAT_NO_BATTERY_MV || spread_mv > BAT_NO_BATTERY_SPREAD_MV) {
-            filtered_mv = -1;
-            shown_pct = -1;
-            bat_publish(mv, -1, false, false);
-            ESP_LOGD(TAG, "battery: no battery detected (%dmV, spread=%dmV)",
-                     mv, spread_mv);
         } else {
-            /* Valid battery detected */
+            /* Valid battery reading */
             int ocv_mv = bat_calc_ocv(mv, debounced_charging);
 
             /* IIR low-pass across bursts.  Anything faster than this is
@@ -580,16 +577,28 @@ static void battery_monitor_task(void *arg)
 
             int target_pct = bat_mv_to_percent(filtered_mv);
 
+            /* Charge-termination clamp: if the charger has completed charging
+             * (debounced_charging is false) and voltage sits in the full float
+             * zone (>= 4140 mV), clamp target_pct to 100% so the gauge reliably
+             * displays 100% after a charge cycle. */
+            if (!debounced_charging && filtered_mv >= 4140) {
+                target_pct = 100;
+            }
+
             if (shown_pct < 0) {
                 shown_pct = target_pct;      /* first reading: adopt directly */
             } else if (settling && xTaskGetTickCount() < settle_until) {
                 /* Hold the displayed value while the cell relaxes. */
             } else {
                 settling = false;
-                /* Slew limit: at most 1 percentage point per update.  This is
-                 * what removes the visible "jump" on plug-in. */
-                if (target_pct > shown_pct) shown_pct++;
-                else if (target_pct < shown_pct && !debounced_charging) shown_pct--;
+                /* Direction lock and slew rate:
+                 * While charging: strictly non-decreasing. Walk up at most 1% per update.
+                 * While discharging: strictly non-increasing. Walk down at most 1% per update. */
+                if (debounced_charging) {
+                    if (target_pct > shown_pct) shown_pct++;
+                } else {
+                    if (target_pct < shown_pct) shown_pct--;
+                }
             }
 
             bat_publish(filtered_mv, shown_pct, debounced_charging, true);
@@ -643,8 +652,9 @@ static void battery_monitor_task(void *arg)
                 }
 
                 charging_duration_s = 0;
+                /* Do NOT wipe shown_pct! Preserving shown_pct prevents sudden jumps on plug-in/unplug.
+                 * Reset filtered_mv so the IIR filter starts fresh from the new OCV. */
                 filtered_mv = -1;
-                shown_pct = -1;
                 break;
             }
         }
@@ -676,7 +686,7 @@ esp_err_t bsp_power_battery_monitor_start(void)
 void bsp_power_battery_get(bsp_battery_t *out)
 {
     if (!out) return;
-    if (!s_bat_mutex) {
+    if (!device_settings_battery_enabled() || !s_bat_mutex) {
         out->percent = -1;
         out->millivolts = -1;
         out->charging = false;

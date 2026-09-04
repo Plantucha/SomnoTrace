@@ -1328,13 +1328,18 @@ static void fb_draw_battery_indicator(int x, int y, int percent, bool charging)
     fb_fill_rect(x + 1, y + 2, 8, 6, rgb565(0, 0, 0)); /* inner cavity */
     fb_fill_rect(x + 10, y + 3, 2, 4, frame_col);    /* terminal nub */
 
-    /* Charging bolt inside the outline */
+    /* Charging bolt inside the outline, or proportional fill if on battery */
     if (charging) {
         fb_fill_rect(x + 4, y + 2, 2, 3, bolt_col);
         fb_fill_rect(x + 3, y + 3, 4, 1, bolt_col);
         fb_fill_rect(x + 2, y + 4, 6, 1, bolt_col);
         fb_fill_rect(x + 3, y + 5, 4, 1, bolt_col);
         fb_fill_rect(x + 4, y + 6, 2, 2, bolt_col);
+    } else if (percent > 0) {
+        int fill_w = (percent * 8 + 50) / 100;
+        if (fill_w < 1) fill_w = 1;
+        if (fill_w > 8) fill_w = 8;
+        fb_fill_rect(x + 1, y + 2, fill_w, 6, text_col);
     }
 
     /* Percentage text to the right of the outline */

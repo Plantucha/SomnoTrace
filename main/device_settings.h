@@ -49,6 +49,7 @@ typedef struct {
     lcd_therapy_mode_t lcd_therapy_mode;
     uint8_t alert_volume;      /* speaker volume for alerts: 0-100 */
     uint16_t lcd_rotation;     /* clockwise degrees: 0, 90, 180, or 270 */
+    bool battery_enabled;      /* true to display battery indicator, false to hide */
 } device_settings_t;
 
 /* Load settings from NVS. Returns ESP_OK if loaded, ESP_ERR_NVS_NOT_FOUND
@@ -60,6 +61,12 @@ esp_err_t device_settings_save(const device_settings_t *cfg);
 
 /* Get current in-memory settings (loaded at boot). */
 const device_settings_t *device_settings_get(void);
+
+/* Check whether the battery indicator is enabled. */
+bool device_settings_battery_enabled(void);
+
+/* Set battery indicator enabled/disabled. Call device_settings_save() to persist. */
+esp_err_t device_settings_set_battery_enabled(bool enabled);
 
 /* Set brightness immediately (applies to hardware + updates in-memory copy).
  * Does NOT persist to NVS — call device_settings_save() for that. */

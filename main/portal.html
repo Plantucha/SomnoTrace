@@ -715,6 +715,13 @@ Display &amp; Sound
 <button type="button" class="btn btn-sm" style="white-space:nowrap" onclick="testAlertVolume()">Test</button>
 </div>
 </div>
+<div class="toggle-row" style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+<div>
+<label for="battery-enabled" style="margin:0;font-weight:600">Battery Indicator <span id="battery-status" class="setting-status"></span></label>
+<div style="font-size:0.8rem;color:var(--text-muted)">Display battery charge and charging status. Turn off if running on USB power without a battery.</div>
+</div>
+<label class="toggle"><input type="checkbox" id="battery-enabled" checked onchange="onBatteryEnabledChange(this)"><span class="toggle-slider"></span></label>
+</div>
 </div>
 </div>
 
@@ -1755,13 +1762,13 @@ function loadStatusTab(d) {
 
   /* Battery */
   var batt = d.battery || {};
-  if (batt.valid) {
+  if (batt.valid && batt.percent != null && batt.percent >= 0) {
     var battStr = batt.percent + '%';
     if (batt.millivolts != null) battStr += ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)';
     if (batt.charging) battStr += ' \u26A1';
     setEl('status-battery', battStr);
   } else {
-    setEl('status-battery', '--');
+    setEl('status-battery', 'USB Power (No battery)');
   }
   setEl('status-tz', d.tz_name || 'UTC');
   var ntpEl = document.getElementById('status-ntp');
@@ -2234,6 +2241,20 @@ function onLcdRotationChange(sel) {
   });
 }
 
+function onBatteryEnabledChange(cb) {
+  var en = cb ? cb.checked : true;
+  setStatus('battery-status', '…', null);
+  fetch('/api/device/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ battery_enabled: en })
+  }).then(function() {
+    setStatus('battery-status', '✓', true);
+  }).catch(function() {
+    setStatus('battery-status', '✗', false);
+  });
+}
+
 function loadDeviceSettings() {
   fetch('/api/device/settings').then(function(r){ return r.json(); }).then(function(d) {
     var br = document.getElementById('lcd-brightness');
@@ -2261,6 +2282,10 @@ function loadDeviceSettings() {
       av.value = sliderVal;
       var avl = document.getElementById('alert-vol-val');
       if (avl) avl.textContent = sliderVal;
+    }
+    var be = document.getElementById('battery-enabled');
+    if (be && typeof d.battery_enabled === 'boolean') {
+      be.checked = d.battery_enabled;
     }
     setLoading('display-sound-details', false);
   }).catch(function() {

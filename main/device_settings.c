@@ -39,6 +39,7 @@ static const char *TAG = "dev_settings";
 #define NVS_KEY_LCD_THERAPY  "lcd_thr"
 #define NVS_KEY_ALERT_VOL    "alrtvol"
 #define NVS_KEY_LCD_ROTATION "lcd_rot"
+#define NVS_KEY_BAT_ENABLED  "bat_en"
 
 /* Brightness stored in tenth-percent units: 1=0.1%, 200=20.0%
  * Discrete steps: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 (roughly 2x each) */
@@ -48,6 +49,7 @@ static const char *TAG = "dev_settings";
 #define DEFAULT_ALERT_VOLUME     65
 #define MIN_ALERT_VOLUME         50
 #define DEFAULT_LCD_ROTATION     LCD_ROTATION_0
+#define DEFAULT_BAT_ENABLED      true
 
 static device_settings_t s_settings;
 
@@ -71,6 +73,7 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     cfg->lcd_therapy_mode = LCD_THERAPY_GRAPH;
     cfg->alert_volume = DEFAULT_ALERT_VOLUME;
     cfg->lcd_rotation = DEFAULT_LCD_ROTATION;
+    cfg->battery_enabled = DEFAULT_BAT_ENABLED;
     /* Clamp stale NVS values to current valid range */
 
     nvs_handle_t h;
@@ -93,6 +96,9 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     if (nvs_get_u8(h, NVS_KEY_ALERT_VOL, &u8val) == ESP_OK) {
         cfg->alert_volume = (u8val < MIN_ALERT_VOLUME) ? MIN_ALERT_VOLUME : u8val;
     }
+    if (nvs_get_u8(h, NVS_KEY_BAT_ENABLED, &u8val) == ESP_OK) {
+        cfg->battery_enabled = (u8val != 0);
+    }
     uint16_t rotation;
     esp_err_t rotation_err = nvs_get_u16(h, NVS_KEY_LCD_ROTATION, &rotation);
     if (rotation_err == ESP_ERR_NVS_TYPE_MISMATCH) {
@@ -110,10 +116,10 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     nvs_close(h);
     nvs_writer_unlock();
     memcpy(&s_settings, cfg, sizeof(s_settings));
-    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u",
+    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d",
              s_settings.brightness, s_settings.brightness / 10.0,
              s_settings.lcd_therapy_mode, s_settings.alert_volume,
-             (unsigned)s_settings.lcd_rotation);
+             (unsigned)s_settings.lcd_rotation, s_settings.battery_enabled);
     return ESP_OK;
 }
 
@@ -128,6 +134,7 @@ static esp_err_t do_device_settings_save(void *arg)
     nvs_set_u8(h, NVS_KEY_LCD_THERAPY, (uint8_t)cfg->lcd_therapy_mode);
     nvs_set_u8(h, NVS_KEY_ALERT_VOL, cfg->alert_volume);
     nvs_set_u16(h, NVS_KEY_LCD_ROTATION, cfg->lcd_rotation);
+    nvs_set_u8(h, NVS_KEY_BAT_ENABLED, cfg->battery_enabled ? 1 : 0);
     ret = nvs_commit(h);
     nvs_close(h);
     return ret;
@@ -141,10 +148,10 @@ esp_err_t device_settings_save(const device_settings_t *cfg)
     esp_err_t ret = nvs_writer_run(do_device_settings_save, (void *)cfg);
     if (ret == ESP_OK) {
         memcpy(&s_settings, cfg, sizeof(s_settings));
-        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u",
+        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d",
                  s_settings.brightness, s_settings.brightness / 10.0,
                  s_settings.lcd_therapy_mode, s_settings.alert_volume,
-                 (unsigned)s_settings.lcd_rotation);
+                 (unsigned)s_settings.lcd_rotation, s_settings.battery_enabled);
     }
     return ret;
 }
@@ -190,6 +197,20 @@ esp_err_t device_settings_set_lcd_rotation(uint16_t degrees)
     return ESP_OK;
 }
 
+bool device_settings_battery_enabled(void)
+{
+    return s_settings.battery_enabled;
+}
+
+esp_err_t device_settings_set_battery_enabled(bool enabled)
+{
+    s_settings.battery_enabled = enabled;
+    if (!enabled) {
+        bsp_display_set_battery(-1, false);
+    }
+    return ESP_OK;
+}
+
 esp_err_t device_settings_get_json(char **out_json)
 {
     if (!out_json) return ESP_ERR_INVALID_ARG;
@@ -199,6 +220,7 @@ esp_err_t device_settings_get_json(char **out_json)
     cJSON_AddNumberToObject(root, "lcd_therapy_mode", (int)s_settings.lcd_therapy_mode);
     cJSON_AddNumberToObject(root, "alert_volume", s_settings.alert_volume);
     cJSON_AddNumberToObject(root, "lcd_rotation", s_settings.lcd_rotation);
+    cJSON_AddBoolToObject(root, "battery_enabled", s_settings.battery_enabled);
 
     *out_json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -245,6 +267,9 @@ esp_err_t device_settings_save_json(const char *json_str)
         cfg.lcd_rotation = lcd_rotation_is_valid(val) ?
                            (uint16_t)val : DEFAULT_LCD_ROTATION;
     }
+    if ((v = cJSON_GetObjectItem(root, "battery_enabled")) && cJSON_IsBool(v)) {
+        cfg.battery_enabled = cJSON_IsTrue(v);
+    }
 
     cJSON_Delete(root);
 
@@ -254,6 +279,10 @@ esp_err_t device_settings_save_json(const char *json_str)
     bsp_audio_set_volume(cfg.alert_volume);
     /* Apply LCD rotation immediately */
     bsp_display_set_rotation(cfg.lcd_rotation);
+    /* Apply battery display immediately if disabled */
+    if (!cfg.battery_enabled) {
+        bsp_display_set_battery(-1, false);
+    }
 
     /* Persist first so device_settings_get() returns the new mode,
      * then re-evaluate therapy display mode and backlight based on the new mode.

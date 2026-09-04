@@ -474,6 +474,8 @@ void app_main(void)
                 bsp_power_battery_get(&batt);
                 if (batt.valid) {
                     bsp_display_set_battery(batt.percent, batt.charging);
+                } else {
+                    bsp_display_set_battery(-1, false);
                 }
             }
         } else {
@@ -557,6 +559,8 @@ void app_main(void)
                 bsp_power_battery_get(&batt);
                 if (batt.valid) {
                     bsp_display_set_battery(batt.percent, batt.charging);
+                } else {
+                    bsp_display_set_battery(-1, false);
                 }
             }
         }
