@@ -64,10 +64,13 @@ INC = [os.path.join(ROOT, "main"), os.path.join(HERE, "test_include"), ROOT]
 # Each host test, and the shipped translation units it links. Keeping this explicit (rather than
 # globbing main/) is deliberate: the set of files a test links IS the thing #202 was about, so it
 # should be visible and reviewable rather than inferred.
+# A header a test #includes is a mutation target too, not just a .c it links: the shipped
+# spool_to_edf() lives in edf_data_dict.h and is the code #202 was about. Headers are listed
+# for targeting and reach; they are never passed to the compiler.
 TESTS = {
     "as11_time_test":       ["main/as11_time.c"],
     "as11_events_test":     ["main/as11_time.c", "@cjson"],
-    "edf_properties_test":  ["main/as11_time.c", "@cjson"],
+    "edf_properties_test":  ["main/as11_time.c", "main/edf_data_dict.h", "@cjson"],
     "vld3_decoder_test":    ["main/oximetry_vld3.c"],
 }
 
@@ -106,7 +109,7 @@ def sources_for(test: str) -> list[str] | None:
             if not CJSON:
                 return None
             out.append(CJSON)
-        else:
+        elif not s.endswith(".h"):
             out.append(os.path.join(ROOT, s))
     return out
 

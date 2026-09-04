@@ -16,3 +16,7 @@ main/edf_data_dict.h:49:equality:>=→>   # spool_to_edf's sign branch. The two 
 # (y == 0 after the March-shift; z == 0 days since 0000-03-01). No AS11 timestamp reaches there.
 main/as11_time.c:58:relational:>=→>
 main/as11_time.c:68:relational:>=→>
+# spool_to_edf: each mutant differs from the original only at a value where both paths agree.
+main/edf_data_dict.h:49:relational:>=→>     # prod == 0: (0+half)/den == (0-half)/den == 0 since half < den
+main/edf_data_dict.h:50:relational:>→>=     # rounded == INT16_MAX: early return and cast both yield INT16_MAX
+main/edf_data_dict.h:51:relational:<→<=     # rounded == INT16_MIN: same, at the other end
