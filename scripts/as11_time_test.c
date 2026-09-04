@@ -192,6 +192,42 @@ int main(void)
     check_period_end("Feb 28 23:00 (leap year rollover)", 2024, 2, 28, 23, 0, "2024-02-29 12:00");
     check_period_end("Oct 24 23:00 (evening before fall-back)", 2026, 10, 24, 23, 0, "2026-10-25 12:00");
 
+    printf("\n=== Scenario 9: Civil-Date Arithmetic at the February Boundary ===\n");
+    /* days_from_civil() is Hinnant's algorithm: the year is shifted so it starts on
+     * March 1, and the shift only fires for January and February. Every scenario above
+     * reaches it with a March-or-later date, so a wrong shift (m < 2, m >= 2) would
+     * pass the whole suite. The event-timestamp parser is the only caller that sees
+     * arbitrary dates and had no host test. Expected values are from an independent
+     * calendar (Python datetime), not from the function under test. */
+    expect_int("ISO event on leap day 2024-02-29T12:00:00.000Z",
+               as11_time_parse_iso8601_ms("2024-02-29T12:00:00.000Z"), 1709208000000LL);
+    expect_int("ISO event last ms of Feb 28 (leap year)",
+               as11_time_parse_iso8601_ms("2024-02-28T23:59:59.999Z"), 1709164799999LL);
+    expect_int("ISO event last second of Feb 28 (non-leap, no ms)",
+               as11_time_parse_iso8601_ms("2023-02-28T23:59:59Z"), 1677628799000LL);
+    expect_int("ISO event first second of Mar 1 (non-leap, no ms)",
+               as11_time_parse_iso8601_ms("2023-03-01T00:00:00Z"), 1677628800000LL);
+    expect_int("ISO event malformed returns -1",
+               as11_time_parse_iso8601_ms("2024-02-29"), -1);
+    expect_int("day number for 20240229 (leap day)",
+               as11_time_day_number("20240229"), 19782);
+    expect_int("day number for 20240301 (day after leap day)",
+               as11_time_day_number("20240301"), 19783);
+    /* 2100 is the first non-leap century year in the era that began in 2000; the
+     * doe/36524 term is inert for every date before it. */
+    expect_int("ISO event on 2100-03-01 (century non-leap boundary)",
+               as11_time_parse_iso8601_ms("2100-03-01T00:00:00Z"), 4107542400000LL);
+    expect_int("day number for 21000301",
+               as11_time_day_number("21000301"), 47541);
+    /* The reverse direction, civil_from_days(), is reached only through the noon-day
+     * label. Pin the offset so the label is a pure function of the epoch. */
+    as11_time_set_offset(0, "test");
+    as11_time_noon_day(4107589200000LL, day, sizeof(day));   /* 2100-03-01T13:00Z */
+    expect_str("noon-day label on 2100-03-01 (century boundary)", day, "21000301");
+    as11_time_noon_day(4107502800000LL, day, sizeof(day));   /* 2100-02-28T13:00Z */
+    expect_str("noon-day label on 2100-02-28 (2100 is not a leap year)", day, "21000228");
+    reset_offset();
+
     printf("\n%s (%d failure%s)\n", fails ? "FAILURES" : "ALL PASS",
            fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
