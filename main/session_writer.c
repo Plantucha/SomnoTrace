@@ -63,6 +63,7 @@
 #include "bsp_display.h"
 #include "post_therapy.h"
 #include "edf_gen.h"
+#include "as11_time.h"
 #include "uploader.h"
 #include "time_sync.h"
 #include "therapy_alert.h"
@@ -1562,14 +1563,7 @@ static void sw_post_task(void *arg)
         esp_err_t ret = edf_gen_generate(session_dir, session_id,
                                         start_epoch_ms, end_epoch_ms, drift_ms);
         char day_folder[32];
-        {
-            time_t t = (time_t)(start_epoch_ms / 1000);
-            struct tm tm;
-            localtime_r(&t, &tm);
-            if (tm.tm_hour < 12) { t -= 86400; localtime_r(&t, &tm); }
-            snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
-                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-        }
+        as11_time_noon_day(start_epoch_ms - drift_ms, day_folder, sizeof(day_folder));
         if (ret == ESP_OK) {
             uploader_on_export_complete(day_folder);
         } else if (ret == ESP_ERR_TIMEOUT) {

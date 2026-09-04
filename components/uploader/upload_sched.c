@@ -271,12 +271,6 @@ static bool run_backend(backend_rt_t *r, int max_days)
         bundle_only_run = true;
     }
 
-    if (!uploader_lease_take(LEASE_WAIT_MS)) {
-        ESP_LOGI(TAG, "%s: storage busy, deferring", be->id);
-        free(ox_refs);
-        return false;
-    }
-
     set_be_state(r, SB_UPLOADING);
     r->n_units = n_units + ox_pending;
     r->cur_unit = 0;
@@ -298,13 +292,13 @@ static bool run_backend(backend_rt_t *r, int max_days)
                                                       : "cannot connect",
                        res == UPLOAD_ERR_PERMANENT);
         if (be->session_end) be->session_end();
-        uploader_lease_give();
         free(ox_refs);
         return true;
     }
 
     int fails = 0;
     bool any_ok = false;
+    bool deferred_busy = false;
     /* Recorded here rather than inside the day loop: a `continue` in that loop
      * used to skip the fingerprint update, leaving the bundle permanently
      * "changed" and the backend reconnecting forever. */
@@ -314,7 +308,6 @@ static bool run_backend(backend_rt_t *r, int max_days)
     if (!refs) refs = calloc(UPLOAD_MAX_GROUPS_PER_DAY, sizeof(*refs));
     if (!refs) {
         if (be->session_end) be->session_end();
-        uploader_lease_give();
         free(ox_refs);
         return false;
     }
@@ -335,12 +328,21 @@ static bool run_backend(backend_rt_t *r, int max_days)
             continue;
         }
 
+        /* Storage lease is scoped to reading the day's EDF files on the SD card.
+         * Taking it per-day avoids blocking exports during long multi-day backlog runs. */
+        if (!uploader_lease_take(LEASE_WAIT_MS)) {
+            ESP_LOGI(TAG, "%s: storage busy, deferring day %s", be->id, daystr);
+            deferred_busy = true;
+            continue;
+        }
+
         int n_refs = upload_scan_day_groups(daystr, refs, UPLOAD_MAX_GROUPS_PER_DAY);
         if (n_refs == 0) {
             /* Files disappeared since the last scan; the next scan will drop
              * the day from the index. */
             ESP_LOGW(TAG, "%s: day %s has no EDF files on the card, skipping",
                      be->id, daystr);
+            uploader_lease_give();
             continue;
         }
 
@@ -348,6 +350,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         if (res != UPLOAD_OK) {
             cooldown_enter(r, "cannot open remote day", res == UPLOAD_ERR_PERMANENT);
             fails = FAILS_BEFORE_SWITCH;
+            uploader_lease_give();
             break;
         }
 
@@ -395,6 +398,11 @@ static bool run_backend(backend_rt_t *r, int max_days)
                 strlcpy(r->err, "root files failed", sizeof(r->err));
             }
         }
+
+        /* All EDF files on SD card for this day have been read and sent.
+         * Release the storage lease before day_end, so network polling
+         * (shq_wait_import can take up to 60s) does not block session exports. */
+        uploader_lease_give();
 
         res = be->day_end ? be->day_end(daystr, day_any) : UPLOAD_OK;
         if (res != UPLOAD_OK) {
@@ -450,7 +458,16 @@ static bool run_backend(backend_rt_t *r, int max_days)
             xSemaphoreTake(s_lock, portMAX_DELAY);
             strlcpy(r->cur_day, ox_refs[oi].day, sizeof(r->cur_day));
             xSemaphoreGive(s_lock);
+
+            bool ox_leased = uploader_lease_take(LEASE_WAIT_MS);
+            if (!ox_leased) {
+                ESP_LOGI(TAG, "%s: storage busy, deferring oximetry %s",
+                         be->id, ox_refs[oi].recording_id);
+                deferred_busy = true;
+                continue;
+            }
             res = be->put_oximetry(&ox_refs[oi]);
+            uploader_lease_give();
             upload_ox_mark(&ox_refs[oi], r->slot,
                            res == UPLOAD_OK ? UG_OK : UG_FAILED, NULL);
             if (res == UPLOAD_OK) {
@@ -478,7 +495,6 @@ static bool run_backend(backend_rt_t *r, int max_days)
     free(refs);
     free(ox_refs);
     if (be->session_end) be->session_end();
-    uploader_lease_give();
 
     if (bundle_committed) {
         upload_index_set_bundle_ok(r->slot, bundle.fp);
@@ -492,12 +508,17 @@ static bool run_backend(backend_rt_t *r, int max_days)
         if (r->state != SB_COOLDOWN)
             cooldown_enter(r, r->err[0] ? r->err : "upload failed", false);
     } else if (!any_ok && !bundle_committed) {
-        /* We connected and transferred nothing.  That is not success — it means
-         * the work list and the card disagreed — and if it were reported as
-         * success the backend would reconnect on every trigger forever.  Back
-         * off and say so; the next scan reconciles the disagreement. */
-        ESP_LOGW(TAG, "%s: connected but transferred nothing", be->id);
-        cooldown_enter(r, "nothing to send (state out of sync)", false);
+        if (deferred_busy) {
+            ESP_LOGI(TAG, "%s: storage busy during upload, deferring without cooldown", be->id);
+            set_be_state(r, SB_IDLE);
+        } else {
+            /* We connected and transferred nothing.  That is not success — it means
+             * the work list and the card disagreed — and if it were reported as
+             * success the backend would reconnect on every trigger forever.  Back
+             * off and say so; the next scan reconciles the disagreement. */
+            ESP_LOGW(TAG, "%s: connected but transferred nothing", be->id);
+            cooldown_enter(r, "nothing to send (state out of sync)", false);
+        }
     } else {
         cooldown_reset(r);
         set_be_state(r, SB_IDLE);
