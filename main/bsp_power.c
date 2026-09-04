@@ -341,7 +341,7 @@ typedef struct {
     uint32_t crc;
 } rtc_bat_backup_t;
 
-static RTC_DATA_ATTR rtc_bat_backup_t s_rtc_bat_backup;
+static RTC_NOINIT_ATTR rtc_bat_backup_t s_rtc_bat_backup;
 
 static inline uint32_t bat_calc_backup_crc(const rtc_bat_backup_t *b)
 {
@@ -576,10 +576,12 @@ static void battery_monitor_task(void *arg)
     int  charging_duration_s = 0;
     bool is_calibrated = false;
 
-    /* Check for warm reboot: restore shown_pct and filtered_mv from RTC Fast RAM. */
+    /* Check for reboot: restore shown_pct and filtered_mv from RTC Fast RAM.
+     * RTC_NOINIT_ATTR survives software restarts, watchdog resets, and firmware
+     * flashing over USB without power interruption. Magic and CRC protect against
+     * cold-power uninitialized SRAM garbage. */
     esp_reset_reason_t rst_reason = esp_reset_reason();
-    if (rst_reason != ESP_RST_POWERON &&
-        s_rtc_bat_backup.magic == BAT_RTC_MAGIC &&
+    if (s_rtc_bat_backup.magic == BAT_RTC_MAGIC &&
         s_rtc_bat_backup.crc == bat_calc_backup_crc(&s_rtc_bat_backup) &&
         s_rtc_bat_backup.shown_pct >= 0 &&
         s_rtc_bat_backup.shown_pct <= 100) {
@@ -588,7 +590,7 @@ static void battery_monitor_task(void *arg)
             filtered_mv = s_rtc_bat_backup.filtered_mv;
         }
         is_calibrated = true;
-        ESP_LOGI(TAG, "battery: restored shown_pct=%d%% filt=%dmV from RTC RAM across warm reboot (reason=%d)",
+        ESP_LOGI(TAG, "battery: restored shown_pct=%d%% filt=%dmV from RTC RAM across reboot (reason=%d)",
                  shown_pct, filtered_mv, (int)rst_reason);
     } else {
         memset(&s_rtc_bat_backup, 0, sizeof(s_rtc_bat_backup));

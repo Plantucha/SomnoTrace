@@ -470,21 +470,13 @@ void app_main(void)
             /* Update battery indicator in SoftAP mode */
             bsp_battery_t batt;
             bsp_power_battery_get(&batt);
-            if (batt.valid) {
-                bsp_display_set_battery(batt.percent, batt.charging);
-            } else {
-                bsp_display_set_battery(-1, false);
-            }
+            bsp_display_set_battery(batt.percent, batt.charging, batt.valid);
         } else {
             /* Update battery indicator every second (immediate redraw only on state change) */
             if (!bsp_display_is_therapy_active()) {
                 bsp_battery_t batt;
                 bsp_power_battery_get(&batt);
-                if (batt.valid) {
-                    bsp_display_set_battery(batt.percent, batt.charging);
-                } else {
-                    bsp_display_set_battery(-1, false);
-                }
+                bsp_display_set_battery(batt.percent, batt.charging, batt.valid);
             }
 
             /* Connected mode: refresh status display every 3 s.

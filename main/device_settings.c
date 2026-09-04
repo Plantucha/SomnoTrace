@@ -206,7 +206,7 @@ esp_err_t device_settings_set_battery_enabled(bool enabled)
 {
     s_settings.battery_enabled = enabled;
     if (!enabled) {
-        bsp_display_set_battery(-1, false);
+        bsp_display_set_battery(-1, false, false);
     }
     return ESP_OK;
 }
@@ -281,7 +281,7 @@ esp_err_t device_settings_save_json(const char *json_str)
     bsp_display_set_rotation(cfg.lcd_rotation);
     /* Apply battery display immediately if disabled */
     if (!cfg.battery_enabled) {
-        bsp_display_set_battery(-1, false);
+        bsp_display_set_battery(-1, false, false);
     }
 
     /* Persist first so device_settings_get() returns the new mode,

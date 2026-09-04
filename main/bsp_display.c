@@ -159,8 +159,9 @@ static int  s_status_nlines = 0;
 static char s_notice[STATUS_LINE_LEN] = "";
 
 /* Battery indicator state */
-static int s_batt_percent = -1;   /* -1 = unknown/not set */
+static int  s_batt_percent = -1;   /* -1 = unknown/not set */
 static bool s_batt_charging = false;
+static bool s_batt_valid = false;
 
 /* Live flow ring buffer for the therapy graph (PSRAM). */
 static float *s_flow_buf;
@@ -842,16 +843,17 @@ void bsp_display_set_as11_paired(bool paired)
     if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
-void bsp_display_set_battery(int percent, bool charging)
+void bsp_display_set_battery(int percent, bool charging, bool valid)
 {
     if (!s_state_mutex) return;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    if (s_batt_percent == percent && s_batt_charging == charging) {
+    if (s_batt_percent == percent && s_batt_charging == charging && s_batt_valid == valid) {
         xSemaphoreGive(s_state_mutex);
         return;
     }
     s_batt_percent = percent;
     s_batt_charging = charging;
+    s_batt_valid = valid;
     s_status_dirty = true;
     xSemaphoreGive(s_state_mutex);
     if (s_display_task) xTaskNotifyGive(s_display_task);
@@ -1421,6 +1423,7 @@ static void render_status(void)
     bool as11_paired = s_as11_paired;
     int batt_pct = s_batt_percent;
     bool batt_chg = s_batt_charging;
+    bool batt_valid = s_batt_valid;
     char notice[STATUS_LINE_LEN];
     memcpy(notice, s_notice, sizeof(notice));
     xSemaphoreGive(s_state_mutex);
@@ -1449,7 +1452,7 @@ static void render_status(void)
     }
 
     /* Battery indicator — left of BLE icon, right of clock area */
-    if (batt_pct >= 0 || (batt_pct == -1 && batt_chg)) {
+    if (batt_valid) {
         fb_draw_battery_indicator(118, 12, batt_pct, batt_chg);
     }
 
