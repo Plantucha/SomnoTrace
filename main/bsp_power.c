@@ -309,9 +309,8 @@ static const adc_channel_t s_bat_adc_channel = ADC_CHANNEL_0;  /* GPIO1 = ADC1_C
 /* Discard the lowest and highest eighth before averaging. */
 #define BAT_TRIM_FRACTION   8
 
-/* Cadence: a real battery cannot move fast, so sample rarely. */
-#define BAT_PERIOD_DISCHARGE_S  30   /* responsive discharge cadence (30s) */
-#define BAT_PERIOD_CHARGE_S     20   /* users watch a charge bar (20s) */
+/* Cadence: sample ADC burst every 10 s for smooth filtering and responsive tracking. */
+#define BAT_SAMPLE_PERIOD_S     10   /* base sampling cadence (10s) */
 #define BAT_UNPLUG_SETTLE_S     10   /* electrochemical relaxation window (10s) */
 #define BAT_DEBOUNCE_SEC        2    /* 2 s debounce to confirm physical plug/unplug edge */
 
@@ -346,6 +345,30 @@ static RTC_NOINIT_ATTR rtc_bat_backup_t s_rtc_bat_backup;
 static inline uint32_t bat_calc_backup_crc(const rtc_bat_backup_t *b)
 {
     return b->magic ^ ((uint32_t)(uint16_t)b->shown_pct << 16) ^ (uint32_t)(uint16_t)b->filtered_mv;
+}
+
+/* Dynamic rate-limiting intervals:
+ * Charging (CC/CV model):
+ *   0%..69% : 35 s per 1%  (fast CC phase: full ~500 mA charge rate)
+ *  70%..84% : 60 s per 1%  (early CV transition: current begins tapering)
+ *  85%..94% : 120 s per 1% (deep CV absorption: ~150-200 mA)
+ *  95%..99% : 180 s per 1% (trickle saturation: <100 mA)
+ * Discharging:
+ *  20%..100%: 30 s per 1%  (standard discharge slew guardrail against load spikes)
+ *   0%..19% : 15 s per 1%  (responsive low-battery knee tracking before PMU cutoff)
+ */
+static inline int bat_charge_step_delay_s(int pct)
+{
+    if (pct < 70) return 35;
+    if (pct < 85) return 60;
+    if (pct < 95) return 120;
+    return 180;
+}
+
+static inline int bat_discharge_step_delay_s(int pct)
+{
+    if (pct < 20) return 15;
+    return 30;
 }
 
 /* Li-ion open-circuit voltage → percent.  Descending by mV; linear
@@ -573,6 +596,7 @@ static void battery_monitor_task(void *arg)
     bool settling = false;
     TickType_t settle_until = 0;
     TickType_t last_nvs_save = 0;
+    TickType_t last_step_tick = 0;
     int  charging_duration_s = 0;
     bool is_calibrated = false;
 
@@ -590,6 +614,7 @@ static void battery_monitor_task(void *arg)
             filtered_mv = s_rtc_bat_backup.filtered_mv;
         }
         is_calibrated = true;
+        last_step_tick = xTaskGetTickCount();
         ESP_LOGI(TAG, "battery: restored shown_pct=%d%% filt=%dmV from RTC RAM across reboot (reason=%d)",
                  shown_pct, filtered_mv, (int)rst_reason);
     } else {
@@ -626,10 +651,9 @@ static void battery_monitor_task(void *arg)
              * displays 100% after a charge cycle. */
             if (!debounced_charging && filtered_mv >= 4140) {
                 target_pct = 100;
+                shown_pct = 100;
                 is_calibrated = true;
-                if (shown_pct < 0) {
-                    shown_pct = 100;
-                }
+                last_step_tick = xTaskGetTickCount();
             }
 
             if (settling && xTaskGetTickCount() < settle_until) {
@@ -644,6 +668,7 @@ static void battery_monitor_task(void *arg)
                          * relaxed OCV. Snap directly to target_pct and engage guardrails. */
                         shown_pct = target_pct;
                         is_calibrated = true;
+                        last_step_tick = xTaskGetTickCount();
                     } else {
                         /* On charger without prior calibration:
                          * If voltage is in the ambiguous CV float zone (>= 4100 mV),
@@ -657,16 +682,30 @@ static void battery_monitor_task(void *arg)
                         } else {
                             shown_pct = target_pct;
                             is_calibrated = true;
+                            last_step_tick = xTaskGetTickCount();
                         }
                     }
                 } else {
-                    /* Direction lock and slew rate:
-                     * While charging: strictly non-decreasing. Walk up at most 1% per update.
-                     * While discharging: strictly non-increasing. Walk down at most 1% per update. */
+                    /* Direction lock and dynamic slew rate:
+                     * While charging: strictly non-decreasing with staged CC/CV delay.
+                     * While discharging: strictly non-increasing with load guardrail. */
+                    TickType_t now = xTaskGetTickCount();
                     if (debounced_charging) {
-                        if (target_pct > shown_pct) shown_pct++;
+                        if (target_pct > shown_pct) {
+                            int delay_s = bat_charge_step_delay_s(shown_pct);
+                            if (now - last_step_tick >= pdMS_TO_TICKS(delay_s * 1000)) {
+                                shown_pct++;
+                                last_step_tick = now;
+                            }
+                        }
                     } else {
-                        if (target_pct < shown_pct) shown_pct--;
+                        if (target_pct < shown_pct) {
+                            int delay_s = bat_discharge_step_delay_s(shown_pct);
+                            if (now - last_step_tick >= pdMS_TO_TICKS(delay_s * 1000)) {
+                                shown_pct--;
+                                last_step_tick = now;
+                            }
+                        }
                     }
                 }
             }
@@ -690,7 +729,7 @@ static void battery_monitor_task(void *arg)
             period_s = (int)((rem + pdMS_TO_TICKS(999)) / pdMS_TO_TICKS(1000));
             if (period_s < 1) period_s = 1;
         } else {
-            period_s = debounced_charging ? BAT_PERIOD_CHARGE_S : BAT_PERIOD_DISCHARGE_S;
+            period_s = BAT_SAMPLE_PERIOD_S;
         }
         int raw_same_count = 0;
         bool candidate_charging = debounced_charging;
@@ -713,6 +752,7 @@ static void battery_monitor_task(void *arg)
                 debounced_charging = candidate_charging;
                 ESP_LOGI(TAG, "battery: charger %s (debounced)",
                          debounced_charging ? "connected" : "disconnected");
+                last_step_tick = xTaskGetTickCount();
 
                 if (!debounced_charging) {
                     settling = true;
@@ -765,8 +805,8 @@ esp_err_t bsp_power_battery_monitor_start(void)
         s_bat_mutex = NULL;
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "battery monitor started (%ds discharge / %ds charge cadence)",
-             BAT_PERIOD_DISCHARGE_S, BAT_PERIOD_CHARGE_S);
+    ESP_LOGI(TAG, "battery monitor started (%ds sampling cadence, dynamic CC/CV slew rate)",
+             BAT_SAMPLE_PERIOD_S);
     return ESP_OK;
 }
 
