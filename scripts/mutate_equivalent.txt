@@ -12,3 +12,7 @@ main/edf_data_dict.h:49:equality:>=→>   # spool_to_edf's sign branch. The two 
 #   prod == 0, where the true branch yields (0 + half)/den and the false branch (0 - half)/den. half
 #   is den/2, so |half| < den for every den >= 1, and C integer division truncates toward zero — both
 #   are 0. No (raw, num, den) triple separates them.
+# Hinnant civil-date arithmetic: the sign branches differ from their mutants only at year 0
+# (y == 0 after the March-shift; z == 0 days since 0000-03-01). No AS11 timestamp reaches there.
+main/as11_time.c:58:relational:>=→>
+main/as11_time.c:68:relational:>=→>

@@ -178,10 +178,15 @@ def executed_lines(outdir: str) -> dict[str, set[int]] | None:
                         if m:
                             src = os.path.abspath(m.group(1).strip())
                             continue
-                        m = re.match(r"\s*([#\-0-9=]+):\s*(\d+):", line)
+                        m = re.match(r"\s*([^:]+):\s*(\d+):", line)
                         if not m or src is None:
                             continue
                         cnt, num = m.group(1).strip(), int(m.group(2))
+                        # Only three markers mean "not executed". Everything else — a count, a
+                        # count with gcov's '*' partial-branch suffix ("9*"), or a form this parser
+                        # has never seen — is REACHED. The first version accepted only [#\-0-9=] and
+                        # so silently dropped every "N*" line: the ternaries and short-circuits,
+                        # i.e. the lines mutation exists to test, all reported as UNREACHED.
                         if num and cnt not in ("#####", "=====", "-"):
                             cov.setdefault(src, set()).add(num)
                 ok_any = True
@@ -230,22 +235,47 @@ def gen_mutants(path: str, limit: int) -> list[tuple[int, str, str, str]]:
     return out
 
 
+# A top-level function definition: a line starting at column 0 that is not a control keyword and
+# carries an opening paren. Deliberately loose — the previous version required a single-line
+# signature returning one of six named types, and across main/*.c it matched NOTHING in 29 files
+# while reporting "no canary candidate found" and carrying on. Most functions here return esp_err_t
+# or void, and many split their parameters across lines.
+_DEF = re.compile(r'^[A-Za-z_][A-Za-z0-9_ \t\*]*\b(\w+)\s*\(')
+_NOT_A_DEF = re.compile(r'^\s*(if|for|while|switch|return|else|do|typedef|struct|enum|union)\b')
+
+
 def canary_for(path: str, lines: list[str]) -> tuple[int, str, str] | None:
-    """Empty the body of the first function that returns a value — extreme mutation. No suite that
-    executes the function can miss it."""
+    """Empty the body of a function with a substantial body — extreme mutation (Descartes). No suite
+    that executes the function can miss it.
+
+    Returns the LARGEST body found rather than the first: a three-line accessor is a weak canary
+    (its removal can be invisible if callers ignore the result), and a weak canary that survives
+    reads exactly like a broken harness."""
+    best = None
     for i, line in enumerate(lines):
-        m = re.match(r'^(static\s+)?(inline\s+)?(int16_t|int|int64_t|bool|uint16_t|double)\s+'
-                     r'(\w+)\s*\([^;]*\)\s*$', line.strip())
-        if m and i + 1 < len(lines) and lines[i + 1].strip() == "{":
-            depth, j = 0, i + 1
-            while j < len(lines):
-                depth += lines[j].count("{") - lines[j].count("}")
-                if depth == 0:
-                    break
-                j += 1
-            if j > i + 2:
-                return i + 2, m.group(4), "".join(lines[i + 2:j])
-    return None
+        if _NOT_A_DEF.match(line) or not _DEF.match(line) or line.rstrip().endswith(";"):
+            continue
+        m = _DEF.match(line)
+        # walk forward to the opening brace of the body, tolerating a multi-line signature
+        j, guard = i, 0
+        while j < len(lines) and "{" not in lines[j]:
+            if ";" in lines[j] or guard > 6:
+                break
+            j += 1
+            guard += 1
+        if j >= len(lines) or "{" not in lines[j]:
+            continue
+        depth, k = 0, j
+        while k < len(lines):
+            depth += lines[k].count("{") - lines[k].count("}")
+            if depth == 0:
+                break
+            k += 1
+        body_start, body_end = j + 1, k
+        n = body_end - body_start
+        if n >= 4 and (best is None or n > best[3]):
+            best = (body_start, m.group(1), "".join(lines[body_start:body_end]), n)
+    return (best[0], best[1], best[2]) if best else None
 
 
 def apply(path: str, old_text: str, new_text: str) -> None:
@@ -258,33 +288,48 @@ def mutate_file(path: str, outdir: str, reach: dict | None, limit: int, equivs: 
     backup = path + ".mutbak"
     shutil.copy(path, backup)
     lines = open(path, encoding="utf-8").readlines()
-    res = {"file": rel, "killed": 0, "unasserted": [], "unreached": [], "equivalent": 0,
-           "canary": None}
+    res = {"file": rel, "killed": 0, "stillborn": 0, "unasserted": [], "unreached": [],
+           "equivalent": 0, "canary": None, "generated": 0}
     try:
         # ── canary first: if it survives, nothing else this run means anything
         c = canary_for(path, lines)
-        if c:
-            ln, fname, body = c
-            apply(path, body, "")
-            ok, _ = suite_passes(outdir)
-            shutil.copy(backup, path)
-            res["canary"] = {"fn": fname, "line": ln, "survived": ok}
-            if ok:
-                return res
+        if c is None:
+            # ⚠️ FAIL CLOSED. No canary means no way to show the harness can detect anything in this
+            # file, and an uncontrolled run reports "0 survivors" for a file it may never have
+            # compiled. The first version carried on regardless — it found no candidate in any of
+            # 29 files and would have reported every one of them as clean.
+            res["canary"] = {"fn": None, "line": 0, "survived": None}
+            return res
+        ln, fname, body = c
+        apply(path, body, "")
+        ok, _ = suite_passes(outdir)
+        shutil.copy(backup, path)
+        res["canary"] = {"fn": fname, "line": ln, "survived": ok}
+        if ok:
+            return res
 
-        for ln, op, orig, mut in gen_mutants(path, limit):
+        mutants = gen_mutants(path, limit)
+        res["generated"] = len(mutants)
+        for ln, op, orig, mut in mutants:
             key = f"{rel}:{ln}:{op}"
             if key in equivs:
                 res["equivalent"] += 1
                 continue
-            if reach is not None and ln not in reach.get(os.path.abspath(path), set()):
+            # gcov marks a #define non-executable, but mutating one acts at every use site: never
+            # let the reach filter skip it.
+            is_macro = orig.lstrip().startswith("#define")
+            if reach is not None and not is_macro and ln not in reach.get(os.path.abspath(path), set()):
                 res["unreached"].append((ln, op, orig.strip()[:70]))
                 continue
             apply(path, orig, mut)
-            ok, _ = suite_passes(outdir)
+            ok, why = suite_passes(outdir)
             shutil.copy(backup, path)
             if ok:
                 res["unasserted"].append((ln, op, orig.strip()[:70]))
+            elif why.endswith("build failed"):
+                # A mutant that does not compile proves nothing about the tests. Counting it as a
+                # kill inflates the score with kills the compiler made, not the suite.
+                res["stillborn"] += 1
             else:
                 res["killed"] += 1
     finally:
@@ -387,12 +432,20 @@ def main() -> int:
         print(f"\n══ {r['file']}")
         if r["canary"]:
             c = r["canary"]
+            if c["survived"] is None:
+                print("   🔴 NO CANARY — no function in this file has a body large enough to empty.")
+                print("   VOID: without a canary there is no evidence this harness can detect")
+                print("         anything here, and '0 survivors' would be indistinguishable from")
+                print("         a file that was never compiled.")
+                return 2
             if c["survived"]:
                 print(f"   🔴 CANARY SURVIVED — {c['fn']}() body emptied and every test still passed.")
                 print("   VOID: the harness is not running what it thinks it is. No other result here counts.")
                 return 2
             print(f"   canary: {c['fn']}() body emptied → killed")
-        print(f"   killed {r['killed']}   unasserted {len(r['unasserted'])}   "
+        if r["generated"] == 0:
+            print("   ⚠️  NO MUTANTS GENERATED — nothing below was tested. The canary is the only evidence.")
+        print(f"   killed {r['killed']}   stillborn {r['stillborn']}   unasserted {len(r['unasserted'])}   "
               f"unreached {len(r['unreached'])}   known-equivalent {r['equivalent']}")
         for ln, op, src in r["unasserted"]:
             print(f"     🔴 UNASSERTED  {r['file']}:{ln}  {op}   {src}")
