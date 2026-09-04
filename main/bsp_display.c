@@ -81,6 +81,7 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b);
 static void fb_clear(uint16_t color);
 static int fb_draw_string_aa(int x, int y, const font_info_t *font, const char *str, uint16_t color);
 static void fb_draw_wifi_indicator(int x, int y, bool connected);
+static void fb_draw_ble_indicator(int x, int y);
 static void render_graph(void);
 static void render_info(void);
 static void render_status(void);
@@ -1304,6 +1305,45 @@ static void render_info(void)
     lcd_flush();
 }
 
+/* Draw Bluetooth paired icon (standard 1px-stroke Bluetooth rune).
+ * Layout: 9×15px icon centered to the left of WiFi bars.
+ * x,y is the top-left corner of the icon bounding box. */
+static void fb_draw_ble_indicator(int x, int y)
+{
+    static const uint16_t bitmap[15] = {
+        0x030, /* ...##.... */
+        0x02C, /* ...#.##.. */
+        0x022, /* ...#...#. */
+        0x121, /* #..#....# */
+        0x0A2, /* .#.#...#. */
+        0x064, /* ..##..#.. */
+        0x028, /* ...#.#... */
+        0x030, /* ...##.... */
+        0x028, /* ...#.#... */
+        0x064, /* ..##..#.. */
+        0x0A2, /* .#.#...#. */
+        0x121, /* #..#....# */
+        0x022, /* ...#...#. */
+        0x02C, /* ...#.##.. */
+        0x030, /* ...##.... */
+    };
+    uint16_t col = rgb565(80, 180, 255);
+
+    for (int r = 0; r < 15; r++) {
+        uint16_t row = bitmap[r];
+        int py = y + r;
+        if (py < 0 || py >= LCD_V_RES) continue;
+        for (int c = 0; c < 9; c++) {
+            if (row & (1 << (8 - c))) {
+                int px = x + c;
+                if (px >= 0 && px < LCD_H_RES) {
+                    s_fb[py * LCD_H_RES + px] = col;
+                }
+            }
+        }
+    }
+}
+
 /* Draw battery percentage with an outline icon and prominent charging bolt.
  * Layout: [22×14px battery outline + 3×6px nub] [N% text]
  * x,y is the top-left of the battery outline. */
@@ -1401,20 +1441,12 @@ static void render_status(void)
 
     fb_draw_wifi_indicator(218, 10, wifi);
 
-    /* AS11 paired icon — small CPAP mask indicator to the left of WiFi bars */
+    /* AS11 BLE paired icon — Bluetooth rune to the left of WiFi bars */
     if (as11_paired) {
-        int bx = 218 - 22;
-        int by = 10;
-        uint16_t icon_col = rgb565(100, 200, 255);
-        /* Simple mask icon: rounded rectangle body + nose bridge */
-        fb_fill_rect(bx, by + 4, 14, 10, icon_col);
-        fb_fill_rect(bx + 5, by + 2, 4, 4, icon_col);
-        /* Strap line */
-        for (int dx = 0; dx < 14; dx += 3)
-            fb_fill_rect(bx + dx, by + 14, 2, 2, icon_col);
+        fb_draw_ble_indicator(199, 11);
     }
 
-    /* Battery indicator — left of AS11 icon, right of clock area */
+    /* Battery indicator — left of BLE icon, right of clock area */
     if (batt_pct >= 0) {
         fb_draw_battery_indicator(118, 12, batt_pct, batt_chg);
     }
