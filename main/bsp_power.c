@@ -26,8 +26,11 @@
 #include "bsp_power.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "esp_attr.h"
+#include "esp_system.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
@@ -307,9 +310,9 @@ static const adc_channel_t s_bat_adc_channel = ADC_CHANNEL_0;  /* GPIO1 = ADC1_C
 #define BAT_TRIM_FRACTION   8
 
 /* Cadence: a real battery cannot move fast, so sample rarely. */
-#define BAT_PERIOD_DISCHARGE_S  60
-#define BAT_PERIOD_CHARGE_S     20   /* users watch a charge bar */
-#define BAT_UNPLUG_SETTLE_S     30   /* let terminal voltage relax to OCV */
+#define BAT_PERIOD_DISCHARGE_S  30   /* responsive discharge cadence (30s) */
+#define BAT_PERIOD_CHARGE_S     20   /* users watch a charge bar (20s) */
+#define BAT_UNPLUG_SETTLE_S     10   /* electrochemical relaxation window (10s) */
 #define BAT_DEBOUNCE_SEC        2    /* 2 s debounce to confirm physical plug/unplug edge */
 
 /* Above this voltage or burst spread the reading cannot be a real Li-ion cell.
@@ -325,6 +328,25 @@ static bsp_battery_t s_bat_state = {
     .percent = -1, .millivolts = -1, .charging = false, .valid = false, .age_s = 0,
 };
 static TickType_t s_bat_last_ok_tick = 0;
+
+/* Warm-reboot persistence: RTC Fast SRAM survives software resets, watchdog
+ * resets, and flashing over USB without power loss. This prevents the battery
+ * gauge from jumping to a false 100% when rebooted on an active charger. */
+#define BAT_RTC_MAGIC   0x534E5442   /* 'SNTB' */
+
+typedef struct {
+    uint32_t magic;
+    int16_t  shown_pct;
+    int16_t  filtered_mv;
+    uint32_t crc;
+} rtc_bat_backup_t;
+
+static RTC_DATA_ATTR rtc_bat_backup_t s_rtc_bat_backup;
+
+static inline uint32_t bat_calc_backup_crc(const rtc_bat_backup_t *b)
+{
+    return b->magic ^ ((uint32_t)(uint16_t)b->shown_pct << 16) ^ (uint32_t)(uint16_t)b->filtered_mv;
+}
 
 /* Li-ion open-circuit voltage → percent.  Descending by mV; linear
  * interpolation between rows.  The 100% anchor is adaptive: it learns the
@@ -553,6 +575,23 @@ static void battery_monitor_task(void *arg)
     TickType_t last_nvs_save = 0;
     int  charging_duration_s = 0;
 
+    /* Check for warm reboot: restore shown_pct and filtered_mv from RTC Fast RAM. */
+    esp_reset_reason_t rst_reason = esp_reset_reason();
+    if (rst_reason != ESP_RST_POWERON &&
+        s_rtc_bat_backup.magic == BAT_RTC_MAGIC &&
+        s_rtc_bat_backup.crc == bat_calc_backup_crc(&s_rtc_bat_backup) &&
+        s_rtc_bat_backup.shown_pct >= 0 &&
+        s_rtc_bat_backup.shown_pct <= 100) {
+        shown_pct = s_rtc_bat_backup.shown_pct;
+        if (s_rtc_bat_backup.filtered_mv > 0) {
+            filtered_mv = s_rtc_bat_backup.filtered_mv;
+        }
+        ESP_LOGI(TAG, "battery: restored shown_pct=%d%% filt=%dmV from RTC RAM across warm reboot (reason=%d)",
+                 shown_pct, filtered_mv, (int)rst_reason);
+    } else {
+        memset(&s_rtc_bat_backup, 0, sizeof(s_rtc_bat_backup));
+    }
+
     for (;;) {
         if (!device_settings_battery_enabled()) {
             bat_publish(-1, -1, debounced_charging, false);
@@ -571,7 +610,7 @@ static void battery_monitor_task(void *arg)
             int ocv_mv = bat_calc_ocv(mv, debounced_charging);
 
             /* IIR low-pass across bursts.  Anything faster than this is
-             * noise by definition at a 20-60 s cadence. */
+             * noise by definition at a 20-30 s cadence. */
             if (filtered_mv < 0) filtered_mv = ocv_mv;
             else filtered_mv += (ocv_mv - filtered_mv) / 4;
 
@@ -602,6 +641,12 @@ static void battery_monitor_task(void *arg)
             }
 
             bat_publish(filtered_mv, shown_pct, debounced_charging, true);
+
+            /* Keep RTC Fast RAM snapshot up to date */
+            s_rtc_bat_backup.magic = BAT_RTC_MAGIC;
+            s_rtc_bat_backup.shown_pct = (int16_t)shown_pct;
+            s_rtc_bat_backup.filtered_mv = (int16_t)filtered_mv;
+            s_rtc_bat_backup.crc = bat_calc_backup_crc(&s_rtc_bat_backup);
             ESP_LOGD(TAG, "battery: vbat=%dmV filt=%dmV target=%d%% shown=%d%% chg=%d spread=%dmV",
                      mv, filtered_mv, target_pct, shown_pct, debounced_charging, spread_mv);
         }
