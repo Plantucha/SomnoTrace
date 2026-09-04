@@ -25,10 +25,32 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ── Spool → EDF fixed-point conversion ──────────────────────────────── */
+
+/* Convert a Summary-spool fixed-point integer to its EDF digital value.
+ * `raw == -1` is the missing sentinel and passes through untouched.
+ * Rounding is SYMMETRIC (half away from zero) — truncating here silently
+ * biased every STR settings value low, which is what issue #192 reported.
+ *
+ * Lives in this header rather than in edf_summary.c so the host property
+ * tests bind to the same definition the firmware uses. A test carrying its
+ * own copy stays green when this one changes. */
+static inline int16_t spool_to_edf(int16_t raw, int num, int den)
+{
+    if (raw == -1 || den <= 0) return -1;
+    int32_t prod = (int32_t)raw * num;
+    int32_t half = den / 2;
+    int32_t rounded = (prod >= 0) ? (prod + half) / den : (prod - half) / den;
+    if (rounded > INT16_MAX) return INT16_MAX;
+    if (rounded < INT16_MIN) return INT16_MIN;
+    return (int16_t)rounded;
+}
 
 /* ── Signal definition structure ─────────────────────────────────────── */
 

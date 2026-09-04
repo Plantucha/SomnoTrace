@@ -37,64 +37,20 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "snt_format.h"      /* clamp_i16, snt_missing_for, is_channel_map_valid */
+#include "edf_data_dict.h"   /* signal counts, spool_to_edf */
 #include "as11_time.h"
 
 /* ════════════════════════════════════════════════════════════════════
- *  Replicated Production Helpers Under Test (main/edf_gen.c)
+ *  Production code under test — included, never replicated.
+ *
+ *  These properties used to assert against private copies of clamp_i16,
+ *  snt_missing_for, is_channel_map_valid, spool_to_edf and the recording-id
+ *  formatter. A copy stays green when the shipped version changes, so the
+ *  suite could not see a regression in the code it names. They are included
+ *  from snt_format.h / edf_data_dict.h / as11_time.h now.
  * ════════════════════════════════════════════════════════════════════ */
 
-#define SNT_MISSING_V1  -1
-#define SNT_MISSING_V2  INT16_MIN
-
-static inline int16_t snt_missing_for(uint8_t version)
-{
-    return (version >= 2) ? SNT_MISSING_V2 : SNT_MISSING_V1;
-}
-
-static inline int16_t clamp_i16(int val, int16_t min_val, int16_t max_val)
-{
-    if (val > max_val) return max_val;
-    if (val < min_val) return min_val;
-    return (int16_t)val;
-}
-
-static inline bool is_channel_map_valid(const int *map, int n_signals, int snt_channels)
-{
-    if (!map) return (snt_channels == n_signals);
-    for (int i = 0; i < n_signals; i++) {
-        if (map[i] < 0 || map[i] >= snt_channels) return false;
-    }
-    return true;
-}
-
-static inline int16_t spool_to_edf(int16_t raw, int num, int den)
-{
-    if (raw == -1 || den <= 0) return -1;
-    int32_t prod = (int32_t)raw * num;
-    int32_t half = den / 2;
-    int32_t rounded = (prod >= 0) ? (prod + half) / den : (prod - half) / den;
-    if (rounded > INT16_MAX) return INT16_MAX;
-    if (rounded < INT16_MIN) return INT16_MIN;
-    return (int16_t)rounded;
-}
-
-static void format_recording_id(char *out, size_t out_len,
-                                int64_t epoch_ms,
-                                const char *srn, const char *mid, const char *vid)
-{
-    static const char *month_names[] = {
-        "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
-    };
-    time_t t = (time_t)(epoch_ms / 1000);
-    struct tm tm;
-    gmtime_r(&t, &tm); /* Test environment uses gmtime_r for UTC baseline */
-
-    snprintf(out, out_len,
-             "Startdate %02d-%s-%04d X X X SRN=%s MID=%s VID=%s",
-             tm.tm_mday, month_names[tm.tm_mon % 12],
-             tm.tm_year + 1900, srn, mid, vid);
-}
 
 /* Event edge parser under test */
 static int64_t find_zle_edge_time_json(const cJSON *msg, int want_value, int64_t clock_drift_ms)
@@ -147,6 +103,13 @@ static int g_fail = 0;
 
 static void test_prop_01_noon_day_boundaries(void)
 {
+    /* Pin the AS11 offset the comments below assume. Without this the test
+     * silently inherits the HOST timezone — as11_time_noon_day() falls back to
+     * ESP-local time when no offset is stored, and PROP_02, which parses
+     * +10:00, runs after this. The suite then passed only in AEST: UTC 36/1,
+     * Europe/Prague 36/1, America/New_York 34/3. */
+    as11_time_set_offset(10 * 3600, "test");
+
     /* 2026-09-02 12:00:00 AEST (+10:00) is 2026-09-02 02:00:00 UTC = epoch 1788314400 */
     /* 1 second before noon (11:59:59 local): belongs to previous treatment day (20260901) */
     char day[16];
@@ -288,16 +251,20 @@ static void test_prop_08_invalid_passthrough_flag(void)
 
 static void test_prop_09_signal_count_invariant(void)
 {
-    /* Verify known EDF signal counts per spec */
-    int brp_count = 2; /* Flow, MaskPress */
-    int pld_count = 9; /* MaskPress, Press, EprPress, Leak, RespRate, TidVol, MinVent, Snore, FlowLim */
-    int sa2_count = 2; /* SpO2, Pulse */
-    int str_count = 134; /* Summary signals */
+    /* Read the SHIPPED macros. Asserting local literals here made this test
+     * pass no matter what edf_data_dict.h said. */
+    TEST_ASSERT(EDF_BRP_SIGNAL_COUNT == 2, "PROP_09: BRP signal count is exactly 2");
+    TEST_ASSERT(EDF_PLD_SIGNAL_COUNT == 9, "PROP_09: PLD signal count is exactly 9");
+    TEST_ASSERT(EDF_SA2_SIGNAL_COUNT == 2, "PROP_09: SA2 signal count is exactly 2");
+    TEST_ASSERT(STR_SIGNAL_COUNT == 134, "PROP_09: STR signal count is exactly 134");
 
-    TEST_ASSERT(brp_count == 2, "PROP_09: BRP signal count is exactly 2");
-    TEST_ASSERT(pld_count == 9, "PROP_09: PLD signal count is exactly 9");
-    TEST_ASSERT(sa2_count == 2, "PROP_09: SA2 signal count is exactly 2");
-    TEST_ASSERT(str_count == 134, "PROP_09: STR signal count is exactly 134");
+    /* …and that the tables really hold that many rows, not just the macros. */
+    TEST_ASSERT(sizeof(g_brp_signals) / sizeof(g_brp_signals[0]) == EDF_BRP_SIGNAL_COUNT,
+                "PROP_09: BRP table length matches its count macro");
+    TEST_ASSERT(sizeof(g_pld_signals) / sizeof(g_pld_signals[0]) == EDF_PLD_SIGNAL_COUNT,
+                "PROP_09: PLD table length matches its count macro");
+    TEST_ASSERT(sizeof(g_sa2_signals) / sizeof(g_sa2_signals[0]) == EDF_SA2_SIGNAL_COUNT,
+                "PROP_09: SA2 table length matches its count macro");
 }
 
 static void test_prop_10_header_date_calendar_vs_noon(void)
@@ -311,7 +278,7 @@ static void test_prop_10_header_date_calendar_vs_noon(void)
     TEST_ASSERT(strcmp(day_folder, "20260902") == 0, "PROP_10: Treatment day folder is 20260902");
 
     char rec_id[128];
-    format_recording_id(rec_id, sizeof(rec_id), epoch_ms, "22251436648", "46", "3");
+    as11_time_format_recording_id(rec_id, sizeof(rec_id), epoch_ms, "22251436648", "46", "3");
     TEST_ASSERT(strncmp(rec_id, "Startdate 03-SEP-2026", 21) == 0, "PROP_10: Waveform recording_id uses calendar date (03-SEP-2026)");
 }
 
@@ -369,7 +336,7 @@ static void test_prop_16_recording_id_format(void)
 {
     char out[128];
     int64_t epoch = 1788394175LL * 1000;
-    format_recording_id(out, sizeof(out), epoch, "22251436648", "46", "3");
+    as11_time_format_recording_id(out, sizeof(out), epoch, "22251436648", "46", "3");
 
     const char *expected = "Startdate 03-SEP-2026 X X X SRN=22251436648 MID=46 VID=3";
     TEST_ASSERT(strcmp(out, expected) == 0, "PROP_16: Recording ID matches ResMed format specification exactly");
@@ -377,6 +344,22 @@ static void test_prop_16_recording_id_format(void)
 
 int main(void)
 {
+    /* PIN THE HOST ZONE. Two properties assert a recording_id, and
+     * as11_time_format_recording_id() formats it with localtime_r() — by
+     * design, because the AS11 writes its own Startdate in local civil time
+     * (a card here shows "Startdate 29-JUL-2026" against startdate 29.07.26).
+     *
+     * The previous revision hid that: its private copy of the formatter called
+     * gmtime_r() with the comment "Test environment uses gmtime_r for UTC
+     * baseline", so PROP_10 and PROP_16 passed in every zone while asserting
+     * behaviour the firmware does not have. A copy that has DRIFTED from the
+     * original is worse than one that matches — it is green and wrong.
+     *
+     * With the real formatter in use the assertions are zone-dependent, so the
+     * zone is fixed here rather than inherited from whoever runs the suite. */
+    setenv("TZ", "UTC", 1);
+    tzset();
+
     printf("=== Running Automated Host Property Test Suite (16/16 Properties) ===\n");
 
     test_prop_01_noon_day_boundaries();
