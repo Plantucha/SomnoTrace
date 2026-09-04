@@ -397,46 +397,60 @@ esp_err_t edf_generate_identification_files(const char *edf_dir,
         return ESP_FAIL;
     }
 
-    char path[300];
+    char json_path[300];
+    char crc_path[300];
     char tmp_path[380];
     size_t json_len = strlen(json_str);
-    snprintf(path, sizeof(path), "%s/Identification.json", edf_dir);
-    FILE *f = edf_open_atomic_file(path, tmp_path, sizeof(tmp_path));
+    snprintf(json_path, sizeof(json_path), "%s/Identification.json", edf_dir);
+    snprintf(crc_path, sizeof(crc_path), "%s/Identification.crc", edf_dir);
+
+    bool json_ok = false;
+    FILE *f = edf_open_atomic_file(json_path, tmp_path, sizeof(tmp_path));
     if (f) {
         if (!edf_write_all(f, json_str, json_len)) {
-            ESP_LOGE(TAG, "cannot write %s: %s", path, strerror(errno));
+            ESP_LOGE(TAG, "cannot write %s: %s", json_path, strerror(errno));
             edf_discard_atomic_file(f, tmp_path);
-        } else if (edf_finalize_atomic_file(f, tmp_path, path) != ESP_OK) {
-            ESP_LOGE(TAG, "cannot finalize %s: %s", path, strerror(errno));
+        } else if (edf_finalize_atomic_file(f, tmp_path, json_path) != ESP_OK) {
+            ESP_LOGE(TAG, "cannot finalize %s: %s", json_path, strerror(errno));
         } else {
-            ESP_LOGI(TAG, "wrote %s (%u bytes)", path, (unsigned)json_len);
+            ESP_LOGI(TAG, "wrote %s (%u bytes)", json_path, (unsigned)json_len);
+            json_ok = true;
         }
     } else {
-        ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
+        ESP_LOGE(TAG, "cannot create %s: %s", json_path, strerror(errno));
     }
 
-    uint32_t crc = edf_crc32_ieee((const uint8_t *)json_str, json_len);
-    snprintf(path, sizeof(path), "%s/Identification.crc", edf_dir);
-    f = edf_open_atomic_file(path, tmp_path, sizeof(tmp_path));
-    if (f) {
-        uint8_t crc_bytes[4] = {
-            (uint8_t)(crc & 0xFF),
-            (uint8_t)((crc >> 8) & 0xFF),
-            (uint8_t)((crc >> 16) & 0xFF),
-            (uint8_t)((crc >> 24) & 0xFF),
-        };
-        if (!edf_write_all(f, crc_bytes, 4)) {
-            ESP_LOGE(TAG, "cannot write %s: %s", path, strerror(errno));
-            edf_discard_atomic_file(f, tmp_path);
-        } else if (edf_finalize_atomic_file(f, tmp_path, path) != ESP_OK) {
-            ESP_LOGE(TAG, "cannot finalize %s: %s", path, strerror(errno));
+    bool crc_ok = false;
+    if (json_ok) {
+        uint32_t crc = edf_crc32_ieee((const uint8_t *)json_str, json_len);
+        f = edf_open_atomic_file(crc_path, tmp_path, sizeof(tmp_path));
+        if (f) {
+            uint8_t crc_bytes[4] = {
+                (uint8_t)(crc & 0xFF),
+                (uint8_t)((crc >> 8) & 0xFF),
+                (uint8_t)((crc >> 16) & 0xFF),
+                (uint8_t)((crc >> 24) & 0xFF),
+            };
+            if (!edf_write_all(f, crc_bytes, 4)) {
+                ESP_LOGE(TAG, "cannot write %s: %s", crc_path, strerror(errno));
+                edf_discard_atomic_file(f, tmp_path);
+                unlink(crc_path);
+            } else if (edf_finalize_atomic_file(f, tmp_path, crc_path) != ESP_OK) {
+                ESP_LOGE(TAG, "cannot finalize %s: %s", crc_path, strerror(errno));
+                unlink(crc_path);
+            } else {
+                ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", crc_path, (unsigned)crc);
+                crc_ok = true;
+            }
         } else {
-            ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", path, (unsigned)crc);
+            ESP_LOGE(TAG, "cannot create %s: %s", crc_path, strerror(errno));
+            unlink(crc_path);
         }
     } else {
-        ESP_LOGE(TAG, "cannot create %s: %s", path, strerror(errno));
+        unlink(crc_path);
+        ESP_LOGW(TAG, "Identification.json write failed — removed stale %s", crc_path);
     }
 
     free(json_str);
-    return ESP_OK;
+    return (json_ok && crc_ok) ? ESP_OK : ESP_FAIL;
 }

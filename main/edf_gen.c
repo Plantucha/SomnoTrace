@@ -653,8 +653,12 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
             }
             size_t slen = strlen(settings_str);
             char cs_path[300];
+            char cs_crc_path[300];
             char cs_tmp[380];
             snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.json", root_settings);
+            snprintf(cs_crc_path, sizeof(cs_crc_path), "%s/CurrentSettings.crc", root_settings);
+
+            bool cs_json_ok = false;
             FILE *csf = edf_open_atomic_file(cs_path, cs_tmp, sizeof(cs_tmp));
             if (csf) {
                 if (!edf_write_all(csf, settings_str, slen)) {
@@ -664,31 +668,44 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                     ESP_LOGE(TAG, "cannot finalize %s: %s", cs_path, strerror(errno));
                 } else {
                     ESP_LOGI(TAG, "wrote %s", cs_path);
+                    cs_json_ok = true;
                 }
             } else {
                 ESP_LOGE(TAG, "cannot create %s: %s", cs_path, strerror(errno));
             }
+
             /* Write CurrentSettings.crc (CRC-32 LE, same format as Identification.crc) */
-            snprintf(cs_path, sizeof(cs_path), "%s/CurrentSettings.crc", root_settings);
-            csf = edf_open_atomic_file(cs_path, cs_tmp, sizeof(cs_tmp));
-            if (csf) {
-                uint32_t cs_crc = edf_crc32_ieee((const uint8_t *)settings_str, slen);
-                uint8_t crc_bytes[4] = {
-                    (uint8_t)(cs_crc & 0xFF),
-                    (uint8_t)((cs_crc >> 8) & 0xFF),
-                    (uint8_t)((cs_crc >> 16) & 0xFF),
-                    (uint8_t)((cs_crc >> 24) & 0xFF),
-                };
-                if (!edf_write_all(csf, crc_bytes, 4)) {
-                    ESP_LOGE(TAG, "cannot write %s: %s", cs_path, strerror(errno));
-                    edf_discard_atomic_file(csf, cs_tmp);
-                } else if (edf_finalize_atomic_file(csf, cs_tmp, cs_path) != ESP_OK) {
-                    ESP_LOGE(TAG, "cannot finalize %s: %s", cs_path, strerror(errno));
+            if (cs_json_ok) {
+                csf = edf_open_atomic_file(cs_crc_path, cs_tmp, sizeof(cs_tmp));
+                if (csf) {
+                    uint32_t cs_crc = edf_crc32_ieee((const uint8_t *)settings_str, slen);
+                    uint8_t crc_bytes[4] = {
+                        (uint8_t)(cs_crc & 0xFF),
+                        (uint8_t)((cs_crc >> 8) & 0xFF),
+                        (uint8_t)((cs_crc >> 16) & 0xFF),
+                        (uint8_t)((cs_crc >> 24) & 0xFF),
+                    };
+                    if (!edf_write_all(csf, crc_bytes, 4)) {
+                        ESP_LOGE(TAG, "cannot write %s: %s", cs_crc_path, strerror(errno));
+                        edf_discard_atomic_file(csf, cs_tmp);
+                        unlink(cs_crc_path);
+                        errors++;
+                    } else if (edf_finalize_atomic_file(csf, cs_tmp, cs_crc_path) != ESP_OK) {
+                        ESP_LOGE(TAG, "cannot finalize %s: %s", cs_crc_path, strerror(errno));
+                        unlink(cs_crc_path);
+                        errors++;
+                    } else {
+                        ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", cs_crc_path, (unsigned)cs_crc);
+                    }
                 } else {
-                    ESP_LOGI(TAG, "wrote %s (crc32=0x%08X)", cs_path, (unsigned)cs_crc);
+                    ESP_LOGE(TAG, "cannot create %s: %s", cs_crc_path, strerror(errno));
+                    unlink(cs_crc_path);
+                    errors++;
                 }
             } else {
-                ESP_LOGE(TAG, "cannot create %s: %s", cs_path, strerror(errno));
+                unlink(cs_crc_path);
+                ESP_LOGW(TAG, "CurrentSettings.json write failed — removed stale %s", cs_crc_path);
+                errors++;
             }
             free(settings_str);
         }
