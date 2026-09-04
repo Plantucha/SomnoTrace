@@ -1224,10 +1224,8 @@ static void render_info(void)
     fb_clear(bg);
 
     /* ── Top half: Header line ───────────────────────────────────────── */
-    /* "CUR" label above left column */
-    int cur_lbl_w = str_width_aa(&roboto_body, "CUR");
-    int cur_lbl_x = 58 - cur_lbl_w / 2;
-    if (cur_lbl_x < 4) cur_lbl_x = 4;
+    /* "CUR" label at left margin */
+    int cur_lbl_x = 12;
     fb_draw_string_aa(cur_lbl_x, 10, &roboto_body, "CUR", label_col);
 
     /* "Leak (L/min)" title in center */
@@ -1237,10 +1235,9 @@ static void render_info(void)
     if (hdr_x < 4) hdr_x = 4;
     fb_draw_string_aa(hdr_x, 10, &roboto_body, leak_hdr, hdr_col);
 
-    /* "AVG" label above right column */
+    /* "AVG" label at right margin */
     int avg_lbl_w = str_width_aa(&roboto_body, "AVG");
-    int avg_lbl_x = 182 - avg_lbl_w / 2;
-    if (avg_lbl_x < 124) avg_lbl_x = 124;
+    int avg_lbl_x = LCD_H_RES - 12 - avg_lbl_w;
     fb_draw_string_aa(avg_lbl_x, 10, &roboto_body, "AVG", label_col);
 
     /* ── Top half: Values (roboto_title 2× scaled, ~66px tall) ───────── */
@@ -1307,13 +1304,13 @@ static void render_info(void)
     lcd_flush();
 }
 
-/* Draw battery percentage with a small outline icon and optional charging bolt.
- * Layout: [12×9px battery outline] [N% text]
+/* Draw battery percentage with an outline icon and prominent charging bolt.
+ * Layout: [22×14px battery outline + 3×6px nub] [N% text]
  * x,y is the top-left of the battery outline. */
 static void fb_draw_battery_indicator(int x, int y, int percent, bool charging)
 {
     uint16_t frame_col = rgb565(180, 180, 180);
-    uint16_t bolt_col = rgb565(255, 200, 0);
+    uint16_t bolt_col = rgb565(255, 204, 0);
 
     /* Text color based on charge level */
     uint16_t text_col;
@@ -1327,30 +1324,39 @@ static void fb_draw_battery_indicator(int x, int y, int percent, bool charging)
         text_col = rgb565(80, 220, 100);     /* green */
     }
 
-    /* Battery outline: 10px wide × 8px tall body + 2px terminal nub */
-    fb_fill_rect(x, y + 1, 10, 8, frame_col);        /* outer frame */
-    fb_fill_rect(x + 1, y + 2, 8, 6, rgb565(0, 0, 0)); /* inner cavity */
-    fb_fill_rect(x + 10, y + 3, 2, 4, frame_col);    /* terminal nub */
+    /* Battery outline: 22px wide × 14px tall body + 3×6px terminal nub */
+    fb_fill_rect(x, y, 22, 14, frame_col);             /* outer frame */
+    fb_fill_rect(x + 1, y + 1, 20, 12, rgb565(0, 0, 0)); /* inner cavity */
+    fb_fill_rect(x + 22, y + 4, 3, 6, frame_col);      /* terminal nub */
 
-    /* Charging bolt inside the outline, or proportional fill if on battery */
+    /* Charging bolt inside the cavity, or proportional fill if on battery */
     if (charging) {
-        fb_fill_rect(x + 4, y + 2, 2, 3, bolt_col);
-        fb_fill_rect(x + 3, y + 3, 4, 1, bolt_col);
-        fb_fill_rect(x + 2, y + 4, 6, 1, bolt_col);
-        fb_fill_rect(x + 3, y + 5, 4, 1, bolt_col);
-        fb_fill_rect(x + 4, y + 6, 2, 2, bolt_col);
+        /* Prominent bold lightning bolt centered in 20×12 cavity */
+        int bx = x + 7;
+        int by = y + 2;
+        fb_fill_rect(bx + 5, by + 0, 2, 1, bolt_col);
+        fb_fill_rect(bx + 4, by + 1, 2, 1, bolt_col);
+        fb_fill_rect(bx + 3, by + 2, 3, 1, bolt_col);
+        fb_fill_rect(bx + 2, by + 3, 3, 1, bolt_col);
+        fb_fill_rect(bx + 1, by + 4, 4, 1, bolt_col);
+        fb_fill_rect(bx + 0, by + 5, 8, 1, bolt_col);  /* waist bar */
+        fb_fill_rect(bx + 3, by + 6, 4, 1, bolt_col);
+        fb_fill_rect(bx + 2, by + 7, 4, 1, bolt_col);
+        fb_fill_rect(bx + 2, by + 8, 3, 1, bolt_col);
+        fb_fill_rect(bx + 1, by + 9, 3, 1, bolt_col);
+        fb_fill_rect(bx + 0, by + 10, 2, 1, bolt_col);
     } else if (percent > 0) {
-        int fill_w = (percent * 8 + 50) / 100;
+        int fill_w = (percent * 20 + 50) / 100;
         if (fill_w < 1) fill_w = 1;
-        if (fill_w > 8) fill_w = 8;
-        fb_fill_rect(x + 1, y + 2, fill_w, 6, text_col);
+        if (fill_w > 20) fill_w = 20;
+        fb_fill_rect(x + 1, y + 1, fill_w, 12, text_col);
     }
 
     /* Percentage text to the right of the outline */
     if (percent >= 0) {
         char pct_str[16];
         snprintf(pct_str, sizeof(pct_str), "%d%%", percent);
-        fb_draw_string_aa(x + 15, y - 3, &roboto_body, pct_str, text_col);
+        fb_draw_string_aa(x + 28, y - 3, &roboto_body, pct_str, text_col);
     }
 }
 
@@ -1410,7 +1416,7 @@ static void render_status(void)
 
     /* Battery indicator — left of AS11 icon, right of clock area */
     if (batt_pct >= 0) {
-        fb_draw_battery_indicator(130, 12, batt_pct, batt_chg);
+        fb_draw_battery_indicator(118, 12, batt_pct, batt_chg);
     }
 
     int y = 48;
