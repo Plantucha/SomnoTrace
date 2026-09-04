@@ -288,6 +288,26 @@ int64_t as11_time_local_noon_epoch(const char *day_label)
     return (t == (time_t)-1) ? 0 : (int64_t)t;
 }
 
+int64_t as11_time_noon_period_end_ms(int64_t as11_epoch_ms)
+{
+    char day_label[16];
+    as11_time_noon_day(as11_epoch_ms, day_label, sizeof(day_label));
+    int y, m, d;
+    if (!parse_label(day_label, &y, &m, &d)) return 0;
+
+    struct tm tm = {
+        .tm_year = y - 1900,
+        .tm_mon = m - 1,
+        .tm_mday = d + 1,        /* Period ends at next day's noon */
+        .tm_hour = 12,
+        .tm_min = 0,
+        .tm_sec = 0,
+        .tm_isdst = -1,
+    };
+    time_t t = mktime(&tm);
+    return (t == (time_t)-1) ? 0 : ((int64_t)t * 1000);
+}
+
 int as11_time_day_number(const char *day_label)
 {
     int y, m, d;

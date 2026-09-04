@@ -31,6 +31,7 @@
 #include "upload_sched.h"
 #include "therapy_alert.h"
 #include "edf_gen.h"
+#include "as11_time.h"
 #include "sd_storage.h"
 #include "ff.h"
 #include "log_stream.h"
@@ -2252,15 +2253,8 @@ static void recreate_edfs_task(void *arg)
 
     for (int i = 0; i < n_sessions; i++) {
         char day_folder[32];
-        time_t t = (time_t)(sessions[i].start_epoch_ms / 1000);
-        struct tm tm;
-        localtime_r(&t, &tm);
-        if (tm.tm_hour < 12) {
-            t -= 86400;
-            localtime_r(&t, &tm);
-        }
-        snprintf(day_folder, sizeof(day_folder), "%04d%02d%02d",
-                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        as11_time_noon_day(sessions[i].start_epoch_ms - sessions[i].clock_drift_ms,
+                           day_folder, sizeof(day_folder));
 
         bool dup = false;
         for (int j = 0; j < n_queued_days; j++) {

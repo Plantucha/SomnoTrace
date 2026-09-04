@@ -62,6 +62,21 @@ static void reset_offset(void)
     as11_time_set_offset(0, "reset");
 }
 
+static void check_period_end(const char *what, int y, int m, int d, int h, int min, const char *want_dt)
+{
+    struct tm tm = { .tm_year = y - 1900, .tm_mon = m - 1, .tm_mday = d, .tm_hour = h, .tm_min = min, .tm_isdst = -1 };
+    time_t t = mktime(&tm);
+    int64_t end_ms = as11_time_noon_period_end_ms((int64_t)t * 1000);
+    time_t end_t = (time_t)(end_ms / 1000);
+    struct tm end_tm;
+    localtime_r(&end_t, &end_tm);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d",
+             end_tm.tm_year + 1900, end_tm.tm_mon + 1, end_tm.tm_mday,
+             end_tm.tm_hour, end_tm.tm_min);
+    expect_str(what, buf, want_dt);
+}
+
 int main(void)
 {
     printf("\n=== Scenario 1: Issue #75 Vector (AS11 -05:00 vs ESP MST7MDT) ===\n");
@@ -129,6 +144,30 @@ int main(void)
     as11_time_noon_day(1773073800LL * 1000LL, day, sizeof(day));
     expect_str("Mar 9 12:30 EDT (next noon-day)", day, "20260309");
 
+    /* Europe/Prague (spring forward on 2026-03-29) */
+    set_tz("CET-1CEST,M3.5.0,M10.5.0/3");
+    reset_offset();
+    struct tm prague_tm = { .tm_year = 126, .tm_mon = 2, .tm_mday = 30, .tm_hour = 0, .tm_min = 30, .tm_isdst = -1 };
+    time_t t_prague = mktime(&prague_tm);
+    as11_time_noon_day((int64_t)t_prague * 1000, day, sizeof(day));
+    expect_str("Prague Mar 30 00:30 (post-midnight on 23h night)", day, "20260329");
+    prague_tm.tm_min = 59;
+    t_prague = mktime(&prague_tm);
+    as11_time_noon_day((int64_t)t_prague * 1000, day, sizeof(day));
+    expect_str("Prague Mar 30 00:59", day, "20260329");
+    prague_tm.tm_hour = 1; prague_tm.tm_min = 0;
+    t_prague = mktime(&prague_tm);
+    as11_time_noon_day((int64_t)t_prague * 1000, day, sizeof(day));
+    expect_str("Prague Mar 30 01:00", day, "20260329");
+
+    /* Australia/Sydney (spring forward on 2026-10-04) */
+    set_tz("AEST-10AEDT,M10.1.0,M4.1.0/3");
+    reset_offset();
+    struct tm syd_tm = { .tm_year = 126, .tm_mon = 9, .tm_mday = 5, .tm_hour = 0, .tm_min = 30, .tm_isdst = -1 };
+    time_t t_syd = mktime(&syd_tm);
+    as11_time_noon_day((int64_t)t_syd * 1000, day, sizeof(day));
+    expect_str("Sydney Oct 5 00:30 (post-midnight on 23h night)", day, "20261004");
+
     printf("\n=== Scenario 6: Non-Noon PeriodStart Rejection ===\n");
     reset_offset();
     derived = as11_time_offset_from_period_start(PS_AUG7 + 7 * 60 * 1000, &off);
@@ -141,6 +180,17 @@ int main(void)
     expect_str("evening session belongs to its own day", day, "20260807");
     as11_time_noon_day(1786197600000LL, day, sizeof(day));
     expect_str("post-midnight session belongs to previous day", day, "20260807");
+
+    printf("\n=== Scenario 8: Noon Period End Boundary Normalization ===\n");
+    set_tz("CET-1CEST,M3.5.0,M10.5.0/3");
+    reset_offset();
+    check_period_end("Sat Mar 28 23:00 (evening before spring-forward)", 2026, 3, 28, 23, 0, "2026-03-29 12:00");
+    check_period_end("Sun Mar 29 05:00 (morning of transition, before noon)", 2026, 3, 29, 5, 0, "2026-03-29 12:00");
+    check_period_end("Sun Mar 29 14:00 (afternoon of transition)", 2026, 3, 29, 14, 0, "2026-03-30 12:00");
+    check_period_end("Mar 31 23:00 (month rollover)", 2026, 3, 31, 23, 0, "2026-04-01 12:00");
+    check_period_end("Dec 31 23:00 (year rollover)", 2026, 12, 31, 23, 0, "2027-01-01 12:00");
+    check_period_end("Feb 28 23:00 (leap year rollover)", 2024, 2, 28, 23, 0, "2024-02-29 12:00");
+    check_period_end("Oct 24 23:00 (evening before fall-back)", 2026, 10, 24, 23, 0, "2026-10-25 12:00");
 
     printf("\n%s (%d failure%s)\n", fails ? "FAILURES" : "ALL PASS",
            fails, fails == 1 ? "" : "s");

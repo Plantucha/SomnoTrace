@@ -25,6 +25,7 @@
 #include "oximetry_vld3.h"
 #include "sd_storage.h"
 #include "time_sync.h"
+#include "as11_time.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -229,15 +230,9 @@ static bool path_join4(char *out, size_t out_size, const char *a,
 
 static bool day_for_epoch(int64_t epoch_ms, char out[9])
 {
-    time_t sec = (time_t)(epoch_ms / 1000);
-    struct tm local;
-    if (!localtime_r(&sec, &local)) return false;
-    /* Match the existing therapy noon-day convention. */
-    if (local.tm_hour < 12) {
-        sec -= 24 * 60 * 60;
-        if (!localtime_r(&sec, &local)) return false;
-    }
-    return strftime(out, 9, "%Y%m%d", &local) == 8;
+    if (!out) return false;
+    as11_time_noon_day(epoch_ms, out, 9);
+    return strlen(out) == 8;
 }
 
 static int64_t civil_epoch_ms(int year, int mon, int day, int hour, int min, int sec)

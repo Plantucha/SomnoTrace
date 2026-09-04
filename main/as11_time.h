@@ -99,6 +99,12 @@ void as11_time_noon_day_for_period_start(int64_t period_start_ms,
  * Returns 0 if the label cannot be parsed. */
 int64_t as11_time_local_noon_epoch(const char *day_label);
 
+/* Return the local epoch ms at which the noon-day period containing
+ * as11_epoch_ms closes (i.e. the following noon at 12:00:00).
+ * Handles DST spring-forward (23h) and fall-back (25h) days seamlessly
+ * via civil calendar field normalization. */
+int64_t as11_time_noon_period_end_ms(int64_t as11_epoch_ms);
+
 /* Days since the Unix epoch for a "YYYYMMDD" label — the STR.edf Date
  * signal.  Returns -1 if the label cannot be parsed. */
 int as11_time_day_number(const char *day_label);

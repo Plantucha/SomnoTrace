@@ -469,18 +469,10 @@ static esp_err_t refresh_today_summary_spool(int64_t end_epoch_ms,
     int64_t as11_end_ms = end_epoch_ms - clock_drift_ms;
 
     /* Compute noon today (AS11 time) as the fromDateTime. */
-    time_t t = (time_t)(as11_end_ms / 1000);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    if (tm.tm_hour < 12) t -= 86400;  /* before noon → previous day */
-    /* Set to noon. */
-    struct tm noon_tm;
-    localtime_r(&t, &noon_tm);
-    noon_tm.tm_hour = 12;
-    noon_tm.tm_min = 0;
-    noon_tm.tm_sec = 0;
-    time_t noon_t = mktime(&noon_tm);
-    int64_t noon_ms = (int64_t)noon_t * 1000;
+    char day_label[16];
+    as11_time_noon_day(as11_end_ms, day_label, sizeof(day_label));
+    int64_t noon_s = as11_time_local_noon_epoch(day_label);
+    int64_t noon_ms = noon_s * 1000;
 
     char from_dt[32];
     epoch_ms_to_iso_utc(noon_ms, from_dt, sizeof(from_dt));
@@ -621,16 +613,7 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
  * as11_ms closes (i.e. the following noon). */
 static int64_t noon_period_end(int64_t as11_ms)
 {
-    time_t t = (time_t)(as11_ms / 1000);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    if (tm.tm_hour >= 12) t += 86400;  /* period ends at NEXT day's noon */
-    struct tm noon_tm;
-    localtime_r(&t, &noon_tm);
-    noon_tm.tm_hour = 12;
-    noon_tm.tm_min = 0;
-    noon_tm.tm_sec = 0;
-    return (int64_t)mktime(&noon_tm) * 1000;
+    return as11_time_noon_period_end_ms(as11_ms);
 }
 
 /* Wait for the AS11 to update its Summary spool after TherapyStop, then
