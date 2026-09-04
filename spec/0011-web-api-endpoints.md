@@ -53,6 +53,12 @@ Used to populate the **Status Tab** and dashboard indicators.
     "free_kb": 12200000
   },
   "therapy_active": false,
+  "battery": {
+    "percent": 85,
+    "millivolts": 3980,
+    "charging": false,
+    "valid": true
+  },
   "ble": {
     "as11_paired": true,
     "as11_device_name": "AirSense 11 #12345",
@@ -61,6 +67,10 @@ Used to populate the **Status Tab** and dashboard indicators.
   }
 }
 ```
+
+> **Note on Battery Telemetry:**
+> - When calibrating (`--%`), `percent` is `-1`, `charging` is `true`, and `valid` is `true`.
+> - When battery monitoring is disabled in settings or no battery is connected, `percent` and `millivolts` are `null`, and `valid` is `false`.
 
 ---
 
@@ -148,7 +158,39 @@ Updates NVS settings.
 
 ---
 
-### 4.4 Therapy Session Data (`GET /api/session/data`)
+### 4.4 Device Hardware Settings (`GET /api/device/settings` & `POST /api/device/settings`)
+Provides access and modification for hardware peripherals, display preferences, and battery monitoring.
+
+#### A. Fetching Settings (`GET /api/device/settings`)
+##### JSON Response Format:
+```json
+{
+  "brightness": 200,
+  "lcd_therapy_mode": 3,
+  "alert_volume": 65,
+  "lcd_rotation": 90,
+  "battery_enabled": true
+}
+```
+
+- `brightness`: LCD backlight PWM duty (1..200, mapping to 0.1%..20.0% brightness).
+- `lcd_therapy_mode`: Display behavior during active therapy (0 = Always On, 1 = Dim, 2 = Off, 3 = Auto).
+- `alert_volume`: Master speaker alert volume percentage (0..100).
+- `lcd_rotation`: Display orientation in degrees (0, 90, 180, 270).
+- `battery_enabled`: Boolean flag controlling battery indicator display and telemetry. When set to `false`, hides the battery gauge on the status LCD and reports `USB Power (No battery)` in the portal.
+
+#### B. Saving Settings (`POST /api/device/settings`)
+Accepts a partial or complete JSON object with any of the fields listed above. Persists updated values to NVS immediately.
+
+##### JSON Response Format:
+`200 OK`
+```json
+{ "status": "ok" }
+```
+
+---
+
+### 4.5 Therapy Session Data (`GET /api/session/data`)
 Serves the session listings or downsampled timeseries datasets.
 
 #### A. Query Parameters:
@@ -199,7 +241,7 @@ Offset (Bytes) | Type       | Field
 
 ---
 
-### 4.5 Live Logs Stream (`GET /api/logs/stream`)
+### 4.6 Live Logs Stream (`GET /api/logs/stream`)
 Real-time streaming console logs using **Server-Sent Events (SSE)**.
 - **Response headers**:
   - `Content-Type: text/event-stream`
@@ -229,7 +271,10 @@ data: I (1280) upload_smb: SMB connected
 - [ ] Stored passwords in NVS are never serialized back to clients (use `"password_set": true`).
 - [ ] Standardized binary stream mode is available to fetch full-resolution timeseries channels.
 - [ ] Live log streaming does not allocate dynamic buffers inside the central print loops to protect heap memory.
+- [ ] Battery telemetry is exposed via `/api/status` with `percent`, `millivolts`, `charging`, and `valid` flags.
+- [ ] Device hardware preferences are accessible via `/api/device/settings` with instant persistence.
 
 ## 7. Changelog
 
 - 2026-07-02: Initial API endpoints contract specification.
+- 2026-09-04: Added `battery` telemetry to `/api/status` and documented `/api/device/settings` endpoint contract.

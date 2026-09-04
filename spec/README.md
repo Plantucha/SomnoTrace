@@ -32,6 +32,10 @@ code.
   gesture. _(Accepted)_
 - `0008-config-and-network-lifecycle.md` — NVS configuration schema, Wi-Fi
   selection/roaming logic, and SoftAP captive-portal fallback. _(Draft)_
+- `0009-web-interface.md` — Progressive Web App (PWA) web interface with theme support. _(Draft)_
+- `0010-web-ui-architecture-and-design.md` — web UI architecture, design tokens, and CSS conventions. _(Draft)_
+- `0011-web-api-endpoints.md` — HTTP REST and SSE data contracts for telemetry and configuration. _(Proposed)_
+- `0012-battery-monitoring-and-power-management.md` — battery ADC sampling, OCV estimation, calibration state machine, dynamic CC/CV slew rate, and power latch. _(Implemented)_
 
 > Draft stubs are placeholders to guide structure; flesh them out as the design
 > firms up.
