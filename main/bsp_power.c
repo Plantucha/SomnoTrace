@@ -574,6 +574,7 @@ static void battery_monitor_task(void *arg)
     TickType_t settle_until = 0;
     TickType_t last_nvs_save = 0;
     int  charging_duration_s = 0;
+    bool is_calibrated = false;
 
     /* Check for warm reboot: restore shown_pct and filtered_mv from RTC Fast RAM. */
     esp_reset_reason_t rst_reason = esp_reset_reason();
@@ -586,6 +587,7 @@ static void battery_monitor_task(void *arg)
         if (s_rtc_bat_backup.filtered_mv > 0) {
             filtered_mv = s_rtc_bat_backup.filtered_mv;
         }
+        is_calibrated = true;
         ESP_LOGI(TAG, "battery: restored shown_pct=%d%% filt=%dmV from RTC RAM across warm reboot (reason=%d)",
                  shown_pct, filtered_mv, (int)rst_reason);
     } else {
@@ -622,36 +624,72 @@ static void battery_monitor_task(void *arg)
              * displays 100% after a charge cycle. */
             if (!debounced_charging && filtered_mv >= 4140) {
                 target_pct = 100;
+                is_calibrated = true;
+                if (shown_pct < 0) {
+                    shown_pct = 100;
+                }
             }
 
-            if (shown_pct < 0) {
-                shown_pct = target_pct;      /* first reading: adopt directly */
-            } else if (settling && xTaskGetTickCount() < settle_until) {
-                /* Hold the displayed value while the cell relaxes. */
+            if (settling && xTaskGetTickCount() < settle_until) {
+                /* Hold the displayed value (including uncalibrated "--%")
+                 * while the cell relaxes after unplugging. */
             } else {
                 settling = false;
-                /* Direction lock and slew rate:
-                 * While charging: strictly non-decreasing. Walk up at most 1% per update.
-                 * While discharging: strictly non-increasing. Walk down at most 1% per update. */
-                if (debounced_charging) {
-                    if (target_pct > shown_pct) shown_pct++;
+                if (!is_calibrated) {
+                    if (!debounced_charging) {
+                        /* On battery without prior calibration (cold boot on battery,
+                         * or after unplugging & settling): terminal voltage is genuine
+                         * relaxed OCV. Snap directly to target_pct and engage guardrails. */
+                        shown_pct = target_pct;
+                        is_calibrated = true;
+                    } else {
+                        /* On charger without prior calibration:
+                         * If voltage is in the ambiguous CV float zone (>= 4100 mV),
+                         * keep shown_pct as -1 (displays "--%") until either:
+                         * 1) Charge completes (100%), or
+                         * 2) Charger is unplugged (snaps to true relaxed OCV after settling).
+                         * Below 4100 mV (e.g. 20-50% battery), terminal voltage is not
+                         * float-clamped, so we can adopt target_pct directly. */
+                        if (filtered_mv >= 4100) {
+                            shown_pct = -1;
+                        } else {
+                            shown_pct = target_pct;
+                            is_calibrated = true;
+                        }
+                    }
                 } else {
-                    if (target_pct < shown_pct) shown_pct--;
+                    /* Direction lock and slew rate:
+                     * While charging: strictly non-decreasing. Walk up at most 1% per update.
+                     * While discharging: strictly non-increasing. Walk down at most 1% per update. */
+                    if (debounced_charging) {
+                        if (target_pct > shown_pct) shown_pct++;
+                    } else {
+                        if (target_pct < shown_pct) shown_pct--;
+                    }
                 }
             }
 
             bat_publish(filtered_mv, shown_pct, debounced_charging, true);
 
-            /* Keep RTC Fast RAM snapshot up to date */
-            s_rtc_bat_backup.magic = BAT_RTC_MAGIC;
-            s_rtc_bat_backup.shown_pct = (int16_t)shown_pct;
-            s_rtc_bat_backup.filtered_mv = (int16_t)filtered_mv;
-            s_rtc_bat_backup.crc = bat_calc_backup_crc(&s_rtc_bat_backup);
-            ESP_LOGD(TAG, "battery: vbat=%dmV filt=%dmV target=%d%% shown=%d%% chg=%d spread=%dmV",
-                     mv, filtered_mv, target_pct, shown_pct, debounced_charging, spread_mv);
+            /* Keep RTC Fast RAM snapshot up to date if calibrated */
+            if (is_calibrated && shown_pct >= 0) {
+                s_rtc_bat_backup.magic = BAT_RTC_MAGIC;
+                s_rtc_bat_backup.shown_pct = (int16_t)shown_pct;
+                s_rtc_bat_backup.filtered_mv = (int16_t)filtered_mv;
+                s_rtc_bat_backup.crc = bat_calc_backup_crc(&s_rtc_bat_backup);
+            }
+            ESP_LOGD(TAG, "battery: vbat=%dmV filt=%dmV target=%d%% shown=%d%% chg=%d cal=%d spread=%dmV",
+                     mv, filtered_mv, target_pct, shown_pct, debounced_charging, is_calibrated, spread_mv);
         }
 
-        int period_s = debounced_charging ? BAT_PERIOD_CHARGE_S : BAT_PERIOD_DISCHARGE_S;
+        int period_s;
+        if (settling && xTaskGetTickCount() < settle_until) {
+            TickType_t rem = settle_until - xTaskGetTickCount();
+            period_s = (int)((rem + pdMS_TO_TICKS(999)) / pdMS_TO_TICKS(1000));
+            if (period_s < 1) period_s = 1;
+        } else {
+            period_s = debounced_charging ? BAT_PERIOD_CHARGE_S : BAT_PERIOD_DISCHARGE_S;
+        }
         int raw_same_count = 0;
         bool candidate_charging = debounced_charging;
 
@@ -694,6 +732,8 @@ static void battery_monitor_task(void *arg)
                             }
                         }
                     }
+                } else {
+                    settling = false;
                 }
 
                 charging_duration_s = 0;

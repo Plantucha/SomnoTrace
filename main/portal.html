@@ -1767,6 +1767,11 @@ function loadStatusTab(d) {
     if (batt.millivolts != null) battStr += ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)';
     if (batt.charging) battStr += ' \u26A1';
     setEl('status-battery', battStr);
+  } else if (batt.valid && batt.charging) {
+    var battStr = '--%';
+    if (batt.millivolts != null) battStr += ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)';
+    battStr += ' \u26A1 (Calibrating)';
+    setEl('status-battery', battStr);
   } else {
     setEl('status-battery', 'USB Power (No battery)');
   }

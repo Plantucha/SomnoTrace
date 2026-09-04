@@ -1355,7 +1355,7 @@ static void fb_draw_battery_indicator(int x, int y, int percent, bool charging)
     /* Text color based on charge level */
     uint16_t text_col;
     if (percent < 0) {
-        text_col = rgb565(100, 100, 100);   /* unknown */
+        text_col = rgb565(160, 180, 205);   /* calibrating / unknown */
     } else if (percent <= 15) {
         text_col = rgb565(255, 60, 60);      /* red */
     } else if (percent <= 30) {
@@ -1393,11 +1393,13 @@ static void fb_draw_battery_indicator(int x, int y, int percent, bool charging)
     }
 
     /* Percentage text to the right of the outline */
+    char pct_str[16];
     if (percent >= 0) {
-        char pct_str[16];
         snprintf(pct_str, sizeof(pct_str), "%d%%", percent);
-        fb_draw_string_aa(x + 28, y - 3, &roboto_body, pct_str, text_col);
+    } else {
+        snprintf(pct_str, sizeof(pct_str), "--%%");
     }
+    fb_draw_string_aa(x + 28, y - 3, &roboto_body, pct_str, text_col);
 }
 
 /* Render the status screen. Snapshots content under the state mutex, then
@@ -1447,7 +1449,7 @@ static void render_status(void)
     }
 
     /* Battery indicator — left of BLE icon, right of clock area */
-    if (batt_pct >= 0) {
+    if (batt_pct >= 0 || (batt_pct == -1 && batt_chg)) {
         fb_draw_battery_indicator(118, 12, batt_pct, batt_chg);
     }
 
