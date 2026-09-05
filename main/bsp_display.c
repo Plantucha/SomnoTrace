@@ -73,6 +73,8 @@
 static uint8_t s_brightness = 100;  /* current brightness (tenth-percent: 1=0.1%, 200=20%) */
 static bool s_backlight_on = true;  /* backlight hardware state */
 static bool s_backlight_force_on = false;  /* SoftAP/portal: keep backlight on */
+static esp_timer_handle_t s_wake_timer = NULL;
+static bool s_temporarily_awake = false;
 
 static const char *TAG = "bsp_display";
 
@@ -946,6 +948,12 @@ void bsp_display_apply_backlight_policy(bool force_on)
         return;
     }
 
+    /* If temporarily awake (touch or motion), keep backlight on until timer expires */
+    if (s_temporarily_awake) {
+        bsp_display_set_backlight(true);
+        return;
+    }
+
     const device_settings_t *dev = device_settings_get();
     bool therapy_active = bsp_display_is_therapy_active();
 
@@ -966,6 +974,53 @@ void bsp_display_apply_backlight_policy(bool force_on)
         bsp_display_set_backlight(true);
         break;
     }
+}
+
+static void wake_timer_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "temporary wake timeout expired");
+    s_temporarily_awake = false;
+    bsp_display_apply_backlight_policy(false);
+}
+
+void bsp_display_wake_temporary(uint32_t duration_sec)
+{
+    if (duration_sec == 0) return;
+
+    if (!s_wake_timer) {
+        esp_timer_create_args_t timer_args = {
+            .callback = wake_timer_cb,
+            .arg = NULL,
+            .name = "lcd_wake_tmr"
+        };
+        esp_err_t err = esp_timer_create(&timer_args, &s_wake_timer);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to create wake timer: %s", esp_err_to_name(err));
+            return;
+        }
+    }
+
+    /* Stop any active timer to re-trigger / extend duration */
+    esp_timer_stop(s_wake_timer);
+
+    s_temporarily_awake = true;
+    bsp_display_set_backlight(true);
+    esp_timer_start_once(s_wake_timer, (uint64_t)duration_sec * 1000000ULL);
+}
+
+bool bsp_display_is_temporarily_awake(void)
+{
+    return s_temporarily_awake;
+}
+
+void bsp_display_cancel_temporary_wake(void)
+{
+    if (s_wake_timer) {
+        esp_timer_stop(s_wake_timer);
+    }
+    s_temporarily_awake = false;
+    bsp_display_apply_backlight_policy(false);
 }
 
 static void fb_fill_rect(int x, int y, int w, int h, uint16_t color)

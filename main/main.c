@@ -47,6 +47,8 @@
 #include "log_stream.h"
 #include "device_settings.h"
 #include "bsp_audio.h"
+#include "bsp_i2c.h"
+#include "bsp_sensor.h"
 #include "crash_diag.h"
 #include "therapy_alert.h"
 #include "nvs_flash.h"
@@ -182,11 +184,15 @@ void app_main(void)
         session_writer_recover();
     }
 
-    /* 4b-2. Initialise audio codec BEFORE BLE — BLE RF activity during
-     * connection causes I2C bus noise that makes ES8311 register writes
-     * NACK.  The codec only depends on bsp_display_init (shared I2C pins). */
+    /* 4b-2. Initialise audio codec and sensors (touch + IMU) BEFORE BLE —
+     * BLE RF activity during connection causes I2C bus noise that makes
+     * register writes NACK. The devices share the I2C bus on GPIO 41/42. */
+    bsp_i2c_init();
     if (bsp_audio_init() != ESP_OK) {
         ESP_LOGW(TAG, "audio codec init failed — buzzer will be unavailable");
+    }
+    if (bsp_sensor_init() != ESP_OK) {
+        ESP_LOGW(TAG, "sensors init failed — wake on touch/motion unavailable");
     }
 
     /* 4c. Initialise BLE (AirSense 11 pairing). Non-fatal on failure.

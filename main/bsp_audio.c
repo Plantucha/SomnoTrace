@@ -23,6 +23,7 @@
  */
 
 #include "bsp_audio.h"
+#include "bsp_i2c.h"
 
 #include <string.h>
 #include <math.h>
@@ -37,10 +38,7 @@
 static const char *TAG = "bsp_audio";
 
 /* ── Hardware pins (Waveshare ESP32-S3-Touch-LCD-1.54) ────────────── */
-#define I2C_NUM         0
-#define I2C_SCL_PIN     41
-#define I2C_SDA_PIN     42
-#define I2C_FREQ_HZ     100000
+#define I2C_FREQ_HZ     BSP_I2C_FREQ_HZ
 
 #define I2S_NUM         0
 #define I2S_MCLK_PIN    8
@@ -206,23 +204,11 @@ static esp_err_t i2c_bus_setup(void)
 {
     if (s_bus_ready) return ESP_OK;
 
-    /* ── I2C master bus ─── */
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    esp_err_t ret = i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C bus init failed: %s", esp_err_to_name(ret));
-        return ret;
+    s_i2c_bus = bsp_i2c_get_bus_handle();
+    if (!s_i2c_bus) {
+        ESP_LOGE(TAG, "I2C bus not available");
+        return ESP_FAIL;
     }
-
-    /* Give the bus a moment to settle after GPIO reconfiguration */
-    vTaskDelay(pdMS_TO_TICKS(50));
 
     /* Probe for ES8311; also scan bus for diagnostics if not found */
     esp_err_t probe = i2c_master_probe(s_i2c_bus, ES8311_ADDR, 100);
@@ -243,7 +229,7 @@ static esp_err_t i2c_bus_setup(void)
         .device_address = ES8311_ADDR,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
-    ret = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev);
+    esp_err_t ret = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C device add failed: %s", esp_err_to_name(ret));
         return ret;

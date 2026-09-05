@@ -160,11 +160,16 @@ static void button_monitor_task(void *arg)
         } else {
             if (pwr_pressed && s_btn.pwr_held_ms >= pwr_short_min_ms &&
                 s_btn.pwr_held_ms <= pwr_short_max_ms) {
-                const device_settings_t *dev = device_settings_get();
-                if (dev->lcd_therapy_mode == LCD_THERAPY_BUTTON) {
-                    bool on = bsp_display_toggle_backlight();
-                    ESP_LOGI(TAG, "POWER button short-press: backlight %s",
-                             on ? "on" : "off");
+                if (bsp_display_is_temporarily_awake()) {
+                    bsp_display_cancel_temporary_wake();
+                    ESP_LOGI(TAG, "POWER button: canceled temporary wake");
+                } else {
+                    const device_settings_t *dev = device_settings_get();
+                    if (dev->lcd_therapy_mode == LCD_THERAPY_BUTTON) {
+                        bool on = bsp_display_toggle_backlight();
+                        ESP_LOGI(TAG, "POWER button short-press: backlight %s",
+                                 on ? "on" : "off");
+                    }
                 }
             }
             s_btn.pwr_held_ms = 0;

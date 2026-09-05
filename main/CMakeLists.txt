@@ -1,7 +1,7 @@
 idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provision.c" "as11_ble.c"
                            "sd_storage.c" "session_writer.c" "time_sync.c"
                            "post_therapy.c" "edf_gen.c" "edf_header.c" "edf_waveform.c" "edf_annotations.c" "edf_summary.c" "log_stream.c" "device_settings.c"
-                           "psram_task.c" "bsp_audio.c" "session_graph.c" "nvs_writer.c"
+                           "psram_task.c" "bsp_audio.c" "bsp_i2c.c" "bsp_sensor.c" "session_graph.c" "nvs_writer.c"
                            "as11_time.c"
                            "crash_diag.c"
                            "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "oximeter_store.c" "oximetry_vld3.c" "oximetry_canonical.c" "oximetry_http.c"

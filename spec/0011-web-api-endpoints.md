@@ -169,7 +169,10 @@ Provides access and modification for hardware peripherals, display preferences, 
   "lcd_therapy_mode": 3,
   "alert_volume": 65,
   "lcd_rotation": 90,
-  "battery_enabled": true
+  "battery_enabled": true,
+  "wake_on_touch": true,
+  "wake_on_motion": true,
+  "wake_timeout_sec": 10
 }
 ```
 
@@ -178,6 +181,9 @@ Provides access and modification for hardware peripherals, display preferences, 
 - `alert_volume`: Master speaker alert volume percentage (0..100).
 - `lcd_rotation`: Display orientation in degrees (0, 90, 180, 270).
 - `battery_enabled`: Boolean flag controlling battery indicator display and telemetry. When set to `false`, hides the battery gauge on the status LCD and reports `USB Power (No battery)` in the portal.
+- `wake_on_touch`: Boolean flag controlling whether tapping the capacitive touch screen illuminates the display when dark.
+- `wake_on_motion`: Boolean flag controlling whether moving/tilting the device illuminates the display when dark.
+- `wake_timeout_sec`: Number of seconds (e.g. 5, 10, 15, 30; 0 = disabled) the display stays illuminated upon touch/motion wake before automatically turning back off.
 
 #### B. Saving Settings (`POST /api/device/settings`)
 Accepts a partial or complete JSON object with any of the fields listed above. Persists updated values to NVS immediately.

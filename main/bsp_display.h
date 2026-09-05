@@ -63,6 +63,17 @@ uint8_t bsp_display_get_brightness(void);
  *   force_on: if true, always turn backlight on (used for SoftAP mode). */
 void bsp_display_apply_backlight_policy(bool force_on);
 
+/* Temporarily wake the backlight for duration_sec seconds (e.g. on touch/motion).
+ * If already awake, extends the timeout. When duration_sec expires, returns
+ * to the base backlight policy. */
+void bsp_display_wake_temporary(uint32_t duration_sec);
+
+/* Returns true if the backlight is currently on due to a temporary wake. */
+bool bsp_display_is_temporarily_awake(void);
+
+/* Cancel any active temporary wake and restore the base backlight policy immediately. */
+void bsp_display_cancel_temporary_wake(void);
+
 /* Set LCD rotation in degrees (0, 90, 180, 270). Applied by the display task
  * using the ST7789's reliable 0°/90° paths plus a software half-turn for
  * 180°/270°, and re-applied after panel reset. */
