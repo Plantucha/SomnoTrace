@@ -58,7 +58,7 @@ typedef struct {
     bool battery_enabled;      /* true to display battery indicator, false to hide */
     /* Temporary wake on touch */
     bool wake_on_touch;        /* true to wake screen on capacitive touch */
-    uint8_t wake_timeout_sec;  /* duration in seconds (5, 10, 15, 30; 0=disabled) */
+    uint8_t wake_timeout_sec;  /* duration in seconds (5, 10, 15, 30, 60; 0=disabled) */
 } device_settings_t;
 
 /* Load settings from NVS. Returns ESP_OK if loaded, ESP_ERR_NVS_NOT_FOUND
