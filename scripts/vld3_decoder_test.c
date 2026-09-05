@@ -65,7 +65,9 @@ int main(void)
     uint8_t header[OX_VLD3_HEADER_LEN];
     ox_vld3_header_t parsed;
     make_header(header, 0, 2026, 8, 29, 5485, 21940);
+    le16(header + 15, 19800);
     assert(ox_vld3_parse_header(header, sizeof(header), 27465, &parsed));
+    assert(parsed.duration_seconds == 21940 && parsed.asleep_seconds == 19800);
     assert(parsed.version == 3 && parsed.mode == 0 && parsed.year == 2026);
     assert(parsed.month == 8 && parsed.day == 29 && parsed.hour == 22);
     assert(parsed.minute == 24 && parsed.second == 42);
@@ -75,6 +77,7 @@ int main(void)
     make_header(header, 1, 2024, 2, 29, 120, 240);
     assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed));
     assert(parsed.mode == 1 && parsed.period_us == 2000000);
+    assert(parsed.datetime_valid);                  /* Feb 29 in a leap year is a real day */
     le32(header + 9, 1234);
     assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed));
     assert(!parsed.declared_size_matches);
@@ -82,13 +85,41 @@ int main(void)
     header[5] = 30;
     assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed));
     assert(!parsed.datetime_valid);
+    make_header(header, 0, 2023, 2, 29, 120, 240);
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed));
+    assert(!parsed.datetime_valid);                 /* ...and not in a common year */
+
+    /* Bounds of the date and time-of-day checks, each side of every edge. */
+    make_header(header, 0, 2015, 1, 1, 120, 240);
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && parsed.datetime_valid);
+    make_header(header, 0, 2014, 12, 31, 120, 240);
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && !parsed.datetime_valid);
+    make_header(header, 0, 2099, 12, 31, 120, 240);
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && parsed.datetime_valid);
+    make_header(header, 0, 2100, 1, 1, 120, 240);
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && !parsed.datetime_valid);
+    make_header(header, 0, 2026, 8, 31, 120, 240);
+    header[6] = 23; header[7] = 59; header[8] = 59;
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && parsed.datetime_valid);
+    header[6] = 24;
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && !parsed.datetime_valid);
+    header[6] = 23; header[7] = 60;
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && !parsed.datetime_valid);
+    header[7] = 59; header[8] = 60;
+    assert(ox_vld3_parse_header(header, sizeof(header), 640, &parsed) && !parsed.datetime_valid);
+
     make_header(header, 0, 2026, 1, 1, 120, 361);
     assert(!ox_vld3_parse_header(header, sizeof(header), 640, &parsed));
     make_header(header, 0, 2026, 1, 1, 120, 480);
     assert(!ox_vld3_parse_header(header, sizeof(header), 639, &parsed));
 
+    assert(!ox_vld3_parse_header(NULL, sizeof(header), 640, &parsed));
+    assert(!ox_vld3_parse_header(header, sizeof(header), 640, NULL));
+
     uint8_t record[OX_VLD3_RECORD_LEN] = { 97, 0x2c, 0x01, 7, 0x40 };
     ox_vld3_record_t sample;
+    assert(!ox_vld3_parse_record(NULL, &sample));
+    assert(!ox_vld3_parse_record(record, NULL));
     assert(ox_vld3_parse_record(record, &sample));
     assert(sample.spo2 == 97 && sample.pulse == 300);
     assert(sample.acceleration == 7 && sample.reserved == 0x40);
