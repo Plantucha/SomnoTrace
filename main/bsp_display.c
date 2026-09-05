@@ -170,8 +170,6 @@ static float *s_flow_local;   /* render-task snapshot */
 static float *s_flow_yf;      /* render-task y coordinates */
 static int    s_flow_head = 0;
 static int    s_flow_count = 0;
-static int    s_flow_disp_head = 0;   /* 12.5 Hz playback playhead */
-static int    s_flow_disp_count = 0;  /* 12.5 Hz playback count */
 
 static volatile int64_t s_last_render_us = 0;
 static esp_timer_handle_t s_display_supervisor_timer = NULL;
@@ -212,8 +210,6 @@ void bsp_display_set_therapy_active(bool active)
         if (active) {
             s_flow_head = 0;
             s_flow_count = 0;
-            s_flow_disp_head = 0;
-            s_flow_disp_count = 0;
             s_leak_sum = 0.0;
             s_leak_count = 0;
             ESP_LOGI(TAG, "therapy %s mode enabled (display_task=%s)",
@@ -267,13 +263,10 @@ void bsp_display_push_flow(float flow_lpm)
         s_flow_buf[s_flow_head] = flow_lpm * 60.0f;
         s_flow_head = (s_flow_head + 1) % FLOW_BUF_SIZE;
         if (s_flow_count < FLOW_BUF_SIZE) s_flow_count++;
-        /* Wake task immediately if display playhead is empty to begin 12.5 Hz pacing */
-        if (s_flow_disp_count == 0) notify = true;
+        notify = true;
     }
     xSemaphoreGive(s_state_mutex);
-    /* In 12.5 Hz pacing mode, display_task wakes up periodically via its
-     * 80 ms timer timeout. We also notify on the very first sample to start
-     * pacing immediately. */
+    /* In Graph Mode, wake display_task on incoming flow data */
     if (notify && s_display_task) xTaskNotifyGive(s_display_task);
 }
 
@@ -1118,7 +1111,7 @@ void bsp_display_show_lines(const char *title, const char *const *lines, int n_l
  * blocked for long. */
 static void render_graph(void)
 {
-    if (!s_panel || !s_fb) return;
+    if (!s_panel || !s_fb || !s_flow_buf || !s_flow_local || !s_flow_yf) return;
 
     const uint16_t bg        = rgb565(9, 11, 18);
     const uint16_t grid_col  = rgb565(28, 32, 46);
@@ -1130,34 +1123,11 @@ static void render_graph(void)
     const uint16_t label_col = rgb565(122, 134, 158);
     const uint16_t unit_col  = rgb565(86, 96, 120);
 
-    if (!s_flow_buf || !s_flow_local || !s_flow_yf) return;
-
     int n, head;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     n = s_flow_count;
     head = s_flow_head;
     memcpy(s_flow_local, s_flow_buf, FLOW_BUF_SIZE * sizeof(float));
-
-    /* Smooth 12.5 Hz pacing: advance display playhead by 2 samples per frame */
-    if (s_flow_disp_count == 0) {
-        s_flow_disp_head = head;
-        s_flow_disp_count = n;
-    } else {
-        int unrendered = (head - s_flow_disp_head + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
-        int adv = 0;
-        if (unrendered > 6) {
-            adv = 3;  /* catch up slightly after packet jitter */
-        } else if (unrendered >= 2) {
-            adv = 2;  /* nominal 12.5 Hz pace (2 samples = 2 px) */
-        } else if (unrendered == 1) {
-            adv = 1;
-        }
-        s_flow_disp_head = (s_flow_disp_head + adv) % FLOW_BUF_SIZE;
-        s_flow_disp_count += adv;
-        if (s_flow_disp_count > n) s_flow_disp_count = n;
-    }
-    int disp_head = s_flow_disp_head;
-    int disp_n = s_flow_disp_count;
     xSemaphoreGive(s_state_mutex);
 
     fb_clear(bg);
@@ -1199,9 +1169,9 @@ static void render_graph(void)
     fb_draw_string_aa(GRAPH_AXIS_W + 3, 1, &roboto_body, "L/m", unit_col);
 
     /* ── Waveform (static scale, right-aligned newest sample) ────────── */
-    int m = disp_n;
+    int m = n;
     if (m > GRAPH_PLOT_W) m = GRAPH_PLOT_W;
-    int start = (disp_head - m + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
+    int start = (head - m + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
     int xbase = LCD_H_RES - m;
 
     float *yf = s_flow_yf;
@@ -1588,14 +1558,12 @@ static void display_task(void *arg)
     disp_mode_t last_mode = (disp_mode_t)-1;
 
     for (;;) {
-        /* In Graph Mode, wake at 12.5 Hz (80 ms cadence) to smoothly pace
-         * waveform scrolling (2 samples / 2 px per frame).
-         * In Info and Status modes, wake at 1.0 Hz (1000 ms cadence) or when
-         * notified of fresh leak data / state changes. */
-        TickType_t wait_ticks = (last_mode == DISP_MODE_GRAPH) ?
-            pdMS_TO_TICKS(GRAPH_FRAME_MS) : pdMS_TO_TICKS(STATUS_FRAME_MS);
-
-        uint32_t notified = ulTaskNotifyTake(pdTRUE, wait_ticks);
+        /* Block until woken by new data / state change (push_flow,
+         * set_therapy_active, show_lines, set_wifi_connected) or until the
+         * status refresh interval elapses. Coalesced notifications mean we
+         * redraw immediately when a packet arrives with zero latency and zero
+         * busy-polling. */
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(STATUS_FRAME_MS));
 
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         disp_mode_t mode = s_mode;
@@ -1626,10 +1594,14 @@ static void display_task(void *arg)
         }
 
         if (mode == DISP_MODE_GRAPH) {
-            /* Smooth 12.5 Hz waveform scrolling (2 flow samples per frame) */
-            render_graph();
-            last_render = now;
-            s_last_render_us = esp_timer_get_time();
+            /* Instantaneous zero-lag redraw on fresh packet data, mode change,
+             * or every second for status/keepalive. */
+            if (notified || mode_changed || dirty ||
+                (now - last_render) >= pdMS_TO_TICKS(1000)) {
+                render_graph();
+                last_render = now;
+                s_last_render_us = esp_timer_get_time();
+            }
         } else if (mode == DISP_MODE_INFO) {
             /* Redraw on new leak data, mode change, or every second for
              * the session runtime clock. */
