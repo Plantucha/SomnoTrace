@@ -8,10 +8,6 @@
 # "I could not think of an input" is not the same claim. When in doubt, leave it out: a re-reported
 # survivor costs a minute, a wrongly suppressed one hides a defect for as long as the entry stands.
 
-main/edf_data_dict.h:49:equality:>=→>   # spool_to_edf's sign branch. The two forms differ only at
-#   prod == 0, where the true branch yields (0 + half)/den and the false branch (0 - half)/den. half
-#   is den/2, so |half| < den for every den >= 1, and C integer division truncates toward zero — both
-#   are 0. No (raw, num, den) triple separates them.
 # Hinnant civil-date arithmetic: the sign branches differ from their mutants only at year 0
 # (y == 0 after the March-shift; z == 0 days since 0000-03-01). No AS11 timestamp reaches there.
 main/as11_time.c:58:relational:>=→>
@@ -20,3 +16,20 @@ main/as11_time.c:68:relational:>=→>
 main/edf_data_dict.h:49:relational:>=→>     # prod == 0: (0+half)/den == (0-half)/den == 0 since half < den
 main/edf_data_dict.h:50:relational:>→>=     # rounded == INT16_MAX: early return and cast both yield INT16_MAX
 main/edf_data_dict.h:51:relational:<→<=     # rounded == INT16_MIN: same, at the other end
+
+# as11_time.c — survivors of the 2026-09-04 --all run that no input can separate from the original.
+main/as11_time.c:85:relational:<→<=        # floor_div: (a < 0) vs (a <= 0) differ only at a == 0, and a == 0
+#   makes a % b == 0, so the && short-circuits before either form is evaluated.
+main/as11_time.c:111:equality:!=→==        # set_offset: the branch holds only an ESP_LOGI and (void)mins. On host
+#   the log is a no-op; on target the two forms differ only in WHEN the "AS11 UTC offset" line is
+#   logged (changed vs unchanged), never in the stored offset. Not testable, not a defect.
+main/as11_time.c:184:arithmetic:+→-        # period_start: k runs over {-1, +1}, so raw + k*86400 and raw - k*86400
+#   produce the same two candidates in the other order. Order matters only on a tie between the two
+#   candidates, which needs anchor == raw, where neither beats best_d == 0.
+main/as11_time.c:193:relational:>=→>       # snap: (best >= 0) vs (best > 0) differ only at best == 0, where
+#   (0 + 450)/900 and (0 - 450)/900 both truncate to 0.
+main/as11_time.c:326:relational:<→<=       # parse_iso8601: the two sscanf formats are identical through the 6th
+#   conversion. n == 6 from the first (no ".mmm") re-parses to n == 6 and ms == 0 either way.
+main/as11_time.c:330:relational:<→<=       # ...and the retry can never return 6 when the first returned < 6, so the
+#   inner `if (n < 6) return -1` fires whenever reached. (The retry block is dead code; a finding
+#   for upstream, not a test gap.)
