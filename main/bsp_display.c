@@ -57,7 +57,7 @@
 
 #define LCD_H_RES           240
 #define LCD_V_RES           240
-#define LCD_PIXEL_CLOCK_HZ  (26666667)  /* 26.66 MHz (80 MHz APB / 3): safe ST7789 write timing margin while sustaining 25 Hz flushes */
+#define LCD_PIXEL_CLOCK_HZ  (15000000)  /* 15 MHz target (80 MHz APB / 6 = 13.33 MHz, 75 ns cycle; ST7789 spec: >=66 ns) */
 #define LCD_SPI_HOST        SPI2_HOST
 #define LCD_CMD_BITS        8
 #define LCD_PARAM_BITS      8
@@ -130,6 +130,7 @@ typedef enum {
 #define STATUS_LINE_LEN    48
 
 #define DISPLAY_TASK_STACK 4096
+#define GRAPH_FRAME_MS     80    /* 12.5 Hz live graph cadence: 2 flow samples (2 px) per frame */
 #define STATUS_FRAME_MS    1000  /* status refresh cadence (live RSSI) */
 
 /* ── Flow graph layout (static, non-adaptive) ───────────────────────────
@@ -169,6 +170,11 @@ static float *s_flow_local;   /* render-task snapshot */
 static float *s_flow_yf;      /* render-task y coordinates */
 static int    s_flow_head = 0;
 static int    s_flow_count = 0;
+static int    s_flow_disp_head = 0;   /* 12.5 Hz playback playhead */
+static int    s_flow_disp_count = 0;  /* 12.5 Hz playback count */
+
+static volatile int64_t s_last_render_us = 0;
+static esp_timer_handle_t s_display_supervisor_timer = NULL;
 
 /* Info panel state */
 static float    s_leak_lpm = 0.0f;       /* latest leak rate (L/min) */
@@ -206,6 +212,8 @@ void bsp_display_set_therapy_active(bool active)
         if (active) {
             s_flow_head = 0;
             s_flow_count = 0;
+            s_flow_disp_head = 0;
+            s_flow_disp_count = 0;
             s_leak_sum = 0.0;
             s_leak_count = 0;
             ESP_LOGI(TAG, "therapy %s mode enabled (display_task=%s)",
@@ -259,11 +267,13 @@ void bsp_display_push_flow(float flow_lpm)
         s_flow_buf[s_flow_head] = flow_lpm * 60.0f;
         s_flow_head = (s_flow_head + 1) % FLOW_BUF_SIZE;
         if (s_flow_count < FLOW_BUF_SIZE) s_flow_count++;
-        notify = true;
+        /* Wake task immediately if display playhead is empty to begin 12.5 Hz pacing */
+        if (s_flow_disp_count == 0) notify = true;
     }
     xSemaphoreGive(s_state_mutex);
-    /* Wake the render task so the graph advances at the data rate. Multiple
-     * notifications between renders coalesce into a single redraw. */
+    /* In 12.5 Hz pacing mode, display_task wakes up periodically via its
+     * 80 ms timer timeout. We also notify on the very first sample to start
+     * pacing immediately. */
     if (notify && s_display_task) xTaskNotifyGive(s_display_task);
 }
 
@@ -415,20 +425,20 @@ static void lcd_flush(void)
         int rows = LCD_V_RES - y0;
         if (rows > LCD_STRIP_ROWS) rows = LCD_STRIP_ROWS;
 
-        /* Wait for a strip buffer to become free.  Never abandon a transfer
-         * mid-flight — reusing a buffer whose DMA is still running corrupts
-         * the panel's DC/RAMWR stream and wedges the controller.
+        /* Wait for previous strip DMA to complete BEFORE queueing this one.
+         * This guarantees num_trans_inflight is 0 when esp_lcd_panel_draw_bitmap()
+         * sends CASET/RASET commands, preventing ESP-IDF from calling
+         * spi_device_get_trans_result(..., portMAX_DELAY).
          *
-         * A 200 ms timeout (2000× the expected ~0.1 ms transfer time)
-         * guards against a permanently wedged DMA — the panel is reset on
-         * the next display_task iteration via lcd_panel_hw_recover(). */
-        if (inflight >= LCD_STRIP_BUFS) {
-            if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(200)) != pdTRUE) {
-                ESP_LOGW(TAG, "lcd_flush: DMA timeout, aborting frame");
+         * A 100 ms timeout (~9x normal 11.5 ms strip transfer time)
+         * catches any DMA stall cleanly without hanging display_task. */
+        if (inflight > 0) {
+            if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100)) != pdTRUE) {
+                ESP_LOGW(TAG, "lcd_flush: DMA timeout on row %d, aborting frame", y0);
                 s_flush_stuck = true;
                 return;
             }
-            inflight--;
+            inflight = 0;
         }
 
         uint16_t *buf = s_strip[bi];
@@ -450,19 +460,18 @@ static void lcd_flush(void)
             memcpy(buf, &s_fb[y0 * LCD_H_RES],
                    (size_t)rows * LCD_H_RES * sizeof(uint16_t));
         }
-        /* Queue asynchronously; the DMA of this strip overlaps the memcpy of
-         * the next one (the completion callback gives s_flush_done). */
+
         esp_lcd_panel_draw_bitmap(s_panel, 0, y0, LCD_H_RES, y0 + rows, buf);
-        inflight++;
+        inflight = 1;
     }
-    /* Drain remaining in-flight transfers. */
-    while (inflight > 0) {
-        if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(200)) != pdTRUE) {
+    /* Drain final in-flight transfer. */
+    if (inflight > 0) {
+        if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "lcd_flush: DMA drain timeout, aborting");
             s_flush_stuck = true;
             return;
         }
-        inflight--;
+        inflight = 0;
     }
 }
 
@@ -703,6 +712,21 @@ static int str_width_aa_2x(const font_info_t *font, const char *str)
     return str_width_aa(font, str) * 2;
 }
 
+static void display_supervisor_cb(void *arg)
+{
+    (void)arg;
+    if (!s_display_task) return;
+    int64_t last = s_last_render_us;
+    if (last == 0) return;
+    int64_t elapsed = esp_timer_get_time() - last;
+    if (elapsed > 3500000) { /* > 3.5 seconds with no render */
+        ESP_LOGW(TAG, "display supervisor: no frame rendered in %lld ms — waking display_task",
+                 (long long)(elapsed / 1000));
+        s_flush_stuck = true;
+        xTaskNotifyGive(s_display_task);
+    }
+}
+
 esp_err_t bsp_display_init(void)
 {
     /* The project's default log level is DEBUG; spi_master emits several DEBUG
@@ -811,6 +835,15 @@ esp_err_t bsp_display_init(void)
         s_display_task = psram_task_create(display_task, "display", DISPLAY_TASK_STACK, NULL, 4, tskNO_AFFINITY, NULL, NULL);
     } else {
         ESP_LOGE(TAG, "state mutex alloc failed, display task not started");
+    }
+
+    /* Start non-intrusive display supervisor timer to monitor display responsiveness */
+    esp_timer_create_args_t sup_args = {
+        .callback = display_supervisor_cb,
+        .name = "disp_sup",
+    };
+    if (esp_timer_create(&sup_args, &s_display_supervisor_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_display_supervisor_timer, 3000000); /* 3s */
     }
 
     ESP_LOGI(TAG, "ST7789 display initialised");
@@ -1104,6 +1137,27 @@ static void render_graph(void)
     n = s_flow_count;
     head = s_flow_head;
     memcpy(s_flow_local, s_flow_buf, FLOW_BUF_SIZE * sizeof(float));
+
+    /* Smooth 12.5 Hz pacing: advance display playhead by 2 samples per frame */
+    if (s_flow_disp_count == 0) {
+        s_flow_disp_head = head;
+        s_flow_disp_count = n;
+    } else {
+        int unrendered = (head - s_flow_disp_head + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
+        int adv = 0;
+        if (unrendered > 6) {
+            adv = 3;  /* catch up slightly after packet jitter */
+        } else if (unrendered >= 2) {
+            adv = 2;  /* nominal 12.5 Hz pace (2 samples = 2 px) */
+        } else if (unrendered == 1) {
+            adv = 1;
+        }
+        s_flow_disp_head = (s_flow_disp_head + adv) % FLOW_BUF_SIZE;
+        s_flow_disp_count += adv;
+        if (s_flow_disp_count > n) s_flow_disp_count = n;
+    }
+    int disp_head = s_flow_disp_head;
+    int disp_n = s_flow_disp_count;
     xSemaphoreGive(s_state_mutex);
 
     fb_clear(bg);
@@ -1145,9 +1199,9 @@ static void render_graph(void)
     fb_draw_string_aa(GRAPH_AXIS_W + 3, 1, &roboto_body, "L/m", unit_col);
 
     /* ── Waveform (static scale, right-aligned newest sample) ────────── */
-    int m = n;
+    int m = disp_n;
     if (m > GRAPH_PLOT_W) m = GRAPH_PLOT_W;
-    int start = (head - m + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
+    int start = (disp_head - m + FLOW_BUF_SIZE) % FLOW_BUF_SIZE;
     int xbase = LCD_H_RES - m;
 
     float *yf = s_flow_yf;
@@ -1534,12 +1588,14 @@ static void display_task(void *arg)
     disp_mode_t last_mode = (disp_mode_t)-1;
 
     for (;;) {
-        /* Block until woken by new data / a state change (push_flow,
-         * set_therapy_active, show_lines, set_wifi_connected) or until the
-         * status refresh interval elapses. This drives the graph at exactly
-         * the data rate (25 Hz) with zero busy-polling; coalesced
-         * notifications mean we never render more often than data arrives. */
-        uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(STATUS_FRAME_MS));
+        /* In Graph Mode, wake at 12.5 Hz (80 ms cadence) to smoothly pace
+         * waveform scrolling (2 samples / 2 px per frame).
+         * In Info and Status modes, wake at 1.0 Hz (1000 ms cadence) or when
+         * notified of fresh leak data / state changes. */
+        TickType_t wait_ticks = (last_mode == DISP_MODE_GRAPH) ?
+            pdMS_TO_TICKS(GRAPH_FRAME_MS) : pdMS_TO_TICKS(STATUS_FRAME_MS);
+
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, wait_ticks);
 
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         disp_mode_t mode = s_mode;
@@ -1570,11 +1626,10 @@ static void display_task(void *arg)
         }
 
         if (mode == DISP_MODE_GRAPH) {
-            /* Redraw on new data or when first entering graph mode. */
-            if (notified || mode_changed) {
-                render_graph();
-                last_render = now;
-            }
+            /* Smooth 12.5 Hz waveform scrolling (2 flow samples per frame) */
+            render_graph();
+            last_render = now;
+            s_last_render_us = esp_timer_get_time();
         } else if (mode == DISP_MODE_INFO) {
             /* Redraw on new leak data, mode change, or every second for
              * the session runtime clock. */
@@ -1582,12 +1637,14 @@ static void display_task(void *arg)
                 (now - last_render) >= pdMS_TO_TICKS(1000)) {
                 render_info();
                 last_render = now;
+                s_last_render_us = esp_timer_get_time();
             }
         } else {
             if (mode_changed || dirty ||
                 (now - last_render) >= pdMS_TO_TICKS(STATUS_FRAME_MS)) {
                 render_status();
                 last_render = now;
+                s_last_render_us = esp_timer_get_time();
             }
         }
 
