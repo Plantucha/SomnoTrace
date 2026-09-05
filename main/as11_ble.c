@@ -1635,6 +1635,12 @@ static void pair_task(void *arg)
     bytes_to_hex(s_srp.A_pad, SRP_PAD, A_hex);
     char *json = heap_caps_malloc(800, MALLOC_CAP_SPIRAM);
     if (!json) json = malloc(800);
+    if (!json) {
+        set_error("StartKeyExchange: out of memory");
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        vTaskDelete(NULL);
+        return;
+    }
     snprintf(json, 800,
              "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"StartKeyExchange\","
              "\"params\":{\"clientPk\":\"%s\"}}", A_hex);
@@ -2117,6 +2123,10 @@ static void reconnect_task(void *arg)
     char *rpc = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
     cJSON *resp = NULL;
     if (!rpc) rpc = malloc(512);
+    if (!rpc) {
+        ESP_LOGW(TAG, "reconnect: Get (test) skipped, out of memory");
+        goto after_get_test;
+    }
     snprintf(rpc, 512,
              "{\"id\":12,\"jsonrpc\":\"1.0\",\"method\":\"Get\","
              "\"params\":[\"ProductGeographicIdentifier\",\"HardwareIdentifier\"]}");
@@ -2133,6 +2143,7 @@ static void reconnect_task(void *arg)
         }
     }
     free(rpc);
+after_get_test:
 
     /* ---- Wait for usable time before subscribing to events or
      * starting the data stream.  Therapy recording depends on accurate
@@ -2175,6 +2186,10 @@ static void reconnect_task(void *arg)
      * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
     rpc = heap_caps_malloc(700, MALLOC_CAP_SPIRAM);
     if (!rpc) rpc = malloc(700);
+    if (!rpc) {
+        ESP_LOGW(TAG, "reconnect: SubscribeEvent skipped, out of memory");
+        goto after_subscribe;
+    }
     snprintf(rpc, 700,
              "{\"id\":13,\"jsonrpc\":\"1.0\",\"method\":\"SubscribeEvent\","
              "\"params\":{\"dataIds\":["
@@ -2197,6 +2212,7 @@ static void reconnect_task(void *arg)
         }
     }
     free(rpc);
+after_subscribe:
 
     /* ---- Query AS11 clock before starting stream ----
      * GetDateTime must be sent before StartStream because active streaming
@@ -2223,6 +2239,10 @@ static void reconnect_task(void *arg)
      * sampleIntervalMs:40 applies to all; reportIntervalMs:200 gives 5 reports/s. */
     rpc = heap_caps_malloc(600, MALLOC_CAP_SPIRAM);
     if (!rpc) rpc = malloc(600);
+    if (!rpc) {
+        ESP_LOGW(TAG, "reconnect: StartStream skipped, out of memory");
+        goto after_start_stream;
+    }
     snprintf(rpc, 600,
              "{\"id\":14,\"jsonrpc\":\"1.0\",\"method\":\"StartStream\","
              "\"params\":{\"dataIds\":["
@@ -2248,6 +2268,7 @@ static void reconnect_task(void *arg)
         }
     }
     free(rpc);
+after_start_stream:
 
     set_state(AS11_STATUS_PAIRED);
     #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
