@@ -3259,6 +3259,10 @@ var dashIsLoading = false;   /* true while SNT files are being downloaded */
 var dashProgrammaticScale = false;  /* guard setScale hook during programmatic updates */
 var SNT_HDR_SIZE = 28;
 var DASH_MAX_DISPLAY = 3000;
+/* Reusable scratch buffers for buildSignalData to eliminate TypedArray GC churn on pan/zoom */
+var dashGridMin = new Float64Array(DASH_MAX_DISPLAY);
+var dashGridMax = new Float64Array(DASH_MAX_DISPLAY);
+var dashOwner = new Int32Array(DASH_MAX_DISPLAY);
 var SNT_MISSING_V1 = -1;
 var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
 
@@ -3828,9 +3832,9 @@ function buildSignalData(sig, range, cols) {
   }
   if (!isFinite(nativeDt)) nativeDt = dt;
 
-  var gridMin = new Float64Array(W), gridMax = new Float64Array(W);
-  var owner = new Int32Array(W);
-  for (var c = 0; c < W; c++) { gridMin[c] = NaN; gridMax[c] = NaN; owner[c] = -1; }
+  dashGridMin.fill(NaN, 0, W);
+  dashGridMax.fill(NaN, 0, W);
+  dashOwner.fill(-1, 0, W);
 
   for (var si = 0; si < slices.length; si++) {
     var sd = slices[si];
@@ -3847,7 +3851,7 @@ function buildSignalData(sig, range, cols) {
       var col = Math.floor((tv - vMin) / dt);
       if (col < 0) col = 0; else if (col >= W) col = W - 1;
       /* Precedence: a later session claims (and resets) any column it touches. */
-      if (owner[col] !== si) { gridMin[col] = NaN; gridMax[col] = NaN; owner[col] = si; }
+      if (dashOwner[col] !== si) { dashGridMin[col] = NaN; dashGridMax[col] = NaN; dashOwner[col] = si; }
       var mn, mx;
       if (hasEnv) {
         mn = mins[j]; mx = maxs[j];
@@ -3857,8 +3861,8 @@ function buildSignalData(sig, range, cols) {
         if (isNaN(v)) continue;
         mn = v; mx = v;
       }
-      if (isNaN(gridMin[col]) || mn < gridMin[col]) gridMin[col] = mn;
-      if (isNaN(gridMax[col]) || mx > gridMax[col]) gridMax[col] = mx;
+      if (isNaN(dashGridMin[col]) || mn < dashGridMin[col]) dashGridMin[col] = mn;
+      if (isNaN(dashGridMax[col]) || mx > dashGridMax[col]) dashGridMax[col] = mx;
     }
   }
 
@@ -3866,16 +3870,29 @@ function buildSignalData(sig, range, cols) {
    * only when the time between consecutive populated columns exceeds a real-gap
    * threshold — a genuine data gap or a session boundary — rather than at every
    * empty column. Without this, zooming in (pixel grid finer than the samples)
-   * would isolate each sample between nulls and shatter the line into dots. */
+   * would isolate each sample between nulls and shatter the line into dots.
+   *
+   * IMPORTANT (uPlot invariant): outT must remain strictly monotonic and finite.
+   * A discontinuity is represented by null in outV at a valid finite timestamp
+   * (e.g. midpoint between sessions). Inserting null into outT breaks uPlot's
+   * binary search, discarding earlier sessions. */
   var gapThresh = Math.max(nativeDt, dt) * 2.5;
   var outT = [], outV = [];
   var prevTc = null;
   for (var k = 0; k < W; k++) {
-    if (isNaN(gridMin[k])) continue;
+    if (isNaN(dashGridMin[k])) continue;
     var tc = vMin + (k + 0.5) * dt;
-    if (prevTc !== null && (tc - prevTc) > gapThresh) { outT.push(null); outV.push(null); }
-    outT.push(tc); outV.push(gridMin[k]);
-    outT.push(tc); outV.push(gridMax[k]);
+    if (prevTc !== null && (tc - prevTc) > gapThresh) {
+      outT.push(prevTc + (tc - prevTc) * 0.5);
+      outV.push(null);
+    }
+    var cMin = dashGridMin[k], cMax = dashGridMax[k];
+    if (cMin === cMax) {
+      outT.push(tc); outV.push(cMin);
+    } else {
+      outT.push(tc); outV.push(cMin);
+      outT.push(tc); outV.push(cMax);
+    }
     prevTc = tc;
   }
   if (!outT.length) return null;
@@ -4310,20 +4327,30 @@ function spo2ColorHook(u) {
   if (half) ctx.translate(half, half);
   var xs = data[0], ys = data[idx];
   var prevPx = null, prevPy = null, prevV = null;
+  var curStroke = null;
   for (var i = 0; i < xs.length; i++) {
-    if (xs[i] == null || ys[i] == null || isNaN(ys[i])) { prevPx = null; continue; }
+    if (xs[i] == null || ys[i] == null || isNaN(ys[i])) {
+      if (curStroke != null) { ctx.stroke(); curStroke = null; }
+      prevPx = null;
+      continue;
+    }
     var px = round(u.valToPos(xs[i], 'x', true));
     var py = round(u.valToPos(ys[i], 'spo2', true));
     if (prevPx != null) {
       var segV = (prevV + ys[i]) / 2;
-      ctx.strokeStyle = spo2ColorMap(segV);
-      ctx.beginPath();
-      ctx.moveTo(prevPx, prevPy);
+      var color = spo2ColorMap(segV);
+      if (color !== curStroke) {
+        if (curStroke != null) ctx.stroke();
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(prevPx, prevPy);
+        curStroke = color;
+      }
       ctx.lineTo(px, py);
-      ctx.stroke();
     }
     prevPx = px; prevPy = py; prevV = ys[i];
   }
+  if (curStroke != null) ctx.stroke();
   ctx.restore();
 }
 /* uPlot draw hook for oximetry panels: draws a dashed horizontal line at the
@@ -4701,14 +4728,16 @@ function updateDashViewImpl() {
         chartEl.classList.add('dash-panel-loading');
       }
     }
-    if (sig.overlay) {
-      var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
-      var ovSrc = buildSignalData(ovSig, cur, dashChartCols(chart));
-      chart.setData([src ? src.t : ovSrc ? ovSrc.t : [], src ? src.v : [], ovSrc ? ovSrc.v : []], false);
-    } else {
-      chart.setData(src ? [src.t, src.v] : [[], []], false);
-    }
-    chart.setScale('x', {min: cur.min, max: cur.max});
+    chart.batch(function(u) {
+      if (sig.overlay) {
+        var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
+        var ovSrc = buildSignalData(ovSig, cur, dashChartCols(u));
+        u.setData([src ? src.t : ovSrc ? ovSrc.t : [], src ? src.v : [], ovSrc ? ovSrc.v : []], false);
+      } else {
+        u.setData(src ? [src.t, src.v] : [[], []], false);
+      }
+      u.setScale('x', {min: cur.min, max: cur.max});
+    });
   }
   dashProgrammaticScale = false;
 }
