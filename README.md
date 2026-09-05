@@ -99,7 +99,7 @@ The board has three physical buttons on the side. Here's what each one does:
 | Button | Action | What It Does |
 |---|---|---|
 | **BOOT** (left) | Hold 5 seconds | Enters Wi-Fi setup mode (AP hotspot) for initial configuration or network changes. |
-| **POWER** (middle) | Single click | Toggles the backlight when **Backlight controlled by POWER button** is selected under Display & Sound. |
+| **POWER** (middle) | Single click | Toggles the LCD backlight on or off on demand (or dismisses a temporary wake). Works across all display modes. |
 | **POWER** (middle) | Hold 5 seconds | Powers off the device. |
 | **POWER** (middle) | Hold 2 seconds | Powers on the device (when off). |
 | **PLUS** (right) | Single click | Acknowledges and silences an interrupted therapy alert (if enabled). |
