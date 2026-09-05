@@ -77,6 +77,19 @@ static void check_period_end(const char *what, int y, int m, int d, int h, int m
     expect_str(what, buf, want_dt);
 }
 
+/* Feed one TimeZoneOffset string through the settings parser, in the FlowGenerator shape
+ * Scenario 4 builds by hand. A successful parse also makes the value the anchor for every
+ * later noon-stamp derivation, which is what Scenario 11 relies on. */
+static bool parse_tz_setting(const char *value, as11_offset_t *out)
+{
+    cJSON n_off = { .child = NULL, .next = NULL, .string = "TimeZoneOffset", .valuestring = (char *)value, .type = cJSON_String };
+    cJSON n_tz = { .child = &n_off, .next = NULL, .string = "TimeZoneFeature", .valuestring = NULL, .type = 0 };
+    cJSON n_fp = { .child = &n_tz, .next = NULL, .string = "FeatureProfiles", .valuestring = NULL, .type = 0 };
+    cJSON n_sp = { .child = &n_fp, .next = NULL, .string = "SettingProfiles", .valuestring = NULL, .type = 0 };
+    cJSON n_fg = { .child = &n_sp, .next = NULL, .string = "FlowGenerator", .valuestring = NULL, .type = 0 };
+    return as11_time_offset_from_settings(&n_fg, out);
+}
+
 int main(void)
 {
     printf("\n=== Scenario 1: Issue #75 Vector (AS11 -05:00 vs ESP MST7MDT) ===\n");
@@ -226,6 +239,59 @@ int main(void)
     expect_str("noon-day label on 2100-03-01 (century boundary)", day, "21000301");
     as11_time_noon_day(4107502800000LL, day, sizeof(day));   /* 2100-02-28T13:00Z */
     expect_str("noon-day label on 2100-02-28 (2100 is not a leap year)", day, "21000228");
+    reset_offset();
+
+    printf("\n=== Scenario 10: Settings Offset Parser Boundaries ===\n");
+    reset_offset();
+    /* Every earlier settings case is a whole hour in the interior of [-12:00, +14:00], so
+     * hh*3600 + mm*60 was never told apart from hh*3600 - mm*60, and neither bound was
+     * ever shown to be inclusive. */
+    expect_int("+05:30 (half-hour offset)", parse_tz_setting("+05:30", &off) ? off : -999999, 19800);
+    expect_int("-03:30 (negative half-hour)", parse_tz_setting("-03:30", &off) ? off : -999999, -12600);
+    expect_int("+00:00 (hour zero is a valid hour)", parse_tz_setting("+00:00", &off) ? off : -999999, 0);
+    expect_int("-12:00 (lower bound is inclusive)", parse_tz_setting("-12:00", &off) ? off : -999999, -43200);
+    expect_int("+14:00 (upper bound is inclusive)", parse_tz_setting("+14:00", &off) ? off : -999999, 50400);
+    expect_int("-12:15 refused (below lower bound)", parse_tz_setting("-12:15", &off) ? 1 : 0, 0);
+    expect_int("+14:15 refused (above upper bound)", parse_tz_setting("+14:15", &off) ? 1 : 0, 0);
+    expect_int("+15:00 refused (hour out of range)", parse_tz_setting("+15:00", &off) ? 1 : 0, 0);
+    /* The sign is optional: an unsigned value reads as positive, and its first digit must
+     * not be swallowed as though it were a sign character. */
+    expect_int("10:00 (unsigned reads as +10:00)", parse_tz_setting("10:00", &off) ? off : -999999, 36000);
+
+    /* as11_time_set_offset() applies the same bounds, inclusive, and ignores the rest. */
+    as11_time_set_offset(-43200, "test");
+    expect_int("set_offset accepts -12:00", as11_time_get_offset(&off) ? off : -999999, -43200);
+    as11_time_set_offset(-43201, "test");
+    expect_int("set_offset ignores 1 s below -12:00", as11_time_get_offset(&off) ? off : -999999, -43200);
+    as11_time_set_offset(50400, "test");
+    expect_int("set_offset accepts +14:00", as11_time_get_offset(&off) ? off : -999999, 50400);
+    as11_time_set_offset(50401, "test");
+    expect_int("set_offset ignores 1 s above +14:00", as11_time_get_offset(&off) ? off : -999999, 50400);
+
+    printf("\n=== Scenario 11: Noon-Stamp Derivation Edges ===\n");
+    /* PS_MEL is 2026-06-29T02:00:00Z, local noon at +10:00. Anchor +10:00 through the
+     * settings parser so the derivation is compared against a known value, not the host TZ. */
+    parse_tz_setting("+10:00", &off);
+    expect_int("PeriodStart 0 refused", as11_time_offset_from_period_start(0, &off) ? 1 : 0, 0);
+    expect_int("noon + 5:00 accepted (at tolerance)",
+               as11_time_offset_from_period_start(PS_MEL + 300 * 1000, &off) ? off : -999999, 36000);
+    expect_int("noon - 5:00 accepted (at tolerance)",
+               as11_time_offset_from_period_start(PS_MEL - 300 * 1000, &off) ? off : -999999, 36000);
+    expect_int("noon + 5:01 refused",
+               as11_time_offset_from_period_start(PS_MEL + 301 * 1000, &off) ? 1 : 0, 0);
+
+    /* 00:00Z is local noon at +12:00 and at -12:00 alike; the anchor decides, and -12:00 is
+     * the lower bound itself. */
+    const int64_t PS_MIDNIGHT_Z = 1782691200000LL;   /* 2026-06-29T00:00:00Z */
+    parse_tz_setting("-10:00", &off);
+    expect_int("00:00Z, anchor -10:00 -> -12:00 (the bound itself)",
+               as11_time_offset_from_period_start(PS_MIDNIGHT_Z, &off) ? off : -999999, -43200);
+    parse_tz_setting("+10:00", &off);
+    expect_int("00:00Z, anchor +10:00 -> +12:00",
+               as11_time_offset_from_period_start(PS_MIDNIGHT_Z, &off) ? off : -999999, 43200);
+    parse_tz_setting("+00:00", &off);
+    expect_int("00:00Z, anchor 00:00 -> +12:00 (tie keeps the raw candidate)",
+               as11_time_offset_from_period_start(PS_MIDNIGHT_Z, &off) ? off : -999999, 43200);
     reset_offset();
 
     printf("\n%s (%d failure%s)\n", fails ? "FAILURES" : "ALL PASS",
