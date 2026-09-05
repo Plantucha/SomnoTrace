@@ -46,6 +46,7 @@ static const char *TAG = "dev_settings";
 #define DEFAULT_BRIGHTNESS       100 /* 10.0% */
 #define MIN_BRIGHTNESS           1   /* 0.1% */
 #define MAX_BRIGHTNESS           200 /* 20.0% */
+#define DEFAULT_LCD_THERAPY_MODE LCD_THERAPY_INFO
 #define DEFAULT_ALERT_VOLUME     65
 #define MIN_ALERT_VOLUME         50
 #define DEFAULT_LCD_ROTATION     LCD_ROTATION_0
@@ -70,7 +71,7 @@ esp_err_t device_settings_load(device_settings_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->brightness = DEFAULT_BRIGHTNESS;
-    cfg->lcd_therapy_mode = LCD_THERAPY_GRAPH;
+    cfg->lcd_therapy_mode = DEFAULT_LCD_THERAPY_MODE;
     cfg->alert_volume = DEFAULT_ALERT_VOLUME;
     cfg->lcd_rotation = DEFAULT_LCD_ROTATION;
     cfg->battery_enabled = DEFAULT_BAT_ENABLED;
@@ -91,7 +92,13 @@ esp_err_t device_settings_load(device_settings_t *cfg)
                           (u8val > MAX_BRIGHTNESS) ? MAX_BRIGHTNESS : u8val;
     }
     if (nvs_get_u8(h, NVS_KEY_LCD_THERAPY, &u8val) == ESP_OK) {
-        cfg->lcd_therapy_mode = (lcd_therapy_mode_t)u8val;
+        if (u8val == LCD_THERAPY_GRAPH || u8val == LCD_THERAPY_OFF ||
+            u8val == LCD_THERAPY_ALWAYS_OFF || u8val == LCD_THERAPY_INFO ||
+            u8val == LCD_THERAPY_BUTTON) {
+            cfg->lcd_therapy_mode = (lcd_therapy_mode_t)u8val;
+        } else {
+            cfg->lcd_therapy_mode = DEFAULT_LCD_THERAPY_MODE;
+        }
     }
     if (nvs_get_u8(h, NVS_KEY_ALERT_VOL, &u8val) == ESP_OK) {
         cfg->alert_volume = (u8val < MIN_ALERT_VOLUME) ? MIN_ALERT_VOLUME : u8val;
@@ -249,11 +256,12 @@ esp_err_t device_settings_save_json(const char *json_str)
     }
     if ((v = cJSON_GetObjectItem(root, "lcd_therapy_mode")) && cJSON_IsNumber(v)) {
         int val = v->valueint;
-        if (val == LCD_THERAPY_OFF || val == LCD_THERAPY_ALWAYS_OFF ||
-            val == LCD_THERAPY_INFO || val == LCD_THERAPY_BUTTON) {
+        if (val == LCD_THERAPY_GRAPH || val == LCD_THERAPY_OFF ||
+            val == LCD_THERAPY_ALWAYS_OFF || val == LCD_THERAPY_INFO ||
+            val == LCD_THERAPY_BUTTON) {
             cfg.lcd_therapy_mode = (lcd_therapy_mode_t)val;
         } else {
-            cfg.lcd_therapy_mode = LCD_THERAPY_GRAPH;
+            cfg.lcd_therapy_mode = DEFAULT_LCD_THERAPY_MODE;
         }
     }
     if ((v = cJSON_GetObjectItem(root, "alert_volume")) && cJSON_IsNumber(v)) {

@@ -693,8 +693,8 @@ Display &amp; Sound
 <div class="form-group">
 <label>Display mode <span id="therapy-status" class="setting-status"></span></label>
 <select id="lcd-therapy-mode" class="form-control" onchange="onLcdTherapyModeChange(this)">
+<option value="3" selected>Show info panel during therapy (default)</option>
 <option value="0">Show live graph during therapy</option>
-<option value="3">Show info panel during therapy</option>
 <option value="1">Backlight off during therapy</option>
 <option value="2">Backlight always off (battery)</option>
 <option value="4">Backlight controlled by POWER button</option>
@@ -2220,7 +2220,8 @@ function onBrightnessInput(val) {
 }
 
 function onLcdTherapyModeChange(sel) {
-  var mode = sel ? parseInt(sel.value) || 0 : 0;
+  var mode = sel ? parseInt(sel.value, 10) : 3;
+  if (isNaN(mode)) mode = 3;
   setStatus('therapy-status', '…', null);
   fetch('/api/device/settings', {
     method: 'POST',

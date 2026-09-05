@@ -29,11 +29,11 @@
 
 /* LCD behaviour during therapy */
 typedef enum {
-    LCD_THERAPY_GRAPH      = 0,  /* Live flow graph (default) */
+    LCD_THERAPY_GRAPH      = 0,  /* Live flow graph */
     LCD_THERAPY_OFF        = 1,  /* Backlight off during therapy, on otherwise */
     LCD_THERAPY_ALWAYS_OFF = 2,  /* Backlight always off (battery-friendly) —
                                  * except during boot and SoftAP mode */
-    LCD_THERAPY_INFO       = 3,  /* Info panel: leak rate + session runtime */
+    LCD_THERAPY_INFO       = 3,  /* Info panel: leak rate + session runtime (default) */
     LCD_THERAPY_BUTTON     = 4,  /* Backlight toggled by a short PWR press */
 } lcd_therapy_mode_t;
 

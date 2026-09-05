@@ -174,7 +174,7 @@ Provides access and modification for hardware peripherals, display preferences, 
 ```
 
 - `brightness`: LCD backlight PWM duty (1..200, mapping to 0.1%..20.0% brightness).
-- `lcd_therapy_mode`: Display behavior during active therapy (0 = Always On, 1 = Dim, 2 = Off, 3 = Auto).
+- `lcd_therapy_mode`: Display behavior during active therapy (0 = Live Graph, 1 = Backlight off during therapy, 2 = Backlight always off, 3 = Info Panel (default), 4 = Power button backlight control).
 - `alert_volume`: Master speaker alert volume percentage (0..100).
 - `lcd_rotation`: Display orientation in degrees (0, 90, 180, 270).
 - `battery_enabled`: Boolean flag controlling battery indicator display and telemetry. When set to `false`, hides the battery gauge on the status LCD and reports `USB Power (No battery)` in the portal.
