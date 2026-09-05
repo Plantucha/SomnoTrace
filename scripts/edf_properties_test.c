@@ -188,6 +188,16 @@ static void test_prop_04_spool_symmetric_rounding(void)
     /* Denominator with scale 20: 30 / 20 = 1.5 -> rounds to 2 */
     int16_t r_scale20 = spool_to_edf(30, 1, 20);
     TEST_ASSERT(r_scale20 == 2, "PROP_04: Scale 20 rounding 30/20 rounds to 2");
+
+    /* Every case above has num == 1, which cannot tell raw * num from raw / num. The
+     * firmware does not: Flow.95/Flow.5/BlowFlow.50 pass (5, 1) and MinVent/TgtVent pass
+     * (2, 25) — see edf_summary.c. Under the multiply→divide mutation Flow.95 comes out
+     * 25x too small and nothing above notices. */
+    TEST_ASSERT(spool_to_edf(30, 5, 1) == 150, "PROP_04: Flow scale (5,1): 30 * 5 = 150");
+    TEST_ASSERT(spool_to_edf(-30, 5, 1) == -150, "PROP_04: Flow scale (5,1) is sign-preserving");
+    TEST_ASSERT(spool_to_edf(32, 2, 25) == 3, "PROP_04: MinVent scale (2,25): 64/25 = 2.56 rounds to 3");
+    TEST_ASSERT(spool_to_edf(31, 2, 25) == 2, "PROP_04: MinVent scale (2,25): 62/25 = 2.48 rounds to 2");
+    TEST_ASSERT(spool_to_edf(-32, 2, 25) == -3, "PROP_04: MinVent scale (2,25): -2.56 rounds away from zero");
 }
 
 static void test_prop_05_clamping_safety(void)
