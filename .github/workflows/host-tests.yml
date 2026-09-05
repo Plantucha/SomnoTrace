@@ -37,6 +37,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends libcjson-dev
 
       - name: Run host tests
+        # The runner's default shell is `bash -e` without pipefail, so the
+        # script's exit status would be lost behind tee.  Both the status and
+        # the summary line are checked; a run that prints neither fails too.
         run: |
+          set -o pipefail
           bash scripts/run_host_tests.sh | tee host-tests.log
-          tail -1 host-tests.log | grep -q ' 0 skipped$' || { echo "::error::a host suite was skipped"; exit 1; }
+          tail -1 host-tests.log | grep -qE '^host tests: [0-9]+ run, 0 failed, 0 skipped$' \
+            || { echo "::error::host tests failed or were skipped: $(tail -1 host-tests.log)"; exit 1; }
