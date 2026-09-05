@@ -445,17 +445,6 @@ static int profile_name_to_mop(const char *name)
  *   Indices (AHI etc)    logical_scale = 10    → num=1, den=10
  *   Duration/enums/SAU   logical_scale = 1     → no conversion needed
  */
-static inline int16_t spool_to_edf(int16_t raw, int num, int den)
-{
-    if (raw == -1 || den <= 0) return -1;
-    int32_t prod = (int32_t)raw * num;
-    int32_t half = den / 2;
-    int32_t rounded = (prod >= 0) ? (prod + half) / den : (prod - half) / den;
-    if (rounded > INT16_MAX) return INT16_MAX;
-    if (rounded < INT16_MIN) return INT16_MIN;
-    return (int16_t)rounded;
-}
-
 /* Build STR data values [4-132] from a summary context and settings JSON.
  * str_values must be pre-filled with 0xFF (sentinel for "no data").
  *
