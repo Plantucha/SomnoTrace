@@ -20,7 +20,7 @@ that is wanted; nothing here depends on running there.
 |---|---|
 | `scripts/run_host_tests.sh` | builds each `scripts/*_test.c` and runs it; fails if a `*_test.c` exists that it does not know about |
 | `scripts/test_include/` | one-file stand-ins for `esp_log.h`, `esp_err.h`, `esp_timer.h`, `esp_heap_caps.h`, `cJSON.h` |
-| `scripts/edf_gen_test.c` | `#include "edf_gen.c"` — tests the real converter end to end (SNT files in, EDF bytes out) |
+| `scripts/edf_gen_test.c` | `#include`s the five `edf_*.c` modules — tests the real converter end to end (SNT files in, EDF bytes out) |
 | `scripts/as11_time_test.c` | AS11 epoch / noon-day arithmetic |
 | `scripts/as11_events_test.c` | event parser (tests a copy of the parser, not the real one) |
 | `scripts/vld3_decoder_test.c` | oximeter VLD3 decoder |
