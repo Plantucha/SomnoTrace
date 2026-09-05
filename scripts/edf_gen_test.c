@@ -23,7 +23,7 @@
 
 /*
  * These tests link the REAL converter: edf_gen.c is #included so that its
- * static helpers (convert_snt_to_edf, noon_day_folder, build_str_data_values,
+ * static helpers (convert_snt_to_edf, build_str_data_values,
  * ...) are reachable, and the generated EDF is parsed back and checked.
  * Nothing here is a copy of production code — when edf_gen.c changes, these
  * tests change behaviour with it.
@@ -40,7 +40,24 @@
  * scripts/test_include is too small for edf_gen.c).
  */
 
-#include "edf_gen.c"          /* found via -I<main dir>, see run_host_tests.sh */
+/* v2.0.0 split the converter into five modules. All are #included so the tests still
+ * reach the static helpers (spool_to_edf, build_str_data_values) they exercise. */
+/* Each module defines its own static TAG; rename per include so they coexist. */
+#define TAG TAG_hdr
+#include "edf_header.c"       /* found via -I<main dir>, see run_host_tests.sh */
+#undef TAG
+#define TAG TAG_wav
+#include "edf_waveform.c"
+#undef TAG
+#define TAG TAG_ann
+#include "edf_annotations.c"
+#undef TAG
+#define TAG TAG_sum
+#include "edf_summary.c"
+#undef TAG
+#define TAG TAG_gen
+#include "edf_gen.c"
+#undef TAG
 
 #include <assert.h>
 #include <math.h>
@@ -969,64 +986,19 @@ static void test_spool_to_edf(void)
     CHECK(spool_to_edf(7, 1, 1) == 7, "identity scale");
 }
 
-/* AS11 noon-day: noon itself belongs to the NEW day, 11:59:59 to the old. */
+/* AS11 noon-day: noon itself belongs to the NEW day, 11:59:59 to the old. Since v2.0.0
+ * edf_gen derives the DATALOG day through as11_time_noon_day() (71e2e64), so that is the
+ * function under test; the offset is pinned so the label is a pure function of the epoch. */
 static void test_noon_day_folder_boundary(void)
 {
-    set_tz("UTC");
+    as11_time_set_offset(0, "test");
     char d[16];
-    noon_day_folder(1772366399000LL, d, sizeof(d));   /* 2026-03-01 11:59:59Z */
+    as11_time_noon_day(1772366399000LL, d, sizeof(d));   /* 2026-03-01 11:59:59Z */
     CHECK(strcmp(d, "20260228") == 0, "11:59:59 → %s want 20260228", d);
-    noon_day_folder(1772366400000LL, d, sizeof(d));   /* 2026-03-01 12:00:00Z */
+    as11_time_noon_day(1772366400000LL, d, sizeof(d));   /* 2026-03-01 12:00:00Z */
     CHECK(strcmp(d, "20260301") == 0, "12:00:00 → %s want 20260301", d);
-    noon_day_folder(1772409599000LL, d, sizeof(d));   /* 2026-03-01 23:59:59Z */
+    as11_time_noon_day(1772409599000LL, d, sizeof(d));   /* 2026-03-01 23:59:59Z */
     CHECK(strcmp(d, "20260301") == 0, "23:59:59 → %s want 20260301", d);
-}
-
-/* Differential: edf_gen's DATALOG day (ESP-local, localtime idiom) against
- * as11_time's offset-arithmetic day for the same instant, with the AS11
- * offset set to the ESP zone's own offset at that instant.  The two are
- * different implementations of one definition and must never disagree.
- * Swept every 30 min through a whole year. */
-static int sweep_noon_day(const char *tz, int report)
-{
-    set_tz(tz);
-    int mism = 0;
-    for (int64_t t = 1767225600; t < 1767225600 + 366LL * 86400; t += 1800) {  /* 2026 */
-        struct tm tm;
-        time_t tt = (time_t)t;
-        localtime_r(&tt, &tm);
-        as11_time_set_offset((as11_offset_t)tm.tm_gmtoff, "test");
-        char a[16], b[16];
-        noon_day_folder(t * 1000, a, sizeof(a));
-        as11_time_noon_day(t * 1000, b, sizeof(b));
-        if (strcmp(a, b) != 0) {
-            if (mism < report)
-                printf("    %s %04d-%02d-%02d %02d:%02d local: edf_gen=%s as11_time=%s\n",
-                       tz, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                       tm.tm_hour, tm.tm_min, a, b);
-            mism++;
-        }
-    }
-    return mism;
-}
-
-static void test_noon_day_agrees_fixed_offset_zones(void)
-{
-    static const char *zones[] = { "UTC", "Asia/Kolkata", "Asia/Tokyo", "America/Phoenix" };
-    for (size_t i = 0; i < sizeof(zones) / sizeof(zones[0]); i++) {
-        int m = sweep_noon_day(zones[i], 3);
-        CHECK(m == 0, "%s: %d disagreements", zones[i], m);
-    }
-}
-
-static void test_noon_day_agrees_dst_zones(void)
-{
-    static const char *zones[] = { "America/New_York", "Europe/Warsaw",
-                                   "Pacific/Auckland", "Australia/Lord_Howe" };
-    for (size_t i = 0; i < sizeof(zones) / sizeof(zones[0]); i++) {
-        int m = sweep_noon_day(zones[i], 2);
-        CHECK(m == 0, "%s: %d disagreements", zones[i], m);
-    }
 }
 
 /* STR settings: the AS11 stores every pressure at 50 digits per cmH2O — its
@@ -1102,14 +1074,7 @@ int main(void)
     run("noon_day_folder: noon starts the new day", test_noon_day_folder_boundary, NULL);
     run("the session's AS11 offset beats the device timezone",
         test_as11_offset_beats_device_timezone, NULL);
-    run("noon-day: edf_gen == as11_time, fixed-offset zones",
-        test_noon_day_agrees_fixed_offset_zones, NULL);
-    run("noon-day: edf_gen == as11_time, DST zones",
-        test_noon_day_agrees_dst_zones,
-        "noon_day_folder uses the localtime `t -= 86400` idiom; wrong across a DST change (same class as #183)");
-    run("STR pressure settings are exact cmH2O x 50",
-        test_str_pressure_settings_exact,
-        "(int16_t)(valuedouble * 50) truncates 4.6, 8.2, 9.2, 10.2, 16.4 ... one LSB low");
+    run("STR pressure settings are exact cmH2O x 50", test_str_pressure_settings_exact, NULL);
 
     if (!getenv("KEEP_TEST_TREE")) rmtree(g_root);
     else printf("test tree kept at %s\n", g_root);

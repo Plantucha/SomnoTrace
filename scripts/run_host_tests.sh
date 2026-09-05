@@ -106,10 +106,14 @@ elif [ -f /usr/include/cjson/cJSON.h ]; then
 else
     CJ_INC=""
     skip_test edf_gen_test "no cJSON (apt install libcjson-dev, or set CJSON_DIR=<dir with cJSON.c/.h>)"
+    skip_test edf_properties_test "no cJSON"
 fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         scripts/edf_gen_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+    # upstream's EDF pipeline property suite (54ae598)
+    run_test edf_properties_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
+        scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
 fi
 
 # Roster check: a test file that exists but is not wired in here would never
