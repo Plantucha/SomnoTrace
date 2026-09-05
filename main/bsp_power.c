@@ -164,12 +164,9 @@ static void button_monitor_task(void *arg)
                     bsp_display_cancel_temporary_wake();
                     ESP_LOGI(TAG, "POWER button: canceled temporary wake");
                 } else {
-                    const device_settings_t *dev = device_settings_get();
-                    if (dev->lcd_therapy_mode == LCD_THERAPY_BUTTON) {
-                        bool on = bsp_display_toggle_backlight();
-                        ESP_LOGI(TAG, "POWER button short-press: backlight %s",
-                                 on ? "on" : "off");
-                    }
+                    bool on = bsp_display_toggle_backlight();
+                    ESP_LOGI(TAG, "POWER button short-press: backlight %s",
+                             on ? "on" : "off");
                 }
             }
             s_btn.pwr_held_ms = 0;

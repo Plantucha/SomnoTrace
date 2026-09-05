@@ -166,24 +166,24 @@ Provides access and modification for hardware peripherals, display preferences, 
 ```json
 {
   "brightness": 200,
-  "lcd_therapy_mode": 3,
+  "therapy_screen": 0,
+  "backlight_mode": 0,
   "alert_volume": 65,
   "lcd_rotation": 90,
   "battery_enabled": true,
   "wake_on_touch": true,
-  "wake_on_motion": true,
   "wake_timeout_sec": 10
 }
 ```
 
 - `brightness`: LCD backlight PWM duty (1..200, mapping to 0.1%..20.0% brightness).
-- `lcd_therapy_mode`: Display behavior during active therapy (0 = Live Graph, 1 = Backlight off during therapy, 2 = Backlight always off, 3 = Info Panel (default), 4 = Power button backlight control).
+- `therapy_screen`: Screen displayed during active therapy (0 = Info Panel (default), 1 = Live Flow Graph, 2 = Main Status Screen).
+- `backlight_mode`: Backlight policy (0 = Always on (default), 1 = Off during therapy, 2 = Always off).
 - `alert_volume`: Master speaker alert volume percentage (0..100).
 - `lcd_rotation`: Display orientation in degrees (0, 90, 180, 270).
 - `battery_enabled`: Boolean flag controlling battery indicator display and telemetry. When set to `false`, hides the battery gauge on the status LCD and reports `USB Power (No battery)` in the portal.
 - `wake_on_touch`: Boolean flag controlling whether tapping the capacitive touch screen illuminates the display when dark.
-- `wake_on_motion`: Boolean flag controlling whether moving/tilting the device illuminates the display when dark.
-- `wake_timeout_sec`: Number of seconds (e.g. 5, 10, 15, 30; 0 = disabled) the display stays illuminated upon touch/motion wake before automatically turning back off.
+- `wake_timeout_sec`: Number of seconds (e.g. 5, 10, 15, 30; 0 = disabled) the display stays illuminated upon touch wake before automatically turning back off.
 
 #### B. Saving Settings (`POST /api/device/settings`)
 Accepts a partial or complete JSON object with any of the fields listed above. Persists updated values to NVS immediately.

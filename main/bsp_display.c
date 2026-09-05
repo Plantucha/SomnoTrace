@@ -192,16 +192,16 @@ void bsp_display_set_therapy_active(bool active)
         return;
     }
 
-    /* Check LCD therapy mode setting */
+    /* Check device settings */
     const device_settings_t *dev = device_settings_get();
-    bool lcd_off_mode = (dev->lcd_therapy_mode == LCD_THERAPY_OFF ||
-                         dev->lcd_therapy_mode == LCD_THERAPY_ALWAYS_OFF);
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     disp_mode_t new_mode;
     if (active) {
-        if (dev->lcd_therapy_mode == LCD_THERAPY_INFO)
+        if (dev->therapy_screen == THERAPY_SCREEN_INFO)
             new_mode = DISP_MODE_INFO;
+        else if (dev->therapy_screen == THERAPY_SCREEN_STATUS)
+            new_mode = DISP_MODE_STATUS;
         else
             new_mode = DISP_MODE_GRAPH;
     } else {
@@ -214,8 +214,9 @@ void bsp_display_set_therapy_active(bool active)
             s_flow_count = 0;
             s_leak_sum = 0.0;
             s_leak_count = 0;
-            ESP_LOGI(TAG, "therapy %s mode enabled (display_task=%s)",
-                     new_mode == DISP_MODE_INFO ? "info" : "graph",
+            ESP_LOGI(TAG, "therapy mode enabled: %s (display_task=%s)",
+                     new_mode == DISP_MODE_INFO ? "info" :
+                     new_mode == DISP_MODE_STATUS ? "status" : "graph",
                      s_display_task ? "alive" : "NULL");
         } else {
             s_status_dirty = true;  /* force immediate status redraw */
@@ -229,18 +230,15 @@ void bsp_display_set_therapy_active(bool active)
     }
     xSemaphoreGive(s_state_mutex);
 
-    /* Backlight policy:
-     *   LCD_THERAPY_GRAPH:      always on
-     *   LCD_THERAPY_INFO:       always on
-     *   LCD_THERAPY_OFF:        off during therapy, on when therapy stops
-     *   LCD_THERAPY_ALWAYS_OFF: off during therapy, stays off when therapy stops */
-    if (lcd_off_mode) {
-        if (active) {
-            bsp_display_set_backlight(false);
-        } else if (dev->lcd_therapy_mode == LCD_THERAPY_OFF) {
-            bsp_display_set_backlight(true);
-        }
-        /* ALWAYS_OFF: backlight stays off when therapy stops */
+    /* Backlight policy during therapy */
+    if (s_temporarily_awake) {
+        /* Keep temporary wake active */
+    } else if (dev->backlight_mode == BACKLIGHT_MODE_OFF_THRP) {
+        bsp_display_set_backlight(!active);
+    } else if (dev->backlight_mode == BACKLIGHT_MODE_ALWAYS_OFF) {
+        bsp_display_set_backlight(false);
+    } else {
+        bsp_display_set_backlight(true);
     }
 
     /* Wake the render task so the mode change is reflected immediately. */
@@ -957,18 +955,15 @@ void bsp_display_apply_backlight_policy(bool force_on)
     const device_settings_t *dev = device_settings_get();
     bool therapy_active = bsp_display_is_therapy_active();
 
-    switch (dev->lcd_therapy_mode) {
-    case LCD_THERAPY_GRAPH:
+    switch (dev->backlight_mode) {
+    case BACKLIGHT_MODE_ON:
         bsp_display_set_backlight(true);
         break;
-    case LCD_THERAPY_OFF:
+    case BACKLIGHT_MODE_OFF_THRP:
         bsp_display_set_backlight(!therapy_active);
         break;
-    case LCD_THERAPY_ALWAYS_OFF:
+    case BACKLIGHT_MODE_ALWAYS_OFF:
         bsp_display_set_backlight(false);
-        break;
-    case LCD_THERAPY_BUTTON:
-        /* A short PWR press owns the backlight state in this mode. */
         break;
     default:
         bsp_display_set_backlight(true);

@@ -36,12 +36,12 @@ static const char *TAG = "dev_settings";
 
 #define NVS_NAMESPACE "device"
 #define NVS_KEY_BRIGHTNESS   "bright"
-#define NVS_KEY_LCD_THERAPY  "lcd_thr"
+#define NVS_KEY_THE_SCREEN   "th_scr"
+#define NVS_KEY_BACKLIGHT    "bk_mod"
 #define NVS_KEY_ALERT_VOL    "alrtvol"
 #define NVS_KEY_LCD_ROTATION "lcd_rot"
 #define NVS_KEY_BAT_ENABLED  "bat_en"
 #define NVS_KEY_WAKE_TOUCH   "wake_tch"
-#define NVS_KEY_WAKE_MOTION  "wake_mot"
 #define NVS_KEY_WAKE_SEC     "wake_sec"
 
 /* Brightness stored in tenth-percent units: 1=0.1%, 200=20.0%
@@ -49,13 +49,13 @@ static const char *TAG = "dev_settings";
 #define DEFAULT_BRIGHTNESS       100 /* 10.0% */
 #define MIN_BRIGHTNESS           1   /* 0.1% */
 #define MAX_BRIGHTNESS           200 /* 20.0% */
-#define DEFAULT_LCD_THERAPY_MODE LCD_THERAPY_INFO
+#define DEFAULT_THE_SCREEN       THERAPY_SCREEN_INFO
+#define DEFAULT_BACKLIGHT_MODE   BACKLIGHT_MODE_ON
 #define DEFAULT_ALERT_VOLUME     65
 #define MIN_ALERT_VOLUME         50
 #define DEFAULT_LCD_ROTATION     LCD_ROTATION_0
 #define DEFAULT_BAT_ENABLED      true
 #define DEFAULT_WAKE_ON_TOUCH    true
-#define DEFAULT_WAKE_ON_MOTION   true
 #define DEFAULT_WAKE_TIMEOUT_SEC 10
 
 static device_settings_t s_settings;
@@ -77,12 +77,12 @@ esp_err_t device_settings_load(device_settings_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->brightness = DEFAULT_BRIGHTNESS;
-    cfg->lcd_therapy_mode = DEFAULT_LCD_THERAPY_MODE;
+    cfg->therapy_screen = DEFAULT_THE_SCREEN;
+    cfg->backlight_mode = DEFAULT_BACKLIGHT_MODE;
     cfg->alert_volume = DEFAULT_ALERT_VOLUME;
     cfg->lcd_rotation = DEFAULT_LCD_ROTATION;
     cfg->battery_enabled = DEFAULT_BAT_ENABLED;
     cfg->wake_on_touch = DEFAULT_WAKE_ON_TOUCH;
-    cfg->wake_on_motion = DEFAULT_WAKE_ON_MOTION;
     cfg->wake_timeout_sec = DEFAULT_WAKE_TIMEOUT_SEC;
     /* Clamp stale NVS values to current valid range */
 
@@ -100,13 +100,14 @@ esp_err_t device_settings_load(device_settings_t *cfg)
         cfg->brightness = (u8val < MIN_BRIGHTNESS) ? MIN_BRIGHTNESS :
                           (u8val > MAX_BRIGHTNESS) ? MAX_BRIGHTNESS : u8val;
     }
-    if (nvs_get_u8(h, NVS_KEY_LCD_THERAPY, &u8val) == ESP_OK) {
-        if (u8val == LCD_THERAPY_GRAPH || u8val == LCD_THERAPY_OFF ||
-            u8val == LCD_THERAPY_ALWAYS_OFF || u8val == LCD_THERAPY_INFO ||
-            u8val == LCD_THERAPY_BUTTON) {
-            cfg->lcd_therapy_mode = (lcd_therapy_mode_t)u8val;
-        } else {
-            cfg->lcd_therapy_mode = DEFAULT_LCD_THERAPY_MODE;
+    if (nvs_get_u8(h, NVS_KEY_THE_SCREEN, &u8val) == ESP_OK) {
+        if (u8val <= THERAPY_SCREEN_STATUS) {
+            cfg->therapy_screen = (therapy_screen_t)u8val;
+        }
+    }
+    if (nvs_get_u8(h, NVS_KEY_BACKLIGHT, &u8val) == ESP_OK) {
+        if (u8val <= BACKLIGHT_MODE_ALWAYS_OFF) {
+            cfg->backlight_mode = (backlight_mode_t)u8val;
         }
     }
     if (nvs_get_u8(h, NVS_KEY_ALERT_VOL, &u8val) == ESP_OK) {
@@ -117,9 +118,6 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     }
     if (nvs_get_u8(h, NVS_KEY_WAKE_TOUCH, &u8val) == ESP_OK) {
         cfg->wake_on_touch = (u8val != 0);
-    }
-    if (nvs_get_u8(h, NVS_KEY_WAKE_MOTION, &u8val) == ESP_OK) {
-        cfg->wake_on_motion = (u8val != 0);
     }
     if (nvs_get_u8(h, NVS_KEY_WAKE_SEC, &u8val) == ESP_OK) {
         cfg->wake_timeout_sec = (u8val > 60) ? DEFAULT_WAKE_TIMEOUT_SEC : u8val;
@@ -141,11 +139,11 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     nvs_close(h);
     nvs_writer_unlock();
     memcpy(&s_settings, cfg, sizeof(s_settings));
-    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d, wake_tch=%d, wake_mot=%d, wake_sec=%u",
+    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), thr_screen=%u, bkl_mode=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d, wake_tch=%d, wake_sec=%u",
              s_settings.brightness, s_settings.brightness / 10.0,
-             s_settings.lcd_therapy_mode, s_settings.alert_volume,
+             s_settings.therapy_screen, s_settings.backlight_mode, s_settings.alert_volume,
              (unsigned)s_settings.lcd_rotation, s_settings.battery_enabled,
-             s_settings.wake_on_touch, s_settings.wake_on_motion, s_settings.wake_timeout_sec);
+             s_settings.wake_on_touch, s_settings.wake_timeout_sec);
     return ESP_OK;
 }
 
@@ -157,12 +155,12 @@ static esp_err_t do_device_settings_save(void *arg)
     if (ret != ESP_OK) return ret;
 
     nvs_set_u8(h, NVS_KEY_BRIGHTNESS, cfg->brightness);
-    nvs_set_u8(h, NVS_KEY_LCD_THERAPY, (uint8_t)cfg->lcd_therapy_mode);
+    nvs_set_u8(h, NVS_KEY_THE_SCREEN, (uint8_t)cfg->therapy_screen);
+    nvs_set_u8(h, NVS_KEY_BACKLIGHT, (uint8_t)cfg->backlight_mode);
     nvs_set_u8(h, NVS_KEY_ALERT_VOL, cfg->alert_volume);
     nvs_set_u16(h, NVS_KEY_LCD_ROTATION, cfg->lcd_rotation);
     nvs_set_u8(h, NVS_KEY_BAT_ENABLED, cfg->battery_enabled ? 1 : 0);
     nvs_set_u8(h, NVS_KEY_WAKE_TOUCH, cfg->wake_on_touch ? 1 : 0);
-    nvs_set_u8(h, NVS_KEY_WAKE_MOTION, cfg->wake_on_motion ? 1 : 0);
     nvs_set_u8(h, NVS_KEY_WAKE_SEC, cfg->wake_timeout_sec);
     ret = nvs_commit(h);
     nvs_close(h);
@@ -177,11 +175,11 @@ esp_err_t device_settings_save(const device_settings_t *cfg)
     esp_err_t ret = nvs_writer_run(do_device_settings_save, (void *)cfg);
     if (ret == ESP_OK) {
         memcpy(&s_settings, cfg, sizeof(s_settings));
-        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), lcd_therapy=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d, wake_tch=%d, wake_mot=%d, wake_sec=%u",
+        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), thr_screen=%u, bkl_mode=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d, wake_tch=%d, wake_sec=%u",
                  s_settings.brightness, s_settings.brightness / 10.0,
-                 s_settings.lcd_therapy_mode, s_settings.alert_volume,
+                 s_settings.therapy_screen, s_settings.backlight_mode, s_settings.alert_volume,
                  (unsigned)s_settings.lcd_rotation, s_settings.battery_enabled,
-                 s_settings.wake_on_touch, s_settings.wake_on_motion, s_settings.wake_timeout_sec);
+                 s_settings.wake_on_touch, s_settings.wake_timeout_sec);
     }
     return ret;
 }
@@ -201,11 +199,16 @@ esp_err_t device_settings_set_brightness(uint8_t percent)
     return ESP_OK;
 }
 
-esp_err_t device_settings_set_lcd_therapy_mode(lcd_therapy_mode_t mode)
+esp_err_t device_settings_set_therapy_screen(therapy_screen_t screen)
 {
-    s_settings.lcd_therapy_mode = mode;
-    /* Re-evaluate display mode and backlight immediately */
+    s_settings.therapy_screen = screen;
     bsp_display_set_therapy_active(bsp_display_is_therapy_active());
+    return ESP_OK;
+}
+
+esp_err_t device_settings_set_backlight_mode(backlight_mode_t mode)
+{
+    s_settings.backlight_mode = mode;
     bsp_display_apply_backlight_policy(false);
     return ESP_OK;
 }
@@ -247,12 +250,12 @@ esp_err_t device_settings_get_json(char **out_json)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "brightness", s_settings.brightness);
-    cJSON_AddNumberToObject(root, "lcd_therapy_mode", (int)s_settings.lcd_therapy_mode);
+    cJSON_AddNumberToObject(root, "therapy_screen", (int)s_settings.therapy_screen);
+    cJSON_AddNumberToObject(root, "backlight_mode", (int)s_settings.backlight_mode);
     cJSON_AddNumberToObject(root, "alert_volume", s_settings.alert_volume);
     cJSON_AddNumberToObject(root, "lcd_rotation", s_settings.lcd_rotation);
     cJSON_AddBoolToObject(root, "battery_enabled", s_settings.battery_enabled);
     cJSON_AddBoolToObject(root, "wake_on_touch", s_settings.wake_on_touch);
-    cJSON_AddBoolToObject(root, "wake_on_motion", s_settings.wake_on_motion);
     cJSON_AddNumberToObject(root, "wake_timeout_sec", s_settings.wake_timeout_sec);
 
     *out_json = cJSON_PrintUnformatted(root);
@@ -280,14 +283,16 @@ esp_err_t device_settings_save_json(const char *json_str)
         if (val > MAX_BRIGHTNESS) val = MAX_BRIGHTNESS;
         cfg.brightness = (uint8_t)val;
     }
-    if ((v = cJSON_GetObjectItem(root, "lcd_therapy_mode")) && cJSON_IsNumber(v)) {
+    if ((v = cJSON_GetObjectItem(root, "therapy_screen")) && cJSON_IsNumber(v)) {
         int val = v->valueint;
-        if (val == LCD_THERAPY_GRAPH || val == LCD_THERAPY_OFF ||
-            val == LCD_THERAPY_ALWAYS_OFF || val == LCD_THERAPY_INFO ||
-            val == LCD_THERAPY_BUTTON) {
-            cfg.lcd_therapy_mode = (lcd_therapy_mode_t)val;
-        } else {
-            cfg.lcd_therapy_mode = DEFAULT_LCD_THERAPY_MODE;
+        if (val >= 0 && val <= THERAPY_SCREEN_STATUS) {
+            cfg.therapy_screen = (therapy_screen_t)val;
+        }
+    }
+    if ((v = cJSON_GetObjectItem(root, "backlight_mode")) && cJSON_IsNumber(v)) {
+        int val = v->valueint;
+        if (val >= 0 && val <= BACKLIGHT_MODE_ALWAYS_OFF) {
+            cfg.backlight_mode = (backlight_mode_t)val;
         }
     }
     if ((v = cJSON_GetObjectItem(root, "alert_volume")) && cJSON_IsNumber(v)) {
@@ -306,9 +311,6 @@ esp_err_t device_settings_save_json(const char *json_str)
     }
     if ((v = cJSON_GetObjectItem(root, "wake_on_touch")) && cJSON_IsBool(v)) {
         cfg.wake_on_touch = cJSON_IsTrue(v);
-    }
-    if ((v = cJSON_GetObjectItem(root, "wake_on_motion")) && cJSON_IsBool(v)) {
-        cfg.wake_on_motion = cJSON_IsTrue(v);
     }
     if ((v = cJSON_GetObjectItem(root, "wake_timeout_sec")) && cJSON_IsNumber(v)) {
         int val = v->valueint;
@@ -330,9 +332,8 @@ esp_err_t device_settings_save_json(const char *json_str)
         bsp_display_set_battery(-1, false, false);
     }
 
-    /* Persist first so device_settings_get() returns the new mode,
-     * then re-evaluate therapy display mode and backlight based on the new mode.
-     * If in SoftAP (force_on), backlight stays on regardless. */
+    /* Persist first so device_settings_get() returns the new settings,
+     * then re-evaluate therapy display mode and backlight based on the new settings. */
     esp_err_t ret = device_settings_save(&cfg);
     bsp_display_set_therapy_active(bsp_display_is_therapy_active());
     bsp_display_apply_backlight_policy(false);

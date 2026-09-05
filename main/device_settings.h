@@ -27,15 +27,19 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
-/* LCD behaviour during therapy */
+/* Screen to display during therapy */
 typedef enum {
-    LCD_THERAPY_GRAPH      = 0,  /* Live flow graph */
-    LCD_THERAPY_OFF        = 1,  /* Backlight off during therapy, on otherwise */
-    LCD_THERAPY_ALWAYS_OFF = 2,  /* Backlight always off (battery-friendly) —
-                                 * except during boot and SoftAP mode */
-    LCD_THERAPY_INFO       = 3,  /* Info panel: leak rate + session runtime (default) */
-    LCD_THERAPY_BUTTON     = 4,  /* Backlight toggled by a short PWR press */
-} lcd_therapy_mode_t;
+    THERAPY_SCREEN_INFO   = 0,  /* Info panel: leak rate + session runtime (default) */
+    THERAPY_SCREEN_GRAPH  = 1,  /* Live flow graph */
+    THERAPY_SCREEN_STATUS = 2,  /* Standby / main status screen */
+} therapy_screen_t;
+
+/* LCD backlight policy */
+typedef enum {
+    BACKLIGHT_MODE_ON         = 0,  /* Backlight always on (default) */
+    BACKLIGHT_MODE_OFF_THRP   = 1,  /* Backlight off during therapy, on otherwise */
+    BACKLIGHT_MODE_ALWAYS_OFF = 2,  /* Backlight always off (dark bedroom / battery) */
+} backlight_mode_t;
 
 /* LCD rotation in clockwise degrees (0 = default) */
 typedef enum {
@@ -47,13 +51,13 @@ typedef enum {
 
 typedef struct {
     uint8_t brightness;        /* tenth-percent units: 1=0.1%, 200=20.0% */
-    lcd_therapy_mode_t lcd_therapy_mode;
+    therapy_screen_t therapy_screen; /* screen shown during therapy */
+    backlight_mode_t backlight_mode; /* backlight behavior */
     uint8_t alert_volume;      /* speaker volume for alerts: 0-100 */
     uint16_t lcd_rotation;     /* clockwise degrees: 0, 90, 180, or 270 */
     bool battery_enabled;      /* true to display battery indicator, false to hide */
-    /* Temporary wake on touch / motion */
+    /* Temporary wake on touch */
     bool wake_on_touch;        /* true to wake screen on capacitive touch */
-    bool wake_on_motion;       /* true to wake screen on IMU tilt/motion */
     uint8_t wake_timeout_sec;  /* duration in seconds (5, 10, 15, 30; 0=disabled) */
 } device_settings_t;
 
@@ -77,9 +81,13 @@ esp_err_t device_settings_set_battery_enabled(bool enabled);
  * Does NOT persist to NVS — call device_settings_save() for that. */
 esp_err_t device_settings_set_brightness(uint8_t percent);
 
-/* Set LCD therapy mode (updates in-memory copy only).
+/* Set therapy screen (updates in-memory copy only).
  * Call device_settings_save() to persist. */
-esp_err_t device_settings_set_lcd_therapy_mode(lcd_therapy_mode_t mode);
+esp_err_t device_settings_set_therapy_screen(therapy_screen_t screen);
+
+/* Set backlight policy (updates in-memory copy only).
+ * Call device_settings_save() to persist. */
+esp_err_t device_settings_set_backlight_mode(backlight_mode_t mode);
 
 /* Set alert speaker volume (0-100). Updates in-memory copy and applies to
  * bsp_audio. Call device_settings_save() to persist. */

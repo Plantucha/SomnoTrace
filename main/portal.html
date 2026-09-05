@@ -691,13 +691,19 @@ Display &amp; Sound
 <input type="range" id="lcd-brightness" class="form-control" min="0" max="7" step="1" value="6" style="padding:0" oninput="onBrightnessInput(this.value)">
 </div>
 <div class="form-group">
-<label>Display mode <span id="therapy-status" class="setting-status"></span></label>
-<select id="lcd-therapy-mode" class="form-control" onchange="onLcdTherapyModeChange(this)">
-<option value="3" selected>Show info panel during therapy (default)</option>
-<option value="0">Show live graph during therapy</option>
-<option value="1">Backlight off during therapy</option>
-<option value="2">Backlight always off (battery)</option>
-<option value="4">Backlight controlled by POWER button</option>
+<label>Screen during therapy <span id="therapy-screen-status" class="setting-status"></span></label>
+<select id="therapy-screen" class="form-control" onchange="onTherapyScreenChange(this)">
+<option value="0" selected>Show info panel (default)</option>
+<option value="1">Show live graph</option>
+<option value="2">Show main status screen</option>
+</select>
+</div>
+<div class="form-group">
+<label>Backlight behavior <span id="backlight-mode-status" class="setting-status"></span></label>
+<select id="backlight-mode" class="form-control" onchange="onBacklightModeChange(this)">
+<option value="0" selected>Always on (default)</option>
+<option value="1">Off during therapy</option>
+<option value="2">Always off (dark bedroom / battery)</option>
 </select>
 </div>
 <div class="form-group">
@@ -725,15 +731,9 @@ Display &amp; Sound
 </div>
 <div class="toggle-row" style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
 <div>
-<label for="wake-master" style="margin:0;font-weight:600">Tap or Move to Wake <span id="wake-status" class="setting-status"></span></label>
-<div style="font-size:0.8rem;color:var(--text-muted)">When display is dark, touch screen or move device to briefly illuminate it.</div>
+<label for="wake-touch" style="margin:0;font-weight:600">Tap to Wake <span id="wake-status" class="setting-status"></span></label>
+<div style="font-size:0.8rem;color:var(--text-muted)">When display is dark, tap touchscreen to briefly illuminate it.</div>
 <div id="wake-suboptions" style="margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:12px;font-size:0.85rem">
-  <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer">
-    <input type="checkbox" id="wake-touch" checked onchange="onWakeSettingsChange()"> Touch screen
-  </label>
-  <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer">
-    <input type="checkbox" id="wake-motion" checked onchange="onWakeSettingsChange()"> Motion / tilt
-  </label>
   <div style="display:inline-flex;align-items:center;gap:6px">
     <span>Stay lit for:</span>
     <select id="wake-timeout" class="form-control" style="width:auto;padding:2px 8px;font-size:0.85rem" onchange="onWakeSettingsChange()">
@@ -744,8 +744,9 @@ Display &amp; Sound
     </select>
   </div>
 </div>
+<div style="margin-top:6px;font-size:0.75rem;color:var(--text-muted)">Tip: Short-press the physical POWER button at any time to turn the screen on or off.</div>
 </div>
-<label class="toggle"><input type="checkbox" id="wake-master" checked onchange="onWakeMasterChange(this)"><span class="toggle-slider"></span></label>
+<label class="toggle"><input type="checkbox" id="wake-touch" checked onchange="onWakeTouchChange(this)"><span class="toggle-slider"></span></label>
 </div>
 </div>
 </div>
@@ -2243,18 +2244,33 @@ function onBrightnessInput(val) {
   }, 200);
 }
 
-function onLcdTherapyModeChange(sel) {
-  var mode = sel ? parseInt(sel.value, 10) : 3;
-  if (isNaN(mode)) mode = 3;
-  setStatus('therapy-status', '…', null);
+function onTherapyScreenChange(sel) {
+  var scr = sel ? parseInt(sel.value, 10) : 0;
+  if (isNaN(scr)) scr = 0;
+  setStatus('therapy-screen-status', '…', null);
   fetch('/api/device/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ lcd_therapy_mode: mode })
+    body: JSON.stringify({ therapy_screen: scr })
   }).then(function() {
-    setStatus('therapy-status', '✓', true);
+    setStatus('therapy-screen-status', '✓', true);
   }).catch(function() {
-    setStatus('therapy-status', '✗', false);
+    setStatus('therapy-screen-status', '✗', false);
+  });
+}
+
+function onBacklightModeChange(sel) {
+  var bkl = sel ? parseInt(sel.value, 10) : 0;
+  if (isNaN(bkl)) bkl = 0;
+  setStatus('backlight-mode-status', '…', null);
+  fetch('/api/device/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backlight_mode: bkl })
+  }).then(function() {
+    setStatus('backlight-mode-status', '✓', true);
+  }).catch(function() {
+    setStatus('backlight-mode-status', '✗', false);
   });
 }
 
@@ -2286,24 +2302,19 @@ function onBatteryEnabledChange(cb) {
   });
 }
 
-function onWakeMasterChange(cb) {
+function onWakeTouchChange(cb) {
   var enabled = cb ? cb.checked : true;
   var sub = document.getElementById('wake-suboptions');
   if (sub) sub.style.opacity = enabled ? '1' : '0.4';
-  var tch = document.getElementById('wake-touch');
-  var mot = document.getElementById('wake-motion');
   var tm = document.getElementById('wake-timeout');
   var timeout = enabled ? (parseInt(tm.value, 10) || 10) : 0;
-  var wakeTouch = enabled && tch ? tch.checked : false;
-  var wakeMotion = enabled && mot ? mot.checked : false;
 
   setStatus('wake-status', '…', null);
   fetch('/api/device/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      wake_on_touch: wakeTouch,
-      wake_on_motion: wakeMotion,
+      wake_on_touch: enabled,
       wake_timeout_sec: timeout
     })
   }).then(function() {
@@ -2315,31 +2326,16 @@ function onWakeMasterChange(cb) {
 
 function onWakeSettingsChange() {
   var tch = document.getElementById('wake-touch');
-  var mot = document.getElementById('wake-motion');
   var tm = document.getElementById('wake-timeout');
-  var master = document.getElementById('wake-master');
-
-  var wakeTouch = tch ? tch.checked : true;
-  var wakeMotion = mot ? mot.checked : true;
+  var enabled = tch ? tch.checked : true;
   var timeout = tm ? parseInt(tm.value, 10) || 10 : 10;
-
-  if (!wakeTouch && !wakeMotion) {
-    if (master) master.checked = false;
-    var sub = document.getElementById('wake-suboptions');
-    if (sub) sub.style.opacity = '0.4';
-  } else {
-    if (master) master.checked = true;
-    var sub = document.getElementById('wake-suboptions');
-    if (sub) sub.style.opacity = '1';
-  }
 
   setStatus('wake-status', '…', null);
   fetch('/api/device/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      wake_on_touch: wakeTouch,
-      wake_on_motion: wakeMotion,
+      wake_on_touch: enabled,
       wake_timeout_sec: timeout
     })
   }).then(function() {
@@ -2359,9 +2355,13 @@ function loadDeviceSettings() {
       var label = document.getElementById('brightness-val');
       if (label) label.textContent = BRIGHTNESS_LABELS[idx];
     }
-    var mode = document.getElementById('lcd-therapy-mode');
-    if (mode && typeof d.lcd_therapy_mode === 'number') {
-      mode.value = String(d.lcd_therapy_mode);
+    var scr = document.getElementById('therapy-screen');
+    if (scr && typeof d.therapy_screen === 'number') {
+      scr.value = String(d.therapy_screen);
+    }
+    var bkl = document.getElementById('backlight-mode');
+    if (bkl && typeof d.backlight_mode === 'number') {
+      bkl.value = String(d.backlight_mode);
     }
     var rot = document.getElementById('lcd-rotation');
     if (rot && typeof d.lcd_rotation === 'number') {
@@ -2381,22 +2381,16 @@ function loadDeviceSettings() {
     if (be && typeof d.battery_enabled === 'boolean') {
       be.checked = d.battery_enabled;
     }
-    var master = document.getElementById('wake-master');
     var tch = document.getElementById('wake-touch');
-    var mot = document.getElementById('wake-motion');
     var tm = document.getElementById('wake-timeout');
     var sub = document.getElementById('wake-suboptions');
 
     var hasTouch = (typeof d.wake_on_touch === 'boolean') ? d.wake_on_touch : true;
-    var hasMotion = (typeof d.wake_on_motion === 'boolean') ? d.wake_on_motion : true;
     var timeout = (typeof d.wake_timeout_sec === 'number') ? d.wake_timeout_sec : 10;
 
     if (tch) tch.checked = hasTouch;
-    if (mot) mot.checked = hasMotion;
     if (tm) tm.value = String(timeout > 0 ? timeout : 10);
-    var isEnabled = (hasTouch || hasMotion) && timeout > 0;
-    if (master) master.checked = isEnabled;
-    if (sub) sub.style.opacity = isEnabled ? '1' : '0.4';
+    if (sub) sub.style.opacity = hasTouch ? '1' : '0.4';
     setLoading('display-sound-details', false);
   }).catch(function() {
     setLoading('display-sound-details', false);

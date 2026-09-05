@@ -57,13 +57,13 @@ void bsp_display_set_backlight(bool on);
 bool bsp_display_toggle_backlight(void);
 uint8_t bsp_display_get_brightness(void);
 
-/* Apply the current backlight policy based on lcd_therapy_mode and therapy
+/* Apply the current backlight policy based on backlight_mode and therapy
  * state.  Called after boot completes, when entering/leaving SoftAP, or
- * when the mode is changed at runtime.
+ * when settings change at runtime.
  *   force_on: if true, always turn backlight on (used for SoftAP mode). */
 void bsp_display_apply_backlight_policy(bool force_on);
 
-/* Temporarily wake the backlight for duration_sec seconds (e.g. on touch/motion).
+/* Temporarily wake the backlight for duration_sec seconds (e.g. on tap).
  * If already awake, extends the timeout. When duration_sec expires, returns
  * to the base backlight policy. */
 void bsp_display_wake_temporary(uint32_t duration_sec);

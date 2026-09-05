@@ -1,5 +1,5 @@
 /*
- * SomnoTrace - Touch (CST816) and IMU (QMI8658) sensor driver for wake events
+ * SomnoTrace - Touch controller (CST816) driver for tap-to-wake events
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  *
  * This file is part of SomnoTrace.
@@ -30,15 +30,12 @@
 extern "C" {
 #endif
 
-/* Initialize touch (CST816) and IMU (QMI8658) sensors and start interrupt listener.
- * Gracefully ignores missing hardware if chips are not present. */
-esp_err_t bsp_sensor_init(void);
+/* Initialize CST816 capacitive touch controller and start interrupt listener.
+ * Gracefully ignores missing hardware if chip is not present. */
+esp_err_t bsp_touch_init(void);
 
 /* Returns true if CST816 touch controller was detected and initialized. */
-bool bsp_sensor_has_touch(void);
-
-/* Returns true if QMI8658 IMU was detected and initialized. */
-bool bsp_sensor_has_imu(void);
+bool bsp_touch_has_touch(void);
 
 #ifdef __cplusplus
 }
