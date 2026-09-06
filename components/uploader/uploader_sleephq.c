@@ -852,10 +852,9 @@ static void shq_session_end(void)
  * opened, so nothing appears in the user's SleepHQ history. */
 #define SHQ_TEST_TIMEOUT_MS 10000
 
-static bool shq_test(char *msg, size_t msg_len)
+static bool shq_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
 {
-    uploader_config_t cfg;
-    uploader_load_config(&cfg);
+    uploader_config_t cfg = *cfgp;   /* by value — see smb_test */
     if (!cfg.shq_client_id[0] || !cfg.shq_client_secret[0]) {
         snprintf(msg, msg_len, "Client ID and Client Secret are required");
         return false;

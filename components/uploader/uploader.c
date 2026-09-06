@@ -532,8 +532,8 @@ void uploader_request_scan(void)
 
 /* ── "Test connection" (web UI) ─────────────────────────────────────── */
 
-esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
-                                   char *msg, size_t msg_len)
+esp_err_t uploader_test_connection(const char *backend_id, const uploader_config_t *cfg,
+                                   bool *out_ok, char *msg, size_t msg_len)
 {
     if (!backend_id || !out_ok || !msg || msg_len == 0) return ESP_ERR_INVALID_ARG;
     *out_ok = false;
@@ -565,8 +565,16 @@ esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* NULL means "whatever is saved"; a caller with unsaved form values passes its own merged
+     * copy. Loaded here rather than in each backend so there is exactly one place that reads
+     * NVS for a probe, and so a test can never write to it. */
+    uploader_config_t stored;
+    if (!cfg) {
+        uploader_load_config(&stored);
+        cfg = &stored;
+    }
     ESP_LOGI(TAG, "%s: connection test requested", be->id);
-    *out_ok = be->test(msg, msg_len);
+    *out_ok = be->test(cfg, msg, msg_len);
     ESP_LOGI(TAG, "%s: connection test %s: %s", be->id,
              *out_ok ? "passed" : "failed", msg);
     /* Released on BOTH outcomes.  There is no early return between the claim

@@ -66,6 +66,10 @@ typedef enum {
  * onto the transient ladder unless the backend is more specific. */
 #define UPLOAD_FAILED  UPLOAD_ERR_TRANSIENT
 
+/* Forward name: the backend vtable below takes a config by pointer, and the struct itself is
+ * defined further down with the rest of the configuration surface. */
+typedef struct uploader_config_s uploader_config_t;
+
 typedef struct {
     const char *id;         /* "smb" | "sleephq" — stable tracking key      */
     const char *label;      /* "NAS (SMB)" — shown in the UI                */
@@ -117,13 +121,17 @@ typedef struct {
      * transferring anything.  Writes a one-line outcome for the user into
      * msg and returns true when the backend is usable.  Must use its own
      * connection object, never the one session_begin() owns — it runs on
-     * the httpd task, not the scheduler. */
-    bool (*test)(char *msg, size_t msg_len);
+     * the httpd task, not the scheduler.
+     *
+     * PROBES THE CONFIG IT IS GIVEN, never NVS (#214.2).  A backend that read its own settings
+     * could only ever test what was already saved, which is why testing used to require saving
+     * and rebooting before you could find out a password was wrong.  `cfg` is never NULL. */
+    bool (*test)(const uploader_config_t *cfg, char *msg, size_t msg_len);
 } upload_backend_t;
 
 /* ── Configuration ──────────────────────────────────────────────────── */
 
-typedef struct {
+struct uploader_config_s {
     /* SMB server */
     bool smb_enabled;        /* toggle: include SMB in upload cycle         */
     char smb_host[64];       /* server IP or hostname                      */
@@ -148,7 +156,7 @@ typedef struct {
      * one click cannot start re-uploading a year of history.
      * Default UPLOAD_DEFAULT_MAX_DAYS (30), hard cap UPLOAD_MAX_DAYS_CAP. */
     int  max_days;
-} uploader_config_t;
+};
 
 /* ── Public API ─────────────────────────────────────────────────────── */
 
@@ -264,6 +272,10 @@ esp_err_t uploader_reset_state(void);
  *                          see the backend interface note) or the uploader
  *                          has not finished initialising
  *   ESP_ERR_NOT_FOUND      unknown backend id
- * Blocks the caller for up to the backend's probe timeout (about 10 s). */
-esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
-                                   char *msg, size_t msg_len);
+ * Blocks the caller for up to the backend's probe timeout (about 10 s).
+ *
+ * `cfg` is the configuration to probe with, or NULL to use what is saved in NVS. A caller that
+ * passes settings from an unsaved form (#214.2) merges them over the stored ones itself, so this
+ * function never has to know where they came from and nothing is written to NVS by a test. */
+esp_err_t uploader_test_connection(const char *backend_id, const uploader_config_t *cfg,
+                                   bool *out_ok, char *msg, size_t msg_len);
