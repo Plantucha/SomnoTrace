@@ -1863,11 +1863,68 @@ static esp_err_t upload_config_post_handler(httpd_req_t *req)
  * Probes one backend with the settings saved in NVS (not the form contents)
  * and answers {"ok":bool,"message":"..."} — 409 while an upload is running.
  * Blocks this worker for up to the backend's probe timeout (about 10 s). */
+/* Copy one string field out of the request body, if the caller sent it.
+ *
+ * ABSENT means "keep what is stored", and so does the portal's masked-password placeholder: a
+ * password input the user never touched shows bullets, and sending those back would probe with a
+ * literal string of bullets. Present-but-empty is NOT the same thing — it is how a user clears a
+ * password to test a guest share, so it must reach the backend as an empty string. */
+/* The eight U+2022 BULLETs the portal shows in a password field it has not been given. Kept as one
+ * literal so the sentinel is greppable from both sides of the wire. */
+#define UPLOAD_TEST_PW_KEEP "â¢â¢â¢â¢â¢â¢â¢â¢"
+static void cfg_str_from(const cJSON *root, const char *key, char *dst, size_t dst_len)
+{
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsString(v) || !v->valuestring) return;             /* absent → stored value stands */
+    if (strcmp(v->valuestring, UPLOAD_TEST_PW_KEEP) == 0) return;  /* masked → stored value stands */
+    snprintf(dst, dst_len, "%s", v->valuestring);
+}
+
+/* Read an OPTIONAL JSON body of settings to probe with (#214.2).
+ *
+ * Returns true when the caller supplied a body and `out` now holds the stored config with those
+ * fields merged over it; false when there was no body, in which case the caller probes with NVS.
+ * Nothing here writes to NVS: a test must never be able to change what the device is configured to
+ * do, which is the whole reason this is a merge into a local copy rather than a save-then-test. */
+static bool upload_test_read_overrides(httpd_req_t *req, uploader_config_t *out)
+{
+    int len = req->content_len;
+    if (len <= 0) return false;
+    /* Bounded hard. The fields together are well under 600 bytes, and an unbounded read on the
+     * httpd task is how a request turns into a heap exhaustion. */
+    if (len > 1024) return false;
+    char *body = malloc((size_t)len + 1);
+    if (!body) return false;
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, body + got, (size_t)(len - got));
+        if (r <= 0) { free(body); return false; }
+        got += r;
+    }
+    body[got] = '\0';
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) return false;
+
+    uploader_load_config(out);          /* start from what is saved, then overlay */
+    cfg_str_from(root, "smb_host",  out->smb_host,  sizeof(out->smb_host));
+    cfg_str_from(root, "smb_share", out->smb_share, sizeof(out->smb_share));
+    cfg_str_from(root, "smb_user",  out->smb_user,  sizeof(out->smb_user));
+    cfg_str_from(root, "smb_pass",  out->smb_pass,  sizeof(out->smb_pass));
+    cfg_str_from(root, "smb_path",  out->smb_path,  sizeof(out->smb_path));
+    cfg_str_from(root, "shq_client_id",     out->shq_client_id,     sizeof(out->shq_client_id));
+    cfg_str_from(root, "shq_client_secret", out->shq_client_secret, sizeof(out->shq_client_secret));
+    cJSON_Delete(root);
+    return true;
+}
+
 static esp_err_t upload_test_send(httpd_req_t *req, const char *backend_id)
 {
     bool ok = false;
     char msg[192];
-    esp_err_t err = uploader_test_connection(backend_id, &ok, msg, sizeof(msg));
+    uploader_config_t form;
+    const uploader_config_t *use = upload_test_read_overrides(req, &form) ? &form : NULL;
+    esp_err_t err = uploader_test_connection(backend_id, use, &ok, msg, sizeof(msg));
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown backend");
         return ESP_FAIL;

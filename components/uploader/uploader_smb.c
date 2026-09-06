@@ -301,10 +301,11 @@ static void smb_session_end(void)
  * Nothing is created or written. */
 #define SMB_TEST_TIMEOUT_S 10
 
-static bool smb_test(char *msg, size_t msg_len)
+static bool smb_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
 {
-    uploader_config_t cfg;
-    uploader_load_config(&cfg);
+    /* By value, so the rest of this function is untouched and every `cfg.field` below still
+     * reads the same way. The copy is ~450 bytes on a task with 12 KB. */
+    uploader_config_t cfg = *cfgp;
     if (!cfg.smb_host[0] || !cfg.smb_share[0]) {
         snprintf(msg, msg_len, "Host and share name are required");
         return false;

@@ -2586,15 +2586,36 @@ function sendAlertTestPush() {
 function testUploadConnection(id) {
   var st = document.getElementById(id + '-test-status');
   var btn = document.getElementById(id + '-test-btn');
-  var card = document.getElementById(id + '-card');
-  /* The device probes with what is saved in NVS, not what is typed here. */
-  if (card && card.querySelector('[data-dirty="true"]')) {
-    if (st) { st.textContent = 'Save settings first, then test'; st.style.color = 'var(--warning)'; }
-    return;
+  /* Probe with what is ON SCREEN, not with what is saved (#214.2). Testing used to require
+     saving first, which meant a reboot before you could find out the password was wrong. Nothing
+     here is written to NVS — the device merges these over the stored settings for one probe. */
+  var val = function(fid) { var e = document.getElementById(fid); return e ? e.value : null; };
+  var body = {};
+  var put = function(key, fid) { var v = val(fid); if (v !== null) body[key] = v; };
+  /* A password the user has not touched still shows its masked placeholder, and sending that back
+     would probe with a literal row of bullets. Omitting the key means "use the stored one"; a
+     field the user DID touch is sent even when empty, because clearing it is how you test a guest
+     share. */
+  var putSecret = function(key, fid) {
+    var e = document.getElementById(fid);
+    if (!e) return;
+    if (e.getAttribute('data-dirty') === 'true') body[key] = e.value;
+  };
+  if (id === 'smb') {
+    put('smb_host', 'smb-host'); put('smb_share', 'smb-share');
+    put('smb_user', 'smb-user'); put('smb_path', 'smb-path');
+    putSecret('smb_pass', 'smb-pass');
+  } else {
+    put('shq_client_id', 'shq-cid');
+    putSecret('shq_client_secret', 'shq-secret');
   }
   if (st) { st.textContent = 'Testing…'; st.style.color = 'var(--text-muted)'; }
   if (btn) btn.disabled = true;
-  fetch('/api/uploads/test-' + (id === 'shq' ? 'sleephq' : id), { method: 'POST' }).then(function(r) {
+  fetch('/api/uploads/test-' + (id === 'shq' ? 'sleephq' : id), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function(r) {
     return r.json();
   }).then(function(d) {
     if (st) {
