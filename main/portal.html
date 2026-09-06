@@ -1037,6 +1037,7 @@ Upload Progress
 <div class="card info-list">
 <div class="card-title">System Status</div>
 <div class="info-row"><span class="info-label">Firmware</span><span class="info-value" id="status-fw">--</span></div>
+<div class="info-row"><span class="info-label">Built from</span><span class="info-value" id="status-repo">--</span></div>
 <div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="status-uptime">--</span></div>
 <div class="info-row"><span class="info-label">Local IP</span><span class="info-value" id="status-ip">--</span></div>
 <div id="status-nets"></div>
@@ -1765,6 +1766,9 @@ function formatSdSpace(total, free) {
 function loadStatusTab(d) {
   function setEl(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
   setEl('status-fw', d.fw_ver || '--');
+  /* Which repository this firmware was built from. Absent on builds from before the
+     stamp existed, so fall back rather than printing "undefined" at people. */
+  setEl('status-repo', d.source_repo || '--');
 
   /* Wi-Fi link state from the new nested object, with fallback to the
    * old flat fields for backward compatibility. */

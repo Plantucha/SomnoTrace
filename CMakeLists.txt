@@ -85,6 +85,25 @@ endif()
 
 set(PROJECT_VER "${FIRMWARE_VERSION}")
 
+# ── Source repository stamp ─────────────────────────────────────────────────
+# WHICH REPOSITORY THIS BINARY WAS BUILT FROM, decided at build time rather than
+# written into the source. A fork that builds through its own CI stamps its own
+# slug without anyone having to remember to: GITHUB_REPOSITORY is set by GitHub
+# Actions for every run, in every fork, and cannot be inherited by accident.
+#
+# ⚠️ THIS IS NOT AN AUTHENTICITY CONTROL and must never be presented as one. Any
+# string compiled into a binary can be copied verbatim by anyone rebuilding it.
+# It answers "where did this build come from?" honestly for honest builds, which
+# is what makes the GPLv3 §7 attribution easy to comply with rather than a chore.
+# Proving origin needs a signature over the artifact, which is a separate matter.
+if(DEFINED ENV{GITHUB_REPOSITORY})
+    set(SOURCE_REPO "$ENV{GITHUB_REPOSITORY}")
+else()
+    set(SOURCE_REPO "local build")
+endif()
+message(STATUS "Source repository: ${SOURCE_REPO}")
+add_compile_definitions(SNT_SOURCE_REPO="${SOURCE_REPO}")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(somnotrace)

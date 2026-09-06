@@ -921,6 +921,12 @@ cJSON *netprov_build_status_json(void)
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
     cJSON_AddStringToObject(resp, "fw_ver", app_desc ? app_desc->version : "unknown");
+    /* Where this build came from (CMakeLists). "local build" off CI. Reported so the
+     * portal can name the source repository beside the version; see the note in
+     * CMakeLists.txt for why this is provenance-for-honest-builds and NOT proof. */
+#ifdef SNT_SOURCE_REPO
+    cJSON_AddStringToObject(resp, "source_repo", SNT_SOURCE_REPO);
+#endif
 
     if (!s_portal_mode) {
         /* Live link state: SSID, IP, RSSI — all derived from the event-driven
