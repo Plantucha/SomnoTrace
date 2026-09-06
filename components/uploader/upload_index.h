@@ -65,7 +65,7 @@
 
 #define UPLOAD_MAX_BACKENDS        4
 #define UPLOAD_BACKEND_ID_LEN      12
-#define UPLOAD_MAX_GROUPS_PER_DAY  24
+#define UPLOAD_MAX_GROUPS_PER_DAY  128
 #define UPLOAD_MAX_DAYS_CAP        366   /* hard ceiling for max_days     */
 #define UPLOAD_DEFAULT_MAX_DAYS    30
 
