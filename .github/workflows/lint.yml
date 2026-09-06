@@ -3,10 +3,20 @@ name: "Lint"
 #
 # TWO TIERS, AND ONLY ONE OF THEM CAN FAIL THE BUILD. The blocking tier is chosen so it
 # is GREEN on main today (measured, not hoped: cppcheck's error/warning/performance/
-# portability set finds 2 issues on the whole tree, both false positives suppressed by
-# name in .cppcheck-suppressions; shellcheck at --severity=warning finds 1, fixed in
-# this change). Everything else — 126 style findings, nearly all "could be const" —
-# is REPORTED as a count and cannot fail anything.
+# portability set finds ONE issue on the whole tree, a false positive suppressed inline
+# where it occurs; shellcheck at --severity=warning finds 1, fixed in this change).
+# Everything else — 103 style findings, nearly all "could be const" — is REPORTED as a
+# count and cannot fail anything.
+#
+# ⚠️ THE FINDING SET IS A FUNCTION OF THE CPPCHECK VERSION, and this is measured rather
+# than feared: ubuntu-latest ships 2.13.0, which reports the embedded-blob false positive
+# as `comparePointers` and 103 style findings; 2.19.0 calls the SAME finding
+# `subtractPointers`, adds a second false positive in upload_sched.c, and reports 126.
+# So the suppressions are INLINE (they move with the code and name every id the check has
+# gone by) rather than in a list file keyed on line numbers, and the style tier is
+# advisory so a version bump can never turn a green branch red on cosmetics alone. The
+# version is printed below on every run: if a runner image bump changes the verdict, the
+# log says which version produced it.
 #
 # That split is the whole design. A linter switched on at full strength over an existing
 # 51k-line codebase produces a permanently red gate, and a permanently red gate teaches
@@ -14,9 +24,9 @@ name: "Lint"
 # every finding after today is one this change introduced.
 on:
   push:
-    paths: ["main/**", "components/**", "scripts/**", ".cppcheck-suppressions", ".github/workflows/lint.yml"]
+    paths: ["main/**", "components/**", "scripts/**", ".github/workflows/lint.yml"]
   pull_request:
-    paths: ["main/**", "components/**", "scripts/**", ".cppcheck-suppressions", ".github/workflows/lint.yml"]
+    paths: ["main/**", "components/**", "scripts/**", ".github/workflows/lint.yml"]
   workflow_dispatch:
 
 permissions:
@@ -44,7 +54,6 @@ jobs:
           cppcheck \
             --enable=warning,performance,portability \
             --std=c11 --language=c --inline-suppr \
-            --suppressions-list=.cppcheck-suppressions \
             --suppress=missingInclude --suppress=missingIncludeSystem \
             --suppress=unmatchedSuppression \
             -i third_party -i build -i managed_components \
@@ -59,7 +68,6 @@ jobs:
           cppcheck \
             --enable=style \
             --std=c11 --language=c --inline-suppr \
-            --suppressions-list=.cppcheck-suppressions \
             --suppress=missingInclude --suppress=missingIncludeSystem \
             --suppress=unusedFunction --suppress=unmatchedSuppression \
             -i third_party -i build -i managed_components \
