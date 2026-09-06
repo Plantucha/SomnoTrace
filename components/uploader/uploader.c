@@ -554,8 +554,13 @@ esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
         return ESP_ERR_INVALID_STATE;
     }
     /* Only one transport at a time: TLS and SMB buffers contend for memory
-     * (see the backend interface note), and a run may be mid-transfer. */
-    if (upload_sched_uploading()) {
+     * (see the backend interface note), and a run may be mid-transfer.
+     *
+     * CLAIMED, not merely checked (#214.1).  Asking upload_sched_uploading()
+     * answers for the instant it is asked, and the probe that follows takes
+     * about 10 s -- long enough for a scheduled pass to start in the gap.  The
+     * claim below both answers and reserves, under the scheduler's own mutex. */
+    if (!upload_sched_probe_begin()) {
         snprintf(msg, msg_len, "An upload is in progress, try again when it has finished");
         return ESP_ERR_INVALID_STATE;
     }
@@ -564,5 +569,9 @@ esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
     *out_ok = be->test(msg, msg_len);
     ESP_LOGI(TAG, "%s: connection test %s: %s", be->id,
              *out_ok ? "passed" : "failed", msg);
+    /* Released on BOTH outcomes.  There is no early return between the claim
+     * and here, which is what keeps the pairing checkable by reading rather
+     * than by trusting every future edit to remember. */
+    upload_sched_probe_end();
     return ESP_OK;
 }
