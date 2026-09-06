@@ -593,11 +593,20 @@ static void do_scan(void)
 {
     int max_days = uploader_max_days();
     const upload_backend_t *bes[UPLOAD_MAX_BACKENDS];
+    /* uploader_enabled_backends() fills `bes` through the out-parameter and returns how
+     * many it wrote; only bes[i] for i < n is read below. cppcheck 2.19 does not follow
+     * the callee's writes and reports the array as uninitialised — its message lists
+     * struct FIELDS (bes.id, bes.label), which shows it lost the array-of-pointers type.
+     * Not reported by 2.13; suppressed by name for the versions that do. The directive is
+     * its own comment because cppcheck only reads one that STARTS the comment, and it
+     * sits at the READ below rather than at the call: cppcheck reports uninitvar where
+     * the value is used, so a directive at the call line is simply never matched. */
     int n = uploader_enabled_backends(bes, UPLOAD_MAX_BACKENDS);
 
     int slots[UPLOAD_MAX_BACKENDS];
     int n_slots = 0;
     for (int i = 0; i < n; i++) {
+        /* cppcheck-suppress uninitvar */
         if (!bes[i]->is_configured || !bes[i]->is_configured()) continue;
         backend_rt_t *r = rt_for(bes[i]);
         if (r && r->slot >= 0) slots[n_slots++] = r->slot;
