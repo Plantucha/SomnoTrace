@@ -103,6 +103,14 @@ static SemaphoreHandle_t s_lock;      /* guards s_rt + s_status for the API */
 
 static upload_sched_busy_fn_t s_busy_fn;
 
+/* "Test connection" probe claim (#214.1), guarded by s_lock like s_rt.  The
+ * timestamp is not decoration: it is what stops a probe that never released
+ * the claim -- a crash inside a backend's test(), a task deleted mid-probe --
+ * from silently stopping every upload until the next reboot.  A lock that can
+ * wedge the uploader forever would be a worse defect than the race it closes. */
+static bool    s_probe_active;
+static int64_t s_probe_since_us;
+
 static int64_t s_next_scan_us;
 static bool    s_scanning;
 static char    s_status[64] = "Starting up";
@@ -530,8 +538,38 @@ static bool run_backend(backend_rt_t *r, int max_days)
 
 /* ── Scheduling pass over all backends ────────────────────────────── */
 
+/* True while a connection test holds the transport claim.  Also the expiry
+ * point: a claim older than UPLOAD_PROBE_MAX_MS is dropped and reported, so the
+ * failure mode of a leaked claim is one warning line and a late upload rather
+ * than an uploader that is permanently and silently idle. */
+static bool probe_in_flight(void)
+{
+    bool held;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_probe_active &&
+        now_us() - s_probe_since_us > (int64_t)UPLOAD_PROBE_MAX_MS * 1000) {
+        ESP_LOGW(TAG, "connection-test claim held for over %d s -- releasing it; "
+                 "an upload pass was deferred until now", UPLOAD_PROBE_MAX_MS / 1000);
+        s_probe_active = false;
+    }
+    held = s_probe_active;
+    xSemaphoreGive(s_lock);
+    return held;
+}
+
 static void run_pass(void)
 {
+    /* ONE choke point, deliberately. Every route into a run -- the periodic
+     * tick, EV_EXPORT, EV_SCAN, a manual request -- arrives through run_pass(),
+     * so guarding here defers all of them.  Guarding only the periodic scan
+     * (as the s_busy_fn hook above does) would leave the event-driven paths
+     * free to open a second transport beside the probe, which is the exact
+     * contention this is meant to prevent. */
+    if (probe_in_flight()) {
+        ESP_LOGD(TAG, "upload pass deferred: a connection test is in flight");
+        return;
+    }
+
     const upload_backend_t *bes[UPLOAD_MAX_BACKENDS];
     int n = uploader_enabled_backends(bes, UPLOAD_MAX_BACKENDS);
     int max_days = uploader_max_days();
@@ -767,6 +805,33 @@ bool upload_sched_uploading(void)
         if (s_rt[i].be && s_rt[i].state == SB_UPLOADING) return true;
     }
     return false;
+}
+
+bool upload_sched_probe_begin(void)
+{
+    bool claimed = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool busy = false;
+    for (int i = 0; i < s_n_rt; i++) {
+        if (s_rt[i].be && s_rt[i].state == SB_UPLOADING) { busy = true; break; }
+    }
+    /* Tested and set under ONE hold of the mutex.  Reusing the public
+     * upload_sched_uploading() here would take no lock and reintroduce the gap
+     * this function exists to close. */
+    if (!busy && !s_probe_active) {
+        s_probe_active = true;
+        s_probe_since_us = now_us();
+        claimed = true;
+    }
+    xSemaphoreGive(s_lock);
+    return claimed;
+}
+
+void upload_sched_probe_end(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_probe_active = false;
+    xSemaphoreGive(s_lock);
 }
 
 /* ── Progress reporting ───────────────────────────────────────────── */

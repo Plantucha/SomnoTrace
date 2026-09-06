@@ -271,7 +271,7 @@ Backs the **Test connection** buttons on the SMB and SleepHQ settings cards. Pro
 - `test-smb`: negotiate, authenticate and open the share with the saved host / share / user / password, then `stat` the saved remote path. Nothing is created: a missing folder is reported as a failure because the uploader's `mkdir` calls do not create parents.
 - `test-sleephq`: TLS connect to `sleephq.com` and one `/oauth/token` request with the saved Client ID / Secret. No import is opened, so nothing appears in the SleepHQ history; the token is discarded rather than cached.
 
-No request body. The request blocks for up to the backend's probe timeout (about 10 s), and is refused while an upload run is active so that only one SMB/TLS transport exists at a time.
+No request body. The request blocks for up to the backend's probe timeout (about 10 s), and is refused with `409 Conflict` while an upload run is active so that only one SMB/TLS transport exists at a time. The probe **claims** the transport slot for its duration rather than only checking it, so a scheduled upload pass that becomes due mid-probe is deferred to the next tick instead of starting alongside it; an unreleased claim expires by itself after 60 s.
 
 ##### JSON Response Format:
 `200 OK` — the probe ran; `ok` says whether it passed and `message` is a one-line outcome to show verbatim:
@@ -309,3 +309,4 @@ No request body. The request blocks for up to the backend's probe timeout (about
 - 2026-07-02: Initial API endpoints contract specification.
 - 2026-09-04: Added `battery` telemetry to `/api/status` and documented `/api/device/settings` endpoint contract.
 - 2026-09-05: Added `/api/uploads/test-smb` and `/api/uploads/test-sleephq` (upload "Test connection" buttons, #123).
+- 2026-09-06: The connection-test probe now claims the upload transport slot for its duration rather than only checking it (#214).
