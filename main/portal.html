@@ -266,6 +266,8 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .dash-stats-tbl th,.dash-stats-tbl td{text-align:right;padding:3px 6px}
 .dash-stats-tbl th:first-child,.dash-stats-tbl td:first-child{text-align:left;color:var(--text-muted)}
 .dash-stats-tbl thead th{color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--card-border)}
+.dash-sessions-popover{position:absolute;top:calc(100% + 4px);left:0;z-index:100;background:var(--card-bg);border:1px solid var(--card-border);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.35);padding:8px 12px;min-width:210px;font-size:.78rem;font-weight:400;color:var(--text);line-height:1.5;white-space:nowrap}
+.dash-sessions-clickable{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px}
 /* Chart zoom/pan toolbar. Desktop: sticky just under the sticky 56px header so
  * it stays in view while scrolling the tall panel stack. Mobile: fixed
  * bottom-right for thumb reach (won't scroll away). */
@@ -990,8 +992,9 @@ Save &amp; Reboot
 <div class="card" id="dash-summary" style="display:none;padding:16px">
 <div class="dash-summary-grid">
 <div>
-<div style="font-size:.85rem;font-weight:600;margin-bottom:8px">Event breakdown <span id="dash-summary-sessions" style="color:var(--text-muted);font-weight:400"></span></div>
-<div id="dash-breakdown"></div>
+<div style="font-size:.85rem;font-weight:600;margin-bottom:8px">Event breakdown <span class="dash-sessions-wrap" style="position:relative;display:inline-block"><span id="dash-summary-sessions" class="dash-summary-sessions" style="color:var(--text-muted);font-weight:400" onclick="toggleSessionsPopover(event)"></span><div id="dash-sessions-popover" class="dash-sessions-popover" style="display:none" onclick="event.stopPropagation()"></div></span></div>
+<table class="dash-stats-tbl"><thead><tr><th>Event</th><th>Index (/hr)</th></tr></thead>
+<tbody id="dash-breakdown"></tbody></table>
 </div>
 <div>
 <div style="font-size:.85rem;font-weight:600;margin-bottom:8px">Statistics</div>
@@ -3383,15 +3386,38 @@ function renderCalendar() {
   el.innerHTML = html;
 }
 
-/* Close the calendar when clicking outside the date navigator.
- * calStepMonth calls stopPropagation() so month-nav clicks don't reach here
- * after renderCalendar() replaces innerHTML and detaches the clicked button. */
+/* Close the calendar and sessions popover when clicking outside */
 document.addEventListener('click', function(e) {
   var cal = document.getElementById('dash-calendar');
-  if (!cal || cal.style.display === 'none') return;
-  var nav = e.target.closest ? e.target.closest('.date-nav-wrap') : null;
-  if (!nav) closeCalendar();
+  if (cal && cal.style.display !== 'none') {
+    var nav = e.target.closest ? e.target.closest('.date-nav-wrap') : null;
+    if (!nav) closeCalendar();
+  }
+  var pop = document.getElementById('dash-sessions-popover');
+  if (pop && pop.style.display !== 'none') {
+    var wrap = e.target.closest ? e.target.closest('.dash-sessions-wrap') : null;
+    if (!wrap) pop.style.display = 'none';
+  }
 });
+
+function toggleSessionsPopover(e) {
+  if (e) e.stopPropagation();
+  var pop = document.getElementById('dash-sessions-popover');
+  if (!pop || !dashSessions || dashSessions.length <= 1) return;
+  pop.style.display = (pop.style.display === 'none' || !pop.style.display) ? 'block' : 'none';
+}
+
+var sessWrap = document.querySelector('.dash-sessions-wrap');
+if (sessWrap) {
+  sessWrap.addEventListener('mouseenter', function() {
+    var pop = document.getElementById('dash-sessions-popover');
+    if (pop && dashSessions && dashSessions.length > 1) pop.style.display = 'block';
+  });
+  sessWrap.addEventListener('mouseleave', function() {
+    var pop = document.getElementById('dash-sessions-popover');
+    if (pop) pop.style.display = 'none';
+  });
+}
 
 function loadSessionData() { loadDashboardData(); }
 
@@ -4130,6 +4156,7 @@ function clearSummary() {
   ['stat-ahi-badge','stat-usage-badge','stat-leak-badge','stat-press-badge'].forEach(function(id){
     setBadge(id, 'badge-gray', '--');
   });
+  var pop = document.getElementById('dash-sessions-popover'); if (pop) { pop.style.display = 'none'; pop.innerHTML = ''; }
   var s = document.getElementById('dash-summary'); if (s) s.style.display = 'none';
 }
 var dashSummary = null;   /* last /api/summary response for the current day */
@@ -4195,7 +4222,7 @@ function computeEventIndices() {
       case 'RERA': rera++; break;
     }
   }
-  return { ahi:(oa+ca+a+hh)/h, oai:oa/h, cai:ca/h, hi:hh/h, rera:rera/h };
+  return { ahi:(oa+ca+a+hh)/h, oai:oa/h, cai:ca/h, hi:hh/h, ai:a/h, rera:rera/h };
 }
 /* Weighted percentile matching OSCAR's Day::percentile() (SleepLib/day.cpp):
  * build a value→count histogram sorted by value, locate the bucket holding the
@@ -4298,14 +4325,16 @@ function renderSummary() {
       { lbl: 'Obstructive (OA)', v: idx ? idx.oai : null, c: '#10b981' },
       { lbl: 'Central (CA)',     v: idx ? idx.cai : null, c: '#22d3ee' },
       { lbl: 'Hypopnea (H)',     v: idx ? idx.hi  : null, c: '#8b5cf6' },
+      { lbl: 'Apnea (A)',        v: idx ? idx.ai  : null, c: '#f59e0b' },
       { lbl: 'RERA',             v: idx ? idx.rera: null, c: '#ec4899' }
     ];
     brk.innerHTML = rows.map(function(r){
-      return '<div class="dash-brk-row"><span class="sw" style="background:' + r.c + '"></span>' +
-             '<span class="lbl">' + r.lbl + '</span><span class="val">' + num(r.v, 2) + '</span></div>';
+      return '<tr><td><span class="sw" style="display:inline-block;width:9px;height:9px;border-radius:2px;background:' + r.c + ';margin-right:7px;vertical-align:-1px"></span>' +
+             r.lbl + '</td><td style="font-weight:600">' + num(r.v, 2) + '</td></tr>';
     }).join('');
   }
   var sc = document.getElementById('dash-summary-sessions');
+  var pop = document.getElementById('dash-sessions-popover');
   if (sc) {
     /* Sessions that ended abnormally (crash recovery, stream timeout, day
      * split) are shown like any other, but say so: their end time is an
@@ -4314,9 +4343,27 @@ function renderSummary() {
     for (var pi = 0; pi < dashSessions.length; pi++) {
       if (dashSessions[pi] && dashSessions[pi].partial) nPartial++;
     }
-    var txt = sum.sessions ? '(' + sum.sessions + ' session' + (sum.sessions > 1 ? 's' : '') + ')' : '';
+    var count = dashSessions.length;
+    var txt = '(' + count + ' session' + (count > 1 ? 's' : '') + '';
     if (nPartial > 0) {
-      txt += (txt ? ' ' : '') + '· ' + nPartial + ' incomplete';
+      txt += ' · ' + nPartial + ' incomplete';
+    }
+    if (count > 1) {
+      txt += ' ▾)';
+      sc.className = 'dash-summary-sessions dash-sessions-clickable';
+      if (pop) {
+        pop.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:var(--text)">Sessions for this day (' + count + ')</div>' +
+          dashSessions.map(function(s, i) {
+            var durMin = Math.round(((s.end_epoch_ms || 0) - (s.start_epoch_ms || 0)) / 60000);
+            return '<div style="padding:2px 0">• <strong>Session ' + (i + 1) + ':</strong> ' +
+                   fmtTime(s.start_epoch_ms) + ' – ' + fmtTime(s.end_epoch_ms) +
+                   ' (' + fmtUsage(durMin) + (s.partial ? '<span style="color:var(--danger)"> · incomplete</span>' : '') + ')</div>';
+          }).join('');
+      }
+    } else {
+      txt += ')';
+      sc.className = 'dash-summary-sessions';
+      if (pop) { pop.style.display = 'none'; pop.innerHTML = ''; }
     }
     sc.textContent = txt;
   }
