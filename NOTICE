@@ -48,6 +48,27 @@ term from the material to which it applies. Per Section 7, this attribution
 requirement is compatible with the GNU GPL and does not constitute a
 "further restriction" under Section 10.
 
+
+  (c) MARKING OF MODIFIED VERSIONS.
+
+      As permitted by Section 7(c) of the GNU General Public License version 3,
+      if You modify this Program and convey the result, You must mark the
+      modified version in reasonable ways as different from the original.
+
+      This term is satisfied automatically by the build itself and requires no
+      separate action: the firmware records the repository it was built from
+      (`SNT_SOURCE_REPO`, set from the CI environment at configure time) and the
+      web portal shows it beside the firmware version as "Built from". A fork
+      built through its own CI therefore identifies itself without anyone having
+      to remember to, and this term asks only that You not remove or falsify
+      that identification.
+
+      NOTE ON WHAT THIS IS NOT. The stamp is provenance for honest builds, not
+      an authenticity control: any string compiled into a binary can be copied
+      by anyone rebuilding it, and this term does not claim otherwise. Proving
+      that a binary came from a particular repository requires a signature over
+      the artifact, which is a separate mechanism and not a licence condition.
+
 ================================================================================
 DUAL / COMMERCIAL LICENSING
 ================================================================================
