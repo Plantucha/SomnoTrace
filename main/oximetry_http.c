@@ -57,7 +57,29 @@ static esp_err_t json_send(httpd_req_t *req, char *json)
 
 static esp_err_t oximetry_recordings_handler(httpd_req_t *req)
 {
+    char date_str[16];
+    if (query(req, "date", date_str, sizeof(date_str)) && strlen(date_str) == 8) {
+        cJSON *arr = NULL;
+        if (oximetry_canonical_list_ready_for_day(date_str, &arr) == ESP_OK && arr) {
+            char *s = cJSON_PrintUnformatted(arr);
+            cJSON_Delete(arr);
+            return json_send(req, s);
+        }
+        return json_send(req, strdup("[]"));
+    }
     return json_send(req, oximetry_canonical_list_json());
+}
+
+static esp_err_t oximetry_days_handler(httpd_req_t *req)
+{
+    (void)req;
+    cJSON *arr = NULL;
+    if (oximetry_canonical_list_days(&arr) == ESP_OK && arr) {
+        char *s = cJSON_PrintUnformatted(arr);
+        cJSON_Delete(arr);
+        return json_send(req, s);
+    }
+    return json_send(req, strdup("[]"));
 }
 
 static esp_err_t oximetry_recording_handler(httpd_req_t *req)
@@ -189,7 +211,12 @@ void oximetry_http_register_handlers(httpd_handle_t server)
         .uri = "/api/oximetry/file", .method = HTTP_HEAD,
         .handler = oximetry_file_handler,
     };
+    httpd_uri_t days = {
+        .uri = "/api/oximetry/days", .method = HTTP_GET,
+        .handler = oximetry_days_handler,
+    };
     httpd_register_uri_handler(server, &list);
+    httpd_register_uri_handler(server, &days);
     httpd_register_uri_handler(server, &recording);
     httpd_register_uri_handler(server, &uploads);
     httpd_register_uri_handler(server, &diagnostics);

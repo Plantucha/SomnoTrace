@@ -99,6 +99,8 @@ esp_err_t oximetry_canonical_resolve_track(const char *recording_id,
 /* JSON APIs return owned cJSON values; the caller must cJSON_Delete(*out).
  * list_ready returns an array of ready recording summaries. */
 esp_err_t oximetry_canonical_list_ready(cJSON **out);
+esp_err_t oximetry_canonical_list_ready_for_day(const char *day, cJSON **out);
+esp_err_t oximetry_canonical_list_days(cJSON **out);
 esp_err_t oximetry_canonical_get_manifest(const char *recording_id,
                                           cJSON **out);
 

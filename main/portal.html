@@ -3282,13 +3282,14 @@ function getOxiRecordings(force) {
 }
 
 function fetchSpo2Days() {
-  return getOxiRecordings().then(function(arr){
-    spo2DaySet = {};
-    arr.forEach(function(rec){
-      if (rec.noon_day && rec.state === 'ready') spo2DaySet[rec.noon_day] = true;
-    });
-    return Object.keys(spo2DaySet);
-  }).catch(function(){ spo2DaySet = {}; return []; });
+  return fetch('/api/oximetry/days').then(function(r){ return r.ok ? r.json() : []; })
+    .then(function(arr){
+      spo2DaySet = {};
+      if (Array.isArray(arr)) {
+        arr.forEach(function(d){ spo2DaySet[d] = true; });
+      }
+      return Object.keys(spo2DaySet);
+    }).catch(function(){ spo2DaySet = {}; return []; });
 }
 
 function handleDateChange(val) { updateDateDisplayLabel(val); loadSessionData(); }
@@ -3475,14 +3476,15 @@ function parseOximetrySnt(buf) {
 function loadOximetryData(noonDay) {
   var seq = ++oxLoadSeq;
   var status = document.getElementById('oximetry-status');
+  var q = noonDay ? ('?date=' + encodeURIComponent(noonDay)) : '';
   Promise.all([
-    getOxiRecordings(),
+    fetch('/api/oximetry/recordings' + q).then(function(r){ return r.ok ? r.json() : []; }),
     fetch('/api/oximetry/diagnostics').then(function(r){ return r.ok ? r.json() : []; })
   ]).then(function(result) {
     if (seq !== oxLoadSeq) return;
     var list = result[0] || [];
     oxDiagnostics = result[1] || [];
-    var selected = list.filter(function(x){ return x.noon_day === noonDay && x.state === 'ready'; });
+    var selected = list.filter(function(x){ return (!noonDay || !x.noon_day || x.noon_day === noonDay) && x.state === 'ready'; });
     if (!selected.length) return [];
     if (status) status.textContent = 'Loading oximetry...';
     return Promise.all(selected.map(function(item) {

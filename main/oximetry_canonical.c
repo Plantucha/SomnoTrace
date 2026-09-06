@@ -1276,6 +1276,73 @@ esp_err_t oximetry_canonical_reconcile(void)
     return ESP_OK;
 }
 
+static int list_day_records(const char *day_path, cJSON *arr, int count_so_far, int max_records)
+{
+    DIR *records = opendir(day_path);
+    if (!records) return count_so_far;
+    struct dirent *re;
+    while ((re = readdir(records)) != NULL && count_so_far < max_records) {
+        if (!safe_component(re->d_name, OXIMETRY_CANONICAL_MAX_COMPONENT)) continue;
+        char record_path[OXIMETRY_CANONICAL_MAX_PATH];
+        if (!path_join2(record_path, sizeof(record_path), day_path, re->d_name)) continue;
+        char pointer[OXIMETRY_CANONICAL_MAX_PATH];
+        if (!path_join2(pointer, sizeof(pointer), record_path, "recording.json")) continue;
+        cJSON *p = read_json_file(pointer);
+        if (!p) continue;
+        cJSON *state = cJSON_GetObjectItem(p, "state");
+        cJSON *gen = cJSON_GetObjectItem(p, "active_generation");
+        if (!cJSON_IsString(state) || strcmp(state->valuestring, "ready") != 0 ||
+            !cJSON_IsNumber(gen) || gen->valueint <= 0) {
+            cJSON_Delete(p);
+            continue;
+        }
+        cJSON_AddItemToArray(arr, p);
+        count_so_far++;
+    }
+    closedir(records);
+    return count_so_far;
+}
+
+esp_err_t oximetry_canonical_list_ready_for_day(const char *day, cJSON **out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    *out = NULL;
+    if (!valid_day_name(day)) return ESP_ERR_INVALID_ARG;
+    if (oximetry_canonical_ensure_dirs() != ESP_OK) return ESP_ERR_INVALID_STATE;
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return ESP_ERR_NO_MEM;
+
+    char day_path[OXIMETRY_CANONICAL_MAX_PATH];
+    if (path_join2(day_path, sizeof(day_path), OX_RECORDINGS, day)) {
+        list_day_records(day_path, arr, 0, OXIMETRY_CANONICAL_MAX_RECORDINGS);
+    }
+    *out = arr;
+    return ESP_OK;
+}
+
+esp_err_t oximetry_canonical_list_days(cJSON **out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    *out = NULL;
+    if (oximetry_canonical_ensure_dirs() != ESP_OK) return ESP_ERR_INVALID_STATE;
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return ESP_ERR_NO_MEM;
+
+    DIR *days = opendir(OX_RECORDINGS);
+    if (!days) {
+        *out = arr;
+        return ESP_OK;
+    }
+    struct dirent *de;
+    while ((de = readdir(days)) != NULL) {
+        if (!valid_day_name(de->d_name)) continue;
+        cJSON_AddItemToArray(arr, cJSON_CreateString(de->d_name));
+    }
+    closedir(days);
+    *out = arr;
+    return ESP_OK;
+}
+
 esp_err_t oximetry_canonical_list_ready(cJSON **out)
 {
     if (!out) return ESP_ERR_INVALID_ARG;
@@ -1295,33 +1362,13 @@ esp_err_t oximetry_canonical_list_ready(cJSON **out)
         if (!valid_day_name(de->d_name)) continue;
         char day_path[OXIMETRY_CANONICAL_MAX_PATH];
         if (!path_join2(day_path, sizeof(day_path), OX_RECORDINGS, de->d_name)) continue;
-        DIR *records = opendir(day_path);
-        if (!records) continue;
-        struct dirent *re;
-        while ((re = readdir(records)) != NULL && count < OXIMETRY_CANONICAL_MAX_RECORDINGS) {
-            if (!safe_component(re->d_name, OXIMETRY_CANONICAL_MAX_COMPONENT)) continue;
-            char record_path[OXIMETRY_CANONICAL_MAX_PATH];
-            if (!path_join2(record_path, sizeof(record_path), day_path, re->d_name)) continue;
-            char pointer[OXIMETRY_CANONICAL_MAX_PATH];
-            if (!path_join2(pointer, sizeof(pointer), record_path, "recording.json")) continue;
-            cJSON *p = read_json_file(pointer);
-            if (!p) continue;
-            cJSON *state = cJSON_GetObjectItem(p, "state");
-            cJSON *gen = cJSON_GetObjectItem(p, "active_generation");
-            if (!cJSON_IsString(state) || strcmp(state->valuestring, "ready") != 0 ||
-                !cJSON_IsNumber(gen) || gen->valueint <= 0) {
-                cJSON_Delete(p);
-                continue;
-            }
-            cJSON_AddItemToArray(arr, p);
-            count++;
-        }
-        closedir(records);
+        count = list_day_records(day_path, arr, count, OXIMETRY_CANONICAL_MAX_RECORDINGS);
     }
     closedir(days);
     *out = arr;
     return ESP_OK;
 }
+
 
 static esp_err_t resolve_recording_internal(const char *recording_id, char *out,
                                             size_t out_size)
