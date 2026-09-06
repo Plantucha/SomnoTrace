@@ -39,13 +39,20 @@ jobs:
           ./scripts/build-dist.sh 2>&1 | tee release-build.log
           ls -l dist/
 
-      - name: Confirm both images exist and are plausible
+      - name: Confirm both images exist, and name them for attestation
         # A release step that exits 0 having published nothing is the failure this
         # catches. Sizes are a floor, not a checksum: an empty or truncated image is
         # the realistic accident, not a subtly wrong one.
+        #
+        # -type f is the whole trick. build-dist.sh also writes
+        # somnotrace-latest-full.bin as a SYMLINK to the versioned file, so a plain
+        # dist/*-full.bin glob matches two paths for one artifact — which failed this
+        # check on its first run, correctly. Attesting the symlink as well would have
+        # produced two subjects for one image and made the attestation say something
+        # slightly untrue, so the real files are resolved here and passed on by name.
         run: |
-          shopt -s nullglob
-          full=(dist/*-full.bin); ota=(dist/*-ota.bin)
+          mapfile -t full < <(find dist -maxdepth 1 -type f -name '*-full.bin')
+          mapfile -t ota  < <(find dist -maxdepth 1 -type f -name '*-ota.bin')
           [ ${#full[@]} -eq 1 ] || { echo "::error::expected exactly one -full.bin, got ${#full[@]}"; exit 1; }
           [ ${#ota[@]}  -eq 1 ] || { echo "::error::expected exactly one -ota.bin, got ${#ota[@]}"; exit 1; }
           for f in "${full[0]}" "${ota[0]}"; do
@@ -53,11 +60,14 @@ jobs:
             [ "$sz" -gt 1000000 ] || { echo "::error::$f is only $sz bytes"; exit 1; }
             echo "$(basename "$f")  $sz bytes  sha256=$(sha256sum "$f" | cut -d' ' -f1)"
           done
+          { echo "FULL_BIN=${full[0]}"; echo "OTA_BIN=${ota[0]}"; } >> "$GITHUB_ENV"
 
       - name: Attest the images
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: "dist/*-full.bin,dist/*-ota.bin"
+          subject-path: |
+            ${{ env.FULL_BIN }}
+            ${{ env.OTA_BIN }}
 
       - name: Upload the images
         uses: actions/upload-artifact@v4
