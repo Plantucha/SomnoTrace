@@ -3387,7 +3387,8 @@ function renderCalendar() {
 }
 
 /* Close the calendar and sessions popover when clicking outside */
-document.addEventListener('click', function(e) {
+/* Close the calendar and sessions popover when clicking/tapping outside */
+function closePopoversIfOutside(e) {
   var cal = document.getElementById('dash-calendar');
   if (cal && cal.style.display !== 'none') {
     var nav = e.target.closest ? e.target.closest('.date-nav-wrap') : null;
@@ -3398,22 +3399,27 @@ document.addEventListener('click', function(e) {
     var wrap = e.target.closest ? e.target.closest('.dash-sessions-wrap') : null;
     if (!wrap) pop.style.display = 'none';
   }
-});
+}
+document.addEventListener('click', closePopoversIfOutside);
+document.addEventListener('pointerdown', closePopoversIfOutside);
 
 function toggleSessionsPopover(e) {
-  if (e) e.stopPropagation();
+  if (e && e.stopPropagation) e.stopPropagation();
   var pop = document.getElementById('dash-sessions-popover');
-  if (!pop || !dashSessions || dashSessions.length <= 1) return;
+  if (!pop || !dashSessions || dashSessions.length === 0) return;
   pop.style.display = (pop.style.display === 'none' || !pop.style.display) ? 'block' : 'none';
 }
 
 var sessWrap = document.querySelector('.dash-sessions-wrap');
 if (sessWrap) {
-  sessWrap.addEventListener('mouseenter', function() {
+  /* Mouse-only hover preview; touch devices use click/tap */
+  sessWrap.addEventListener('pointerenter', function(e) {
+    if (e.pointerType && e.pointerType !== 'mouse') return;
     var pop = document.getElementById('dash-sessions-popover');
-    if (pop && dashSessions && dashSessions.length > 1) pop.style.display = 'block';
+    if (pop && dashSessions && dashSessions.length >= 1) pop.style.display = 'block';
   });
-  sessWrap.addEventListener('mouseleave', function() {
+  sessWrap.addEventListener('pointerleave', function(e) {
+    if (e.pointerType && e.pointerType !== 'mouse') return;
     var pop = document.getElementById('dash-sessions-popover');
     if (pop) pop.style.display = 'none';
   });
@@ -3574,7 +3580,7 @@ var DASH_SIGNALS = [
     minKey:'flowMin',  maxKey:'flowMax',  color:'#3b82f6',          y:{min:-150,max:150}, height:200, decimals:1 },
   { key:'press',   label:'Pressure',   unit:'cmH\u2082O', src:'pld', ch:'press',
     minKey:null, maxKey:null,            color:'--color-pressure', y:null,               height:200, decimals:1,
-    overlay: { ch:'eprPress', label:'EPR', color:'#22c55e' } },
+    overlay: { ch:'eprPress', label:'EPAP', color:'#22c55e' } },
   { key:'leak',    label:'Leak Rate',  unit:'L/min', src:'pld', ch:'leak',
     minKey:null, maxKey:null,            color:'--color-leak',      y:{min:0,max:null},   height:200, decimals:1 },
   { key:'flowlim', label:'Flow Limit', unit:'',      src:'pld', ch:'flowlim',
@@ -4344,28 +4350,30 @@ function renderSummary() {
       if (dashSessions[pi] && dashSessions[pi].partial) nPartial++;
     }
     var count = dashSessions.length;
-    var txt = '(' + count + ' session' + (count > 1 ? 's' : '') + '';
-    if (nPartial > 0) {
-      txt += ' · ' + nPartial + ' incomplete';
-    }
-    if (count > 1) {
+    if (count >= 1) {
+      var txt = '(' + count + ' session' + (count > 1 ? 's' : '');
+      if (nPartial > 0) {
+        txt += ' · ' + nPartial + ' incomplete';
+      }
       txt += ' ▾)';
       sc.className = 'dash-summary-sessions dash-sessions-clickable';
       if (pop) {
-        pop.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:var(--text)">Sessions for this day (' + count + ')</div>' +
+        var hdr = count === 1 ? 'Session for this day' : 'Sessions for this day (' + count + ')';
+        pop.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:var(--text)">' + hdr + '</div>' +
           dashSessions.map(function(s, i) {
             var durMin = Math.round(((s.end_epoch_ms || 0) - (s.start_epoch_ms || 0)) / 60000);
-            return '<div style="padding:2px 0">• <strong>Session ' + (i + 1) + ':</strong> ' +
+            var prefix = count === 1 ? '• ' : '• <strong>Session ' + (i + 1) + ':</strong> ';
+            return '<div style="padding:2px 0">' + prefix +
                    fmtTime(s.start_epoch_ms) + ' – ' + fmtTime(s.end_epoch_ms) +
                    ' (' + fmtUsage(durMin) + (s.partial ? '<span style="color:var(--danger)"> · incomplete</span>' : '') + ')</div>';
           }).join('');
       }
+      sc.textContent = txt;
     } else {
-      txt += ')';
       sc.className = 'dash-summary-sessions';
+      sc.textContent = '';
       if (pop) { pop.style.display = 'none'; pop.innerHTML = ''; }
     }
-    sc.textContent = txt;
   }
 
   /* Stats table */
@@ -5097,12 +5105,6 @@ function renderDashboardCharts() {
     lbl.className = 'dash-signal-label';
     lbl.textContent = sig.unit ? (sig.label + ' (' + sig.unit + ')') : sig.label;
     lbl.style.color = sigColor(sig);
-    if (sig.overlay) {
-      var ovSpan = document.createElement('span');
-      ovSpan.textContent = '  ' + sig.overlay.label;
-      ovSpan.style.color = sig.overlay.color;
-      lbl.appendChild(ovSpan);
-    }
     var chartEl = document.createElement('div');
     chartEl.id = 'chart-' + sig.key;
     chartEl.style.cssText = 'position:relative;touch-action:pan-y';
