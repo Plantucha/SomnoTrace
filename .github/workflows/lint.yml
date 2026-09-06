@@ -40,11 +40,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install cppcheck and shellcheck
+        # Whatever the runner image ships. Pinning an exact apt revision would break the
+        # build the day Ubuntu rebuilds the package for unrelated reasons — an outage in
+        # exchange for nothing. The versions are RECORDED in scripts/lint-versions.env and
+        # the drift is reported below, which is what makes an unexplained new finding
+        # distinguishable from a regression the contributor actually introduced.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cppcheck shellcheck
-          cppcheck --version
-          shellcheck --version | head -2
+
+      - name: Report analyser versions against the pins
+        run: |
+          . scripts/lint-versions.env
+          have_cpp=$(cppcheck --version | awk '{print $2}')
+          have_sh=$(shellcheck --version | awk '/^version:/{print $2}')
+          echo "cppcheck   $have_cpp  (pinned $CPPCHECK_VERSION)"
+          echo "shellcheck $have_sh  (pinned $SHELLCHECK_VERSION)"
+          [ "$have_cpp" = "$CPPCHECK_VERSION" ] || echo             "::warning::cppcheck is $have_cpp but scripts/lint-versions.env pins $CPPCHECK_VERSION — the finding set may differ; re-measure and update the pin in the same commit"
+          [ "$have_sh" = "$SHELLCHECK_VERSION" ] || echo             "::warning::shellcheck is $have_sh but scripts/lint-versions.env pins $SHELLCHECK_VERSION — the finding set may differ; re-measure and update the pin in the same commit"
 
       - name: cppcheck — blocking tier (errors and warnings)
         # third_party/ is vendored (libsmb2, esp-idf-ftpServer): not ours to fix, and its
