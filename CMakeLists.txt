@@ -104,6 +104,15 @@ endif()
 message(STATUS "Source repository: ${SOURCE_REPO}")
 add_compile_definitions(SNT_SOURCE_REPO="${SOURCE_REPO}")
 
+# The project this source descends from. Unlike SOURCE_REPO above this is NOT read
+# from the environment: it travels IN THE TREE, so a fork inherits it by copying the
+# code and would have to edit this line deliberately to remove it. That is the point.
+# SOURCE_REPO alone answers "where was this built?", which leaves a fork's portal
+# naming a repository the reader has no reference point for; this answers "what is it
+# a fork OF?", which is the attribution NOTICE already requires be preserved.
+set(UPSTREAM_REPO "ilyakruchinin/SomnoTrace")
+add_compile_definitions(SNT_UPSTREAM_REPO="${UPSTREAM_REPO}")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(somnotrace)

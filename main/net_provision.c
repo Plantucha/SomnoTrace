@@ -939,6 +939,9 @@ cJSON *netprov_build_status_json(void)
 #ifdef SNT_SOURCE_REPO
     cJSON_AddStringToObject(resp, "source_repo", SNT_SOURCE_REPO);
 #endif
+#ifdef SNT_UPSTREAM_REPO
+    cJSON_AddStringToObject(resp, "upstream_repo", SNT_UPSTREAM_REPO);
+#endif
 
     if (!s_portal_mode) {
         /* Live link state: SSID, IP, RSSI — all derived from the event-driven
