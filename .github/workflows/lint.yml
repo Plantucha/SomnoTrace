@@ -1,0 +1,103 @@
+name: "Lint"
+# Static analysis for the firmware sources and this repo's own shell scripts.
+#
+# TWO TIERS, AND ONLY ONE OF THEM CAN FAIL THE BUILD. The blocking tier is chosen so it
+# is GREEN on main today (measured, not hoped: cppcheck's error/warning/performance/
+# portability set finds ONE issue on the whole tree, a false positive suppressed inline
+# where it occurs; shellcheck at --severity=warning finds 1, fixed in this change).
+# Everything else — 103 style findings, nearly all "could be const" — is REPORTED as a
+# count and cannot fail anything.
+#
+# ⚠️ THE FINDING SET IS A FUNCTION OF THE CPPCHECK VERSION, and this is measured rather
+# than feared: ubuntu-latest ships 2.13.0, which reports the embedded-blob false positive
+# as `comparePointers` and 103 style findings; 2.19.0 calls the SAME finding
+# `subtractPointers`, adds a second false positive in upload_sched.c, and reports 126.
+# So the suppressions are INLINE (they move with the code and name every id the check has
+# gone by) rather than in a list file keyed on line numbers, and the style tier is
+# advisory so a version bump can never turn a green branch red on cosmetics alone. The
+# version is printed below on every run: if a runner image bump changes the verdict, the
+# log says which version produced it.
+#
+# That split is the whole design. A linter switched on at full strength over an existing
+# 51k-line codebase produces a permanently red gate, and a permanently red gate teaches
+# people to ignore CI, which costs more than the lint was worth. Starting green means
+# every finding after today is one this change introduced.
+on:
+  push:
+    paths: ["main/**", "components/**", "scripts/**", ".github/workflows/lint.yml"]
+  pull_request:
+    paths: ["main/**", "components/**", "scripts/**", ".github/workflows/lint.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck and shellcheck
+        # Whatever the runner image ships. Pinning an exact apt revision would break the
+        # build the day Ubuntu rebuilds the package for unrelated reasons — an outage in
+        # exchange for nothing. The versions are RECORDED in scripts/lint-versions.env and
+        # the drift is reported below, which is what makes an unexplained new finding
+        # distinguishable from a regression the contributor actually introduced.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cppcheck shellcheck
+
+      - name: Report analyser versions against the pins
+        run: |
+          . scripts/lint-versions.env
+          have_cpp=$(cppcheck --version | awk '{print $2}')
+          have_sh=$(shellcheck --version | awk '/^version:/{print $2}')
+          echo "cppcheck   $have_cpp  (pinned $CPPCHECK_VERSION)"
+          echo "shellcheck $have_sh  (pinned $SHELLCHECK_VERSION)"
+          [ "$have_cpp" = "$CPPCHECK_VERSION" ] || echo             "::warning::cppcheck is $have_cpp but scripts/lint-versions.env pins $CPPCHECK_VERSION — the finding set may differ; re-measure and update the pin in the same commit"
+          [ "$have_sh" = "$SHELLCHECK_VERSION" ] || echo             "::warning::shellcheck is $have_sh but scripts/lint-versions.env pins $SHELLCHECK_VERSION — the finding set may differ; re-measure and update the pin in the same commit"
+
+      - name: cppcheck — blocking tier (errors and warnings)
+        # third_party/ is vendored (libsmb2, esp-idf-ftpServer): not ours to fix, and its
+        # findings would drown ours. build/ and managed_components/ are generated.
+        # --error-exitcode=1 is what makes this a gate rather than a report.
+        run: |
+          cppcheck \
+            --enable=warning,performance,portability \
+            --std=c11 --language=c --inline-suppr \
+            --suppress=missingInclude --suppress=missingIncludeSystem \
+            --suppress=unmatchedSuppression \
+            -i third_party -i build -i managed_components \
+            --error-exitcode=1 \
+            --template='{severity}: {file}:{line}: {message} [{id}]' \
+            main components
+
+      - name: cppcheck — style tier (report only, never fails)
+        # Reported so the number is visible and can be worked down deliberately, rather
+        # than hidden until someone decides to turn it on and finds 126 of them.
+        run: |
+          cppcheck \
+            --enable=style \
+            --std=c11 --language=c --inline-suppr \
+            --suppress=missingInclude --suppress=missingIncludeSystem \
+            --suppress=unusedFunction --suppress=unmatchedSuppression \
+            -i third_party -i build -i managed_components \
+            --template='{severity}: {file}:{line}: {message} [{id}]' \
+            main components 2> style.txt || true
+          n=$(grep -c '^style:' style.txt || true)
+          echo "cppcheck style findings: ${n:-0}"
+          echo "### cppcheck style findings: ${n:-0} (advisory)" >> "$GITHUB_STEP_SUMMARY"
+          sort -t: -k4 style.txt | awk -F'[][]' '{print $2}' | sort | uniq -c | sort -rn \
+            | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: shellcheck — this repo's own scripts
+        # OUR scripts only: third_party ships 15 more, and we do not maintain them.
+        # --severity=warning is the blocking tier; the 7 remaining `note`-level findings
+        # (all SC2086 word-splitting on paths we control) are left for a separate pass.
+        run: |
+          mapfile -t sh_files < <(git ls-files '*.sh' | grep -v '^third_party/')
+          printf 'checking %d script(s):\n' "${#sh_files[@]}"
+          printf '  %s\n' "${sh_files[@]}"
+          shellcheck --severity=warning -f gcc "${sh_files[@]}"

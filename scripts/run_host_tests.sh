@@ -35,7 +35,10 @@
 # The last line is always "host tests: N run, M failed, K skipped".  A caller
 # that does not see that line must treat the run as not having happened.
 set -u
-cd "$(dirname "$0")/.."
+# `|| exit` is not decoration (SC2164): without it a failed cd leaves the script running
+# in whatever directory it was invoked from, where MAIN_DIR and the test globs below
+# resolve against the wrong tree — a run that reports on files it did not mean to check.
+cd "$(dirname "$0")/.." || exit 1
 
 MAIN_DIR=${MAIN_DIR:-main}
 OUT=${OUT:-build/host_tests}
