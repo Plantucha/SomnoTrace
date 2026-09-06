@@ -852,10 +852,9 @@ static void shq_session_end(void)
  * opened, so nothing appears in the user's SleepHQ history. */
 #define SHQ_TEST_TIMEOUT_MS 10000
 
-static bool shq_test(char *msg, size_t msg_len)
+static bool shq_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
 {
-    uploader_config_t cfg;
-    uploader_load_config(&cfg);
+    uploader_config_t cfg = *cfgp;   /* by value — see smb_test */
     if (!cfg.shq_client_id[0] || !cfg.shq_client_secret[0]) {
         snprintf(msg, msg_len, "Client ID and Client Secret are required");
         return false;
@@ -891,6 +890,18 @@ static bool shq_test(char *msg, size_t msg_len)
     esp_tls_conn_destroy(tls);
     memset(token, 0, SHQ_TOKEN_MAX);
     free(token);
+
+    /* #214.3 -- what the TLS handshake actually cost on this task's stack.
+     * Measured rather than estimated: the httpd worker gets 12 KB in PSRAM and
+     * a handshake is expected to want 6.5-8.5 KB, so the margin is real but
+     * thin, and it is worth a log line on the one path that exercises it.
+     *
+     * ESP-IDF returns this value in BYTES.  Vanilla FreeRTOS returns WORDS, and
+     * scaling by sizeof(StackType_t) here -- the reflex when porting the idiom
+     * -- would report four times the true headroom, which is the direction that
+     * hides a problem rather than raising one. */
+    ESP_LOGI(TAG, "sleephq: connection test finished with %u bytes of stack headroom",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     if (rc != ESP_OK) {
         snprintf(msg, msg_len, "%s", err);
