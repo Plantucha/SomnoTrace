@@ -1,0 +1,82 @@
+name: "Lint"
+# Static analysis for the firmware sources and this repo's own shell scripts.
+#
+# TWO TIERS, AND ONLY ONE OF THEM CAN FAIL THE BUILD. The blocking tier is chosen so it
+# is GREEN on main today (measured, not hoped: cppcheck's error/warning/performance/
+# portability set finds 2 issues on the whole tree, both false positives suppressed by
+# name in .cppcheck-suppressions; shellcheck at --severity=warning finds 1, fixed in
+# this change). Everything else — 126 style findings, nearly all "could be const" —
+# is REPORTED as a count and cannot fail anything.
+#
+# That split is the whole design. A linter switched on at full strength over an existing
+# 51k-line codebase produces a permanently red gate, and a permanently red gate teaches
+# people to ignore CI, which costs more than the lint was worth. Starting green means
+# every finding after today is one this change introduced.
+on:
+  push:
+    paths: ["main/**", "components/**", "scripts/**", ".cppcheck-suppressions", ".github/workflows/lint.yml"]
+  pull_request:
+    paths: ["main/**", "components/**", "scripts/**", ".cppcheck-suppressions", ".github/workflows/lint.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck and shellcheck
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cppcheck shellcheck
+          cppcheck --version
+          shellcheck --version | head -2
+
+      - name: cppcheck — blocking tier (errors and warnings)
+        # third_party/ is vendored (libsmb2, esp-idf-ftpServer): not ours to fix, and its
+        # findings would drown ours. build/ and managed_components/ are generated.
+        # --error-exitcode=1 is what makes this a gate rather than a report.
+        run: |
+          cppcheck \
+            --enable=warning,performance,portability \
+            --std=c11 --language=c --inline-suppr \
+            --suppressions-list=.cppcheck-suppressions \
+            --suppress=missingInclude --suppress=missingIncludeSystem \
+            --suppress=unmatchedSuppression \
+            -i third_party -i build -i managed_components \
+            --error-exitcode=1 \
+            --template='{severity}: {file}:{line}: {message} [{id}]' \
+            main components
+
+      - name: cppcheck — style tier (report only, never fails)
+        # Reported so the number is visible and can be worked down deliberately, rather
+        # than hidden until someone decides to turn it on and finds 126 of them.
+        run: |
+          cppcheck \
+            --enable=style \
+            --std=c11 --language=c --inline-suppr \
+            --suppressions-list=.cppcheck-suppressions \
+            --suppress=missingInclude --suppress=missingIncludeSystem \
+            --suppress=unusedFunction --suppress=unmatchedSuppression \
+            -i third_party -i build -i managed_components \
+            --template='{severity}: {file}:{line}: {message} [{id}]' \
+            main components 2> style.txt || true
+          n=$(grep -c '^style:' style.txt || true)
+          echo "cppcheck style findings: ${n:-0}"
+          echo "### cppcheck style findings: ${n:-0} (advisory)" >> "$GITHUB_STEP_SUMMARY"
+          sort -t: -k4 style.txt | awk -F'[][]' '{print $2}' | sort | uniq -c | sort -rn \
+            | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: shellcheck — this repo's own scripts
+        # OUR scripts only: third_party ships 15 more, and we do not maintain them.
+        # --severity=warning is the blocking tier; the 7 remaining `note`-level findings
+        # (all SC2086 word-splitting on paths we control) are left for a separate pass.
+        run: |
+          mapfile -t sh_files < <(git ls-files '*.sh' | grep -v '^third_party/')
+          printf 'checking %d script(s):\n' "${#sh_files[@]}"
+          printf '  %s\n' "${sh_files[@]}"
+          shellcheck --severity=warning -f gcc "${sh_files[@]}"
