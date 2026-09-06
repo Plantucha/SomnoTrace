@@ -386,6 +386,19 @@ int upload_ox_pending(const upload_ox_ref_t *refs, int n_refs, int backend_slot)
     int n = 0; for (int i = 0; i < n_refs; i++) if (upload_ox_status(&refs[i], backend_slot) != UG_OK) n++; return n;
 }
 
+int upload_ox_cached_pending(int backend_slot)
+{
+    if (!s_loaded) upload_ox_init();
+    if (!s_loaded || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL) return 0;
+    int n = 0;
+    for (int i = 0; i < UPLOAD_OX_MAX_UNITS; i++) {
+        if (s_states[i].used && s_states[i].backend[backend_slot].status != UG_OK) {
+            n++;
+        }
+    }
+    return n;
+}
+
 char *upload_ox_status_json(void)
 {
     upload_ox_ref_t *refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);

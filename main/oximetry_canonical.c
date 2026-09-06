@@ -1302,11 +1302,17 @@ esp_err_t oximetry_canonical_list_ready(cJSON **out)
             if (!safe_component(re->d_name, OXIMETRY_CANONICAL_MAX_COMPONENT)) continue;
             char record_path[OXIMETRY_CANONICAL_MAX_PATH];
             if (!path_join2(record_path, sizeof(record_path), day_path, re->d_name)) continue;
-            if (!recording_ready_at(record_path)) continue;
             char pointer[OXIMETRY_CANONICAL_MAX_PATH];
             if (!path_join2(pointer, sizeof(pointer), record_path, "recording.json")) continue;
             cJSON *p = read_json_file(pointer);
             if (!p) continue;
+            cJSON *state = cJSON_GetObjectItem(p, "state");
+            cJSON *gen = cJSON_GetObjectItem(p, "active_generation");
+            if (!cJSON_IsString(state) || strcmp(state->valuestring, "ready") != 0 ||
+                !cJSON_IsNumber(gen) || gen->valueint <= 0) {
+                cJSON_Delete(p);
+                continue;
+            }
             cJSON_AddItemToArray(arr, p);
             count++;
         }

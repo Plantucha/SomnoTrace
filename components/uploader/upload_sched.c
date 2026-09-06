@@ -845,13 +845,6 @@ esp_err_t upload_sched_progress_json(char **out_json)
 void upload_sched_summary(int *out_pending, const char **out_worst)
 {
     int max_days = uploader_max_days();
-    upload_ox_ref_t *ox_refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);
-    if (!ox_refs) {
-        if (out_pending) *out_pending = 0;
-        if (out_worst) *out_worst = "idle";
-        return;
-    }
-    int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
     int pending = 0;
     const char *worst = "idle";
 
@@ -859,12 +852,11 @@ void upload_sched_summary(int *out_pending, const char **out_worst)
         backend_rt_t *r = &s_rt[i];
         if (!r->be || !r->be->is_configured || !r->be->is_configured()) continue;
         pending += upload_index_backend_pending(r->slot, max_days);
-        pending += upload_ox_pending(ox_refs, n_ox, r->slot);
+        pending += upload_ox_cached_pending(r->slot);
         if (r->state == SB_COOLDOWN) worst = "cooldown";
         else if (r->state == SB_UPLOADING && strcmp(worst, "cooldown") != 0)
             worst = "uploading";
     }
-    free(ox_refs);
     if (out_pending) *out_pending = pending;
     if (out_worst) *out_worst = worst;
 }

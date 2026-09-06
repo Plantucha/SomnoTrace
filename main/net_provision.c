@@ -861,22 +861,32 @@ static struct {
     TickType_t tz_tick;
 } s_status_cache;
 
-static void status_cache_refresh_sd(void)
+static volatile bool s_sd_refreshing = false;
+
+static void sd_refresh_task(void *arg)
 {
-    if (!sd_storage_is_ready()) {
-        s_status_cache.sd_valid = false;
-        return;
-    }
-    FATFS *fs = NULL;
-    DWORD free_clst = 0;
-    if (f_getfree("0:", &free_clst, &fs) == FR_OK && fs) {
-        s_status_cache.sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
-        s_status_cache.sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
-        s_status_cache.sd_valid = true;
-    } else {
-        s_status_cache.sd_valid = false;
+    (void)arg;
+    if (sd_storage_is_ready()) {
+        FATFS *fs = NULL;
+        DWORD free_clst = 0;
+        if (f_getfree("0:", &free_clst, &fs) == FR_OK && fs) {
+            s_status_cache.sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
+            s_status_cache.sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
+            s_status_cache.sd_valid = true;
+        }
     }
     s_status_cache.sd_tick = xTaskGetTickCount();
+    s_sd_refreshing = false;
+    vTaskDelete(NULL);
+}
+
+static void trigger_sd_refresh(void)
+{
+    if (s_sd_refreshing || !sd_storage_is_ready()) return;
+    s_sd_refreshing = true;
+    if (xTaskCreate(sd_refresh_task, "sd_refresh", 3072, NULL, 1, NULL) != pdPASS) {
+        s_sd_refreshing = false;
+    }
 }
 
 static void status_cache_refresh_nvs(void)
@@ -892,10 +902,10 @@ cJSON *netprov_build_status_json(void)
     TickType_t now = xTaskGetTickCount();
     uint32_t ms = portTICK_PERIOD_MS;
 
-    /* Refresh SD free space at most once per STATUS_CACHE_SD_MS */
+    /* Refresh SD free space asynchronously at most once per STATUS_CACHE_SD_MS */
     if (!s_status_cache.sd_valid ||
         (uint32_t)((now - s_status_cache.sd_tick) * ms) >= STATUS_CACHE_SD_MS) {
-        status_cache_refresh_sd();
+        trigger_sd_refresh();
     }
 
     /* Refresh NVS-backed settings at most once per STATUS_CACHE_NVS_MS */
@@ -2978,6 +2988,18 @@ static esp_err_t actions_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static inline esp_err_t reg_uri(httpd_handle_t handle, const httpd_uri_t *uri_handler)
+{
+    esp_err_t err = httpd_register_uri_handler(handle, uri_handler);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to register URI '%s' (method %d): %s",
+                 uri_handler ? uri_handler->uri : "NULL",
+                 uri_handler ? (int)uri_handler->method : -1,
+                 esp_err_to_name(err));
+    }
+    return err;
+}
+
 static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
@@ -3006,7 +3028,7 @@ static esp_err_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 60;
+    config.max_uri_handlers = 128;
     config.stack_size = 12288;
     config.max_open_sockets = 20;
     config.recv_wait_timeout = 1;       /* close idle keep-alive sockets fast */
@@ -3038,39 +3060,39 @@ static esp_err_t start_webserver(void)
     oximetry_http_register_handlers(s_httpd);
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
-    httpd_register_uri_handler(s_httpd, &root);
+    reg_uri(s_httpd, &root);
 
     httpd_uri_t wifi_uri = { .uri = "/wifi", .method = HTTP_GET, .handler = root_get_handler };
-    httpd_register_uri_handler(s_httpd, &wifi_uri);
+    reg_uri(s_httpd, &wifi_uri);
 
     httpd_uri_t manifest = { .uri = "/manifest.json", .method = HTTP_GET, .handler = manifest_get_handler };
-    httpd_register_uri_handler(s_httpd, &manifest);
+    reg_uri(s_httpd, &manifest);
 
     httpd_uri_t sw = { .uri = "/sw.js", .method = HTTP_GET, .handler = sw_get_handler };
-    httpd_register_uri_handler(s_httpd, &sw);
+    reg_uri(s_httpd, &sw);
 
     httpd_uri_t uplot_js = { .uri = "/uplot.js", .method = HTTP_GET, .handler = uplot_js_get_handler };
-    httpd_register_uri_handler(s_httpd, &uplot_js);
+    reg_uri(s_httpd, &uplot_js);
 
     httpd_uri_t uplot_css = { .uri = "/uplot.css", .method = HTTP_GET, .handler = uplot_css_get_handler };
-    httpd_register_uri_handler(s_httpd, &uplot_css);
+    reg_uri(s_httpd, &uplot_css);
 
     httpd_uri_t logo_svg = { .uri = "/logo.svg", .method = HTTP_GET, .handler = logo_svg_get_handler };
-    httpd_register_uri_handler(s_httpd, &logo_svg);
+    reg_uri(s_httpd, &logo_svg);
 
     httpd_uri_t favicon = { .uri = "/favicon.svg", .method = HTTP_GET, .handler = favicon_get_handler };
-    httpd_register_uri_handler(s_httpd, &favicon);
+    reg_uri(s_httpd, &favicon);
 
     httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
-    httpd_register_uri_handler(s_httpd, &status);
+    reg_uri(s_httpd, &status);
 
     httpd_uri_t tz_db = { .uri = "/api/tz", .method = HTTP_GET, .handler = tz_get_handler };
-    httpd_register_uri_handler(s_httpd, &tz_db);
+    reg_uri(s_httpd, &tz_db);
 
     httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler };
     httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
-    httpd_register_uri_handler(s_httpd, &scan);
-    httpd_register_uri_handler(s_httpd, &save);
+    reg_uri(s_httpd, &scan);
+    reg_uri(s_httpd, &save);
 
     /* AirSense 11 BLE pairing endpoints (status folded into /api/status) */
     httpd_uri_t ble_scan = { .uri = "/api/ble/scan", .method = HTTP_GET, .handler = ble_scan_handler };
@@ -3078,90 +3100,90 @@ static esp_err_t start_webserver(void)
     httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
     httpd_uri_t ble_forget = { .uri = "/api/ble/forget", .method = HTTP_POST, .handler = ble_forget_handler };
     httpd_uri_t ble_pass = { .uri = "/api/ble/passthrough", .method = HTTP_POST, .handler = ble_passthrough_handler };
-    httpd_register_uri_handler(s_httpd, &ble_scan);
-    httpd_register_uri_handler(s_httpd, &ble_pair);
-    httpd_register_uri_handler(s_httpd, &ble_conf);
-    httpd_register_uri_handler(s_httpd, &ble_forget);
-    httpd_register_uri_handler(s_httpd, &ble_pass);
+    reg_uri(s_httpd, &ble_scan);
+    reg_uri(s_httpd, &ble_pair);
+    reg_uri(s_httpd, &ble_conf);
+    reg_uri(s_httpd, &ble_forget);
+    reg_uri(s_httpd, &ble_pass);
 
     /* Oximeter (O2 Ring) BLE pairing endpoints (status folded into /api/status) */
     httpd_uri_t ox_scan = { .uri = "/api/ox/scan", .method = HTTP_GET, .handler = ox_scan_handler };
     httpd_uri_t ox_pair = { .uri = "/api/ox/pair", .method = HTTP_POST, .handler = ox_pair_handler };
     httpd_uri_t ox_forget = { .uri = "/api/ox/forget", .method = HTTP_POST, .handler = ox_forget_handler };
     httpd_uri_t ox_pm = { .uri = "/api/ox/probe-mode", .method = HTTP_POST, .handler = ox_probe_mode_handler };
-    httpd_register_uri_handler(s_httpd, &ox_scan);
-    httpd_register_uri_handler(s_httpd, &ox_pair);
-    httpd_register_uri_handler(s_httpd, &ox_forget);
-    httpd_register_uri_handler(s_httpd, &ox_pm);
+    reg_uri(s_httpd, &ox_scan);
+    reg_uri(s_httpd, &ox_pair);
+    reg_uri(s_httpd, &ox_forget);
+    reg_uri(s_httpd, &ox_pm);
 
     /* EZShare-compatible file server endpoints */
     httpd_uri_t dir_hdl = { .uri = "/dir", .method = HTTP_GET, .handler = dir_get_handler };
     httpd_uri_t dl_hdl = { .uri = "/download", .method = HTTP_GET, .handler = download_get_handler };
-    httpd_register_uri_handler(s_httpd, &dir_hdl);
-    httpd_register_uri_handler(s_httpd, &dl_hdl);
+    reg_uri(s_httpd, &dir_hdl);
+    reg_uri(s_httpd, &dl_hdl);
 
     /* Upload configuration endpoints (status folded into /api/status) */
     httpd_uri_t up_prog_get = { .uri = "/api/uploads/progress", .method = HTTP_GET, .handler = upload_progress_get_handler };
     httpd_uri_t up_state_get = { .uri = "/api/uploads/state", .method = HTTP_GET, .handler = upload_state_get_handler };
     httpd_uri_t up_cfg_get = { .uri = "/api/uploads/config", .method = HTTP_GET, .handler = upload_config_get_handler };
     httpd_uri_t up_cfg_post = { .uri = "/api/uploads/config", .method = HTTP_POST, .handler = upload_config_post_handler };
-    httpd_register_uri_handler(s_httpd, &up_cfg_get);
-    httpd_register_uri_handler(s_httpd, &up_cfg_post);
-    httpd_register_uri_handler(s_httpd, &up_prog_get);
-    httpd_register_uri_handler(s_httpd, &up_state_get);
+    reg_uri(s_httpd, &up_cfg_get);
+    reg_uri(s_httpd, &up_cfg_post);
+    reg_uri(s_httpd, &up_prog_get);
+    reg_uri(s_httpd, &up_state_get);
 
     /* "Test connection" buttons: probe a backend with the saved settings */
     httpd_uri_t up_test_smb = { .uri = "/api/uploads/test-smb", .method = HTTP_POST, .handler = upload_test_smb_handler };
     httpd_uri_t up_test_shq = { .uri = "/api/uploads/test-sleephq", .method = HTTP_POST, .handler = upload_test_sleephq_handler };
-    httpd_register_uri_handler(s_httpd, &up_test_smb);
-    httpd_register_uri_handler(s_httpd, &up_test_shq);
+    reg_uri(s_httpd, &up_test_smb);
+    reg_uri(s_httpd, &up_test_shq);
 
     /* Device settings endpoints (brightness, LCD therapy mode) */
     httpd_uri_t settings_all = { .uri = "/api/settings/all", .method = HTTP_GET, .handler = settings_all_get_handler };
-    httpd_register_uri_handler(s_httpd, &settings_all);
+    reg_uri(s_httpd, &settings_all);
     httpd_uri_t dev_get = { .uri = "/api/device/settings", .method = HTTP_GET, .handler = device_settings_get_handler };
     httpd_uri_t dev_post = { .uri = "/api/device/settings", .method = HTTP_POST, .handler = device_settings_post_handler };
-    httpd_register_uri_handler(s_httpd, &dev_get);
-    httpd_register_uri_handler(s_httpd, &dev_post);
+    reg_uri(s_httpd, &dev_get);
+    reg_uri(s_httpd, &dev_post);
 
     /* Audio test beep endpoint */
     httpd_uri_t beep_test = { .uri = "/api/device/test-beep", .method = HTTP_POST, .handler = audio_test_beep_handler };
-    httpd_register_uri_handler(s_httpd, &beep_test);
+    reg_uri(s_httpd, &beep_test);
 
     /* Therapy alert config endpoints */
     httpd_uri_t alert_cfg_get = { .uri = "/api/alert/config", .method = HTTP_GET, .handler = alert_config_get_handler };
     httpd_uri_t alert_cfg_post = { .uri = "/api/alert/config", .method = HTTP_POST, .handler = alert_config_post_handler };
     httpd_uri_t alert_test = { .uri = "/api/alert/test", .method = HTTP_POST, .handler = alert_test_push_handler };
-    httpd_register_uri_handler(s_httpd, &alert_cfg_get);
-    httpd_register_uri_handler(s_httpd, &alert_cfg_post);
-    httpd_register_uri_handler(s_httpd, &alert_test);
+    reg_uri(s_httpd, &alert_cfg_get);
+    reg_uri(s_httpd, &alert_cfg_post);
+    reg_uri(s_httpd, &alert_test);
 
     /* Reboot endpoint */
     httpd_uri_t reboot_post = { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler };
-    httpd_register_uri_handler(s_httpd, &reboot_post);
+    reg_uri(s_httpd, &reboot_post);
 
     /* Heap stats endpoint (per-task stack HWM, internal/PSRAM/DMA breakdown) */
     httpd_uri_t heap_stats = { .uri = "/api/heap", .method = HTTP_GET, .handler = heap_stats_handler };
-    httpd_register_uri_handler(s_httpd, &heap_stats);
+    reg_uri(s_httpd, &heap_stats);
 
     /* Consolidated actions endpoint */
     httpd_uri_t actions = { .uri = "/api/actions", .method = HTTP_POST, .handler = actions_handler };
-    httpd_register_uri_handler(s_httpd, &actions);
+    reg_uri(s_httpd, &actions);
 
     httpd_uri_t format_prog = { .uri = "/api/format-progress", .method = HTTP_GET, .handler = format_progress_handler };
-    httpd_register_uri_handler(s_httpd, &format_prog);
+    reg_uri(s_httpd, &format_prog);
 
     /* OTA firmware upload endpoint */
     httpd_uri_t ota_upload = { .uri = "/api/ota", .method = HTTP_POST, .handler = ota_upload_handler };
-    httpd_register_uri_handler(s_httpd, &ota_upload);
+    reg_uri(s_httpd, &ota_upload);
 
     /* OTA firmware download from URL endpoint */
     httpd_uri_t ota_url = { .uri = "/api/ota-url", .method = HTTP_POST, .handler = ota_url_handler };
-    httpd_register_uri_handler(s_httpd, &ota_url);
+    reg_uri(s_httpd, &ota_url);
 
     /* OTA progress polling endpoint */
     httpd_uri_t ota_prog = { .uri = "/api/ota-progress", .method = HTTP_GET, .handler = ota_progress_handler };
-    httpd_register_uri_handler(s_httpd, &ota_prog);
+    reg_uri(s_httpd, &ota_prog);
 
     /* Log stream endpoints (SSE, download, level control) */
     log_stream_register_handlers(s_httpd);
@@ -3174,13 +3196,13 @@ static esp_err_t start_webserver(void)
     httpd_uri_t days_list     = { .uri = "/api/days", .method = HTTP_GET, .handler = days_list_handler };
     httpd_uri_t summary_uri   = { .uri = "/api/summary", .method = HTTP_GET, .handler = summary_handler };
     httpd_uri_t sess_settings = { .uri = "/api/session/settings", .method = HTTP_GET, .handler = session_settings_handler };
-    httpd_register_uri_handler(s_httpd, &sessions_list);
-    httpd_register_uri_handler(s_httpd, &session_graph);
-    httpd_register_uri_handler(s_httpd, &session_file);
-    httpd_register_uri_handler(s_httpd, &session_file_head);
-    httpd_register_uri_handler(s_httpd, &days_list);
-    httpd_register_uri_handler(s_httpd, &summary_uri);
-    httpd_register_uri_handler(s_httpd, &sess_settings);
+    reg_uri(s_httpd, &sessions_list);
+    reg_uri(s_httpd, &session_graph);
+    reg_uri(s_httpd, &session_file);
+    reg_uri(s_httpd, &session_file_head);
+    reg_uri(s_httpd, &days_list);
+    reg_uri(s_httpd, &summary_uri);
+    reg_uri(s_httpd, &sess_settings);
 
     if (s_portal_mode) {
         /* Captive-portal probe intercepts (return 302 to trigger portal popup) */
@@ -3201,7 +3223,7 @@ static esp_err_t start_webserver(void)
                 .method = HTTP_GET,
                 .handler = redirect_to_portal,
             };
-            httpd_register_uri_handler(s_httpd, &probe);
+            reg_uri(s_httpd, &probe);
         }
         httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, http_404_error_handler);
     }

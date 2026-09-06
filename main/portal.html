@@ -1228,11 +1228,18 @@ function switchTab(tabId) {
   if (tabId === 'logs') {
     document.body.classList.add('fixed-height');
     loadLogLevel();
+    if (!logHistoryLoaded) loadLogHistory();
     renderLogTerminal(true);
   } else {
     document.body.classList.remove('fixed-height');
   }
   /* Lazy-load Settings tab data on first visit. */
+  if (tabId === 'settings') {
+    if (!tzData) {
+      var tzSel = document.getElementById('tz-select');
+      loadTimezoneList(tzSel ? tzSel.value : '');
+    }
+  }
   if (tabId === 'settings' && !settingsLoaded) {
     settingsLoaded = true;
     setLoading('display-sound-card', true);
@@ -1402,6 +1409,7 @@ function loadTimezones(savedTzName) {
   } else {
     sel.innerHTML = '<option value="">Select timezone…</option>';
   }
+  sel.onfocus = function() { if (!tzData) loadTimezoneList(this.value); };
   sel.onchange = function() { markDirty(this); updateTzStr(); };
 }
 
@@ -1681,7 +1689,7 @@ function loadStatus(data) {
       mdnsInput.setAttribute('data-dirty', 'false');
     }
 
-    setTimeout(function() { loadTimezoneList(d.tz_name || ''); }, 2000);
+    /* Timezone list is lazy-loaded when the Settings tab is opened */
 
     if (d.ssids && d.ssids.length > 0) {
       activeBlocks = d.ssids.length;
@@ -3062,18 +3070,28 @@ function handleLogData(text) {
 }
 
 var wsEvicted = false;
+var logHistoryLoaded = false;
+
+function loadLogHistory() {
+  if (logHistoryLoaded) return;
+  logHistoryLoaded = true;
+  fetch('/api/logs/history').then(function(r) { return r.text(); }).then(function(text) {
+    handleLogData(text);
+    renderLogTerminal(true);
+  }).catch(function() {
+    logHistoryLoaded = false;
+  });
+}
 
 function connectWs() {
   if (appWs) return;
   wsEvicted = false;
   setLogConnStatus('connecting');
 
-  /* Load initial log history on first connect if empty */
-  if (!logLines.length) {
-    fetch('/api/logs/history').then(function(r) { return r.text(); }).then(function(text) {
-      handleLogData(text);
-      renderLogTerminal(true);
-    }).catch(function() {});
+  /* Load log history only if the logs tab is already active */
+  var logsSec = document.getElementById('logs');
+  if (logsSec && logsSec.classList.contains('active') && !logHistoryLoaded) {
+    loadLogHistory();
   }
 
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -3244,17 +3262,33 @@ function fetchDays() {
     }).catch(function(){ dashDays = []; dashDaySet = {}; return []; });
 }
 
+var cachedOxiRecordings = null;
+var oxiRecordingsPromise = null;
+function getOxiRecordings(force) {
+  if (!force && cachedOxiRecordings) return Promise.resolve(cachedOxiRecordings);
+  if (!force && oxiRecordingsPromise) return oxiRecordingsPromise;
+  oxiRecordingsPromise = fetch('/api/oximetry/recordings').then(function(r){
+    if (!r.ok) return [];
+    return r.json();
+  }).then(function(arr){
+    cachedOxiRecordings = Array.isArray(arr) ? arr : [];
+    oxiRecordingsPromise = null;
+    return cachedOxiRecordings;
+  }).catch(function(){
+    oxiRecordingsPromise = null;
+    return [];
+  });
+  return oxiRecordingsPromise;
+}
+
 function fetchSpo2Days() {
-  return fetch('/api/oximetry/recordings').then(function(r){ return r.ok ? r.json() : []; })
-    .then(function(arr){
-      spo2DaySet = {};
-      if (Array.isArray(arr)) {
-        arr.forEach(function(rec){
-          if (rec.noon_day && rec.state === 'ready') spo2DaySet[rec.noon_day] = true;
-        });
-      }
-      return Object.keys(spo2DaySet);
-    }).catch(function(){ spo2DaySet = {}; return []; });
+  return getOxiRecordings().then(function(arr){
+    spo2DaySet = {};
+    arr.forEach(function(rec){
+      if (rec.noon_day && rec.state === 'ready') spo2DaySet[rec.noon_day] = true;
+    });
+    return Object.keys(spo2DaySet);
+  }).catch(function(){ spo2DaySet = {}; return []; });
 }
 
 function handleDateChange(val) { updateDateDisplayLabel(val); loadSessionData(); }
@@ -3442,10 +3476,7 @@ function loadOximetryData(noonDay) {
   var seq = ++oxLoadSeq;
   var status = document.getElementById('oximetry-status');
   Promise.all([
-    fetch('/api/oximetry/recordings').then(function(r){
-      if (!r.ok) throw new Error('oximetry list ' + r.status);
-      return r.json();
-    }),
+    getOxiRecordings(),
     fetch('/api/oximetry/diagnostics').then(function(r){ return r.ok ? r.json() : []; })
   ]).then(function(result) {
     if (seq !== oxLoadSeq) return;
@@ -3674,7 +3705,9 @@ function dashSetStatus(m) {
  * determinate percentage as waveform files download.  On mobile
  * (<=600px) the bar sticks below the header so it stays visible
  * even when the user has scrolled into the chart area. */
+var dashProgTimer = null;
 function dashProgShow(label, pct, sticky) {
+  if (dashProgTimer) { clearTimeout(dashProgTimer); dashProgTimer = null; }
   var wrap = document.getElementById('dash-progress');
   if (!wrap) return;
   wrap.style.display = 'block';
@@ -3688,6 +3721,7 @@ function dashProgShow(label, pct, sticky) {
   if (pc)  pc.textContent  = Math.round(pct) + '%';
 }
 function dashProgShimmer(label) {
+  if (dashProgTimer) { clearTimeout(dashProgTimer); dashProgTimer = null; }
   var wrap = document.getElementById('dash-progress');
   if (!wrap) return;
   wrap.style.display = 'block';
@@ -3701,6 +3735,7 @@ function dashProgShimmer(label) {
   if (pc)  pc.textContent  = '';
 }
 function dashProgError(msg) {
+  if (dashProgTimer) { clearTimeout(dashProgTimer); dashProgTimer = null; }
   var wrap = document.getElementById('dash-progress');
   if (!wrap) return;
   wrap.style.display = 'block';
@@ -3721,10 +3756,18 @@ function dashProgDone(label) {
   var txt  = document.getElementById('dash-progress-text');
   var pc   = document.getElementById('dash-progress-pct');
   if (fill) { fill.classList.remove('shimmer'); fill.style.width = '100%'; }
-  if (txt) txt.textContent = '';
-  if (pc)  pc.textContent  = '';
+  if (txt) txt.textContent = label || '';
+  if (pc)  pc.textContent  = '100%';
+  if (dashProgTimer) clearTimeout(dashProgTimer);
+  dashProgTimer = setTimeout(function() {
+    if (wrap && !dashIsLoading) {
+      wrap.style.display = 'none';
+      if (fill) fill.style.width = '0%';
+    }
+  }, 600);
 }
 function dashProgHide() {
+  if (dashProgTimer) { clearTimeout(dashProgTimer); dashProgTimer = null; }
   var wrap = document.getElementById('dash-progress');
   if (!wrap) return;
   wrap.style.display = 'none';
@@ -4665,9 +4708,9 @@ function loadDashboardData() {
       if (!(dashSessionData[idx] && dashSessionData[idx].noTherapy)) nFetch++;
     });
     if (nFetch === 0) nFetch = 1;  /* avoid div-by-zero */
-    /* Phase weights: overview 20%, pld 5%, detail 70% (brp L0 is the bulk).
-     * Events share the first 5% (shimmer phase). */
-    var W_EVENTS = 5, W_BRP_MM = 20, W_PLD = 5, W_BRP = 70;
+    /* Phase weights: overview MinMax 25%, pld 25%, detail 40% (flow L0).
+     * Events share the first 10% (shimmer phase). */
+    var W_EVENTS = 10, W_BRP_MM = 25, W_PLD = 25, W_BRP = 40;
 
     /* Initialize per-session data slots. Each holds two independent sources:
      * brp (flow + pressure, 25 Hz) and pld (leak/snore/flowlim, 0.5 Hz). */
@@ -4746,21 +4789,20 @@ function loadDashboardData() {
       return pldChain;
     }).then(function() {
       if (myLoadId !== dashLoadId) return;  /* cancelled */
+      /* ── Stage 1 Milestone: Overview is fully rendered & interactive! ── */
       renderSummary();   /* leak percentiles now computable from PLD samples */
       renderStreamQuality();
+      updateDashView();
       /* Cache the overview (L1 + PLD) */
       if (!isToday(dateStr)) {
         dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
       }
-      dashSetStatus('Loading detail...');
+      dashSetStatus('Syncing breath detail...');
       if (myLoadId === dashLoadId)
-        dashProgShow('Loading detail...', W_EVENTS + W_BRP_MM + W_PLD, true);
+        dashProgShow('Syncing breath detail...', W_EVENTS + W_BRP_MM + W_PLD, true);
 
-      /* Step 3: BRP L0 raw (background) — replaces the flow overview
-       * with full-resolution 25 Hz samples for zoom detail. Requests do not
-       * begin until all overview data is ready or failed.
-       * v2 format: fetch flow (1-ch: flow only).
-       * v1 (backwards compat): fetch brp (2-ch: flow + pressure). */
+      /* ── Stage 2: Continuous High-Res Upgrade (Immediate Background Pipeline) ──
+       * Fetches 25 Hz flow without delay. Graphs are already visible and interactive. */
       var l0Done = 0;
       var l0Chain = Promise.resolve();
       dashSessions.forEach(function(s, idx) {
@@ -4779,7 +4821,7 @@ function loadDashboardData() {
           }
           l0Done++;
           if (myLoadId === dashLoadId)
-            dashProgShow('Loading detail...', W_EVENTS + W_BRP_MM + W_PLD + W_BRP * l0Done / nFetch, true);
+            dashProgShow('Syncing breath detail...', W_EVENTS + W_BRP_MM + W_PLD + W_BRP * l0Done / nFetch, true);
         });
       });
 
@@ -5388,9 +5430,9 @@ window.onload = function() {
   var todayIso = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
   if (!PORTAL_MODE) {
     switchTab('dashboard');
-    Promise.all([fetchDays(), fetchSpo2Days()]).then(function(results) {
-      var days = results[0];
-      if (days.length) {
+    dashProgShimmer('Connecting & loading sessions...');
+    fetchDays().then(function(days) {
+      if (days && days.length) {
         var latestDay = days[days.length - 1].day;
         var latestIso = dayToIso(latestDay);
         if (picker) picker.value = latestIso;
@@ -5401,6 +5443,10 @@ window.onload = function() {
         updateDateDisplayLabel(todayIso);
         dashSetStatus('No sessions recorded yet');
       }
+    });
+    fetchSpo2Days().then(function() {
+      var el = document.getElementById('dash-calendar');
+      if (el && el.style.display === 'block') renderCalendar();
     });
   } else if (picker) {
     picker.value = todayIso;
