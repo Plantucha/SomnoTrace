@@ -1038,6 +1038,7 @@ Upload Progress
 <div class="card-title">System Status</div>
 <div class="info-row"><span class="info-label">Firmware</span><span class="info-value" id="status-fw">--</span></div>
 <div class="info-row"><span class="info-label">Built from</span><span class="info-value" id="status-repo">--</span></div>
+<div class="info-row" id="row-upstream" style="display:none"><span class="info-label">Upstream</span><span class="info-value" id="status-upstream">--</span></div>
 <div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="status-uptime">--</span></div>
 <div class="info-row"><span class="info-label">Local IP</span><span class="info-value" id="status-ip">--</span></div>
 <div id="status-nets"></div>
@@ -1769,6 +1770,17 @@ function loadStatusTab(d) {
   /* Which repository this firmware was built from. Absent on builds from before the
      stamp existed, so fall back rather than printing "undefined" at people. */
   setEl('status-repo', d.source_repo || '--');
+  /* The upstream project, shown ONLY when this build did not come from it — on an
+     official build the two are the same and a second identical line is just noise.
+     A local build ("local build") is not a fork and must not be labelled as one, so
+     it is excluded too: this row answers "what is this a fork of?", and the honest
+     answer for an unbuilt-by-CI tree is "nothing yet". */
+  var srcRepo = d.source_repo || '';
+  var upstream = d.upstream_repo || '';
+  var isFork = upstream && srcRepo && srcRepo !== upstream && srcRepo !== 'local build';
+  var upRow = document.getElementById('row-upstream');
+  if (upRow) upRow.style.display = isFork ? '' : 'none';
+  setEl('status-upstream', upstream || '--');
 
   /* Wi-Fi link state from the new nested object, with fallback to the
    * old flat fields for backward compatibility. */

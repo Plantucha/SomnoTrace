@@ -63,6 +63,13 @@ requirement is compatible with the GNU GPL and does not constitute a
       to remember to, and this term asks only that You not remove or falsify
       that identification.
 
+      The build also carries the name of the upstream project it descends from
+      (`SNT_UPSTREAM_REPO`), which the portal shows as "Upstream" whenever the
+      two differ. That value lives in the source tree rather than in the build
+      environment, so a modified version inherits it by copying the code. It is
+      the same attribution required by term (b) above, placed where a user of
+      the device can see it rather than only where a reader of this file can.
+
       NOTE ON WHAT THIS IS NOT. The stamp is provenance for honest builds, not
       an authenticity control: any string compiled into a binary can be copied
       by anyone rebuilding it, and this term does not claim otherwise. Proving
