@@ -1809,18 +1809,22 @@ function loadStatusTab(d) {
 
   /* Battery */
   var batt = d.battery || {};
-  if (batt.valid && batt.percent != null && batt.percent >= 0) {
-    var battStr = batt.percent + '%';
-    if (batt.millivolts != null) battStr += ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)';
-    if (batt.charging) battStr += ' \u26A1';
-    setEl('status-battery', battStr);
-  } else if (batt.valid && batt.charging) {
-    var battStr = '--%';
-    if (batt.millivolts != null) battStr += ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)';
-    battStr += ' \u26A1 (Calibrating)';
-    setEl('status-battery', battStr);
-  } else {
-    setEl('status-battery', 'USB Power (No battery)');
+  var battEl = document.getElementById('status-battery');
+  if (battEl) {
+    if (batt.valid && batt.percent != null && batt.percent >= 0) {
+      var battStr = batt.percent + '%';
+      if (batt.millivolts != null) battStr += ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)';
+      if (batt.charging) battStr += ' \u26A1';
+      battEl.textContent = battStr;
+      battEl.title = '';
+    } else if (batt.valid && batt.charging) {
+      var volt = batt.millivolts != null ? ' (' + (batt.millivolts / 1000).toFixed(2) + 'V)' : '';
+      battEl.innerHTML = '--%' + volt + ' \u26A1 <span title="With battery: unplug USB for 10\u201315s to calibrate (or charge to 100%). Without battery: turn off Battery Indicator in Settings." style="cursor:help;text-decoration:underline dotted">(Calibrating)</span>';
+      battEl.title = '';
+    } else {
+      battEl.textContent = 'USB Power (No battery)';
+      battEl.title = '';
+    }
   }
   setEl('status-tz', d.tz_name || 'UTC');
   var ntpEl = document.getElementById('status-ntp');
