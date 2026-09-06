@@ -1,0 +1,69 @@
+name: "Release build"
+# Builds the two distributable images the releases page carries today —
+# somnotrace-<ver>-full.bin (flashable at 0x0) and -ota.bin — through the repo's own
+# scripts/build-dist.sh, and ATTESTS them.
+#
+# WHY ATTEST. A string compiled into a binary proves nothing: anyone rebuilding the
+# source can copy it. A build attestation is different in kind — it is a signed
+# statement, made by GitHub's own workflow identity and recorded in a public
+# transparency log, binding this exact artifact digest to the repository, workflow and
+# commit that produced it. A fork building the same source gets an attestation naming
+# THE FORK, which is precisely the distinction a watermark cannot make on its own.
+#
+# It costs nothing on a public repository and adds seconds, not minutes.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write        # mint the OIDC token the attestation is signed against
+  attestations: write    # record the attestation on the repository
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags, not a shallow clone: build-dist.sh derives the version — and therefore
+          # the ARTIFACT FILENAMES — from `git describe --tags`. On a depth-1 clone every
+          # release would be published as somnotrace-0.0.0+1.g<sha>-full.bin.
+          fetch-depth: 0
+
+      - name: Build the distributable images
+        run: |
+          set -o pipefail
+          ./scripts/build-dist.sh 2>&1 | tee release-build.log
+          ls -l dist/
+
+      - name: Confirm both images exist and are plausible
+        # A release step that exits 0 having published nothing is the failure this
+        # catches. Sizes are a floor, not a checksum: an empty or truncated image is
+        # the realistic accident, not a subtly wrong one.
+        run: |
+          shopt -s nullglob
+          full=(dist/*-full.bin); ota=(dist/*-ota.bin)
+          [ ${#full[@]} -eq 1 ] || { echo "::error::expected exactly one -full.bin, got ${#full[@]}"; exit 1; }
+          [ ${#ota[@]}  -eq 1 ] || { echo "::error::expected exactly one -ota.bin, got ${#ota[@]}"; exit 1; }
+          for f in "${full[0]}" "${ota[0]}"; do
+            sz=$(stat -c %s "$f")
+            [ "$sz" -gt 1000000 ] || { echo "::error::$f is only $sz bytes"; exit 1; }
+            echo "$(basename "$f")  $sz bytes  sha256=$(sha256sum "$f" | cut -d' ' -f1)"
+          done
+
+      - name: Attest the images
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*-full.bin,dist/*-ota.bin"
+
+      - name: Upload the images
+        uses: actions/upload-artifact@v4
+        with:
+          name: somnotrace-images
+          path: |
+            dist/*-full.bin
+            dist/*-ota.bin
+          retention-days: 7
