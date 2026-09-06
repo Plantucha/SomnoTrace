@@ -40,6 +40,22 @@
 #include "snt_format.h"      /* clamp_i16, snt_missing_for, is_channel_map_valid */
 #include "edf_data_dict.h"   /* signal counts, spool_to_edf */
 #include "as11_time.h"
+#include "edf_internal.h"
+
+/* Minimal stubs for edf file I/O not under test */
+cJSON *edf_read_json_file(const char *p) { (void)p; return NULL; }
+esp_err_t edf_write_json_file(const char *p, const cJSON *j) { (void)p; (void)j; return -1; }
+uint8_t *edf_read_bin_file(const char *p, size_t *l) { (void)p; (void)l; return NULL; }
+FILE *edf_open_atomic_file(const char *p, char *t, size_t tl) { (void)p; (void)t; (void)tl; return NULL; }
+void edf_discard_atomic_file(FILE *f, const char *t) { (void)f; (void)t; }
+esp_err_t edf_finalize_atomic_file(FILE *f, const char *t, const char *p) { (void)f; (void)t; (void)p; return -1; }
+int edf_write_header(FILE *f, const char *pid, const char *rid, const char *sd, const char *st, int nr, const char *rd, const char *rf, const edf_signal_def_t *sig, int nsig) {
+    (void)f; (void)pid; (void)rid; (void)sd; (void)st; (void)nr; (void)rd; (void)rf; (void)sig; (void)nsig; return -1;
+}
+bool edf_write_all(FILE *f, const void *b, size_t s) { (void)f; (void)b; (void)s; return false; }
+uint16_t edf_crc16_ccitt(const uint8_t *d, size_t l) { (void)d; (void)l; return 0; }
+
+#include "edf_summary.c"
 
 /* ════════════════════════════════════════════════════════════════════
  *  Production code under test — included, never replicated.
@@ -48,7 +64,7 @@
  *  snt_missing_for, is_channel_map_valid, spool_to_edf and the recording-id
  *  formatter. A copy stays green when the shipped version changes, so the
  *  suite could not see a regression in the code it names. They are included
- *  from snt_format.h / edf_data_dict.h / as11_time.h now.
+ *  from snt_format.h / edf_data_dict.h / as11_time.h / edf_summary.c now.
  * ════════════════════════════════════════════════════════════════════ */
 
 
@@ -352,6 +368,146 @@ static void test_prop_16_recording_id_format(void)
     TEST_ASSERT(strcmp(out, expected) == 0, "PROP_16: Recording ID matches ResMed format specification exactly");
 }
 
+static void test_prop_17_str_mask_window_clamping(void)
+{
+    /* 2026-09-02 noon epoch ms */
+    int64_t noon_ms = as11_time_local_noon_epoch("20260902") * 1000;
+    summary_ctx_t ctx;
+    int16_t vals[STR_DATA_COUNT];
+    int16_t on_extra[20], off_extra[20];
+
+    /* 1. Arithmetic trap test: negative start (-15 min) with 45 min duration.
+     * Actual session interval is [-15, +30].
+     * Must clamp to [0, 30]. If off_min was computed from clamped start (0 + 45),
+     * off_min would be 45. We strictly assert vals[2] == 30 and vals[2] != 45. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.n_session_entries = 1;
+    ctx.session_entries[0].ts = noon_ms - 15LL * 60000LL;
+    ctx.session_entries[0].duration_min = 45;
+    int ev1 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev1 == 2, "PROP_17: Negative start session produces 2 mask events");
+    TEST_ASSERT(vals[1] == 0, "PROP_17: Negative start MaskOn clamped to 0");
+    TEST_ASSERT(vals[2] == 30, "PROP_17: MaskOff computed from true start (-15 + 45 = 30, not 0 + 45 = 45)");
+
+    /* 2. Cross-noon session: start 6:00 AM (1080 min) with 420 min duration (7h -> 13:00, 1500 min).
+     * Must clamp to [1080, 1440]. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.n_session_entries = 1;
+    ctx.session_entries[0].ts = noon_ms + 1080LL * 60000LL;
+    ctx.session_entries[0].duration_min = 420;
+    int ev2 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev2 == 2, "PROP_17: Cross-noon session produces 2 mask events");
+    TEST_ASSERT(vals[1] == 1080, "PROP_17: Cross-noon MaskOn is 1080");
+    TEST_ASSERT(vals[2] == 1440, "PROP_17: Cross-noon MaskOff clamped to 1440");
+
+    /* 3. Zero-overlap defensive skip: session ending before noon [-60, -30]. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.n_session_entries = 1;
+    ctx.session_entries[0].ts = noon_ms - 60LL * 60000LL;
+    ctx.session_entries[0].duration_min = 30;
+    int ev3 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev3 == 0, "PROP_17: Session ending before noon is skipped (0 events)");
+
+    /* 4. Zero-overlap defensive skip: session starting after next noon [1445, 1475]. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.n_session_entries = 1;
+    ctx.session_entries[0].ts = noon_ms + 1445LL * 60000LL;
+    ctx.session_entries[0].duration_min = 30;
+    int ev4 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev4 == 0, "PROP_17: Session starting after next noon is skipped (0 events)");
+
+    /* 5. Zero-overlap defensive skip: zero-duration at noon [0, 0]. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.n_session_entries = 1;
+    ctx.session_entries[0].ts = noon_ms;
+    ctx.session_entries[0].duration_min = 0;
+    int ev5 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev5 == 0, "PROP_17: Zero-duration session at noon is skipped (0 events)");
+
+    /* 6. Normal session regression: 23:00 to 07:00 [660, 1140]. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.n_session_entries = 1;
+    ctx.session_entries[0].ts = noon_ms + 660LL * 60000LL;
+    ctx.session_entries[0].duration_min = 480;
+    int ev6 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev6 == 2, "PROP_17: Normal overnight session produces 2 events");
+    TEST_ASSERT(vals[1] == 660, "PROP_17: Normal session MaskOn = 660");
+    TEST_ASSERT(vals[2] == 1140, "PROP_17: Normal session MaskOff = 1140");
+
+    /* 7. Multiple sessions: night session [600, 1000] and cross-noon session [1380, 1500]. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.n_session_entries = 2;
+    ctx.session_entries[0].ts = noon_ms + 600LL * 60000LL;
+    ctx.session_entries[0].duration_min = 400;
+    ctx.session_entries[1].ts = noon_ms + 1380LL * 60000LL;
+    ctx.session_entries[1].duration_min = 120;
+    int ev7 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev7 == 4, "PROP_17: Multi-session day produces 4 events");
+    TEST_ASSERT(vals[1] == 600 && vals[2] == 1000, "PROP_17: Multi-session first pair is 600..1000");
+    TEST_ASSERT(on_extra[0] == 1380 && off_extra[0] == 1440, "PROP_17: Multi-session second pair clamped to 1380..1440");
+
+    /* 8. Fallback coherence: Both PeriodStart and PeriodEnd before noon [-10, -2].
+     * Must NOT emit orphaned MaskOn = 0 with MaskOff = -1. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.has_scalar[SUM_F_PERIOD_START] = true;
+    ctx.scalars[SUM_F_PERIOD_START] = noon_ms - 10LL * 60000LL;
+    ctx.has_scalar[SUM_F_PERIOD_END] = true;
+    ctx.scalars[SUM_F_PERIOD_END] = noon_ms - 2LL * 60000LL;
+    int ev8 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev8 == 0, "PROP_17: Fallback wholly before noon produces 0 events (no orphaned half-pair)");
+    TEST_ASSERT(vals[1] == -1 && vals[2] == -1, "PROP_17: Fallback wholly before noon leaves MaskOn/MaskOff unset");
+
+    /* 9. Fallback cross-noon: PeriodStart before noon (-10 min) to +50 min. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.has_scalar[SUM_F_PERIOD_START] = true;
+    ctx.scalars[SUM_F_PERIOD_START] = noon_ms - 10LL * 60000LL;
+    ctx.has_scalar[SUM_F_PERIOD_END] = true;
+    ctx.scalars[SUM_F_PERIOD_END] = noon_ms + 50LL * 60000LL;
+    int ev9 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev9 == 2, "PROP_17: Fallback cross-noon produces 2 events");
+    TEST_ASSERT(vals[1] == 0, "PROP_17: Fallback cross-noon MaskOn clamped to 0");
+    TEST_ASSERT(vals[2] == 50, "PROP_17: Fallback cross-noon MaskOff is 50");
+
+    /* 10. Fallback overflow: PeriodStart 1080 to PeriodEnd 1500. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.has_scalar[SUM_F_PERIOD_START] = true;
+    ctx.scalars[SUM_F_PERIOD_START] = noon_ms + 1080LL * 60000LL;
+    ctx.has_scalar[SUM_F_PERIOD_END] = true;
+    ctx.scalars[SUM_F_PERIOD_END] = noon_ms + 1500LL * 60000LL;
+    int ev10 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev10 == 2, "PROP_17: Fallback overflow produces 2 events");
+    TEST_ASSERT(vals[1] == 1080, "PROP_17: Fallback overflow MaskOn is 1080");
+    TEST_ASSERT(vals[2] == 1440, "PROP_17: Fallback overflow MaskOff clamped to 1440");
+
+    /* 11. Live path clamping (collect_session_mask_pairs) */
+    mask_pair_t pair;
+    int got_live1 = collect_session_mask_pairs("/tmp", "dummy_sess", noon_ms, 0,
+                                               noon_ms - 5LL * 60000LL,
+                                               noon_ms + 25LL * 60000LL,
+                                               &pair, 1);
+    TEST_ASSERT(got_live1 == 1, "PROP_17: Live path negative-start produces 1 pair");
+    TEST_ASSERT(pair.on_min == 0, "PROP_17: Live path MaskOn clamped to 0");
+    TEST_ASSERT(pair.off_min == 25, "PROP_17: Live path MaskOff is 25");
+
+    int got_live2 = collect_session_mask_pairs("/tmp", "dummy_sess", noon_ms, 0,
+                                               noon_ms + 1100LL * 60000LL,
+                                               noon_ms + 1480LL * 60000LL,
+                                               &pair, 1);
+    TEST_ASSERT(got_live2 == 1, "PROP_17: Live path cross-noon produces 1 pair");
+    TEST_ASSERT(pair.on_min == 1100, "PROP_17: Live path MaskOn is 1100");
+    TEST_ASSERT(pair.off_min == 1440, "PROP_17: Live path MaskOff clamped to 1440");
+}
+
 int main(void)
 {
     /* PIN THE HOST ZONE. Two properties assert a recording_id, and
@@ -370,7 +526,7 @@ int main(void)
     setenv("TZ", "UTC", 1);
     tzset();
 
-    printf("=== Running Automated Host Property Test Suite (16/16 Properties) ===\n");
+    printf("=== Running Automated Host Property Test Suite (17/17 Properties) ===\n");
 
     test_prop_01_noon_day_boundaries();
     test_prop_02_timezone_offset_persistence();
@@ -388,6 +544,7 @@ int main(void)
     test_prop_14_ms_to_samples_rounding();
     test_prop_15_safe_denominator_guard();
     test_prop_16_recording_id_format();
+    test_prop_17_str_mask_window_clamping();
 
     printf("\n=== Property Test Results: %d Passed, %d Failed ===\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

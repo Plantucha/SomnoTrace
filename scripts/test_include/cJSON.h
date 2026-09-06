@@ -153,6 +153,27 @@ static inline void cJSON_AddNumberToObject(cJSON *obj, const char *name, double 
     cJSON_AddItemToArray(obj, item);
 }
 
+static inline void cJSON_AddNullToObject(cJSON *obj, const char *name)
+{
+    if (!obj) return;
+    cJSON *item = (cJSON *)calloc(1, sizeof(cJSON));
+    if (!item) return;
+    if (name) item->string = _test_strdup(name);
+    cJSON_AddItemToArray(obj, item);
+}
+
+static inline cJSON *cJSON_Parse(const char *json)
+{
+    (void)json;
+    return NULL;
+}
+
+static inline char *cJSON_PrintUnformatted(const cJSON *item)
+{
+    (void)item;
+    return NULL;
+}
+
 static inline void cJSON_Delete(cJSON *item)
 {
     if (!item) return;

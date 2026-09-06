@@ -883,21 +883,34 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
         int64_t event_ntp_ms = ctx->session_entries[i].ts + clock_drift_ms;
         int min_from_noon = (int)((event_ntp_ms - noon_epoch_ms) / 60000);
 
-        /* Both ends must fall inside the day window this record declares.
-         * A pair outside 0..1440 is exactly what OSCAR reports as "Mask times
-         * are out of range. Possible SDcard corruption" before discarding it,
-         * taking the whole day's session times with it.  If we ever compute
-         * one the bucket is wrong: drop the entry and say so, rather than
-         * emit a value the consumer will read as a corrupt card. */
-        {
-            int dur_chk = (int)ctx->session_entries[i].duration_min;
-            if (min_from_noon < 0 ||
-                min_from_noon + dur_chk > STR_MASK_MINUTES_MAX) {
-                ESP_LOGI(TAG, "STR.edf: %s session %d window %d..%d min is "
-                         "outside the day — entry skipped", day_label, i,
-                         min_from_noon, min_from_noon + dur_chk);
-                continue;
-            }
+        /* A pair outside 0..1440 is what OSCAR reports as "Mask times are out
+         * of range" and discards, taking the day's session times with it.
+         * Sessions crossing the noon boundary or affected by minor clock drift
+         * are clamped to [0, 1440], preserving continuous session data while
+         * maintaining a valid STR.edf record. Entries with zero overlap are skipped. */
+        int dur = (int)ctx->session_entries[i].duration_min;
+        int off_min = min_from_noon + dur;
+
+        /* Skip entries with zero overlap with this 24-hour day. */
+        if (off_min <= 0 || min_from_noon >= STR_MASK_MINUTES_MAX) {
+            ESP_LOGI(TAG, "STR.edf: %s session %d window %d..%d min is "
+                     "outside the day — entry skipped", day_label, i,
+                     min_from_noon, off_min);
+            continue;
+        }
+
+        /* Clamp overlapping boundaries to [0, 1440].
+         * Clamping happens AFTER off_min calculation so off_min reflects
+         * the session's actual end time, not an artificially shifted one. */
+        if (min_from_noon < 0) {
+            ESP_LOGD(TAG, "STR.edf: %s session %d MaskOn %d clamped to 0",
+                     day_label, i, min_from_noon);
+            min_from_noon = 0;
+        }
+        if (off_min > STR_MASK_MINUTES_MAX) {
+            ESP_LOGD(TAG, "STR.edf: %s session %d MaskOff %d clamped to %d",
+                     day_label, i, off_min, STR_MASK_MINUTES_MAX);
+            off_min = STR_MASK_MINUTES_MAX;
         }
 
         if (mask_on_count == 0)
@@ -906,10 +919,6 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
             mask_on_extra[mask_on_count - 1] = (int16_t)min_from_noon;
         mask_on_count++;
 
-        /* MaskOff = MaskOn + per-session duration (from spool, verified
-         * against AS11 export). 0-duration → MaskOff = MaskOn. */
-        int dur = (int)ctx->session_entries[i].duration_min;
-        int off_min = min_from_noon + dur;
         if (mask_off_count == 0)
             str_values[2] = (int16_t)off_min;
         else
@@ -917,21 +926,23 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
         mask_off_count++;
     }
 
-    /* Fallback: use PeriodStart/PeriodEnd if no session entries */
-    if (mask_on_count == 0 && ctx->has_scalar[SUM_F_PERIOD_START]) {
+    /* Fallback: use PeriodStart/PeriodEnd if no session entries.
+     * Evaluated as a pair to prevent orphaned half-pairs. */
+    if (mask_on_count == 0 && mask_off_count == 0 &&
+        ctx->has_scalar[SUM_F_PERIOD_START] && ctx->has_scalar[SUM_F_PERIOD_END]) {
         int64_t ps_ntp = ctx->scalars[SUM_F_PERIOD_START] + clock_drift_ms;
-        int min_from_noon = (int)((ps_ntp - noon_epoch_ms) / 60000);
-        if (min_from_noon >= 0 && min_from_noon <= STR_MASK_MINUTES_MAX) {
-            str_values[1] = (int16_t)min_from_noon;
-            mask_on_count = 1;
-        }
-    }
-    if (mask_off_count == 0 && ctx->has_scalar[SUM_F_PERIOD_END]) {
         int64_t pe_ntp = ctx->scalars[SUM_F_PERIOD_END] + clock_drift_ms;
-        int min_from_noon = (int)((pe_ntp - noon_epoch_ms) / 60000);
-        if (min_from_noon >= 0 && min_from_noon <= STR_MASK_MINUTES_MAX) {
-            str_values[2] = (int16_t)min_from_noon;
-            mask_off_count = 1;
+        int on = (int)((ps_ntp - noon_epoch_ms) / 60000);
+        int off = (int)((pe_ntp - noon_epoch_ms) / 60000);
+        if (off > 0 && on < STR_MASK_MINUTES_MAX) {
+            if (on < 0) on = 0;
+            if (off > STR_MASK_MINUTES_MAX) off = STR_MASK_MINUTES_MAX;
+            if (on < off) {
+                str_values[1] = (int16_t)on;
+                str_values[2] = (int16_t)off;
+                mask_on_count = 1;
+                mask_off_count = 1;
+            }
         }
     }
 
@@ -1054,13 +1065,15 @@ static int collect_session_mask_pairs(const char *session_dir,
         int off = (i < n_off) ? off_min[i] : on;
         if (off < on) off = on;
 
-        /* Never emit a window outside the day this record declares — see
-         * STR_MASK_MINUTES_MAX. */
-        if (on < 0 || off > STR_MASK_MINUTES_MAX) {
+        /* Skip entries with zero overlap with this 24-hour day. */
+        if (off <= 0 || on >= STR_MASK_MINUTES_MAX) {
             ESP_LOGI(TAG, "STR.edf: %s window %d..%d min is outside the day "
                      "— entry skipped", session_id, on, off);
             continue;
         }
+        /* Clamp overlapping boundaries to [0, 1440]. */
+        if (on < 0) on = 0;
+        if (off > STR_MASK_MINUTES_MAX) off = STR_MASK_MINUTES_MAX;
         out[written].on_min = on;
         out[written].off_min = off;
         written++;
