@@ -70,11 +70,24 @@ requirement is compatible with the GNU GPL and does not constitute a
       the same attribution required by term (b) above, placed where a user of
       the device can see it rather than only where a reader of this file can.
 
-      NOTE ON WHAT THIS IS NOT. The stamp is provenance for honest builds, not
-      an authenticity control: any string compiled into a binary can be copied
-      by anyone rebuilding it, and this term does not claim otherwise. Proving
-      that a binary came from a particular repository requires a signature over
-      the artifact, which is a separate mechanism and not a licence condition.
+      WHAT THIS IS FOR. Two things, neither of them enforcement. First, a user
+      can tell whose build they are running: this Program is distributed with no
+      warranty and is not a medical device, and that disclaimer is made by the
+      original author about the code the original author wrote. A modified
+      version may behave differently in ways its own author understands and the
+      original author has never seen, and a user is entitled to know which one
+      is on the device in front of them. Second, it keeps the attribution
+      required by term (b) present by default, so that a modified version which
+      simply builds the code credits its origin without anyone having to
+      remember to.
+
+      NOTE ON WHAT THIS IS NOT. It is not an authenticity control. Any string
+      compiled into a binary can be changed by whoever rebuilds it, exactly as
+      this file can, and this term does not pretend otherwise. Its value is that
+      the honest path is the default one and removal becomes deliberate rather
+      than accidental. Proving that a binary came from a particular repository
+      requires a signature over the artifact, which is a separate mechanism and
+      not a licence condition.
 
 ================================================================================
 DUAL / COMMERCIAL LICENSING
