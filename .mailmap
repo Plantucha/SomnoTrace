@@ -1,0 +1,9 @@
+# Canonical author identities for `git shortlog`, `git log --author` and any
+# contributor list generated from the history.
+#
+# Format: <canonical name> <canonical email> <name as committed> <email as committed>
+#
+# This file changes NOTHING about the commits themselves — mailmap is a display
+# mapping applied by git at read time. No history is rewritten.
+
+Michal Planicka <plantucha@gmail.com> Plantucha <plantucha@gmail.com>
