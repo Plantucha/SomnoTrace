@@ -2008,8 +2008,9 @@ static void reconnect_task(void *arg)
         /* Two-phase retry:
          * Phase 1 — fast: 3 attempts with 2-4s backoff for transient disconnect
          *   (AS11 needs a few seconds to restart advertising).
-         * Phase 2 — slow: retry every 60s indefinitely for when the AS11 is off
-         *   at boot and turned on later.  Without this, a single failed
+         * Phase 2 — slow: 60s backoff between attempts for when the AS11 is off
+         *   at boot and turned on later (with 30s BLE connect timeout, giving a
+         *   ~90s overall cycle).  Without this, a single failed
          *   reconnect_task at boot means the ST never connects to the AS11
          *   until manually rebooted. */
         bool connected = false;
@@ -2050,7 +2051,7 @@ static void reconnect_task(void *arg)
                 return;
             }
             slow_attempt++;
-            ESP_LOGI(TAG, "reconnect: slow retry %d in 60s...", slow_attempt);
+            ESP_LOGI(TAG, "reconnect: waiting 60s before slow retry %d...", slow_attempt);
             for (int i = 0; i < 60; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 if (!s_pair_cache.valid || s_manual_disconnect) break;
@@ -2062,6 +2063,7 @@ static void reconnect_task(void *arg)
                 return;
             }
             set_state(AS11_STATUS_CONNECTING);
+            ESP_LOGI(TAG, "reconnect: slow retry %d connecting...", slow_attempt);
             if (do_connect_and_discover() == ESP_OK) {
                 connected = true;
                 break;
