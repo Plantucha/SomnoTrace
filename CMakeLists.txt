@@ -85,6 +85,34 @@ endif()
 
 set(PROJECT_VER "${FIRMWARE_VERSION}")
 
+# ── Source repository stamp ─────────────────────────────────────────────────
+# WHICH REPOSITORY THIS BINARY WAS BUILT FROM, decided at build time rather than
+# written into the source. A fork that builds through its own CI stamps its own
+# slug without anyone having to remember to: GITHUB_REPOSITORY is set by GitHub
+# Actions for every run, in every fork, and cannot be inherited by accident.
+#
+# ⚠️ THIS IS NOT AN AUTHENTICITY CONTROL and must never be presented as one. Any
+# string compiled into a binary can be copied verbatim by anyone rebuilding it.
+# It answers "where did this build come from?" honestly for honest builds, which
+# is what makes the GPLv3 §7 attribution easy to comply with rather than a chore.
+# Proving origin needs a signature over the artifact, which is a separate matter.
+if(DEFINED ENV{GITHUB_REPOSITORY})
+    set(SOURCE_REPO "$ENV{GITHUB_REPOSITORY}")
+else()
+    set(SOURCE_REPO "local build")
+endif()
+message(STATUS "Source repository: ${SOURCE_REPO}")
+add_compile_definitions(SNT_SOURCE_REPO="${SOURCE_REPO}")
+
+# The project this source descends from. Unlike SOURCE_REPO above this is NOT read
+# from the environment: it travels IN THE TREE, so a fork inherits it by copying the
+# code and would have to edit this line deliberately to remove it. That is the point.
+# SOURCE_REPO alone answers "where was this built?", which leaves a fork's portal
+# naming a repository the reader has no reference point for; this answers "what is it
+# a fork OF?", which is the attribution NOTICE already requires be preserved.
+set(UPSTREAM_REPO "ilyakruchinin/SomnoTrace")
+add_compile_definitions(SNT_UPSTREAM_REPO="${UPSTREAM_REPO}")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(somnotrace)
