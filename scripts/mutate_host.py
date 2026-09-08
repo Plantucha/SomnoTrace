@@ -193,12 +193,25 @@ def executed_lines(outdir: str) -> dict[str, set[int]] | None:
                         if not m or src is None:
                             continue
                         cnt, num = m.group(1).strip(), int(m.group(2))
-                        # Only three markers mean "not executed". Everything else — a count, a
-                        # count with gcov's '*' partial-branch suffix ("9*"), or a form this parser
-                        # has never seen — is REACHED. The first version accepted only [#\-0-9=] and
-                        # so silently dropped every "N*" line: the ternaries and short-circuits,
-                        # i.e. the lines mutation exists to test, all reported as UNREACHED.
-                        if num and cnt not in ("#####", "=====", "-"):
+                        # Two markers mean "executable but never executed": ##### and =====. A count, a
+                        # count with gcov's "*" partial-branch suffix ("9*"), or a form this parser has
+                        # never seen are all REACHED. The first version accepted only [#\-0-9=] and so
+                        # silently dropped every "N*" line: the ternaries and short-circuits, i.e. the
+                        # lines mutation exists to test, all reported as UNREACHED.
+                        #
+                        # "-" WAS ON THAT LIST AND SHOULD NOT HAVE BEEN. It does not mean "never
+                        # executed"; it means the line carries no executable code OF ITS OWN, which is
+                        # what gcov prints for the CONTINUATION lines of a multi-line expression:
+                        #       20:   57:    if (!data || !out || len < OX_VLD3_HEADER_LEN ||
+                        #        -:   58:        source_size < OX_VLD3_HEADER_LEN + OX_VLD3_RECORD_LEN)
+                        # The whole condition is charged to line 57 and line 58 gets "-", so a mutant on
+                        # 58 was reported UNREACHED -- "write a test that reaches it" for a line executed
+                        # twenty times -- and a test that DID kill it could not clear the report. Every
+                        # wrapped condition in the tree was affected, which is most of the interesting
+                        # ones. Reach is UNKNOWN for such a line, and unknown is fail-closed here: keep
+                        # it, run the mutant, let the suite answer. Same shape as the "N*" bug above:
+                        # a gcov form the parser did not understand, read as absence.
+                        if num and cnt not in ("#####", "====="):
                             cov.setdefault(src, set()).add(num)
                 ok_any = True
             except OSError:
