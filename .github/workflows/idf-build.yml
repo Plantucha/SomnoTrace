@@ -1,0 +1,78 @@
+name: "IDF build"
+# Compiles the ESP32-S3 firmware, which the host tests structurally cannot: they build
+# host-compatible C with gcc, so a broken FreeRTOS call, a missing component CMakeLists, a Kconfig
+# that no longer applies or an app that outgrew its partition all pass them and fail the device.
+#
+# ⚠️ THE IDF VERSION IS DELIBERATELY NOT WRITTEN HERE. The repo already pins it twice — once in
+# `.devcontainer/devcontainer.json` and once as `IDF_TAG` in `scripts/idf.sh` — and a third copy in a
+# file nobody edits during an IDF bump is a pin that silently stops matching. This job runs the same
+# `./scripts/idf.sh build` a developer runs, so CI follows that pin automatically and builds through
+# the wrapper rather than around it. Overriding is still one variable: `IDF_TAG=v5.6 ./scripts/idf.sh`.
+on:
+  push:
+    paths:
+      - "main/**"
+      - "components/**"
+      - "third_party/**"
+      - "CMakeLists.txt"
+      - "sdkconfig.defaults"
+      - "partitions.csv"
+      - "scripts/idf.sh"
+      - "scripts/build-dist.sh"
+      - "scripts/gen_tz_db.py"
+      - ".github/workflows/idf-build.yml"
+  pull_request:
+    paths:
+      - "main/**"
+      - "components/**"
+      - "third_party/**"
+      - "CMakeLists.txt"
+      - "sdkconfig.defaults"
+      - "partitions.csv"
+      - "scripts/idf.sh"
+      - "scripts/build-dist.sh"
+      - "scripts/gen_tz_db.py"
+      - ".github/workflows/idf-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  idf-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # FULL history and tags, not the default depth-1. The top-level CMakeLists derives
+          # PROJECT_VER from `git describe --tags --long --dirty`, and that is what ends up in
+          # esp_app_desc_t.version and on the portal's version line. On a shallow clone describe
+          # fails and the fallback yields `0.0.0+1.g<sha>` — a build that succeeds while stamping
+          # the firmware with a version that is not the firmware's.
+          fetch-depth: 0
+
+      - name: Build firmware
+        # The runner's default shell is `bash -e` WITHOUT pipefail, so a failing build piped into
+        # tee would report the exit status of tee — the same fail-open that made a broken host suite
+        # go green before it was caught (see host-tests.yml).
+        run: |
+          set -o pipefail
+          ./scripts/idf.sh build 2>&1 | tee idf-build.log
+
+      - name: Confirm an image was actually produced
+        # A build step can exit 0 having produced nothing if the toolchain is ever invoked wrongly.
+        # Name the artifact and the version the log claims, so a green run says what it built.
+        run: |
+          test -f build/somnotrace.bin || {
+            echo "::error::idf.py build exited 0 but build/somnotrace.bin does not exist"; exit 1; }
+          echo "image: $(stat -c '%n %s bytes' build/somnotrace.bin)"
+          grep -m1 'Firmware version:' idf-build.log || echo "::warning::no version line in the build log"
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idf-build-log
+          path: idf-build.log
+          retention-days: 7
