@@ -1869,9 +1869,16 @@ static esp_err_t upload_config_post_handler(httpd_req_t *req)
  * password input the user never touched shows bullets, and sending those back would probe with a
  * literal string of bullets. Present-but-empty is NOT the same thing — it is how a user clears a
  * password to test a guest share, so it must reach the backend as an empty string. */
-/* The eight U+2022 BULLETs the portal shows in a password field it has not been given. Kept as one
- * literal so the sentinel is greppable from both sides of the wire. */
-#define UPLOAD_TEST_PW_KEEP "â¢â¢â¢â¢â¢â¢â¢â¢"
+/* The overlay fields together are well under 600 bytes; an unbounded read on the httpd task
+ * is how a request turns into a heap exhaustion. */
+#define UPLOAD_TEST_BODY_MAX 1024
+
+/* The eight U+2022 BULLETs the portal shows in a password field it has not been given. Kept as
+ * one literal so the sentinel is greppable from both sides of the wire, and spelled as hex
+ * escapes because written as bullets it survives an editor round-trip only until something
+ * re-encodes the file -- and a sentinel that silently stops matching is a stored password
+ * overwritten with eight literal bullets. */
+#define UPLOAD_TEST_PW_KEEP "\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2"
 static void cfg_str_from(const cJSON *root, const char *key, char *dst, size_t dst_len)
 {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, key);
@@ -1890,9 +1897,9 @@ static bool upload_test_read_overrides(httpd_req_t *req, uploader_config_t *out)
 {
     int len = req->content_len;
     if (len <= 0) return false;
-    /* Bounded hard. The fields together are well under 600 bytes, and an unbounded read on the
-     * httpd task is how a request turns into a heap exhaustion. */
-    if (len > 1024) return false;
+    /* The bound is the CALLER's: over-sized bodies are refused with a 413 there, because
+     * returning from here without draining the socket desynchronises a keep-alive
+     * connection -- the next request reads the leftover payload as its headers. */
     char *body = malloc((size_t)len + 1);
     if (!body) return false;
     int got = 0;
@@ -1923,6 +1930,10 @@ static esp_err_t upload_test_send(httpd_req_t *req, const char *backend_id)
     bool ok = false;
     char msg[192];
     uploader_config_t form;
+    if (req->content_len > UPLOAD_TEST_BODY_MAX) {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "request body too large");
+        return ESP_FAIL;
+    }
     const uploader_config_t *use = upload_test_read_overrides(req, &form) ? &form : NULL;
     esp_err_t err = uploader_test_connection(backend_id, use, &ok, msg, sizeof(msg));
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
