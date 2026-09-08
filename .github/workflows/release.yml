@@ -23,6 +23,11 @@ permissions:
 
 jobs:
   release:
+    # Only the upstream repository publishes releases. A fork that pushes a v* tag
+    # would otherwise mint an attestation naming the fork and upload images that look
+    # official; the attestation would be honest about its origin, but the artifacts
+    # would still be sitting on a releases page. Requested in discussion #223.
+    if: github.repository == 'ilyakruchinin/SomnoTrace'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
