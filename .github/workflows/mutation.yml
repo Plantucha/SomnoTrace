@@ -1,0 +1,50 @@
+name: "Mutation check"
+# Runs scripts/mutants.py, which has been in this repo since #207 with nothing invoking it.
+#
+# WHAT IT ADDS OVER THE HOST TESTS. Those answer "do the tests pass?". This answers "would
+# the tests have caught it?" — it plants a known defect in the exporter and fails if the
+# suite still goes green. A test that passes against broken code is worse than no test,
+# because it reports safety it does not provide.
+#
+# IT REFUSES RATHER THAN GUESSES. The harness runs a baseline (must pass), a canary (a
+# planted mutant that MUST die), and reports VOID with a non-zero exit if either control
+# fails — so a run that measured nothing can never be read as a run that found nothing.
+# That is why this job can be blocking: its failure modes are loud by construction.
+on:
+  push:
+    paths: ["main/**", "scripts/**", ".github/workflows/mutation.yml"]
+  pull_request:
+    paths: ["main/**", "scripts/**", ".github/workflows/mutation.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcjson
+        # Same dependency the host tests need; without it the harness SKIPS the two suites
+        # that cover the exporter and correctly reports VOID rather than a kill count.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends libcjson-dev
+
+      - name: Run the mutation check
+        run: |
+          set -o pipefail
+          python3 scripts/mutants.py 2>&1 | tee mutants.log
+          tail -1 mutants.log | grep -qE '^[0-9]+/[0-9]+ mutants killed' \
+            || { echo "::error::no kill-count line — the run did not complete"; exit 1; }
+
+      - name: Upload the mutation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-log
+          path: mutants.log
+          retention-days: 7
