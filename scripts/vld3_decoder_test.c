@@ -113,6 +113,29 @@ int main(void)
     make_header(header, 0, 2026, 1, 1, 120, 480);
     assert(!ox_vld3_parse_header(header, sizeof(header), 639, &parsed));
 
+    /* The smallest source a VLD3 file can be: the 40-byte header plus exactly one
+       5-byte record. 45 must parse -- a single record is still a recording -- and 44
+       must not, because no whole record follows the header.
+
+       This bound had no test. scripts/mutate_host.py reported oximetry_vld3.c:58 as
+       UNREACHED, meaning relaxing `source_size <` to `<=` -- which rejects a valid
+       45-byte file -- was a change no test could see. The 639 case above exercises the
+       record-alignment check on the line below it, not this one.
+
+       Note 44 is rejected by this guard before the alignment check would also have
+       rejected it, so only the 45 case pins the guard itself. */
+    make_header(header, 0, 2026, 8, 29, 1, 4);
+    assert(ox_vld3_parse_header(header, sizeof(header), 45, &parsed));
+    assert(parsed.sample_count == 1 && parsed.period_us == 4000000);
+    assert(parsed.declared_size_matches);
+    assert(!ox_vld3_parse_header(header, sizeof(header), 44, &parsed));
+
+    /* ...and the 2 s cadence at the same floor, so the bound is not accidentally
+       tied to one sampling mode. */
+    make_header(header, 1, 2026, 8, 29, 1, 2);
+    assert(ox_vld3_parse_header(header, sizeof(header), 45, &parsed));
+    assert(parsed.sample_count == 1 && parsed.period_us == 2000000);
+
     assert(!ox_vld3_parse_header(NULL, sizeof(header), 640, &parsed));
     assert(!ox_vld3_parse_header(header, sizeof(header), 640, NULL));
 
