@@ -87,6 +87,24 @@ void upload_sched_set_busy_fn(upload_sched_busy_fn_t fn);
  * "Test connection" probe does not open a second transport alongside it. */
 bool upload_sched_uploading(void);
 
+/* Claim the single transport slot for a "Test connection" probe (#214.1).
+ *
+ * upload_sched_uploading() alone is CHECK-THEN-ACT: it reports the state at the
+ * instant it is asked, and a scheduled pass can start in the gap between that
+ * answer and the probe opening its socket -- roughly a 10 s window, since that
+ * is how long a probe takes.  These two close it from both sides: begin() tests
+ * and sets under the same mutex that guards the runtime slots, and the
+ * scheduler refuses to start a pass while the claim is held.
+ *
+ * Returns false when a run is already in flight (or another probe holds the
+ * claim), in which case NOTHING is claimed and the caller must not probe.
+ * Every successful begin() MUST be paired with end(); a claim that is never
+ * released expires by itself after UPLOAD_PROBE_MAX_MS so a crashed probe
+ * cannot wedge uploads for the rest of the uptime. */
+#define UPLOAD_PROBE_MAX_MS 60000
+bool upload_sched_probe_begin(void);
+void upload_sched_probe_end(void);
+
 /* Compact progress for the Web UI.  Caller frees. */
 esp_err_t upload_sched_progress_json(char **out_json);
 
