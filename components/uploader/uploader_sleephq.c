@@ -562,20 +562,52 @@ static esp_err_t shq_wait_import(esp_tls_t *tls, const char *import_id)
         char *body = NULL; size_t body_len = 0;
         int status = shq_http_request(tls, "GET", path, NULL, s_token,
                                        NULL, NULL, &body, &body_len);
-        if (status < 200 || status >= 300) { free(body); return ESP_FAIL; }
-        cJSON *root = cJSON_Parse(body); free(body);
-        if (!root) return ESP_FAIL;
+        /* Every failure below used to return the same bare ESP_FAIL, and the caller
+         * reports all of them as "import processing failed for day <d>" -- which reads
+         * as "SleepHQ rejected the import" whichever one actually happened. Three
+         * different causes wearing one message is why #151 could run for weeks without
+         * the cause being identifiable from a log. Say which.
+         *
+         * Measured on the log attached to #151: the failing GET returns HTTP 200 with a
+         * 1971-byte body, well under the read cap, so the body is NOT truncated and the
+         * failure is decided in the lines below -- but which line is not recoverable
+         * from the log as it stands. */
+        if (status < 200 || status >= 300) {
+            ESP_LOGW(TAG, "import %s: status query returned HTTP %d", import_id, status);
+            free(body);
+            return ESP_FAIL;
+        }
+        cJSON *root = cJSON_Parse(body);
+        if (!root) {
+            /* A body we cannot parse is OUR problem, not SleepHQ's verdict. The length
+             * and the head of it separate the cases: a truncated body shows a length at
+             * the read cap, a de-chunking fault shows hex chunk prefixes in the text. */
+            ESP_LOGW(TAG, "import %s: unparseable status body (%u bytes): %.120s",
+                     import_id, (unsigned)body_len, body ? body : "(null)");
+            free(body);
+            return ESP_FAIL;
+        }
+        free(body);
         cJSON *data = cJSON_GetObjectItem(root, "data");
         cJSON *attrs = data ? cJSON_GetObjectItem(data, "attributes") : NULL;
         cJSON *st = attrs ? cJSON_GetObjectItem(attrs, "status") : NULL;
         const char *name = cJSON_IsString(st) ? st->valuestring : "";
         bool complete = strcmp(name, "complete") == 0 || strcmp(name, "completed") == 0;
         bool failed = strcmp(name, "failed") == 0 || strcmp(name, "error") == 0;
+        if (failed || (!name[0] && attempt == 0)) {
+            /* The remote verdict, verbatim. An absent status means the reply was not the
+             * shape we expect, which is a different bug from a rejected import -- warn on
+             * the first poll only, since that case still retries and would otherwise log
+             * thirty times. Behaviour is unchanged by this commit; only what it says is. */
+            ESP_LOGW(TAG, "import %s: remote status \"%s\" after %d poll(s)",
+                     import_id, name[0] ? name : "(absent)", attempt + 1);
+        }
         cJSON_Delete(root);
         if (complete) return ESP_OK;
         if (failed) return ESP_FAIL;
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
+    ESP_LOGW(TAG, "import %s: still not complete after 30 polls (~60 s)", import_id);
     return ESP_ERR_TIMEOUT;
 }
 
