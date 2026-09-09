@@ -66,14 +66,56 @@ have_sh=$(shellcheck --version | awk '/^version:/{print $2}')
 # the repo has a single board that is the whole picture; the day a second one lands this
 # wants a matrix, exactly as the build job does, or the unbuilt board goes unlinted —
 # which is the failure this comment exists to prevent recurring.
-compile_db() {
-    [ -f build/compile_commands.json ] || ./scripts/idf.sh reconfigure >/dev/null 2>&1
-    [ -f build/compile_commands.json ] || return 1
-    python3 - "$PWD" <<'PYEOF'
-import json, os, sys
-root = sys.argv[1]
+# Every board configuration, not just whichever one happens to be configured.
+#
+# ⚠️ THIS IS THE WHOLE POINT AND IT IS EASY TO GET WRONG. `idf.py reconfigure` uses the
+# sdkconfig already in the tree, so on a clean checkout it silently picks the DEFAULT
+# board and the database contains only that board's sources. A file compiled solely under
+# `if(CONFIG_SOMNOTRACE_BOARD_X)` is then never analysed, and the gate reports a clean
+# tier it did not earn.
+#
+# That is not hypothetical: measured on a 92,000-line branch whose new sources are all
+# behind such a guard, a clean checkout gave 3 findings and the same tree with that board
+# configured gave 15 -- including an out-of-bounds array read on the OTA failure path.
+# The first run looked like a pass.
+#
+# So: enumerate the sdkconfig defaults the repo ships and lint each resulting
+# configuration, unioning the findings. With one board this is exactly the old behaviour
+# and costs one reconfigure. It stops being a no-op the moment a second board lands,
+# which is when a single-configuration gate would otherwise start lying.
+lint_configs() {
+    local base="sdkconfig.defaults" extra
+    [ -f "$base" ] || base=""
+    printf '%s\n' "${base:-<none>}"
+    for extra in sdkconfig.*.defaults; do
+        [ -e "$extra" ] || continue
+        [ "$extra" = "$base" ] && continue
+        printf '%s;%s\n' "$base" "$extra"
+    done
+}
+
+# One configuration -> one filtered, path-rewritten compile database. Echoes the unit
+# count; writes .lint-compile-db.json.
+compile_db_for() {
+    local defaults="$1" bdir="$2"
+    # ⚠️ SDKCONFIG_DEFAULTS ONLY APPLIES WHEN THERE IS NO sdkconfig YET. Once one exists
+    # in the tree it wins, every later configuration silently resolves to the first, and
+    # the run reports N configurations that were all the same one. Measured: four
+    # "configurations" each reporting an identical 55 translation units, none of them the
+    # board being asked for. Give each its own SDKCONFIG path so the defaults are actually
+    # read, and so no run leaves a tree-level sdkconfig behind to poison the next.
+    if [ "$defaults" = "<none>" ]; then
+        ./scripts/idf.sh -B "$bdir" -D SDKCONFIG="$bdir/sdkconfig" reconfigure >/dev/null 2>&1
+    else
+        ./scripts/idf.sh -B "$bdir" -D SDKCONFIG="$bdir/sdkconfig" \
+                         -D SDKCONFIG_DEFAULTS="$defaults" reconfigure >/dev/null 2>&1
+    fi
+    [ -f "$bdir/compile_commands.json" ] || return 1
+    python3 - "$PWD" "$bdir" <<'PYEOF'
+import json, sys
+root, bdir = sys.argv[1], sys.argv[2]
 try:
-    db = json.load(open("build/compile_commands.json"))
+    db = json.load(open(f"{bdir}/compile_commands.json"))
 except Exception:
     sys.exit(1)
 keep = []
@@ -127,33 +169,41 @@ CPPCHECK_COMMON=(--std=c11 --language=c --inline-suppr
                  --template='{severity}: {file}:{line}: {message} [{id}]')
 
 rc=0
+: > /tmp/lint-style.$$
+n_cfg=0
+any_db=0
 
-if units=$(compile_db); then
-    # ABSOLUTE path, deliberately. Given a RELATIVE --project, cppcheck normalises the
-    # paths it reports differently and the path-glob suppressions below stop matching --
-    # silently, with no warning, so the gate goes red on LVGL and Espressif code.
-    # Measured: --project=.lint-compile-db.json leaves 2 third-party findings,
-    # --project=$PWD/.lint-compile-db.json leaves 0. Same file, same flags.
-    CPP_TARGET=(--project="$PWD/.lint-compile-db.json")
-    printf '\n▸ cppcheck — driven by the compile database (%s translation units)\n' "$units"
-else
-    CPP_TARGET=(main components)
-    printf '\n▸ cppcheck — NO COMPILE DATABASE, falling back to a directory scan\n'
-    printf '  This is the weaker check: no -D, no include paths, no idea which branch of\n'
-    printf '  an #if is live. Sources selected by Kconfig may go unanalysed entirely.\n'
-    printf '  Needs Docker (or a prior build). See the note above compile_db().\n'
-fi
+while IFS= read -r cfg; do
+    n_cfg=$((n_cfg + 1))
+    bdir="build-lint-$n_cfg"
+    if units=$(compile_db_for "$cfg" "$bdir"); then
+        any_db=1
+        CPP_TARGET=(--project="$PWD/.lint-compile-db.json")
+        printf '\n▸ cppcheck — configuration %s (%s translation units)\n' \
+               "$([ "$cfg" = "<none>" ] && echo "default" || echo "$cfg")" "$units"
+    else
+        CPP_TARGET=(main components)
+        printf '\n▸ cppcheck — NO COMPILE DATABASE for %s, falling back to a directory scan\n' "$cfg"
+        printf '  This is the weaker check: no -D, no include paths, no idea which branch of\n'
+        printf '  an #if is live. Sources selected by Kconfig may go unanalysed entirely.\n'
+        printf '  Needs Docker (or a prior build).\n'
+    fi
 
-printf '\n▸ cppcheck — blocking tier\n'
-cppcheck --enable=warning,performance,portability "${CPPCHECK_COMMON[@]}" \
-         --error-exitcode=1 "${CPP_TARGET[@]}" || rc=1
+    printf '  blocking tier:\n'
+    cppcheck --enable=warning,performance,portability "${CPPCHECK_COMMON[@]}" \
+             --error-exitcode=1 "${CPP_TARGET[@]}" || rc=1
 
-printf '\n▸ cppcheck — style tier (advisory)\n'
-cppcheck --enable=style --suppress=unusedFunction "${CPPCHECK_COMMON[@]}" \
-         "${CPP_TARGET[@]}" 2>&1 >/dev/null | grep '^style:' > /tmp/lint-style.$$ || true
-printf '  %s style finding(s)\n' "$(wc -l < /tmp/lint-style.$$)"
-awk -F'[][]' '{print $2}' /tmp/lint-style.$$ | sort | uniq -c | sort -rn | sed 's/^/    /'
-rm -f /tmp/lint-style.$$
+    cppcheck --enable=style --suppress=unusedFunction "${CPPCHECK_COMMON[@]}" \
+             "${CPP_TARGET[@]}" 2>&1 >/dev/null | grep '^style:' >> /tmp/lint-style.$$ || true
+    rm -rf "$bdir" .lint-compile-db.json
+done < <(lint_configs)
+
+printf '\n▸ cppcheck — style tier (advisory, all %d configuration(s))\n' "$n_cfg"
+sort -u /tmp/lint-style.$$ > /tmp/lint-style-u.$$
+printf '  %s style finding(s)\n' "$(wc -l < /tmp/lint-style-u.$$)"
+awk -F'[][]' '{print $2}' /tmp/lint-style-u.$$ | sort | uniq -c | sort -rn | sed 's/^/    /'
+rm -f /tmp/lint-style.$$ /tmp/lint-style-u.$$
+[ "$any_db" = 1 ] || printf '\n  ⚠️ no configuration produced a compile database; every tier above is the weak scan\n'
 
 printf '\n▸ shellcheck — our own scripts\n'
 # OUR scripts only: third_party ships more that we do not maintain.
