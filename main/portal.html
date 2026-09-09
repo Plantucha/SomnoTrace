@@ -3505,6 +3505,8 @@ var DASH_MAX_DISPLAY = 3000;
 /* Reusable scratch buffers for buildSignalData to eliminate TypedArray GC churn on pan/zoom */
 var dashGridMin = new Float64Array(DASH_MAX_DISPLAY);
 var dashGridMax = new Float64Array(DASH_MAX_DISPLAY);
+var dashGridOvMin = new Float64Array(DASH_MAX_DISPLAY);
+var dashGridOvMax = new Float64Array(DASH_MAX_DISPLAY);
 var dashOwner = new Int32Array(DASH_MAX_DISPLAY);
 var SNT_MISSING_V1 = -1;
 var SNT_MISSING_V2 = -32768;  /* INT16_MIN */
@@ -4085,14 +4087,21 @@ function buildSignalData(sig, range, cols) {
   }
   if (!isFinite(nativeDt)) nativeDt = dt;
 
+  var hasOv = !!(sig.overlay && sig.overlay.ch);
+
   dashGridMin.fill(NaN, 0, W);
   dashGridMax.fill(NaN, 0, W);
+  if (hasOv) {
+    dashGridOvMin.fill(NaN, 0, W);
+    dashGridOvMax.fill(NaN, 0, W);
+  }
   dashOwner.fill(-1, 0, W);
 
   for (var si = 0; si < slices.length; si++) {
     var sd = slices[si];
     var t = sd.t;
     var vals = sd[sig.ch];
+    var ovVals = hasOv ? sd[sig.overlay.ch] : null;
     var mins = sig.minKey ? sd[sig.minKey] : null;
     var maxs = sig.maxKey ? sd[sig.maxKey] : null;
     var hasEnv = !!(mins && maxs);
@@ -4104,18 +4113,32 @@ function buildSignalData(sig, range, cols) {
       var col = Math.floor((tv - vMin) / dt);
       if (col < 0) col = 0; else if (col >= W) col = W - 1;
       /* Precedence: a later session claims (and resets) any column it touches. */
-      if (dashOwner[col] !== si) { dashGridMin[col] = NaN; dashGridMax[col] = NaN; dashOwner[col] = si; }
+      if (dashOwner[col] !== si) {
+        dashGridMin[col] = NaN; dashGridMax[col] = NaN;
+        if (hasOv) { dashGridOvMin[col] = NaN; dashGridOvMax[col] = NaN; }
+        dashOwner[col] = si;
+      }
       var mn, mx;
       if (hasEnv) {
         mn = mins[j]; mx = maxs[j];
-        if (isNaN(mn) || isNaN(mx)) continue;
+        if (!isNaN(mn) && !isNaN(mx)) {
+          if (isNaN(dashGridMin[col]) || mn < dashGridMin[col]) dashGridMin[col] = mn;
+          if (isNaN(dashGridMax[col]) || mx > dashGridMax[col]) dashGridMax[col] = mx;
+        }
       } else {
         var v = vals[j];
-        if (isNaN(v)) continue;
-        mn = v; mx = v;
+        if (!isNaN(v)) {
+          if (isNaN(dashGridMin[col]) || v < dashGridMin[col]) dashGridMin[col] = v;
+          if (isNaN(dashGridMax[col]) || v > dashGridMax[col]) dashGridMax[col] = v;
+        }
       }
-      if (isNaN(dashGridMin[col]) || mn < dashGridMin[col]) dashGridMin[col] = mn;
-      if (isNaN(dashGridMax[col]) || mx > dashGridMax[col]) dashGridMax[col] = mx;
+      if (ovVals) {
+        var ov = ovVals[j];
+        if (!isNaN(ov)) {
+          if (isNaN(dashGridOvMin[col]) || ov < dashGridOvMin[col]) dashGridOvMin[col] = ov;
+          if (isNaN(dashGridOvMax[col]) || ov > dashGridOvMax[col]) dashGridOvMax[col] = ov;
+        }
+      }
     }
   }
 
@@ -4128,28 +4151,46 @@ function buildSignalData(sig, range, cols) {
    * IMPORTANT (uPlot invariant): outT must remain strictly monotonic and finite.
    * A discontinuity is represented by null in outV at a valid finite timestamp
    * (e.g. midpoint between sessions). Inserting null into outT breaks uPlot's
-   * binary search, discarding earlier sessions. */
+   * binary search, discarding earlier sessions.
+   * When sig.overlay is present, both channels must be emitted in lockstep so
+   * outT, outV, and outOvV have identical lengths and aligned null gap breaks. */
   var gapThresh = Math.max(nativeDt, dt) * 2.5;
-  var outT = [], outV = [];
+  var outT = [], outV = [], outOvV = hasOv ? [] : null;
   var prevTc = null;
   for (var k = 0; k < W; k++) {
-    if (isNaN(dashGridMin[k])) continue;
+    var cMin = dashGridMin[k], cMax = dashGridMax[k];
+    var oMin = hasOv ? dashGridOvMin[k] : NaN, oMax = hasOv ? dashGridOvMax[k] : NaN;
+    if (isNaN(cMin) && isNaN(oMin)) continue;
+
     var tc = vMin + (k + 0.5) * dt;
     if (prevTc !== null && (tc - prevTc) > gapThresh) {
       outT.push(prevTc + (tc - prevTc) * 0.5);
       outV.push(null);
+      if (hasOv) outOvV.push(null);
     }
-    var cMin = dashGridMin[k], cMax = dashGridMax[k];
-    if (cMin === cMax) {
-      outT.push(tc); outV.push(cMin);
+
+    var vMinVal = isNaN(cMin) ? null : cMin;
+    var vMaxVal = isNaN(cMax) ? null : cMax;
+    var oMinVal = isNaN(oMin) ? null : oMin;
+    var oMaxVal = isNaN(oMax) ? null : oMax;
+
+    var twoPoints = (cMin !== cMax && !isNaN(cMin)) || (oMin !== oMax && !isNaN(oMin));
+    if (!twoPoints) {
+      outT.push(tc);
+      outV.push(vMinVal);
+      if (hasOv) outOvV.push(oMinVal);
     } else {
-      outT.push(tc); outV.push(cMin);
-      outT.push(tc); outV.push(cMax);
+      outT.push(tc);
+      outV.push(vMinVal);
+      if (hasOv) outOvV.push(oMinVal);
+      outT.push(tc);
+      outV.push(vMaxVal);
+      if (hasOv) outOvV.push(oMaxVal);
     }
     prevTc = tc;
   }
   if (!outT.length) return null;
-  return {t: outT, v: outV};
+  return {t: outT, v: outV, ovV: outOvV};
 }
 
 /* Fetch a binary .snt file via a single sequential GET.
@@ -5005,9 +5046,7 @@ function updateDashViewImpl() {
     }
     chart.batch(function(u) {
       if (sig.overlay) {
-        var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
-        var ovSrc = buildSignalData(ovSig, cur, dashChartCols(u));
-        u.setData([src ? src.t : ovSrc ? ovSrc.t : [], src ? src.v : [], ovSrc ? ovSrc.v : []], false);
+        u.setData([src ? src.t : [], src ? src.v : [], (src && src.ovV) ? src.ovV : []], false);
       } else {
         u.setData(src ? [src.t, src.v] : [[], []], false);
       }
@@ -5025,13 +5064,8 @@ function makeDashPanel(sig, el, cur) {
   } else if (el) {
     el.classList.remove('dash-panel-loading');
   }
-  var ovSrc = null;
-  if (sig.overlay) {
-    var ovSig = { src: sig.src, ch: sig.overlay.ch, minKey: null, maxKey: null };
-    ovSrc = buildSignalData(ovSig, cur, dashChartCols(null, el));
-  }
   var data = sig.overlay
-    ? [src ? src.t : ovSrc ? ovSrc.t : [], src ? src.v : [], ovSrc ? ovSrc.v : []]
+    ? [src ? src.t : [], src ? src.v : [], (src && src.ovV) ? src.ovV : []]
     : (src ? [src.t, src.v] : [[], []]);
   /* Y scale: no sig.y -> fully auto; y.range fn -> custom auto; both bounds ->
    * fixed; only min (max null) -> hard floor with a dynamic top. */
