@@ -1777,7 +1777,7 @@ function loadStatusTab(d) {
      answer for an unbuilt-by-CI tree is "nothing yet". */
   var srcRepo = d.source_repo || '';
   var upstream = d.upstream_repo || '';
-  var isFork = upstream && srcRepo && srcRepo !== upstream && srcRepo !== 'local build';
+  var isFork = upstream && srcRepo && srcRepo !== upstream && srcRepo !== 'local build' && srcRepo !== 'unknown CI build';
   var upRow = document.getElementById('row-upstream');
   if (upRow) upRow.style.display = isFork ? '' : 'none';
   setEl('status-upstream', upstream || '--');

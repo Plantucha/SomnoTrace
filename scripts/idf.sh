@@ -58,9 +58,11 @@ fi
 
 # Forward CI environment variables into the container if present.
 ENV_ARGS=()
-if [ -n "${GITHUB_REPOSITORY:-}" ]; then
-    ENV_ARGS+=(-e "GITHUB_REPOSITORY=${GITHUB_REPOSITORY}")
-fi
+for var in GITHUB_REPOSITORY GITHUB_ACTIONS CI; do
+    if [ -n "${!var:-}" ]; then
+        ENV_ARGS+=(-e "$var=${!var}")
+    fi
+done
 
 # With no args, drop into an interactive shell. "exec" runs an arbitrary
 # command; otherwise the args are passed to idf.py.
