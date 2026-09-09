@@ -128,19 +128,32 @@ jobs:
         if: ${{ matrix.config.defaults != '' }}
         run: |
           B="build-${{ matrix.config.name }}"
-          miss=0
+          # ⚠️ ONLY THIS PROJECT'S OWN SYMBOLS ARE ASSERTED. An earlier version required
+          # every symbol in the defaults file to appear verbatim in the resolved sdkconfig
+          # and failed the DEFAULT board of this repo: Kconfig legitimately drops a default
+          # whose dependencies are unmet, and CONFIG_BT_NIMBLE_PINNED_TO_CORE and
+          # CONFIG_MBEDTLS_DYNAMIC_BUFFER_PEER_CRED are two that do. Asserting IDF internals
+          # makes the gate fail on correct configurations, which is the failure this job
+          # exists to prevent, one level up.
+          #
+          # What must hold is narrower and is the thing worth checking: the board this leg
+          # claims is the board that got configured. CONFIG_SOMNOTRACE_* is ours, so a
+          # missing one means the leg fell back rather than that Kconfig disagreed.
+          miss=0; checked=0
           IFS=';' read -ra FILES <<< '${{ matrix.config.defaults }}'
           for f in "${FILES[@]}"; do
             [ -f "$f" ] || continue
             while read -r line; do
               case "$line" in ''|'#'*) continue ;; esac
+              case "$line" in CONFIG_SOMNOTRACE_*) ;; *) continue ;; esac
               key=${line%%=*}; val=${line#*=}
+              checked=$((checked + 1))
               grep -qxF "$key=$val" "$B/sdkconfig" || {
-                echo "::error::$key=$val from $f did not take in $B/sdkconfig"; miss=1; }
+                echo "::error::$key=$val from $f did not take in $B/sdkconfig — this leg did not build the board it claims"; miss=1; }
             done < "$f"
           done
           [ "$miss" = 0 ] || exit 1
-          echo "all requested symbols present in $B/sdkconfig"
+          echo "$checked CONFIG_SOMNOTRACE_* symbol(s) verified in $B/sdkconfig"
 
       - name: Upload the build log
         if: always()
