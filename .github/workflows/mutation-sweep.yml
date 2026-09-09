@@ -62,13 +62,26 @@ jobs:
           grep -qE '[0-9]+ unasserted survivor\(s\)' mutation-sweep.log || {
             echo "::error::no survivor-count line — the sweep did not run to completion"; exit 1; }
 
+      - name: Flag survivors that are not in the committed inventory
+        # scripts/mutation_survivors.txt is checked in, so the normal way a new survivor
+        # gets noticed is a line appearing in a pull request's diff. This is the backstop
+        # for the ones that arrive without a diff — a dependency bump, a compiler change,
+        # or a merge that nobody re-swept. A warning, not a failure: the count is a report.
+        if: always()
+        run: |
+          if grep -qE '^ *\+ NEW ' mutation-sweep.log; then
+            n=$(grep -cE '^ *\+ NEW ' mutation-sweep.log)
+            echo "::warning::$n survivor(s) not in scripts/mutation_survivors.txt — regenerate with: python3 scripts/mutate_host.py --all --write-inventory"
+            grep -E '^ *\+ NEW ' mutation-sweep.log
+          fi
+
       - name: Summary
         if: always()
         run: |
           {
             echo "### Mutation sweep (advisory)"
             echo '```'
-            grep -E '^SCOPE|^ *not seen|unasserted survivor\(s\)|^ *canary|^ *killed ' mutation-sweep.log || true
+            grep -E '^SCOPE|^INVENTORY|^ *[+-] (NEW|was here)|^ *not seen|unasserted survivor\(s\)|^ *canary|^ *killed ' mutation-sweep.log || true
             echo '```'
             echo ""
             echo "UNASSERTED means the mutant ran and every test still passed."
