@@ -207,8 +207,19 @@ rm -f /tmp/lint-style.$$ /tmp/lint-style-u.$$
 
 printf '\n▸ shellcheck — our own scripts\n'
 # OUR scripts only: third_party ships more that we do not maintain.
-mapfile -t sh_files < <(git ls-files '*.sh' | grep -v '^third_party/')
+mapfile -t sh_files < <(git ls-files '*.sh' 2>/dev/null | grep -v '^third_party/')
+# Fall back to a walk when git cannot answer — inside --docker the checkout is bind-mounted
+# and `git ls-files` returns nothing, which fed shellcheck an EMPTY argument list. shellcheck
+# then exits non-zero for having no input, and the run reported BLOCKING TIER FAILED with no
+# finding to show for it: a red gate that names nothing is worse than no gate.
+if [ "${#sh_files[@]}" -eq 0 ]; then
+    mapfile -t sh_files < <(find . -name '*.sh' -not -path './third_party/*' \
+                                   -not -path './build*/*' -not -path './.git/*' | sed 's|^\./||')
+fi
 printf '  %d script(s)\n' "${#sh_files[@]}"
+if [ "${#sh_files[@]}" -eq 0 ]; then
+    echo "::warning::no shell scripts found to check — the shell tier ran on nothing"
+fi
 # SC2034 ("appears unused") is EXCLUDED from the blocking tier and reported below with the
 # other advisories instead. It is not a correctness finding, and it is structurally noisy on
 # any script that destructures a record:
