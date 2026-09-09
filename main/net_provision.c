@@ -735,9 +735,16 @@ static esp_err_t root_get_handler(httpd_req_t *req)
      * linker placed them in the same region. The check is named differently across
      * versions — comparePointers on 2.13, subtractPointers on 2.19.
      *
-     * Both are suppressed tree-wide in scripts/lint.sh rather than here: the same pattern
-     * arrives with every embedded blob, and a per-site directive means the next person to
-     * use EMBED_FILES gets a red gate for correct code. See the rationale there. */
+     * BOTH FORMS ARE PRESENT ON PURPOSE, and removing either one reds the gate.
+     *
+     * The tree-wide `--suppress=comparePointers` in scripts/lint.sh exists so the NEXT
+     * embedded blob does not need a new directive. It is not sufficient on its own:
+     * measured on CI, cppcheck 2.13 does not apply an id-only `--suppress` to findings
+     * produced from a `--project` run, so this site came back as a blocking error while
+     * passing locally on 2.19. The inline directive below is what actually silences it
+     * under the version CI runs. */
+    /* cppcheck-suppress comparePointers */
+    /* cppcheck-suppress subtractPointers */
     httpd_resp_send(req, PORTAL_HTML_START, PORTAL_HTML_LEN);
     return ESP_OK;
 }
