@@ -53,6 +53,19 @@ jobs:
         # the drift is reported below, which is what makes an unexplained new finding
         # distinguishable from a regression the contributor actually introduced.
         run: |
+          # ⚠️ DROP THE RUNNER'S THIRD-PARTY APT SOURCES FIRST. The ubuntu-latest image ships
+          # lists for Google Chrome, Microsoft and Azure that this project never installs from.
+          # When one of them serves a bad index, `apt-get update` exits 100 and every job that
+          # installs anything goes red before reaching a line of project code. Measured
+          # 2026-09-09: `Hash Sum mismatch` on dl.google.com/linux/chrome-stable reddened
+          # host-tests, lint and mutation together, and survived a re-run — it is an outage,
+          # not a flake, and retrying does not clear it.
+          #
+          # Removing the lists is the fix rather than `|| true`, which would hide a genuine
+          # failure to reach the Ubuntu archive — the one we do depend on.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cppcheck shellcheck
 
