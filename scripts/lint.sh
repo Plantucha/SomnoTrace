@@ -41,6 +41,59 @@ have_sh=$(shellcheck --version | awk '/^version:/{print $2}')
 [ "$have_sh" = "$SHELLCHECK_VERSION" ] || \
     echo "note: shellcheck $have_sh, CI pins $SHELLCHECK_VERSION — findings may differ (scripts/lint-versions.env)"
 
+# ── The compile database, and why this is not a directory scan ───────────────────────
+# `cppcheck main components` analyses source as TEXT: no -D, no include paths, no idea
+# which branch of an #if is live. On a project whose files are selected by Kconfig that
+# is not a weaker check, it is a different one — it reads code the compiler never sees
+# and misses code the compiler does.
+#
+# Measured, on a 92,000-line branch proposed for this repo whose new sources all sit
+# behind `if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B)` in main/CMakeLists.txt:
+#
+#     directory scan     1 real finding
+#     compile database  17, of which 16 were new to that branch
+#
+# Among the 16: an out-of-bounds read of a 7-element array guarded by `< 8`, on the OTA
+# failure-reporting path; an uninitialised variable in session_writer.c; a null
+# dereference if an allocation fails. None of them is reachable by a text scan.
+#
+# `idf.py reconfigure` produces the database WITHOUT compiling, so this costs seconds.
+# The paths inside it are the CONTAINER's (/project/...), so they are rewritten to this
+# checkout, and the list is filtered to our own sources — unfiltered it carries all
+# ~1,100 ESP-IDF translation units and the run takes minutes to tell you nothing.
+#
+# ⚠️ ONE DATABASE IS ONE CONFIGURATION. It reflects the board that was configured. While
+# the repo has a single board that is the whole picture; the day a second one lands this
+# wants a matrix, exactly as the build job does, or the unbuilt board goes unlinted —
+# which is the failure this comment exists to prevent recurring.
+compile_db() {
+    [ -f build/compile_commands.json ] || ./scripts/idf.sh reconfigure >/dev/null 2>&1
+    [ -f build/compile_commands.json ] || return 1
+    python3 - "$PWD" <<'PYEOF'
+import json, os, sys
+root = sys.argv[1]
+try:
+    db = json.load(open("build/compile_commands.json"))
+except Exception:
+    sys.exit(1)
+keep = []
+for e in db:
+    f = e["file"].replace("/project", root)
+    if not (f.startswith(root + "/main/") or f.startswith(root + "/components/")):
+        continue
+    if "/third_party/" in f or "/managed_components/" in f:
+        continue
+    cmd = e.get("command") or " ".join(e.get("arguments", []))
+    keep.append({"file": f,
+                 "directory": e.get("directory", "").replace("/project", root),
+                 "command": cmd.replace("/project", root)})
+if not keep:
+    sys.exit(1)
+json.dump(keep, open(".lint-compile-db.json", "w"))
+print(len(keep))
+PYEOF
+}
+
 # The pointer-subtraction pair is suppressed for the WHOLE tree, not per site.
 # ESP-IDF's EMBED_FILES gives each blob a `_binary_<name>_start[]` / `_binary_<name>_end[]`
 # pair of linker symbols, and `end - start` is the documented way to get its length.
@@ -54,22 +107,50 @@ have_sh=$(shellcheck --version | awk '/^version:/{print $2}')
 # the `_binary_*` pattern, so the check has found nothing else; if that stops being true
 # the answer is a targeted assertion, not re-enabling a check with a 100% false-positive
 # rate. `comparePointers` is the same finding under cppcheck 2.13's name for it.
+# -i excludes files we ASK cppcheck to check; it does not stop it reporting inside a
+# vendored header reached through an #include. With the compile database cppcheck follows
+# every include the compiler does, so LVGL and the Espressif components arrive as findings
+# we neither own nor can fix. They are suppressed BY PATH below, or the gate is red on
+# third-party code.
+#
+# Keep this note out of the array literal. An apostrophe inside a comment there ends up
+# opening a quote that the next quoted argument closes, and the suppressions silently do
+# not apply -- which is exactly how this was written wrong the first time.
 CPPCHECK_COMMON=(--std=c11 --language=c --inline-suppr
                  --suppress=missingInclude --suppress=missingIncludeSystem
                  --suppress=unmatchedSuppression
                  --suppress=subtractPointers --suppress=comparePointers
                  -i third_party -i build -i managed_components
+                 --suppress=*:*/managed_components/*
+                 --suppress=*:*/third_party/*
+                 --suppress=*:*/esp-idf/*
                  --template='{severity}: {file}:{line}: {message} [{id}]')
 
 rc=0
 
+if units=$(compile_db); then
+    # ABSOLUTE path, deliberately. Given a RELATIVE --project, cppcheck normalises the
+    # paths it reports differently and the path-glob suppressions below stop matching --
+    # silently, with no warning, so the gate goes red on LVGL and Espressif code.
+    # Measured: --project=.lint-compile-db.json leaves 2 third-party findings,
+    # --project=$PWD/.lint-compile-db.json leaves 0. Same file, same flags.
+    CPP_TARGET=(--project="$PWD/.lint-compile-db.json")
+    printf '\n▸ cppcheck — driven by the compile database (%s translation units)\n' "$units"
+else
+    CPP_TARGET=(main components)
+    printf '\n▸ cppcheck — NO COMPILE DATABASE, falling back to a directory scan\n'
+    printf '  This is the weaker check: no -D, no include paths, no idea which branch of\n'
+    printf '  an #if is live. Sources selected by Kconfig may go unanalysed entirely.\n'
+    printf '  Needs Docker (or a prior build). See the note above compile_db().\n'
+fi
+
 printf '\n▸ cppcheck — blocking tier\n'
 cppcheck --enable=warning,performance,portability "${CPPCHECK_COMMON[@]}" \
-         --error-exitcode=1 main components || rc=1
+         --error-exitcode=1 "${CPP_TARGET[@]}" || rc=1
 
 printf '\n▸ cppcheck — style tier (advisory)\n'
 cppcheck --enable=style --suppress=unusedFunction "${CPPCHECK_COMMON[@]}" \
-         main components 2>&1 >/dev/null | grep '^style:' > /tmp/lint-style.$$ || true
+         "${CPP_TARGET[@]}" 2>&1 >/dev/null | grep '^style:' > /tmp/lint-style.$$ || true
 printf '  %s style finding(s)\n' "$(wc -l < /tmp/lint-style.$$)"
 awk -F'[][]' '{print $2}' /tmp/lint-style.$$ | sort | uniq -c | sort -rn | sed 's/^/    /'
 rm -f /tmp/lint-style.$$
@@ -101,6 +182,8 @@ sh_style=$(shellcheck --severity=style -f gcc "${sh_files[@]}" 2>/dev/null | gre
 printf '  %s style/info finding(s)\n' "${sh_style:-0}"
 shellcheck --severity=style -f gcc "${sh_files[@]}" 2>/dev/null \
   | grep -oE 'SC[0-9]+' | sort | uniq -c | sort -rn | head -10 | sed 's/^/       /' || true
+
+rm -f .lint-compile-db.json
 
 printf '\n%s\n' "$([ $rc -eq 0 ] && echo 'lint: blocking tier clean' || echo 'lint: BLOCKING TIER FAILED')"
 exit $rc
