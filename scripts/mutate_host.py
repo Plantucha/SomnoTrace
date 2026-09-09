@@ -67,12 +67,30 @@ INC = [os.path.join(ROOT, "main"), os.path.join(HERE, "test_include"), ROOT]
 # A header a test #includes is a mutation target too, not just a .c it links: the shipped
 # spool_to_edf() lives in edf_data_dict.h and is the code #202 was about. Headers are listed
 # for targeting and reach; they are never passed to the compiler.
+#
+# A "#" prefix means the same thing for a .c file: v2.0.0 split the EDF converter into five
+# modules, and edf_gen_test.c #includes all five so it can reach their statics. They are part
+# of that test's own translation unit, so listing them WITHOUT the prefix would hand gcc a
+# second copy and every build would fail on duplicate symbols. They are still shipped code a
+# host test executes, so they are targeted and counted; they are just not passed to the
+# compiler. Before this marker existed they were invisible: five files the suite has exercised
+# since v2.0.0 were reported as untested, because the map is what the harness believes.
 TESTS = {
     "as11_time_test":       ["main/as11_time.c"],
     "as11_events_test":     ["main/as11_time.c", "@cjson"],
-    "edf_properties_test":  ["main/as11_time.c", "main/edf_data_dict.h", "@cjson"],
+    "edf_gen_test":         ["main/as11_time.c", "@cjson",
+                             "#main/edf_header.c", "#main/edf_waveform.c",
+                             "#main/edf_annotations.c", "#main/edf_summary.c",
+                             "#main/edf_gen.c"],
+    "edf_properties_test":  ["main/as11_time.c", "main/edf_data_dict.h", "@cjson",
+                             "#main/edf_summary.c"],
     "vld3_decoder_test":    ["main/oximetry_vld3.c"],
 }
+
+
+def target_path(entry: str) -> str:
+    """The repo-relative path a TESTS entry names, without the "#" include-marker."""
+    return entry[1:] if entry.startswith("#") else entry
 
 EQUIV_FILE = os.path.join(HERE, "mutate_equivalent.txt")
 
@@ -117,6 +135,8 @@ def sources_for(test: str) -> list[str] | None:
             if not CJSON:
                 return None
             out.append(CJSON)
+        elif s.startswith("#"):
+            continue      # already inside the test's translation unit -- see TESTS
         elif not s.endswith(".h"):
             out.append(os.path.join(ROOT, s))
     return out
@@ -130,9 +150,23 @@ def build(test: str, outdir: str, coverage: bool = False) -> str | None:
     cmd = ["gcc", "-O0", "-o", exe, os.path.join(HERE, test + ".c"), *src]
     if coverage:
         cmd += ["--coverage"]
-    cmd += [f"-I{d}" for d in INC]
-    if CJSON:
+    # Header order depends on what the test links, and it has to.
+    #
+    # scripts/test_include/cJSON.h is not a declaration set: it is a working stub, 17 static
+    # inline functions. A test that does NOT link cJSON.c therefore gets its implementation
+    # from that header alone, and putting the real cJSON.h in front turns those inlines into
+    # ordinary externs -- as11_time.c then fails to link on undefined cJSON_GetObjectItem.
+    #
+    # A test that DOES link cJSON.c needs the opposite. The stub covers a 20-function subset
+    # and lacks cJSON_Print, cJSON_IsTrue and cJSON_AddItemReferenceToObject, so behind the
+    # shim such a test dies on implicit declarations. edf_gen_test is the first wired test to
+    # reach past the subset, which is why this stayed invisible until it was added to TESTS.
+    #
+    # run_host_tests.sh has always ordered it this way -- $CJ_INC ahead of $SHIM, and only on
+    # the two cJSON legs. This is the harness catching up with the suite it measures.
+    if CJSON and "@cjson" in TESTS[test]:
         cmd.append("-I" + os.path.dirname(CJSON))
+    cmd += [f"-I{d}" for d in INC]
     cmd.append("-lm")
     r = subprocess.run(cmd, capture_output=True, cwd=outdir)
     return exe if r.returncode == 0 else None
@@ -234,9 +268,14 @@ def harness_blind_spot() -> tuple[int, int, list[str]]:
     Silence about the denominator is how a mutation score becomes a comfort."""
     covered = set()
     for t in TESTS:
+        # A test that cannot build covers nothing. Counting its sources anyway inflates the
+        # numerator on exactly the machines where it is least true: without cJSON the two EDF
+        # suites are skipped, and before this check the summary still credited them.
+        if sources_for(t) is None:
+            continue
         for src in TESTS[t]:
             if src != "@cjson":
-                covered.add(os.path.abspath(os.path.join(ROOT, src)))
+                covered.add(os.path.abspath(os.path.join(ROOT, target_path(src))))
     total = []
     for base in ("main", "components"):
         for dirpath, _dirs, files in os.walk(os.path.join(ROOT, base)):
@@ -515,7 +554,8 @@ def main() -> int:
     print("REACH     " + ("gcov line coverage available" if reach is not None
                           else "UNAVAILABLE — failing closed, every mutant will be run"))
 
-    targets = a.files or ([os.path.join(ROOT, s) for t in TESTS for s in TESTS[t] if s != "@cjson"]
+    targets = a.files or ([os.path.join(ROOT, target_path(s))
+                           for t in TESTS for s in TESTS[t] if s != "@cjson"]
                           if a.all else [])
     targets = sorted({os.path.abspath(t if os.path.isabs(t) else os.path.join(ROOT, t))
                       for t in targets})
