@@ -733,14 +733,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
      * linker symbols ESP-IDF's EMBED_FILES generates at the ends of ONE embedded blob.
      * cppcheck sees two unrelated extern objects being subtracted and cannot know the
      * linker placed them in the same region. The check is named differently across
-     * versions — comparePointers on 2.13, subtractPointers on 2.19 — so both are named
-     * below; the unused one is harmless under --suppress=unmatchedSuppression.
+     * versions — comparePointers on 2.13, subtractPointers on 2.19.
      *
-     * The two directives are their own comments on purpose: cppcheck reads a suppression
-     * only when the comment STARTS with `cppcheck-suppress`, so one buried after prose in
-     * the same block is silently ignored — a suppression that looks present and is not. */
-    /* cppcheck-suppress comparePointers */
-    /* cppcheck-suppress subtractPointers */
+     * Both are suppressed tree-wide in scripts/lint.sh rather than here: the same pattern
+     * arrives with every embedded blob, and a per-site directive means the next person to
+     * use EMBED_FILES gets a red gate for correct code. See the rationale there. */
     httpd_resp_send(req, PORTAL_HTML_START, PORTAL_HTML_LEN);
     return ESP_OK;
 }
