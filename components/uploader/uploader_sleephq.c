@@ -60,7 +60,8 @@ static const char *TAG = "upload_shq";
 
 #define SHQ_TIMEOUT_MS  30000
 #define SHQ_READ_BUF    1024
-#define SHQ_RESP_CAP    4096
+#define SHQ_HDR_CAP     8192    /* Cloudflare + SleepHQ headers (CSP, Report-To, etc. are ~3.2 KB) */
+#define SHQ_RESP_CAP    32768   /* Max response body in PSRAM (supports 700+ files per import) */
 
 /* Token cache (token string in PSRAM; allocated on first auth). */
 #define SHQ_TOKEN_MAX  512
@@ -116,11 +117,13 @@ static int shq_tls_write_all(esp_tls_t *tls, const void *data, size_t len)
  * Uses buffered reads (not 1-byte-at-a-time) for compatibility with mbedTLS. */
 static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_len)
 {
-    /* Buffer for entire response (headers + body) */
-    size_t buf_cap = SHQ_RESP_CAP + 1024;
+    /* Buffer for entire response (headers + body), allocated strictly in PSRAM */
+    size_t buf_cap = SHQ_HDR_CAP + SHQ_RESP_CAP;
     char *buf = heap_caps_malloc(buf_cap, MALLOC_CAP_SPIRAM);
-    if (!buf) buf = malloc(buf_cap);
-    if (!buf) return -1;
+    if (!buf) {
+        ESP_LOGE(TAG, "failed to allocate %u bytes in PSRAM for response buffer", (unsigned)buf_cap);
+        return -1;
+    }
 
     size_t buf_len = 0;
     char *header_end = NULL;
@@ -194,7 +197,12 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
     if (content_length > 0 && body_in_buf < content_length) {
         size_t remaining = content_length - body_in_buf;
         while (remaining > 0) {
-            if (buf_len >= buf_cap - 1) break;
+            if (buf_len >= buf_cap - 1) {
+                ESP_LOGE(TAG, "response exceeded buffer capacity (%u bytes, content_length=%u)",
+                         (unsigned)buf_cap, (unsigned)content_length);
+                free(buf);
+                return -1;
+            }
             size_t to_read = remaining < (buf_cap - buf_len - 1) ?
                              remaining : (buf_cap - buf_len - 1);
             ssize_t n = esp_tls_conn_read(tls, buf + buf_len, to_read);
@@ -203,14 +211,23 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
                 free(buf);
                 return -1;
             }
-            if (n == 0) break;
+            if (n == 0) {
+                ESP_LOGE(TAG, "connection closed before full body read (%u bytes remaining of %u)",
+                         (unsigned)remaining, (unsigned)content_length);
+                free(buf);
+                return -1;
+            }
             buf_len += n;
             remaining -= n;
         }
     } else if (chunked) {
         /* Read until we see 0\r\n\r\n or connection closes */
         while (1) {
-            if (buf_len >= buf_cap - 1) break;
+            if (buf_len >= buf_cap - 1) {
+                ESP_LOGE(TAG, "chunked response exceeded buffer capacity (%u bytes)", (unsigned)buf_cap);
+                free(buf);
+                return -1;
+            }
             ssize_t n = esp_tls_conn_read(tls, buf + buf_len, buf_cap - buf_len - 1);
             if (n < 0) { free(buf); return -1; }
             if (n == 0) break;
@@ -221,7 +238,10 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
     } else if (content_length == 0 && !chunked) {
         /* No Content-Length, no chunked — read until connection closes */
         while (1) {
-            if (buf_len >= buf_cap - 1) break;
+            if (buf_len >= buf_cap - 1) {
+                ESP_LOGW(TAG, "connection-closed response reached buffer capacity (%u bytes)", (unsigned)buf_cap);
+                break;
+            }
             ssize_t n = esp_tls_conn_read(tls, buf + buf_len, buf_cap - buf_len - 1);
             if (n <= 0) break;
             buf_len += n;
@@ -273,12 +293,20 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
 
     /* Extract body if requested */
     if (body_out) {
-        if (body_total > SHQ_RESP_CAP) body_total = SHQ_RESP_CAP;
-        char *body = heap_caps_malloc(SHQ_RESP_CAP, MALLOC_CAP_SPIRAM);
-        if (!body) body = malloc(SHQ_RESP_CAP);
-        if (!body) { free(buf); return -1; }
+        if (body_total > SHQ_RESP_CAP) {
+            ESP_LOGW(TAG, "response body truncated to cap (%u > %u bytes)",
+                     (unsigned)body_total, (unsigned)SHQ_RESP_CAP);
+            body_total = SHQ_RESP_CAP;
+        }
+        char *body = heap_caps_malloc(body_total + 1, MALLOC_CAP_SPIRAM);
+        if (!body) {
+            ESP_LOGE(TAG, "failed to allocate %u bytes in PSRAM for response body",
+                     (unsigned)(body_total + 1));
+            free(buf);
+            return -1;
+        }
         memcpy(body, body_start, body_total);
-        if (body_total < SHQ_RESP_CAP) body[body_total] = '\0';
+        body[body_total] = '\0';
         *body_out = body;
         if (body_len) *body_len = body_total;
     }
@@ -573,19 +601,24 @@ static esp_err_t shq_wait_import(esp_tls_t *tls, const char *import_id)
          * failure is decided in the lines below -- but which line is not recoverable
          * from the log as it stands. */
         if (status < 200 || status >= 300) {
-            ESP_LOGW(TAG, "import %s: status query returned HTTP %d", import_id, status);
+            ESP_LOGW(TAG, "import %s: status query returned HTTP %d (attempt %d/30)",
+                     import_id, status, attempt + 1);
             free(body);
-            return ESP_FAIL;
+            if (attempt + 1 >= 30) return ESP_FAIL;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
         }
         cJSON *root = cJSON_Parse(body);
         if (!root) {
             /* A body we cannot parse is OUR problem, not SleepHQ's verdict. The length
              * and the head of it separate the cases: a truncated body shows a length at
              * the read cap, a de-chunking fault shows hex chunk prefixes in the text. */
-            ESP_LOGW(TAG, "import %s: unparseable status body (%u bytes): %.120s",
-                     import_id, (unsigned)body_len, body ? body : "(null)");
+            ESP_LOGW(TAG, "import %s: unparseable status body (%u bytes, attempt %d/30): %.120s",
+                     import_id, (unsigned)body_len, attempt + 1, body ? body : "(null)");
             free(body);
-            return ESP_FAIL;
+            if (attempt + 1 >= 30) return ESP_FAIL;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
         }
         free(body);
         cJSON *data = cJSON_GetObjectItem(root, "data");
