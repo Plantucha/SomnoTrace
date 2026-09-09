@@ -41,9 +41,23 @@ have_sh=$(shellcheck --version | awk '/^version:/{print $2}')
 [ "$have_sh" = "$SHELLCHECK_VERSION" ] || \
     echo "note: shellcheck $have_sh, CI pins $SHELLCHECK_VERSION — findings may differ (scripts/lint-versions.env)"
 
+# The pointer-subtraction pair is suppressed for the WHOLE tree, not per site.
+# ESP-IDF's EMBED_FILES gives each blob a `_binary_<name>_start[]` / `_binary_<name>_end[]`
+# pair of linker symbols, and `end - start` is the documented way to get its length.
+# cppcheck sees two unrelated extern arrays and calls it undefined behaviour. It is a
+# false positive every time, and a NEW one appears for every blob anyone embeds — so a
+# per-site inline suppression means the gate breaks on a change that is entirely correct,
+# and the person who hits it has to know this to get past it.
+#
+# WHAT THIS GIVES UP, stated rather than buried: a genuine subtraction of pointers into
+# two different objects would no longer be caught. Every instance in this tree today is
+# the `_binary_*` pattern, so the check has found nothing else; if that stops being true
+# the answer is a targeted assertion, not re-enabling a check with a 100% false-positive
+# rate. `comparePointers` is the same finding under cppcheck 2.13's name for it.
 CPPCHECK_COMMON=(--std=c11 --language=c --inline-suppr
                  --suppress=missingInclude --suppress=missingIncludeSystem
                  --suppress=unmatchedSuppression
+                 --suppress=subtractPointers --suppress=comparePointers
                  -i third_party -i build -i managed_components
                  --template='{severity}: {file}:{line}: {message} [{id}]')
 
