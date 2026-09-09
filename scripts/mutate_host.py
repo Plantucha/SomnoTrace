@@ -221,6 +221,35 @@ def executed_lines(outdir: str) -> dict[str, set[int]] | None:
     return cov if cov else None
 
 
+def harness_blind_spot() -> tuple[int, int, list[str]]:
+    """(covered, total, a few uncovered names) for the C sources under main/ and components/.
+
+    ⚠️ THE HARNESS ONLY SEES WHAT A HOST TEST LINKS. TESTS above is a hand-written map, so a
+    file no wired test compiles is not "clean" here -- it is INVISIBLE, and a run that says
+    "0 unasserted survivors" says nothing whatever about it. Measured the day this was
+    written: a branch adding 63 new .c/.h files under main/ produced an identical report to
+    the branch without them, because none of them is linked by a wired test.
+
+    A count is printed on every run so that reading the summary tells you the denominator.
+    Silence about the denominator is how a mutation score becomes a comfort."""
+    covered = set()
+    for t in TESTS:
+        for src in TESTS[t]:
+            if src != "@cjson":
+                covered.add(os.path.abspath(os.path.join(ROOT, src)))
+    total = []
+    for base in ("main", "components"):
+        for dirpath, _dirs, files in os.walk(os.path.join(ROOT, base)):
+            if any(skip in dirpath for skip in ("/build", "/managed_components", "/third_party")):
+                continue
+            for f in files:
+                if f.endswith((".c", ".h")):
+                    total.append(os.path.abspath(os.path.join(dirpath, f)))
+    uncovered = sorted(set(total) - covered)
+    names = [os.path.relpath(p, ROOT) for p in uncovered[:5]]
+    return len(covered), len(total), names
+
+
 # ── mutants ─────────────────────────────────────────────────────────────────────────────────────
 OPS: list[tuple[str, str, str]] = [
     ("<=", "<", "relational"), ("<", "<=", "relational"),
@@ -474,6 +503,15 @@ def main() -> int:
         return 2
 
     reach = executed_lines(outdir)
+    cov_n, cov_total, cov_names = harness_blind_spot()
+    if cov_total:
+        blind = cov_total - cov_n
+        print(f"SCOPE     {cov_n} of {cov_total} C sources are linked by a wired host test; "
+              f"{blind} are INVISIBLE to this harness")
+        if blind:
+            print("          not seen: " + ", ".join(cov_names) +
+                  (f", +{blind - len(cov_names)} more" if blind > len(cov_names) else ""))
+            print("          a clean report below says nothing about those files.")
     print("REACH     " + ("gcov line coverage available" if reach is not None
                           else "UNAVAILABLE — failing closed, every mutant will be run"))
 
