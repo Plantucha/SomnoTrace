@@ -56,6 +56,12 @@ if [ -t 0 ]; then
     TTY_ARGS+=(-it)
 fi
 
+# Forward CI environment variables into the container if present.
+ENV_ARGS=()
+if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+    ENV_ARGS+=(-e "GITHUB_REPOSITORY=${GITHUB_REPOSITORY}")
+fi
+
 # With no args, drop into an interactive shell. "exec" runs an arbitrary
 # command; otherwise the args are passed to idf.py.
 if [ "$#" -eq 0 ]; then
@@ -69,6 +75,7 @@ fi
 exec docker run --rm \
     "${TTY_ARGS[@]}" \
     "${DEVICE_ARGS[@]}" \
+    "${ENV_ARGS[@]}" \
     -v "${PROJECT_DIR}:/project" \
     -w /project \
     "$IMAGE" \
