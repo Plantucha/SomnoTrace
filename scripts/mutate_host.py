@@ -128,13 +128,40 @@ def find_cjson() -> str | None:
 CJSON = find_cjson()
 
 
+def find_cjson_system() -> str | None:
+    """The include directory of a cJSON installed as a system library, or None.
+
+    apt's libcjson-dev -- which is what BOTH workflows install -- ships cJSON.h and
+    libcjson.so and no cJSON.c at all. find_cjson() above hunts only for the source, so it
+    returns None there and every cJSON-linking test is skipped.
+
+    scripts/run_host_tests.sh has always handled this case, with -lcjson. The harness did not,
+    and the consequence was measured rather than guessed: in a ubuntu:24.04 container carrying
+    exactly the packages the workflows install, run_host_tests.sh reports "5 run, 0 failed,
+    0 skipped" while this harness built 2 of the 5 tests and printed SCOPE 2 of 80. A tool
+    whose job is to report what the suite does not cover was itself covering less than the
+    suite, on the one machine where CI runs.
+
+    Deliberately not a fallback for a missing source: build() prefers cJSON.c when there is
+    one, because a source can be compiled in with the same flags as everything else."""
+    for d in ("/usr/include/cjson", "/usr/local/include/cjson"):
+        if os.path.exists(os.path.join(d, "cJSON.h")):
+            return d
+    return None
+
+
+CJSON_SYS = find_cjson_system()
+
+
 def sources_for(test: str) -> list[str] | None:
     out = []
     for s in TESTS[test]:
         if s == "@cjson":
-            if not CJSON:
-                return None
-            out.append(CJSON)
+            if CJSON:
+                out.append(CJSON)       # compiled in from source
+            elif CJSON_SYS is None:
+                return None             # neither source nor system library: genuinely skipped
+            # else: linked as -lcjson in build(), so there is no source to add here
         elif s.startswith("#"):
             continue      # already inside the test's translation unit -- see TESTS
         elif not s.endswith(".h"):
@@ -164,10 +191,15 @@ def build(test: str, outdir: str, coverage: bool = False) -> str | None:
     #
     # run_host_tests.sh has always ordered it this way -- $CJ_INC ahead of $SHIM, and only on
     # the two cJSON legs. This is the harness catching up with the suite it measures.
-    if CJSON and "@cjson" in TESTS[test]:
+    links_cjson = "@cjson" in TESTS[test]
+    if links_cjson and CJSON:
         cmd.append("-I" + os.path.dirname(CJSON))
+    elif links_cjson and CJSON_SYS:
+        cmd.append("-I" + CJSON_SYS)
     cmd += [f"-I{d}" for d in INC]
     cmd.append("-lm")
+    if links_cjson and not CJSON and CJSON_SYS:
+        cmd.append("-lcjson")           # -l goes after the objects that need it
     r = subprocess.run(cmd, capture_output=True, cwd=outdir)
     return exe if r.returncode == 0 else None
 
@@ -530,7 +562,8 @@ def main() -> int:
         print("gcc not found", file=sys.stderr)
         return 3
     outdir = tempfile.mkdtemp(prefix="snt-mutate-")
-    print(f"cJSON: {CJSON or '<not found — tests needing it are SKIPPED, not failed>'}")
+    print("cJSON: " + (CJSON or (f"-lcjson from {CJSON_SYS}" if CJSON_SYS else
+                                 "<not found — tests needing it are SKIPPED, not failed>")))
 
     if a.selftest:
         return selftest(outdir)
