@@ -114,21 +114,53 @@ compile_db_for() {
     python3 - "$PWD" "$bdir" <<'PYEOF'
 import json, sys
 root, bdir = sys.argv[1], sys.argv[2]
+CROOT = "/project"          # where scripts/idf.sh bind-mounts this checkout inside the image
+
+def rehost(p):
+    """Container path -> host path, ANCHORED AT THE PREFIX.
+
+    str.replace(CROOT, root) rewrites EVERY occurrence, which corrupts any path that
+    merely contains the word:
+        /project/main/projects.c  ->  <root>/main<root>s.c
+    and a checkout kept under ~/projects/ puts the substring back into the result, so the
+    damage depends on where the developer keeps their code. Requiring the prefix AND its
+    trailing separator means only the mount point moves."""
+    if p == CROOT:
+        return root
+    if p.startswith(CROOT + "/"):
+        return root + p[len(CROOT):]
+    return p
+
+def rehost_arg(a):
+    """Same, for one compiler argument -- where the path usually follows a flag, as in
+    -I/project/main or -DX=/project/y. Everything before the first '/' is kept, so an
+    argument that merely mentions a similar path (-I/opt/project/include) is untouched."""
+    i = a.find("/")
+    if i < 0:
+        return a
+    return a[:i] + rehost(a[i:])
+
 try:
     db = json.load(open(f"{bdir}/compile_commands.json"))
 except Exception:
     sys.exit(1)
 keep = []
 for e in db:
-    f = e["file"].replace("/project", root)
+    f = rehost(e["file"])
     if not (f.startswith(root + "/main/") or f.startswith(root + "/components/")):
         continue
     if "/third_party/" in f or "/managed_components/" in f:
         continue
-    cmd = e.get("command") or " ".join(e.get("arguments", []))
+    # Prefer "arguments" when the generator emits it: already tokenised, so each path is
+    # rewritten on its own and an argument containing a space cannot be split by accident.
+    args = e.get("arguments")
+    if args:
+        cmd = " ".join(rehost_arg(a) for a in args)
+    else:
+        cmd = " ".join(rehost_arg(a) for a in (e.get("command") or "").split())
     keep.append({"file": f,
-                 "directory": e.get("directory", "").replace("/project", root),
-                 "command": cmd.replace("/project", root)})
+                 "directory": rehost(e.get("directory", "")),
+                 "command": cmd})
 if not keep:
     sys.exit(1)
 json.dump(keep, open(".lint-compile-db.json", "w"))
@@ -195,7 +227,17 @@ while IFS= read -r cfg; do
 
     cppcheck --enable=style --suppress=unusedFunction "${CPPCHECK_COMMON[@]}" \
              "${CPP_TARGET[@]}" 2>&1 >/dev/null | grep '^style:' >> /tmp/lint-style.$$ || true
-    rm -rf "$bdir" .lint-compile-db.json
+    # scripts/idf.sh runs the container as root against a bind mount, so build-lint-*
+    # and everything under it is owned by root on the host. A plain rm then fails with
+    # Permission denied on any system without inherited directory ACLs, and the tree is
+    # left dirty. Ask the container to remove it -- it is the one user that can.
+    if ! rm -rf "$bdir" 2>/dev/null; then
+        ./scripts/idf.sh exec rm -rf "/project/$bdir" >/dev/null 2>&1 || true
+    fi
+    if [ -e "$bdir" ]; then
+        printf "  ⚠️ could not remove %s — remove it by hand before the next run\n" "$bdir"
+    fi
+    rm -f .lint-compile-db.json
 done < <(lint_configs)
 
 printf '\n▸ cppcheck — style tier (advisory, all %d configuration(s))\n' "$n_cfg"
