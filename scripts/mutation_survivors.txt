@@ -29,21 +29,3 @@ main/edf_gen.c:309:relational:<=→<                   # if (end_ntp <= 0) {
 main/edf_gen.c:311:relational:>→>=                   # if (maskoff_as11 > 0) {
 main/edf_gen.c:312:arithmetic:+→-                    # end_ntp = maskoff_as11 + clock_drift_ms;
 main/edf_gen.c:316:relational:>→>=                   # if (end_ntp > 0) {
-main/edf_waveform.c:32:relational:<=→<               # if (!f || channels_in_file <= 0) return UINT32_MAX;
-main/edf_waveform.c:35:relational:<→<=               # if (cur < 0) return UINT32_MAX;
-main/edf_waveform.c:38:relational:<→<=               # if (fseek(f, cur, SEEK_SET) != 0 || end < 0) return UINT32_MAX;
-main/edf_waveform.c:40:relational:<=→<               # if (end <= (long)sizeof(snt_header_t)) return 0;
-main/edf_waveform.c:61:logical:&&→||                 # if (events && cJSON_IsArray(events)) {
-main/edf_waveform.c:63:relational:<→<=               # for (int i = 0; i < n; i++) {
-main/edf_waveform.c:67:logical:||→&&                 # if (!label || !cJSON_IsString(label)) continue;
-main/edf_waveform.c:70:logical:&&→||                 # if (rt && cJSON_IsString(rt)) {
-main/edf_waveform.c:99:logical:&&→||                 # if (events && cJSON_IsArray(events)) {
-main/edf_waveform.c:101:relational:<→<=              # for (int i = 0; i < n; i++) {
-main/edf_waveform.c:105:logical:||→&&                # if (!label || !cJSON_IsString(label)) continue;
-main/edf_waveform.c:108:logical:&&→||                # if (rt && cJSON_IsString(rt)) {
-main/edf_waveform.c:135:logical:&&→||                # if (data_id && cJSON_IsString(data_id) &&
-main/edf_waveform.c:138:logical:&&→||                # if (events && cJSON_IsArray(events)) {
-main/edf_waveform.c:140:relational:<→<=              # for (int i = 0; i < n; i++) {
-main/edf_waveform.c:144:logical:&&→||                # if (val && cJSON_IsNumber(val) &&
-main/edf_waveform.c:148:logical:&&→||                # if (rt && cJSON_IsString(rt)) {
-main/edf_waveform.c:151:relational:>→>=              # if (as11_ms > 0)

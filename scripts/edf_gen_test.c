@@ -1283,6 +1283,353 @@ static void test_identification_missing_source_is_refused(void)
     assert(ident_slurp(crc_path, NULL) == NULL);
 }
 
+/* ── edf_waveform: the guards in the event-file readers ──────────────────────
+ * Eighteen of the harness's thirty-three survivors lived in these three
+ * functions, all of them the same shape: a guard whose false branch nothing
+ * exercised. `events && cJSON_IsArray(events)` flipped to `||` still returns
+ * the right answer on every well-formed file, because a well-formed file always
+ * has an array there. The tests below are therefore all MALFORMED input — the
+ * only input that tells the two versions apart.
+ *
+ * Two of the mutants matter beyond the score. Dropping the IsString check on a
+ * label reaches strcmp(NULL, ...) and dropping it on reportTime reaches the
+ * ISO-8601 parser with a NULL pointer, both from a file the device wrote after
+ * a crash or a partial flush.
+ */
+static void wf_write(const char *path, const char *jsonl)
+{
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    assert(fputs(jsonl, f) >= 0);
+    assert(fclose(f) == 0);
+}
+
+static const char *wf_path(char *dst, size_t cap, const char *name)
+{
+    snprintf(dst, cap, "%s/%s", g_root, name);
+    return dst;
+}
+
+/* ---- snt_available_samples -------------------------------------------------- */
+
+static void test_wf_available_samples_guards(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_avail.snt");
+
+    /* A file holding exactly the header and nothing else: no samples, and that
+     * is a 0, not an error. */
+    FILE *f = fopen(p, "wb");
+    assert(f);
+    snt_header_t h;
+    memset(&h, 0, sizeof(h));
+    assert(fwrite(&h, 1, sizeof(h), f) == sizeof(h));
+    assert(fclose(f) == 0);
+    f = fopen(p, "rb");
+    assert(f);
+    assert(snt_available_samples(f, 2) == 0);
+
+    /* CHANNELS ZERO IS REFUSED, not divided by. `channels_in_file <= 0` weakened
+     * to `< 0` lets a zero through to `data_bytes / frame` with frame == 0. */
+    assert(snt_available_samples(f, 0) == UINT32_MAX);
+    assert(snt_available_samples(f, -1) == UINT32_MAX);
+    assert(snt_available_samples(NULL, 2) == UINT32_MAX);
+    assert(fclose(f) == 0);
+
+    /* An EMPTY file is 0 samples. end == 0 here, so a guard written `end <= 0`
+     * instead of `end < 0` reports UINT32_MAX — an error where there is none. */
+    f = fopen(p, "wb"); assert(f); assert(fclose(f) == 0);
+    f = fopen(p, "rb"); assert(f);
+    assert(snt_available_samples(f, 2) == 0);
+    assert(fclose(f) == 0);
+
+    /* Header plus three whole frames of two channels, read from the START of the
+     * file: ftell is 0 there, so `cur < 0` weakened to `<= 0` would refuse a
+     * perfectly ordinary call. */
+    f = fopen(p, "wb");
+    assert(f);
+    assert(fwrite(&h, 1, sizeof(h), f) == sizeof(h));
+    int16_t frames[6] = { 1, 2, 3, 4, 5, 6 };
+    assert(fwrite(frames, sizeof(int16_t), 6, f) == 6);
+    assert(fclose(f) == 0);
+    f = fopen(p, "rb");
+    assert(f);
+    assert(ftell(f) == 0);
+    assert(snt_available_samples(f, 2) == 3);
+    assert(fclose(f) == 0);
+}
+
+/* ---- edf_find_mask_on_time / edf_find_mask_off_time -------------------------- */
+
+static void test_wf_mask_times_are_found(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_mask_ok.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:10:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:20:00.000\"}]}}\n");
+    int64_t on = edf_find_mask_on_time(p);
+    int64_t off = edf_find_mask_off_time(p);
+    assert(on > 0);
+    assert(off > on);
+    /* MaskOff takes the LAST one in the file, MaskOn the first — asserted as an
+     * ordering rather than a constant so the test does not pin a timezone. */
+    assert(off - on == 8 * 3600 * 1000 + 10 * 60 * 1000);
+}
+
+static void test_wf_mask_on_last_wins_is_first_wins(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_mask_first.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T23:00:00.000\"}]}}\n");
+    int64_t a = edf_find_mask_on_time(p);
+    wf_path(p, sizeof(p), "wf_mask_one.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    /* MaskOn returns on the FIRST match; a second one later must not move it. */
+    assert(a == edf_find_mask_on_time(p));
+}
+
+static void test_wf_mask_off_takes_the_last(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_maskoff_last.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T05:00:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n");
+    int64_t last = edf_find_mask_off_time(p);
+    wf_path(p, sizeof(p), "wf_maskoff_one.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n");
+    /* MaskOff keeps scanning and reports the last — the session ends when the
+     * mask last came off, not the first time it did. */
+    assert(last == edf_find_mask_off_time(p));
+}
+
+static void test_wf_events_must_be_an_array(void)
+{
+    char p[400];
+    /* "events" as an OBJECT. cJSON_GetArraySize counts an object's children too,
+     * so a mutant that drops the IsArray half of the guard walks into it and
+     * finds the MaskOn inside. */
+    wf_path(p, sizeof(p), "wf_events_obj.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":{\"x\":{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}}}}\n");
+    assert(edf_find_mask_on_time(p) == -1);
+
+    wf_path(p, sizeof(p), "wf_events_obj_off.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":{\"x\":{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}}}}\n");
+    assert(edf_find_mask_off_time(p) == -1);
+}
+
+static void test_wf_a_non_string_label_is_skipped(void)
+{
+    char p[400];
+    /* A numeric "event". The guard is `!label || !cJSON_IsString(label)`; turn
+     * that `||` into `&&` and a number reaches strcmp(label->valuestring, ...)
+     * with valuestring NULL. */
+    wf_path(p, sizeof(p), "wf_label_num.jsonl");
+    wf_write(p, "{\"params\":{\"events\":[{\"event\":123,"
+                "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(edf_find_mask_on_time(p) == -1);
+    assert(edf_find_mask_off_time(p) == -1);
+}
+
+static void test_wf_a_non_string_report_time_is_skipped(void)
+{
+    char p[400];
+    /* A numeric "reportTime" behind a matching label. Dropping the IsString half
+     * of `rt && cJSON_IsString(rt)` hands a NULL to the ISO-8601 parser. */
+    wf_path(p, sizeof(p), "wf_rt_num.jsonl");
+    wf_write(p, "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+                "\"reportTime\":99999}]}}\n");
+    assert(edf_find_mask_on_time(p) == -1);
+
+    wf_path(p, sizeof(p), "wf_rt_num_off.jsonl");
+    wf_write(p, "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+                "\"reportTime\":99999}]}}\n");
+    assert(edf_find_mask_off_time(p) == -1);
+}
+
+/* ---- edf_find_zle_edge_time --------------------------------------------------- */
+
+static void test_wf_zle_only_reads_zle_records(void)
+{
+    char p[400];
+    /* dataId is present but is not _ZLE. The guard is
+     * `data_id && cJSON_IsString(data_id) && strcmp(...) == 0`; turning the
+     * first && into || makes it `data_id || (IsString && strcmp == 0)`, so ANY
+     * record with a dataId is treated as a ZLE record. */
+    wf_path(p, sizeof(p), "wf_zle_other.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"OTHER\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_value_must_be_a_number(void)
+{
+    char p[400];
+    /* "value" as a STRING. `val && cJSON_IsNumber(val) && ...` with the first
+     * && turned into || accepts it, because val is merely non-NULL. */
+    wf_path(p, sizeof(p), "wf_zle_valstr.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":\"1\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable(void)
+{
+    char p[400];
+    /* A numeric reportTime is not a string, so the AS11 path is skipped and the
+     * ntpTimeMs fallback answers. Dropping the IsString check parses NULL. */
+    wf_path(p, sizeof(p), "wf_zle_ntp.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":7,\"ntpTimeMs\":1756000000000}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == 1756000000000LL);
+}
+
+static void test_wf_zle_clock_drift_is_added_to_the_as11_time(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_zle_drift.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    int64_t zero = edf_find_zle_edge_time(p, 1, 0);
+    int64_t plus = edf_find_zle_edge_time(p, 1, 4321);
+    assert(zero > 0);
+    assert(plus - zero == 4321);
+}
+
+/* Round two: the guards that a single malformed record cannot separate.
+ *
+ * `rt && cJSON_IsString(rt)` weakened to `||` still yields -1 on a file whose
+ * only MaskOn has a numeric reportTime, because the parser hands back a failure
+ * for the NULL valuestring and -1 is what the caller would have returned anyway.
+ * The two versions diverge only when a USABLE record follows a broken one:
+ * MaskOn returns on its first match, so the mutant returns -1 and never reaches
+ * the good line; MaskOff keeps the last, so the mutant overwrites a good time
+ * with -1. Each therefore needs the bad record on the side its function cares
+ * about. */
+
+static void test_wf_mask_on_survives_a_broken_record_before_a_good_one(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_on_bad_then_good.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\",\"reportTime\":99999}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    int64_t got = edf_find_mask_on_time(p);
+    wf_path(p, sizeof(p), "wf_on_good_only.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(got > 0);
+    assert(got == edf_find_mask_on_time(p));
+}
+
+static void test_wf_mask_off_survives_a_broken_record_after_a_good_one(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_off_good_then_bad.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\",\"reportTime\":99999}]}}\n");
+    int64_t got = edf_find_mask_off_time(p);
+    wf_path(p, sizeof(p), "wf_off_good_only.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n");
+    assert(got > 0);
+    assert(got == edf_find_mask_off_time(p));
+}
+
+static void test_wf_zle_events_must_be_an_array(void)
+{
+    char p[400];
+    /* The same object-shaped events as the MaskOn case, but inside a _ZLE
+     * record — a separate copy of the guard, and it needed its own test. */
+    wf_path(p, sizeof(p), "wf_zle_events_obj.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":{\"x\":{\"value\":1,"
+        "\"ntpTimeMs\":1756000000000}}}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_rejects_a_zero_ntp_time(void)
+{
+    char p[400];
+    /* ntpTimeMs of 0 is not a time, it is an unset field. `cand > 0` weakened to
+     * `>= 0` accepts it and reports the epoch as a ZLE edge. */
+    wf_path(p, sizeof(p), "wf_zle_ntp_zero.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"ntpTimeMs\":0}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_an_epoch_report_time_is_not_a_time(void)
+{
+    char p[400];
+    /* A reportTime that parses to 0 must not become `0 + drift`. `as11_ms > 0`
+     * weakened to `>= 0` turns an unset timestamp into a real-looking edge
+     * exactly one drift away from the epoch. The ntpTimeMs here is what the
+     * function SHOULD fall back to, so the assertion names the right answer
+     * rather than merely rejecting the wrong one. */
+    wf_path(p, sizeof(p), "wf_zle_epoch.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"1970-01-01T00:00:00.000\","
+        "\"ntpTimeMs\":1756000000000}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 60000) == 1756000000000LL);
+}
+
+static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
+{
+    char p[400], q[400];
+    /* THE ONE CASE WHERE cand IS EXACTLY ZERO. `cand < 0` weakened to `<= 0`
+     * makes a drift that happens to cancel the AS11 timestamp fall through to
+     * the ntpTimeMs fallback — so a computed zero silently becomes a different
+     * clock's answer instead of being rejected.
+     *
+     * The drift is derived at run time rather than hard-coded, because the AS11
+     * time depends on the host timezone and pinning it would make this test a
+     * clock test. */
+    wf_path(p, sizeof(p), "wf_zle_drift_probe.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    int64_t as11 = edf_find_zle_edge_time(p, 1, 0);
+    assert(as11 > 0);
+
+    wf_path(q, sizeof(q), "wf_zle_cancel.jsonl");
+    wf_write(q,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\","
+        "\"ntpTimeMs\":1756000000000}]}}\n");
+    /* as11 + (-as11) == 0, which is not a time. The ntp value must NOT rescue it:
+     * the AS11 path answered, and it answered zero. */
+    assert(edf_find_zle_edge_time(q, 1, -as11) == -1);
+}
+
 int main(void)
 {
     snprintf(g_root, sizeof(g_root), "%s/snt_edf_test_XXXXXX",
@@ -1326,6 +1673,35 @@ int main(void)
         test_identification_absent_fields_are_empty_or_zero, NULL);
     run("a missing identification.json is refused and writes nothing",
         test_identification_missing_source_is_refused, NULL);
+
+    run("snt_available_samples refuses 0 channels and an empty file is 0",
+        test_wf_available_samples_guards, NULL);
+    run("MaskOn and MaskOff are read from the event file",
+        test_wf_mask_times_are_found, NULL);
+    run("MaskOn takes the first match", test_wf_mask_on_last_wins_is_first_wins, NULL);
+    run("MaskOff takes the last match", test_wf_mask_off_takes_the_last, NULL);
+    run("an events object is not an events array", test_wf_events_must_be_an_array, NULL);
+    run("a non-string event label is skipped", test_wf_a_non_string_label_is_skipped, NULL);
+    run("a non-string reportTime is skipped",
+        test_wf_a_non_string_report_time_is_skipped, NULL);
+    run("_ZLE search ignores other dataIds", test_wf_zle_only_reads_zle_records, NULL);
+    run("_ZLE value must be a number", test_wf_zle_value_must_be_a_number, NULL);
+    run("_ZLE falls back to ntpTimeMs",
+        test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable, NULL);
+    run("_ZLE adds the clock drift to the AS11 time",
+        test_wf_zle_clock_drift_is_added_to_the_as11_time, NULL);
+
+    run("MaskOn skips a broken record and finds the next",
+        test_wf_mask_on_survives_a_broken_record_before_a_good_one, NULL);
+    run("MaskOff is not overwritten by a broken later record",
+        test_wf_mask_off_survives_a_broken_record_after_a_good_one, NULL);
+    run("_ZLE events object is not an array", test_wf_zle_events_must_be_an_array, NULL);
+    run("_ZLE rejects a zero ntpTimeMs", test_wf_zle_rejects_a_zero_ntp_time, NULL);
+    run("_ZLE epoch reportTime falls through to ntp",
+        test_wf_zle_an_epoch_report_time_is_not_a_time, NULL);
+
+    run("_ZLE rejects an AS11 time cancelled by the drift",
+        test_wf_zle_a_drift_cancelled_time_is_not_a_time, NULL);
 
     if (!getenv("KEEP_TEST_TREE")) rmtree(g_root);
     else printf("test tree kept at %s\n", g_root);
