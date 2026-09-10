@@ -118,6 +118,23 @@ run_test() {
     fi
 }
 
+# run_check <name> <command...> — for a check that is not a compiled C test.
+# Shares the counters so one summary line still covers everything that ran.
+run_check() {
+    local name=$1; shift
+    known="$known $name"
+    if [ -n "$ONLY" ] && [ "$ONLY" != "$name" ]; then return; fi
+    ran=$((ran + 1))
+    local log="$OUT/$name.log"
+    if "$@" > "$log" 2>&1; then
+        echo "### $name: PASS  ($(tail -1 "$log"))"
+    else
+        echo "### $name: FAIL"
+        failed=$((failed + 1))
+        [ $QUIET = 1 ] || cat "$log"
+    fi
+}
+
 # skip_test <name> <reason>
 skip_test() {
     known="$known $1"
@@ -148,6 +165,17 @@ if [ -n "$CJ_INC" ]; then
     # upstream's EDF pipeline property suite (54ae598)
     run_test edf_properties_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+fi
+
+# The mutation harness's TEXTUAL layer has nothing else to catch a mistake in it. Every
+# other part is checked by running — a badly formed mutant fails to compile and is counted
+# stillborn — but a mutant generated on the wrong part of a line still builds and still
+# passes, which is precisely how operators inside trailing comments produced survivors that
+# no test could ever kill. Needs no compiler, so it runs wherever python3 does.
+if command -v python3 >/dev/null 2>&1; then
+    run_check mutate_host_self_test python3 scripts/mutate_host.py --self-test
+else
+    skip_test mutate_host_self_test "no python3"
 fi
 
 # Roster check: a test file that exists but is not wired in here would never

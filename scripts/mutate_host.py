@@ -422,6 +422,24 @@ OPS: list[tuple[str, str, str]] = [
 
 SKIP_LINE = re.compile(r'^\s*(//|/\*|\*|#include|#pragma)')
 
+# Where a TRAILING comment starts. SKIP_LINE above only catches a comment that begins a
+# line, so an operator inside `x = y;  /* >= 0 here */` was fair game and got mutated —
+# producing a byte-identical program that every test passes, reported as a survivor.
+# Measured on this tree: 392 lines across 22 files in main/ carry a mutable operator in a
+# trailing comment and could each generate one of these.
+#
+# Taking the FIRST /* or // as the boundary is deliberately conservative. A line like
+# `a /* note */ + b` stops being mutated after the comment, so the count can only go down,
+# never wrong: a mutant not generated costs a little coverage, a mutant that cannot fail
+# costs the reader's trust in every other line of the report.
+_COMMENT_START = re.compile(r'/\*|//')
+
+
+def code_of(line: str) -> str:
+    """The part of a source line before any trailing comment."""
+    m = _COMMENT_START.search(line)
+    return line[:m.start()] if m else line
+
 
 def load_equivalents() -> set[str]:
     out = set()
@@ -441,9 +459,13 @@ def gen_mutants(path: str, limit: int) -> list[tuple[int, str, str, str]]:
     for i, line in enumerate(lines, 1):
         if SKIP_LINE.match(line) or '"' in line:
             continue          # string literals: a changed message is not a behaviour change
+        code = code_of(line)
         for a, b, name in OPS:
-            if a in line:
-                out.append((i, f"{name}:{a.strip()}→{b.strip()}", line, line.replace(a, b, 1)))
+            if a in code:
+                # Rebuild the line so the comment survives byte-for-byte: only the code
+                # half is edited, and only its first occurrence, exactly as before.
+                mutated = code.replace(a, b, 1) + line[len(code):]
+                out.append((i, f"{name}:{a.strip()}→{b.strip()}", line, mutated))
                 break
         if len(out) >= limit:
             break
@@ -457,6 +479,63 @@ def gen_mutants(path: str, limit: int) -> list[tuple[int, str, str, str]]:
 # or void, and many split their parameters across lines.
 _DEF = re.compile(r'^[A-Za-z_][A-Za-z0-9_ \t\*]*\b(\w+)\s*\(')
 _NOT_A_DEF = re.compile(r'^\s*(if|for|while|switch|return|else|do|typedef|struct|enum|union)\b')
+
+
+def self_test() -> int:
+    """Assertions on the textual layer — the part with no compiler to catch it.
+
+    Everything else here is checked by running: a bad mutant fails to build and is counted
+    stillborn. gen_mutants has no such backstop, because a mutant it generates wrongly still
+    compiles — that is exactly how the trailing-comment bug produced survivors nobody could
+    kill. So this is the piece that needs pinning."""
+    fails = []
+
+    def eq(what, got, want):
+        if got != want:
+            fails.append(f"{what}: got {got!r}, want {want!r}")
+
+    eq("code_of: no comment", code_of("    if (a >= b) {\n"), "    if (a >= b) {\n")
+    eq("code_of: block comment", code_of("    x = 1;  /* >= 0 */\n"), "    x = 1;  ")
+    eq("code_of: line comment", code_of("    x = 1;  // >= 0\n"), "    x = 1;  ")
+    eq("code_of: whole-line comment", code_of("  /* >= */\n"), "  ")
+
+    d = tempfile.mkdtemp(prefix="selftest-")
+    try:
+        p = os.path.join(d, "t.c")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("int f(int a, int b)\n"                  # 1
+                    "{\n"                                     # 2
+                    "    int n = a - 1;     /* >= 0 always */\n"  # 3
+                    "    if (a > b) return 1;\n"              # 4
+                    "    return 0;\n"                         # 5
+                    "}\n")                                    # 6
+        got = gen_mutants(p, 100)
+        lines_hit = sorted(m[0] for m in got)
+
+        # Line 3's only >= is inside the comment; its CODE has a '-', which is a real
+        # operator, so line 3 is still mutated -- on the minus, not on the comment.
+        m3 = [m for m in got if m[0] == 3]
+        eq("line 3 produces one mutant", len(m3), 1)
+        if m3:
+            eq("line 3 mutates the code operator", m3[0][1], "arithmetic:-→+")
+            eq("line 3 keeps its comment", m3[0][3].endswith("/* >= 0 always */\n"), True)
+        m4 = [m for m in got if m[0] == 4]
+        eq("line 4 mutates the comparison", m4[0][1] if m4 else None, "relational:>→>=")
+        eq("no mutant on a brace-only line", 2 in lines_hit, False)
+
+        # A line whose ONLY operator lives in the comment must yield nothing at all.
+        p2 = os.path.join(d, "u.c")
+        with open(p2, "w", encoding="utf-8") as f:
+            f.write("void g(void)\n{\n    step();      /* runs when n >= 2 */\n}\n")
+        eq("comment-only operator generates no mutant",
+           [m[0] for m in gen_mutants(p2, 100)], [])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    for f in fails:
+        print(f"  FAIL {f}")
+    print(f"mutate_host self-test: {'PASS' if not fails else str(len(fails)) + ' FAILED'}")
+    return 1 if fails else 0
 
 
 def canary_for(path: str, lines: list[str]) -> tuple[int, str, str] | None:
@@ -641,6 +720,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=25, help="max mutants per file")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cjson", help="path to cJSON.c when it is not beside the project")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check the textual mutation layer and exit; no compiler needed")
     ap.add_argument("--write-inventory", action="store_true",
                     help="rewrite scripts/mutation_survivors.txt from this run; needs --all, "
                          "and refuses where any suite is skipped")
@@ -649,6 +730,9 @@ def main() -> int:
     global CJSON
     if a.cjson:
         CJSON = a.cjson
+
+    if a.self_test:
+        return self_test()
 
     if not shutil.which("gcc"):
         print("gcc not found", file=sys.stderr)
