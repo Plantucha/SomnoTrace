@@ -40,6 +40,7 @@
 
 #include "as11_ble.h"
 #include "as11_reconnect.h"
+#include "as11_adv.h"
 #include "session_writer.h"
 #include "bsp_display.h"
 #include "time_sync.h"
@@ -900,23 +901,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             ESP_LOGD(TAG, "Scan report from %s: parse failed (rc=%d), "
                      "trying manual AD parse", addr_str, rc);
             memset(&f, 0, sizeof(f));
-            for (int off = 0; off + 1 < raw_len; ) {
-                uint8_t ad_len = raw[off];
-                if (ad_len == 0 || off + 1 + ad_len > raw_len) break;
-                uint8_t ad_type = raw[off + 1];
-                const uint8_t *ad_data = raw + off + 2;
-                int ad_data_len = ad_len - 1;
-                if (ad_type == 0x09 || ad_type == 0x08) {
-                    /* Complete or Shortened Local Name */
-                    f.name = ad_data;
-                    f.name_len = ad_data_len;
-                } else if (ad_type == 0x03 || ad_type == 0x02) {
-                    /* Complete or Incomplete 16-bit Service UUID list */
-                    f.uuids16 = (void *)ad_data;
-                    f.num_uuids16 = ad_data_len / 2;
-                }
-                off += 1 + ad_len;
-            }
+            as11_adv_fields_t sal;
+            as11_adv_salvage(raw, raw_len, &sal);
+            f.name        = sal.name;
+            f.name_len    = (uint8_t)sal.name_len;
+            /* The cast stays HERE rather than inside as11_adv_salvage(): a
+             * UUID list begins at an arbitrary offset in the payload and so
+             * carries no alignment guarantee, and the salvage parser returns
+             * bytes precisely so that the one place assuming otherwise is
+             * visible. Unchanged from what shipped. */
+            f.uuids16     = (const ble_uuid16_t *)sal.uuids16;
+            f.num_uuids16 = (uint8_t)sal.num_uuids16;
         }
 
         bool match = false;
