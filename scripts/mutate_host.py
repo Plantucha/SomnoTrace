@@ -212,6 +212,35 @@ def find_cjson_system() -> str | None:
 CJSON_SYS = find_cjson_system()
 
 
+def sanitizer_flags() -> list[str]:
+    """-fsanitize flags when this toolchain has them, else nothing.
+
+    The harness must build the way scripts/run_host_tests.sh builds, or its verdict is
+    about a different program. It matters more here than there: a mutation that corrupts
+    memory rather than changing an answer survives a suite that only checks answers.
+    Three did in edf_header.c -- a malloc one element short, and a header field written
+    88 bytes BEFORE a stack array -- and all three die under AddressSanitizer.
+
+    Probed once, by compiling. Asking the compiler is cheaper than maintaining a list of
+    which versions support what, and it cannot be wrong."""
+    if os.environ.get("SNT_NO_SANITIZE"):
+        return []
+    d = tempfile.mkdtemp(prefix="sancheck-")
+    try:
+        src = os.path.join(d, "t.c")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("int main(void){return 0;}\n")
+        r = subprocess.run(["gcc", "-fsanitize=address,undefined",
+                            "-o", os.path.join(d, "t"), src],
+                           capture_output=True)
+        return ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if r.returncode == 0 else []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+SANITIZE = sanitizer_flags()
+
+
 def sources_for(test: str) -> list[str] | None:
     out = []
     for s in TESTS[test]:
@@ -234,6 +263,7 @@ def build(test: str, outdir: str, coverage: bool = False) -> str | None:
         return None
     exe = os.path.join(outdir, test)
     cmd = ["gcc", "-O0", "-o", exe, os.path.join(HERE, test + ".c"), *src]
+    cmd += SANITIZE
     if coverage:
         cmd += ["--coverage"]
     # Header order depends on what the test links, and it has to.
@@ -626,6 +656,9 @@ def main() -> int:
     outdir = tempfile.mkdtemp(prefix="snt-mutate-")
     print("cJSON: " + (CJSON or (f"-lcjson from {CJSON_SYS}" if CJSON_SYS else
                                  "<not found — tests needing it are SKIPPED, not failed>")))
+    print("SANITIZE: " + (" ".join(SANITIZE) if SANITIZE else
+                          "<none — a mutant that corrupts memory instead of changing an "
+                          "answer may survive>"))
 
     if a.selftest:
         return selftest(outdir)

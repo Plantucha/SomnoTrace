@@ -14,8 +14,6 @@
 #
 # Format:  <path>:<line>:<operator>      # the line as it stands today
 
-main/edf_annotations.c:63:arithmetic:-→+             # strncpy(path, edf_path, sizeof(path) - 1);
-main/edf_annotations.c:64:arithmetic:-→+             # path[sizeof(path) - 1] = '\0';
 main/edf_annotations.c:68:arithmetic:*→/             # snt_event_t *ev_list = malloc(capacity * sizeof(snt_event_t));
 main/edf_annotations.c:83:logical:&&→||              # if (data_id && cJSON_IsString(data_id)) {
 main/edf_annotations.c:151:relational:<→<=           # for (size_t i = 0; i + 1 < count; i++) {
@@ -31,11 +29,6 @@ main/edf_gen.c:309:relational:<=→<                   # if (end_ntp <= 0) {
 main/edf_gen.c:311:relational:>→>=                   # if (maskoff_as11 > 0) {
 main/edf_gen.c:312:arithmetic:+→-                    # end_ntp = maskoff_as11 + clock_drift_ms;
 main/edf_gen.c:316:relational:>→>=                   # if (end_ntp > 0) {
-main/edf_header.c:71:relational:>→>=                 # if (len > width) len = width;
-main/edf_header.c:84:relational:<→<=                 # if (written < 0 || (size_t)written >= tmp_path_len) {
-main/edf_header.c:125:arithmetic:+→-                 # char *buf = malloc(fsize + 1);
-main/edf_header.c:188:arithmetic:+→-                 # edf_write_field(hdr + 88, 80, recording_id);         /* recording ID *
-main/edf_header.c:189:arithmetic:+→-                 # edf_write_field(hdr + 168, 8, start_date);           /* start date */
 main/edf_waveform.c:32:relational:<=→<               # if (!f || channels_in_file <= 0) return UINT32_MAX;
 main/edf_waveform.c:35:relational:<→<=               # if (cur < 0) return UINT32_MAX;
 main/edf_waveform.c:38:relational:<→<=               # if (fseek(f, cur, SEEK_SET) != 0 || end < 0) return UINT32_MAX;

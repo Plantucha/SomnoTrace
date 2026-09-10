@@ -33,3 +33,12 @@ main/as11_time.c:326:relational:<→<=       # parse_iso8601: the two sscanf for
 main/as11_time.c:330:relational:<→<=       # ...and the retry can never return 6 when the first returned < 6, so the
 #   inner `if (n < 6) return -1` fires whenever reached. (The retry block is dead code; a finding
 #   for upstream, not a test gap.)
+
+# edf_write_field's clamp. `len > width` vs `len >= width`: at len == width the mutant
+# assigns width to a variable that already holds width. Every other value takes the same
+# branch in both. The assignment is a no-op, so no input can separate them.
+main/edf_header.c:71:relational:>→>=
+# edf_open_atomic_file's snprintf guard. `written < 0` vs `written <= 0`: they differ only
+# at written == 0, and the format is "%s.tmp", so snprintf returns at least 4 for every
+# path including "". Zero is unreachable, so the extra case the mutant adds is never taken.
+main/edf_header.c:84:relational:<→<=
