@@ -3,7 +3,8 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Tests the event classification and state transitions in session_writer.c
+ * Tests the event classification in as11_events.c (linked, not copied)
+ * and the state transitions in session_writer.c,
  * ensuring Mask Fit and tube drying (Cooldown) modes are never recorded
  * as therapy sessions while mid-therapy reboot recovery and 3 AM restarts
  * remain fully supported.
@@ -19,67 +20,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 
-/* Replicated event taxonomy from session_writer.c */
-typedef enum {
-    AS11_EV_NONE = 0,
-    AS11_EV_THERAPY_START,
-    AS11_EV_THERAPY_STOP,
-    AS11_EV_MASK_FIT_START,
-    AS11_EV_MASK_FIT_STOP,
-    AS11_EV_COOLDOWN_START,
-    AS11_EV_COOLDOWN_STOP,
-    AS11_EV_STANDBY_START,
-} as11_event_t;
-
-/* Replicated parser from session_writer.c */
-static as11_event_t check_event_notification(const cJSON *msg, const char **out_report)
-{
-    if (out_report) *out_report = NULL;
-
-    cJSON *params = cJSON_GetObjectItem(msg, "params");
-    if (!params) return AS11_EV_NONE;
-
-    cJSON *events = cJSON_GetObjectItem(params, "events");
-    if (!events || !cJSON_IsArray(events)) return AS11_EV_NONE;
-
-    int n = cJSON_GetArraySize(events);
-    for (int i = 0; i < n; i++) {
-        cJSON *ev = cJSON_GetArrayItem(events, i);
-        if (!ev) continue;
-        cJSON *event = cJSON_GetObjectItem(ev, "event");
-        if (!event || !cJSON_IsString(event)) continue;
-        const char *name = event->valuestring;
-
-        if (strcmp(name, "TherapyStart") == 0) {
-            cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
-            if (out_report && rt && cJSON_IsString(rt))
-                *out_report = rt->valuestring;
-            return AS11_EV_THERAPY_START;
-        }
-        if (strcmp(name, "TherapyStop") == 0) {
-            return AS11_EV_THERAPY_STOP;
-        }
-        if (strcmp(name, "MaskFitStart") == 0 ||
-            strcmp(name, "MaskfitStarted") == 0 ||
-            strcmp(name, "LearnTargetsStart") == 0) {
-            return AS11_EV_MASK_FIT_START;
-        }
-        if (strcmp(name, "MaskFitStop") == 0 ||
-            strcmp(name, "LearnTargetsStop") == 0) {
-            return AS11_EV_MASK_FIT_STOP;
-        }
-        if (strcmp(name, "CooldownStarted") == 0) {
-            return AS11_EV_COOLDOWN_START;
-        }
-        if (strcmp(name, "CooldownStopped") == 0) {
-            return AS11_EV_COOLDOWN_STOP;
-        }
-        if (strcmp(name, "StandbyStarted") == 0) {
-            return AS11_EV_STANDBY_START;
-        }
-    }
-    return AS11_EV_NONE;
-}
+#include "as11_events.h"
 
 /* State machine test fixture */
 typedef struct {
@@ -389,6 +330,68 @@ int main(void) {
         printf("  [PASS] Test 8: CSL.edf CSR Event Labels, Backdate & Deduplication (Issue #190)\n");
     }
 
-    printf("\n>>> ALL AS11 EVENT TESTS PASSED (8/8) <<<\n");
+    /* Test 9: Malformed EventNotification payloads.
+     *
+     * Each case below pins a guard the mutation harness reported as unasserted
+     * the moment as11_events.c became linkable: flipping the operator left the
+     * whole suite green.  Two of the three do not merely misclassify — they
+     * dereference NULL, so the guards are load-bearing rather than defensive
+     * decoration. */
+    {
+        /* "events" present but an OBJECT, not an array.  cJSON_GetArraySize()
+         * does not check the type; it counts children, and cJSON_GetArrayItem()
+         * walks the same list.  Without the cJSON_IsArray() guard an object's
+         * members would be classified as events. */
+        cJSON *m1 = cJSON_CreateObject();
+        cJSON *p1 = cJSON_CreateObject();
+        cJSON_AddItemToObject(m1, "params", p1);
+        cJSON *notarr = cJSON_CreateObject();
+        cJSON_AddItemToObject(p1, "events", notarr);
+        cJSON *inner = cJSON_CreateObject();
+        cJSON_AddStringToObject(inner, "event", "TherapyStart");
+        cJSON_AddItemToObject(notarr, "0", inner);
+        assert(check_event_notification(m1, NULL) == AS11_EV_NONE);
+        cJSON_Delete(m1);
+
+        /* "event" present but not a string: valuestring is NULL there, so
+         * dropping the cJSON_IsString() guard reaches strcmp(NULL, ...). */
+        cJSON *m2 = cJSON_CreateObject();
+        cJSON *p2 = cJSON_CreateObject();
+        cJSON_AddItemToObject(m2, "params", p2);
+        cJSON *arr2 = cJSON_CreateArray();
+        cJSON_AddItemToObject(p2, "events", arr2);
+        cJSON *it2 = cJSON_CreateObject();
+        cJSON_AddNumberToObject(it2, "event", 123);
+        cJSON_AddItemToArray(arr2, it2);
+        assert(check_event_notification(m2, NULL) == AS11_EV_NONE);
+        cJSON_Delete(m2);
+
+        /* TherapyStart carrying a reportTime the caller does not want.
+         * session_writer.c has call sites that pass NULL, and writing through
+         * it is what the && chain prevents. */
+        cJSON *m3 = make_event_msg("TherapyStart", "2026-09-17T03:00:00Z");
+        assert(check_event_notification(m3, NULL) == AS11_EV_THERAPY_START);
+        cJSON_Delete(m3);
+
+        /* No params at all. */
+        cJSON *m4 = cJSON_CreateObject();
+        assert(check_event_notification(m4, NULL) == AS11_EV_NONE);
+        cJSON_Delete(m4);
+
+        /* Empty events array: nothing matches, and out_report is still cleared
+         * rather than left holding whatever the caller had. */
+        cJSON *m5 = cJSON_CreateObject();
+        cJSON *p5 = cJSON_CreateObject();
+        cJSON_AddItemToObject(m5, "params", p5);
+        cJSON_AddItemToObject(p5, "events", cJSON_CreateArray());
+        const char *rt5 = "sentinel";
+        assert(check_event_notification(m5, &rt5) == AS11_EV_NONE);
+        assert(rt5 == NULL);
+        cJSON_Delete(m5);
+
+        printf("  [PASS] Test 9: Malformed EventNotification payloads rejected\n");
+    }
+
+    printf("\n>>> ALL AS11 EVENT TESTS PASSED (9/9) <<<\n");
     return 0;
 }

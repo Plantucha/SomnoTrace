@@ -69,6 +69,7 @@
 #include "therapy_alert.h"
 #include "crash_diag.h"
 #include "snt_format.h"
+#include "as11_events.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1817,68 +1818,6 @@ static void write_event(session_writer_t *s, const cJSON *msg)
 }
 
 /* ── Notification parsing ─────────────────────────────────────────── */
-
-/* Event types recognized in check_event_notification */
-typedef enum {
-    AS11_EV_NONE = 0,
-    AS11_EV_THERAPY_START,
-    AS11_EV_THERAPY_STOP,
-    AS11_EV_MASK_FIT_START,
-    AS11_EV_MASK_FIT_STOP,
-    AS11_EV_COOLDOWN_START,
-    AS11_EV_COOLDOWN_STOP,
-    AS11_EV_STANDBY_START,
-} as11_event_t;
-
-/* Check an EventNotification for therapy start/stop and lifecycle events. */
-static as11_event_t check_event_notification(const cJSON *msg, const char **out_report)
-{
-    if (out_report) *out_report = NULL;
-
-    cJSON *params = cJSON_GetObjectItem(msg, "params");
-    if (!params) return AS11_EV_NONE;
-
-    cJSON *events = cJSON_GetObjectItem(params, "events");
-    if (!events || !cJSON_IsArray(events)) return AS11_EV_NONE;
-
-    int n = cJSON_GetArraySize(events);
-    for (int i = 0; i < n; i++) {
-        cJSON *ev = cJSON_GetArrayItem(events, i);
-        if (!ev) continue;
-        cJSON *event = cJSON_GetObjectItem(ev, "event");
-        if (!event || !cJSON_IsString(event)) continue;
-        const char *name = event->valuestring;
-
-        if (strcmp(name, "TherapyStart") == 0) {
-            cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
-            if (out_report && rt && cJSON_IsString(rt))
-                *out_report = rt->valuestring;
-            return AS11_EV_THERAPY_START;
-        }
-        if (strcmp(name, "TherapyStop") == 0) {
-            return AS11_EV_THERAPY_STOP;
-        }
-        if (strcmp(name, "MaskFitStart") == 0 ||
-            strcmp(name, "MaskfitStarted") == 0 ||
-            strcmp(name, "LearnTargetsStart") == 0) {
-            return AS11_EV_MASK_FIT_START;
-        }
-        if (strcmp(name, "MaskFitStop") == 0 ||
-            strcmp(name, "LearnTargetsStop") == 0) {
-            return AS11_EV_MASK_FIT_STOP;
-        }
-        if (strcmp(name, "CooldownStarted") == 0) {
-            return AS11_EV_COOLDOWN_START;
-        }
-        if (strcmp(name, "CooldownStopped") == 0) {
-            return AS11_EV_COOLDOWN_STOP;
-        }
-        if (strcmp(name, "StandbyStarted") == 0) {
-            return AS11_EV_STANDBY_START;
-        }
-    }
-    return AS11_EV_NONE;
-}
 
 /* ── Fast-path StreamData parser (bypasses cJSON) ─────────────────── */
 

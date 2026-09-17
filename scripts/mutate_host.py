@@ -77,7 +77,7 @@ INC = [os.path.join(ROOT, "main"), os.path.join(HERE, "test_include"), ROOT]
 # since v2.0.0 were reported as untested, because the map is what the harness believes.
 TESTS = {
     "as11_time_test":       ["main/as11_time.c"],
-    "as11_events_test":     ["main/as11_time.c", "@cjson"],
+    "as11_events_test":     ["main/as11_events.c", "main/as11_time.c", "@cjson"],
     "edf_gen_test":         ["main/as11_time.c", "@cjson",
                              "#main/edf_header.c", "#main/edf_waveform.c",
                              "#main/edf_annotations.c", "#main/edf_summary.c",
