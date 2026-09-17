@@ -36,10 +36,10 @@
  * The StaticTask_t (TCB, ~92 bytes) stays in internal RAM (FreeRTOS
  * requirement).  The stack is allocated with MALLOC_CAP_SPIRAM.
  *
- * For long-lived tasks (run forever): just call this once and forget.
- * For self-deleting tasks: the caller must keep the out_stack/out_tcb
- * pointers and free them after the task has exited (e.g. on next
- * invocation — "deferred free" pattern).
+ * For self-deleting tasks: if out_stack and out_tcb are NULL (default),
+ * the task is automatically tracked and its stack and TCB are reaped
+ * once the task has exited and been processed by the FreeRTOS idle task.
+ * Alternatively, pass non-NULL pointers to manage memory explicitly.
  *
  * @param task_func   Task function
  * @param name        FreeRTOS task name
@@ -47,8 +47,10 @@
  * @param arg         Task argument
  * @param priority    Task priority
  * @param core_id     Core affinity (0, 1, or tskNO_AFFINITY)
- * @param out_stack   If non-NULL, receives the PSRAM stack pointer (caller frees)
- * @param out_tcb     If non-NULL, receives the internal TCB pointer (caller frees)
+ * @param out_stack   If non-NULL, receives the PSRAM stack pointer (caller frees).
+ *                    If NULL, memory is automatically reclaimed upon task exit.
+ * @param out_tcb     If non-NULL, receives the internal TCB pointer (caller frees).
+ *                    If NULL, memory is automatically reclaimed upon task exit.
  * @return Task handle, or NULL on failure
  */
 TaskHandle_t psram_task_create(TaskFunction_t task_func,
@@ -59,3 +61,10 @@ TaskHandle_t psram_task_create(TaskFunction_t task_func,
                                BaseType_t core_id,
                                StackType_t **out_stack,
                                StaticTask_t **out_tcb);
+
+/**
+ * Reaps any terminated self-deleting tasks that were created with
+ * psram_task_create(..., NULL, NULL).  Called automatically by a periodic timer
+ * and on every psram_task_create() call; exposed here for explicit sweeps.
+ */
+void psram_task_reap(void);
