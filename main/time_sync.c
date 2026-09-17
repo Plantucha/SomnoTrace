@@ -498,17 +498,25 @@ void time_sync_apply_saved_timezone(void)
 
 esp_err_t time_sync_init(void)
 {
+    static bool s_initialized = false;
+    if (s_initialized) {
+        return ESP_OK;
+    }
+    s_initialized = true;
+
     /* Idempotent — also called early in app_main() so that any session
      * started during BLE reconnect gets a local-time session id. */
     time_sync_apply_saved_timezone();
 
-    /* Check for a user-configured custom NTP server in NVS. */
-    char ntp_srv[NTP_SRV_MAX];
-    time_sync_get_ntp_server(ntp_srv, sizeof(ntp_srv));
-    bool has_custom_ntp = (ntp_srv[0] != '\0');
+    /* Check for a user-configured custom NTP server in NVS.
+     * Buffer must be static: sntp_setservername() stores the raw pointer
+     * without copying, and the tcpip task resolves it asynchronously. */
+    static char s_ntp_srv[NTP_SRV_MAX];
+    time_sync_get_ntp_server(s_ntp_srv, sizeof(s_ntp_srv));
+    bool has_custom_ntp = (s_ntp_srv[0] != '\0');
 
     esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(
-        has_custom_ntp ? ntp_srv : "pool.ntp.org");
+        has_custom_ntp ? s_ntp_srv : "pool.ntp.org");
     sntp_cfg.smooth_sync = false;
     sntp_cfg.sync_cb = sntp_sync_cb;
 
@@ -519,7 +527,7 @@ esp_err_t time_sync_init(void)
         sntp_cfg.start = false;
         sntp_cfg.renew_servers_after_new_IP = false;
         sntp_cfg.ip_event_to_renew = 0;
-        ESP_LOGI(TAG, "SNTP started — custom server: %s", ntp_srv);
+        ESP_LOGI(TAG, "SNTP started — custom server: %s", s_ntp_srv);
     } else {
         /* Auto mode: DHCP option 42 + public NTP fallbacks. */
         sntp_cfg.server_from_dhcp = true;
@@ -551,7 +559,7 @@ esp_err_t time_sync_init(void)
     }
 
     if (has_custom_ntp) {
-        ESP_LOGI(TAG, "SNTP started — custom server: %s, sync every %d ms", ntp_srv, SNTP_SYNC_MS);
+        ESP_LOGI(TAG, "SNTP started — custom server: %s, sync every %d ms", s_ntp_srv, SNTP_SYNC_MS);
     } else {
         ESP_LOGI(TAG, "SNTP started — DHCP option 42 + pool.ntp.org + time.google.com, sync every %d ms", SNTP_SYNC_MS);
     }

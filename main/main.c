@@ -233,6 +233,12 @@ void app_main(void)
         }
     }
 
+    /* Always initialise time sync: loads timezone/NTP config from NVS
+     * and arms SNTP before Wi-Fi connects so DHCP option 42 (NTP server)
+     * is accepted when the DHCP ACK arrives and renewal handlers are active.
+     * Starts SNTP (which will simply time out or retry if offline). */
+    time_sync_init();
+
     /* 7. Try to connect to configured Wi-Fi. */
     char ip[16] = "0.0.0.0";
     esp_err_t err = ESP_FAIL;
@@ -247,10 +253,6 @@ void app_main(void)
     bool wifi_connected = false;
     bool degraded_mode = false;
     bool ntp_ok = false;
-
-    /* Always initialise time sync: loads the timezone from NVS (no network
-     * needed) and starts SNTP (which will simply time out without Wi-Fi). */
-    time_sync_init();
 
     if (err == ESP_OK) {
         wifi_connected = true;
