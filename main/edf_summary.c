@@ -927,9 +927,18 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
     }
 
     /* Fallback: use PeriodStart/PeriodEnd if no session entries.
-     * Evaluated as a pair to prevent orphaned half-pairs. */
+     * Evaluated as a pair to prevent orphaned half-pairs.
+     * The period spans the whole noon-to-noon reporting window, not the
+     * therapy session — emitting it unconditionally manufactured a ~24h
+     * phantom session on every idle day (MaskOn=0, MaskOff≈1440,
+     * Duration=0; discussion #266).  Only fall back when the AS11's own
+     * counters say therapy happened, so a day with real usage but missing
+     * field-6 entries still produces a mask pair and stays valid in
+     * consumers that skip days with no mask events (OSCAR validday). */
     if (mask_on_count == 0 && mask_off_count == 0 &&
-        ctx->has_scalar[SUM_F_PERIOD_START] && ctx->has_scalar[SUM_F_PERIOD_END]) {
+        ctx->has_scalar[SUM_F_PERIOD_START] && ctx->has_scalar[SUM_F_PERIOD_END] &&
+        (get_scalar(ctx, SUM_F_DURATION_MIN, 0) > 0 ||
+         get_scalar(ctx, SUM_F_SESSION_COUNT, 0) > 0)) {
         int64_t ps_ntp = ctx->scalars[SUM_F_PERIOD_START] + clock_drift_ms;
         int64_t pe_ntp = ctx->scalars[SUM_F_PERIOD_END] + clock_drift_ms;
         int on = (int)((ps_ntp - noon_epoch_ms) / 60000);

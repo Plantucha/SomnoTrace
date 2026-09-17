@@ -465,13 +465,18 @@ static void test_prop_17_str_mask_window_clamping(void)
     TEST_ASSERT(ev8 == 0, "PROP_17: Fallback wholly before noon produces 0 events (no orphaned half-pair)");
     TEST_ASSERT(vals[1] == -1 && vals[2] == -1, "PROP_17: Fallback wholly before noon leaves MaskOn/MaskOff unset");
 
-    /* 9. Fallback cross-noon: PeriodStart before noon (-10 min) to +50 min. */
+    /* 9. Fallback cross-noon: PeriodStart before noon (-10 min) to +50 min.
+     * DurationMin > 0 marks the day as a therapy day — the fallback is
+     * gated on therapy evidence since idle days must not emit mask events
+     * (phantom 24h sessions, discussion #266). */
     memset(&ctx, 0, sizeof(ctx));
     memset(vals, 0xFF, sizeof(vals));
     ctx.has_scalar[SUM_F_PERIOD_START] = true;
     ctx.scalars[SUM_F_PERIOD_START] = noon_ms - 10LL * 60000LL;
     ctx.has_scalar[SUM_F_PERIOD_END] = true;
     ctx.scalars[SUM_F_PERIOD_END] = noon_ms + 50LL * 60000LL;
+    ctx.has_scalar[SUM_F_DURATION_MIN] = true;
+    ctx.scalars[SUM_F_DURATION_MIN] = 60;
     int ev9 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
     TEST_ASSERT(ev9 == 2, "PROP_17: Fallback cross-noon produces 2 events");
     TEST_ASSERT(vals[1] == 0, "PROP_17: Fallback cross-noon MaskOn clamped to 0");
@@ -484,10 +489,50 @@ static void test_prop_17_str_mask_window_clamping(void)
     ctx.scalars[SUM_F_PERIOD_START] = noon_ms + 1080LL * 60000LL;
     ctx.has_scalar[SUM_F_PERIOD_END] = true;
     ctx.scalars[SUM_F_PERIOD_END] = noon_ms + 1500LL * 60000LL;
+    ctx.has_scalar[SUM_F_DURATION_MIN] = true;
+    ctx.scalars[SUM_F_DURATION_MIN] = 60;
     int ev10 = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
     TEST_ASSERT(ev10 == 2, "PROP_17: Fallback overflow produces 2 events");
     TEST_ASSERT(vals[1] == 1080, "PROP_17: Fallback overflow MaskOn is 1080");
     TEST_ASSERT(vals[2] == 1440, "PROP_17: Fallback overflow MaskOff clamped to 1440");
+
+    /* 10b. Idle-day regression (discussion #266): a summary with only the
+     * noon-to-noon reporting period and DurationMin = 0 must NOT emit a
+     * mask pair — that fallback manufactured phantom ~24h sessions
+     * (MaskOn=0, MaskOff≈1440) on every unused day.  SessionCount = 0
+     * alone; also verify the SessionCount>0 variant still falls back. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.has_scalar[SUM_F_PERIOD_START] = true;
+    ctx.scalars[SUM_F_PERIOD_START] = noon_ms;
+    ctx.has_scalar[SUM_F_PERIOD_END] = true;
+    ctx.scalars[SUM_F_PERIOD_END] = noon_ms + 1436LL * 60000LL;
+    ctx.has_scalar[SUM_F_DURATION_MIN] = true;
+    ctx.scalars[SUM_F_DURATION_MIN] = 0;
+    ctx.has_scalar[SUM_F_SESSION_COUNT] = true;
+    ctx.scalars[SUM_F_SESSION_COUNT] = 0;
+    int ev10b = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev10b == 0, "PROP_17: Idle day (Duration=0, Sessions=0) produces 0 mask events");
+    TEST_ASSERT(vals[1] == -1 && vals[2] == -1,
+                "PROP_17: Idle day leaves MaskOn/MaskOff at -1 sentinel");
+    TEST_ASSERT(vals[3] == 0, "PROP_17: Idle day MaskEvents is 0");
+
+    /* 10c. Therapy day with missing field-6 but SessionCount > 0:
+     * fallback must still fire (OSCAR drops days with no mask pair). */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.has_scalar[SUM_F_PERIOD_START] = true;
+    ctx.scalars[SUM_F_PERIOD_START] = noon_ms;
+    ctx.has_scalar[SUM_F_PERIOD_END] = true;
+    ctx.scalars[SUM_F_PERIOD_END] = noon_ms + 1436LL * 60000LL;
+    ctx.has_scalar[SUM_F_DURATION_MIN] = true;
+    ctx.scalars[SUM_F_DURATION_MIN] = 0;
+    ctx.has_scalar[SUM_F_SESSION_COUNT] = true;
+    ctx.scalars[SUM_F_SESSION_COUNT] = 1;
+    int ev10c = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, 0);
+    TEST_ASSERT(ev10c == 2, "PROP_17: SessionCount>0 with no entries still falls back");
+    TEST_ASSERT(vals[1] == 0 && vals[2] == 1436,
+                "PROP_17: SessionCount>0 fallback emits the period window");
 
     /* 11. Live path clamping (collect_session_mask_pairs) */
     mask_pair_t pair;
