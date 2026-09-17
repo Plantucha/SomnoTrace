@@ -123,6 +123,7 @@ typedef struct {
 
 #define ALERT_EVT_Q_LEN     8
 #define ALERT_MONITOR_STACK 4096
+#define ALERT_ROUTINE_STACK 16384
 #define ALERT_TICK_MS       30000
 
 static StaticQueue_t s_evt_q_buf;
@@ -566,29 +567,114 @@ done:
     vTaskDelete(NULL);
 }
 
+/* ── Reclaiming self-deleting routine tasks ────────────────────────
+ * alert_routine_task() ends in vTaskDelete(NULL).  Its stack and TCB come
+ * from the caller (xTaskCreateStaticPinnedToCore), so FreeRTOS releases
+ * neither: the task is flagged tskSTATICALLY_ALLOCATED_STACK_AND_TCB and
+ * prvDeleteTCB() takes the branch that frees nothing.  Every routine
+ * therefore orphaned ALERT_ROUTINE_STACK bytes of PSRAM plus one
+ * StaticTask_t of internal RAM, for as long as the device stayed up.
+ *
+ * main/psram_task.c grew an equivalent reaper, but main is not reachable
+ * from a component, so the sweep lives here.
+ *
+ * A slot is released only when a sweep finds eDeleted after an earlier sweep
+ * already did.  eTaskGetState() reports eDeleted from the moment the task
+ * calls vTaskDelete(NULL), which is before the idle task has finished with
+ * the TCB; deferring by one sweep keeps both buffers alive across that
+ * window.  The state stays eDeleted afterwards too — once the idle task
+ * unlinks it, xStateListItem has no container, which eTaskGetState() also
+ * reports as eDeleted — so a finished task is never missed.
+ */
+#define ALERT_REAP_SLOTS 4
+
+typedef struct {
+    TaskHandle_t  handle;
+    StackType_t  *stack;
+    StaticTask_t *tcb;
+    bool          seen_deleted;
+} alert_reap_slot_t;
+
+static alert_reap_slot_t s_reap[ALERT_REAP_SLOTS];   /* owner task only */
+
+static void reap_finished_routines(void)
+{
+    for (int i = 0; i < ALERT_REAP_SLOTS; i++) {
+        alert_reap_slot_t *s = &s_reap[i];
+        if (s->handle == NULL) continue;
+
+        if (eTaskGetState(s->handle) != eDeleted) {
+            s->seen_deleted = false;
+            continue;
+        }
+        if (!s->seen_deleted) {
+            s->seen_deleted = true;      /* confirm on the next sweep */
+            continue;
+        }
+
+        heap_caps_free(s->stack);
+        heap_caps_free(s->tcb);
+        s->handle       = NULL;
+        s->stack        = NULL;
+        s->tcb          = NULL;
+        s->seen_deleted = false;
+    }
+}
+
+static bool track_routine_for_reap(TaskHandle_t h, StackType_t *stack,
+                                   StaticTask_t *tcb)
+{
+    for (int i = 0; i < ALERT_REAP_SLOTS; i++) {
+        if (s_reap[i].handle == NULL) {
+            s_reap[i].handle       = h;
+            s_reap[i].stack        = stack;
+            s_reap[i].tcb          = tcb;
+            s_reap[i].seen_deleted = false;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Owner task only. */
 static void start_alert_routine(void)
 {
+    /* Release what earlier routines left behind before taking another 16 KB. */
+    reap_finished_routines();
+
     /* Bumping the generation cancels any routine still winding down; it will
-     * observe the mismatch and exit on its own.  No handle is stored and no
-     * sleep is needed, so there is nothing to dangle. */
+     * observe the mismatch and exit on its own.  The handle is kept only so
+     * the sweep above can tell when that routine's stack is safe to free. */
     uint32_t gen = ++s_routine_gen;
     set_state(ALERT_PENDING);
 
     TaskHandle_t h = NULL;
-    StackType_t *stack = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM);
+    StackType_t *stack = heap_caps_malloc(ALERT_ROUTINE_STACK, MALLOC_CAP_SPIRAM);
     StaticTask_t *tcb  = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
     if (stack && tcb) {
         h = xTaskCreateStaticPinnedToCore(alert_routine_task, "alert_routine",
-                                          16384, (void *)(uintptr_t)gen, 5,
+                                          ALERT_ROUTINE_STACK,
+                                          (void *)(uintptr_t)gen, 5,
                                           stack, tcb, 0);
     }
     if (!h) {
         /* Without the routine there will be no push and no buzzer, so say so
-         * rather than sitting silently in PENDING for ever. */
+         * rather than sitting silently in PENDING for ever.  Whichever of the
+         * two allocations succeeded is released here: this path leaked it even
+         * when no task was ever created. */
         ESP_LOGE(TAG, "failed to create alert routine task — disarming");
+        heap_caps_free(stack);
+        heap_caps_free(tcb);
         set_state(ALERT_DISARMED);
         return;
+    }
+    if (!track_routine_for_reap(h, stack, tcb)) {
+        /* Pathological: ALERT_REAP_SLOTS routines have not finished yet.
+         * Alerting matters more than the memory, so the routine still runs and
+         * this one stack goes unreclaimed — which is what happened to every
+         * routine before this sweep existed. */
+        ESP_LOGW(TAG, "no reclaim slot free — this routine's %d byte stack "
+                      "will not be reclaimed", ALERT_ROUTINE_STACK);
     }
     s_routine_active = true;
 }
@@ -745,6 +831,7 @@ static void alert_owner_task(void *arg)
     for (;;) {
         alert_evt_t ev;
         if (xQueueReceive(s_evt_q, &ev, pdMS_TO_TICKS(ALERT_TICK_MS)) != pdTRUE) {
+            reap_finished_routines();
             reevaluate_state();
             if (++ticks >= report_every) {
                 ticks = 0;
