@@ -51,6 +51,43 @@ typedef struct {
     const char *label;
 } snt_event_t;
 
+/* Order events by onset, then by label, and drop exact (onset, label) repeats.
+ *
+ * The tie-break on label is what makes the adjacent-only pass correct.  Ordering
+ * on onset alone leaves events that share a second in an arbitrary order — this
+ * is a selection sort and is not stable — so a repeat with a different label
+ * between the two copies survived: each element is only ever compared against
+ * the previous KEPT one, so [A, B, A] at one onset kept both copies of A and the
+ * event reached EVE.edf/CSL.edf twice.
+ */
+static size_t sort_and_dedup_events(snt_event_t *ev, size_t count)
+{
+    for (size_t i = 0; i + 1 < count; i++) {
+        for (size_t j = i + 1; j < count; j++) {
+            bool before = ev[j].onset_sec < ev[i].onset_sec;
+            if (!before && ev[j].onset_sec == ev[i].onset_sec) {
+                before = strcmp(ev[j].label, ev[i].label) < 0;
+            }
+            if (before) {
+                snt_event_t tmp = ev[i];
+                ev[i] = ev[j];
+                ev[j] = tmp;
+            }
+        }
+    }
+
+    size_t kept = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (kept > 0 &&
+            ev[kept - 1].onset_sec == ev[i].onset_sec &&
+            strcmp(ev[kept - 1].label, ev[i].label) == 0) {
+            continue;
+        }
+        ev[kept++] = ev[i];
+    }
+    return kept;
+}
+
 static esp_err_t generate_annotation_edf(const char *edf_path,
                                          const char *snt_path,
                                          int64_t session_start_ms, int64_t clock_drift_ms,
@@ -147,27 +184,8 @@ static esp_err_t generate_annotation_edf(const char *edf_path,
         ESP_LOGW(TAG, "generate_annotation_edf: cannot open %s: %s", snt_path, strerror(errno));
     }
 
-    /* Sort events by onset_sec */
-    for (size_t i = 0; i + 1 < count; i++) {
-        for (size_t j = i + 1; j < count; j++) {
-            if (ev_list[j].onset_sec < ev_list[i].onset_sec) {
-                snt_event_t tmp = ev_list[i];
-                ev_list[i] = ev_list[j];
-                ev_list[j] = tmp;
-            }
-        }
-    }
-
-    /* Deduplicate identical onset and label */
-    size_t dedup_count = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (dedup_count > 0 &&
-            ev_list[dedup_count - 1].onset_sec == ev_list[i].onset_sec &&
-            strcmp(ev_list[dedup_count - 1].label, ev_list[i].label) == 0) {
-            continue;
-        }
-        ev_list[dedup_count++] = ev_list[i];
-    }
+    /* Sort by onset (label breaks ties) and drop exact repeats. */
+    size_t dedup_count = sort_and_dedup_events(ev_list, count);
     if (dedup_count < count) {
         ESP_LOGI(TAG, "%s: deduplicated %zu duplicate events (%zu → %zu)",
                  csl_mode ? "CSL.edf" : "EVE.edf", count - dedup_count,

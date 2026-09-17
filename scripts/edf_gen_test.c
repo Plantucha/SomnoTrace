@@ -1630,6 +1630,39 @@ static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
     assert(edf_find_zle_edge_time(q, 1, -as11) == -1);
 }
 
+/* The dedup pass compares each event only against the previous KEPT one, so it
+ * is correct only if identical (onset, label) pairs are adjacent after sorting.
+ * Ordering on onset alone did not guarantee that. */
+static void test_annotation_dedup_interleaved_duplicate(void)
+{
+    snt_event_t ev[3] = {
+        { 100, 0, "Obstructive Apnea" },
+        { 100, 0, "CSR Start" },
+        { 100, 0, "Obstructive Apnea" },
+    };
+    size_t n = sort_and_dedup_events(ev, 3);
+    CHECK(n == 2, "the repeat separated by another label is still dropped");
+    CHECK(ev[0].onset_sec == 100 && ev[1].onset_sec == 100, "survivors keep the onset");
+    CHECK(strcmp(ev[0].label, ev[1].label) != 0, "the survivors are the two distinct labels");
+}
+
+static void test_annotation_dedup_orders_and_keeps_distinct(void)
+{
+    snt_event_t ev[5] = {
+        { 300, 0, "Hypopnea" },
+        { 100, 0, "Obstructive Apnea" },
+        { 100, 0, "Obstructive Apnea" },
+        { 200, 0, "Arousal" },
+        { 100, 0, "CSR End" },
+    };
+    size_t n = sort_and_dedup_events(ev, 5);
+    CHECK(n == 4, "only the exact repeat is dropped");
+    CHECK(ev[0].onset_sec == 100 && ev[1].onset_sec == 100, "both distinct 100s survive");
+    CHECK(strcmp(ev[0].label, "CSR End") == 0, "label breaks the onset tie");
+    CHECK(ev[2].onset_sec == 200 && ev[3].onset_sec == 300, "onsets ascend");
+    CHECK(sort_and_dedup_events(ev, 0) == 0, "an empty list is handled");
+}
+
 int main(void)
 {
     snprintf(g_root, sizeof(g_root), "%s/snt_edf_test_XXXXXX",
@@ -1658,6 +1691,10 @@ int main(void)
         test_pld_channel_map_out_of_range_is_refused, NULL);
     run("snt_missing_for per version", test_snt_missing_sentinel_per_version, NULL);
     run("spool_to_edf keeps the -1 sentinel", test_spool_to_edf, NULL);
+    run("annotation dedup drops a repeat separated by another label at one onset",
+        test_annotation_dedup_interleaved_duplicate, NULL);
+    run("annotation dedup orders by onset then label and keeps distinct events",
+        test_annotation_dedup_orders_and_keeps_distinct, NULL);
     run("noon_day_folder: noon starts the new day", test_noon_day_folder_boundary, NULL);
     run("the session's AS11 offset beats the device timezone",
         test_as11_offset_beats_device_timezone, NULL);
