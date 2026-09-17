@@ -214,6 +214,43 @@ If we ever need to parse AS10 EDF files:
 - JSON labels differ: AS10 uses `Essentials` (Plus/On) instead of
   `PatientView` (Full/Basic), and tube types may use different strings
 
+#### 4.3.5 Clock Domains & Drift Reconciliation in STR.edf
+
+Summary records in `STR.edf` synthesize data across three distinct clock
+domains:
+
+1. **ESP NTP Domain (Authoritative UTC Wall Clock):**
+   - Synchronized via SNTP at boot and periodic network intervals.
+   - Forms the absolute time-base for DATALOG waveform filenames
+     (`YYYYMMDD_HHMMSS`), EDF header start times (`StartTime`, `StartDate`),
+     and web UI timeline displays.
+   - Consumers (such as OSCAR) reconstruct session timestamps from `STR.edf`
+     as `(local noon of record Date) + MaskOn * 60 seconds` and correlate
+     them against DATALOG filenames within a ~1 minute matching window.
+
+2. **AS11 RTC Domain (Drifting Device Clock):**
+   - The AS11 flow generator maintains an internal real-time clock that drifts
+     relative to true NTP (typically by several seconds or minutes).
+   - SomnoTrace measures this drift upon BLE connection via `GetDateTime` RPC:
+     `clock_drift_ms = NTP_epoch_ms - AS11_epoch_ms`.
+   - Timestamps generated directly by the AS11 internal clock domain include:
+     - BLE live event notifications (`reportTime` in `events.snt`).
+     - Summary spool protobuf field 6 (`SessionModeEntries`, sub-field 1 MaskOn).
+     - Summary spool protobuf field 40 (`ClockB`).
+   - To align these timestamps with NTP-based DATALOG files and EDF headers,
+     SomnoTrace translates them to NTP: `t_ntp = t_as11 + clock_drift_ms`.
+
+3. **Nominal Calendar Domain (Invariant Reporting Boundaries):**
+   - Summary spool fields 2 & 3 (`PeriodStart` and `PeriodEnd`) represent the
+     AS11's 24-hour reporting bucket boundaries in its configured local timezone
+     (spanning exactly 1440 minutes / 86,400,000 ms, from local noon to next local noon).
+   - These are nominal civil day definitions, NOT real-time sensor events.
+   - Spool filenames (`YYYYMMDD.spool`) and STR record Date indexing derive
+     directly from raw `PeriodStart` without drift correction.
+   - In the event that a therapy day has missing field-6 entries, the fallback
+     window evaluates `PeriodStart` and `PeriodEnd` directly against local noon
+     without adding `clock_drift_ms`, cleanly emitting `[0, 1440]`.
+
 ## 5. Acceptance criteria
 
 - [x] STR.edf stats fields match AS11 firmware output (verified via
@@ -225,6 +262,9 @@ If we ever need to parse AS10 EDF files:
 - [x] STR.edf settings enum fields match AS11 firmware output (verified
       via AS11 native EDF comparison, OSCAR source, and airbreak-plus,
       2026-07-31).  See §4.3.4.
+- [x] STR.edf mask events reconcile AS11 RTC drift for field 6 entries
+      while preserving nominal calendar noon bounds for PeriodStart/PeriodEnd
+      fallback (2026-09-18).  See §4.3.5.
 - [ ] Multi-day STR.edf opens correctly in OSCAR.
 - [ ] BRP/PLD/SA2/EVE EDF files match AS11 SD card output.
 

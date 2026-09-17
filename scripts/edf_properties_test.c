@@ -534,6 +534,23 @@ static void test_prop_17_str_mask_window_clamping(void)
     TEST_ASSERT(vals[1] == 0 && vals[2] == 1436,
                 "PROP_17: SessionCount>0 fallback emits the period window");
 
+    /* 10d. Fallback with nominal 1440m period and non-zero clock drift:
+     * PeriodStart/PeriodEnd are nominal reporting bounds and do NOT carry
+     * drift. With clock_drift_ms = -240000 (-4 min), it must emit clean [0, 1440]
+     * rather than leaking drift into [0, 1436]. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(vals, 0xFF, sizeof(vals));
+    ctx.has_scalar[SUM_F_PERIOD_START] = true;
+    ctx.scalars[SUM_F_PERIOD_START] = noon_ms;
+    ctx.has_scalar[SUM_F_PERIOD_END] = true;
+    ctx.scalars[SUM_F_PERIOD_END] = noon_ms + 1440LL * 60000LL;
+    ctx.has_scalar[SUM_F_DURATION_MIN] = true;
+    ctx.scalars[SUM_F_DURATION_MIN] = 60;
+    int ev10d = build_str_mask_events(&ctx, vals, on_extra, off_extra, noon_ms, -240000);
+    TEST_ASSERT(ev10d == 2, "PROP_17: Fallback with drift produces 2 events");
+    TEST_ASSERT(vals[1] == 0 && vals[2] == 1440,
+                "PROP_17: Fallback emits nominal [0, 1440] without drift contamination");
+
     /* 11. Live path clamping (collect_session_mask_pairs) */
     mask_pair_t pair;
     int got_live1 = collect_session_mask_pairs("/tmp", "dummy_sess", noon_ms, 0,

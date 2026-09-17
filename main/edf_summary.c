@@ -829,12 +829,24 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
                                  int16_t *mask_on_extra, int16_t *mask_off_extra,
                                  int64_t period_start_ms, int64_t clock_drift_ms)
 {
-    /* Summary timestamps are in AS11 time.  The MaskOn/MaskOff *values* are
-     * deliberately exported in NTP time so their session intervals match the
-     * NTP-based EDF headers, filenames, and event annotations (OSCAR matches
-     * sessions to STR mask events within a ~1 minute window).
+    /* Summary spool data involves two distinct time domains:
      *
-     * Two different clocks are involved and both matter:
+     *  1. Real-time session entries (field 6 SessionModeEntries) and ClockB
+     *     (field 40) are written in the AS11 internal RTC clock domain.
+     *     They drift relative to NTP and MUST have clock_drift_ms applied
+     *     (drift = NTP - AS11) so the emitted MaskOn/MaskOff minutes align
+     *     with NTP-based EDF headers, DATALOG filenames, and event
+     *     annotations (OSCAR matches sessions to STR mask events within a
+     *     ~1 minute window).
+     *
+     *  2. Reporting period boundaries (fields 2/3 PeriodStart and PeriodEnd)
+     *     are nominal noon-to-noon calendar bucket definitions in the AS11's
+     *     own timezone (exactly 1440 min / 86,400,000 ms).  They are invariant
+     *     calendar anchors rather than real-time sensor events, and MUST NOT
+     *     have clock_drift_ms added (doing so would double-shift nominal noon
+     *     by the drift).
+     *
+     * Two different clocks are involved in positioning:
      *
      *  - The noon-day *bucket* belongs to the AS11.  The device defines its
      *    reporting day noon-to-noon in ITS OWN timezone and stamps
@@ -928,6 +940,12 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
 
     /* Fallback: use PeriodStart/PeriodEnd if no session entries.
      * Evaluated as a pair to prevent orphaned half-pairs.
+     * PeriodStart and PeriodEnd represent nominal calendar noon reporting
+     * boundaries (exactly 24 hours / 1440 min), NOT real-time sensor events.
+     * They do not carry clock drift, so clock_drift_ms is not added here
+     * (adding it previously double-shifted the nominal window, producing
+     * drifted bounds like [0, 1436] or [0, 1431] instead of [0, 1440]).
+     *
      * The period spans the whole noon-to-noon reporting window, not the
      * therapy session — emitting it unconditionally manufactured a ~24h
      * phantom session on every idle day (MaskOn=0, MaskOff≈1440,
@@ -939,10 +957,10 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
         ctx->has_scalar[SUM_F_PERIOD_START] && ctx->has_scalar[SUM_F_PERIOD_END] &&
         (get_scalar(ctx, SUM_F_DURATION_MIN, 0) > 0 ||
          get_scalar(ctx, SUM_F_SESSION_COUNT, 0) > 0)) {
-        int64_t ps_ntp = ctx->scalars[SUM_F_PERIOD_START] + clock_drift_ms;
-        int64_t pe_ntp = ctx->scalars[SUM_F_PERIOD_END] + clock_drift_ms;
-        int on = (int)((ps_ntp - noon_epoch_ms) / 60000);
-        int off = (int)((pe_ntp - noon_epoch_ms) / 60000);
+        int64_t ps = ctx->scalars[SUM_F_PERIOD_START];
+        int64_t pe = ctx->scalars[SUM_F_PERIOD_END];
+        int on = (int)((ps - noon_epoch_ms) / 60000);
+        int off = (int)((pe - noon_epoch_ms) / 60000);
         if (off > 0 && on < STR_MASK_MINUTES_MAX) {
             if (on < 0) on = 0;
             if (off > STR_MASK_MINUTES_MAX) off = STR_MASK_MINUTES_MAX;
