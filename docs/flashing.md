@@ -15,80 +15,48 @@
 
 ## Step-by-Step Instructions
 
-### Step 1: Download the Firmware
+### Step 1: Open the Web Flasher
 
-1. Go to the [SomnoTrace Releases page](https://github.com/ilyakruchinin/SomnoTrace/releases).
-2. Under the latest release, download the file ending in **`-full.bin`** (e.g., `somnotrace-v1.0.2-full.bin`).
-   - ⚠️ **Do NOT download the `-ota.bin` file** — that is for over-the-air updates from within the web interface only, and cannot be used for initial flashing.
-3. Save the file somewhere easy to find on your computer (e.g., your Downloads folder).
+1. Connect your Waveshare board to your computer using a **USB-C data cable**.
+2. Open **[somnotrace.com](https://somnotrace.com)** in a Web Serial browser (Chrome, Edge, Brave, or Opera).
 
 ---
 
-### Step 2: Connect Your Device
+### Step 2: Install in 3 Clicks
 
-1. Plug the USB-C cable into the Waveshare board.
-2. **Press and hold the BOOT button** (the left physical button on the side of the board) while plugging the other end into your computer. This puts the board into flashing mode.
-3. Once plugged in, release the BOOT button. The screen may light up or remain dark — either is normal.
+1. Click **Install SomnoTrace**.
+2. In the browser popup, select **`USB JTAG/serial debug unit`** (or your device's COM / tty port).
+3. Click **Connect**.
 
-> **Already plugged in?** Unplug the cable, hold the BOOT button, plug it back in, then release.
+That's it! SomnoTrace handles everything automatically:
+- Fetches the latest stable release directly from GitHub.
+- Puts the ESP32-S3 into ROM download mode programmatically.
+- Flashes the complete firmware image.
+- Automatically reboots the device into SomnoTrace when complete.
 
----
-
-### Step 3: Open the Web Flasher
-
-1. Open **Google Chrome** or **Microsoft Edge**.
-2. Navigate to the official [Espressif Web Flasher](https://espressif.github.io/esptool-js/).
-
----
-
-### Step 4: Connect to the Board
-
-1. In the Web Flasher, leave the baud rate at the default (**921600**).
-2. Click the blue **Connect** button at the top.
-3. A browser popup will appear showing available serial devices:
-   - Look for **`USB JTAG/serial debug unit`** or **`ESP32-S3`** (or a COM / tty port).
-   - Select it and click **Connect**.
-4. Once connected, the console at the bottom will display device details (confirming it is an ESP32-S3).
-
-> **Port already in use?** If the Connect button doesn't work or the port doesn't appear, refresh the browser page and try again.
+> **Manual Boot Fallback:** If your device doesn't enter download mode automatically within 7 seconds, unplug the USB-C cable, press and **hold the BOOT button** (the leftmost physical button on the top edge), plug the USB-C cable back in, then release the button and click Install.
 
 ---
 
-### Step 5: Flash the Firmware
+### Step 3: First Boot & Wi-Fi Setup
 
-1. In the **Flash Address** box, make sure the address is set to:
-   ```text
-   0x0
-   ```
-2. Click **Choose File** (or Browse) next to `0x0`, and select the **`-full.bin`** file you downloaded in Step 1.
-3. Click the **Program** (or Flash) button.
-4. You will see a progress bar and percentage counter. Flashing takes about **30 to 60 seconds**.
-5. When finished, the status will show **"Leaving... Finished successfully"**.
-
----
-
-### Step 6: First Boot & Wi-Fi Setup
-
-1. Unplug the USB cable and plug it back in (or press the power button) to restart the device.
-2. The LCD display will show the **SomnoTrace** logo and display setup instructions.
-3. On your smartphone or computer, search for nearby Wi-Fi networks:
-   - Connect to the network named **`SomnoTrace-Setup`** (or `SomnoTrace-XXXXXX`).
-4. A setup page will open automatically (or open your browser and visit `http://192.168.4.1`):
-   - Select your home Wi-Fi network and enter the password.
+1. The LCD display will illuminate with the **SomnoTrace** logo and indicate setup mode.
+2. On your phone or computer, connect to the Wi-Fi network named **`SomnoTrace-Setup`**.
+3. A captive portal setup page opens automatically (or visit `http://somnotrace.local` / `http://192.168.4.1`):
+   - Select your home Wi-Fi network and enter your password.
    - Click **Save & Connect**.
-5. SomnoTrace will connect to your home Wi-Fi and show its new IP address on the LCD screen!
+4. SomnoTrace connects to your home network and displays its IP address and clock on the LCD screen.
 
-You can now open any web browser on your home network and visit:
+You can now open any browser on your local network and visit:
 ```text
 http://somnotrace.local
 ```
-*(or open the IP address shown on the screen).*
 
 ---
 
-### Step 7: Pair Your AirSense 11
+### Step 4: Pair Your AirSense 11
 
-Once Wi-Fi is configured, the next step is to pair SomnoTrace with your CPAP over Bluetooth so therapy sessions can be recorded.
+Once Wi-Fi is configured, pair SomnoTrace with your CPAP over Bluetooth:
 
 👉 **[AirSense 11 Pairing Guide](pairing.md)**
 

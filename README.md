@@ -191,17 +191,22 @@ Access the built-in web portal from any device on your Wi-Fi network without ins
 
 ## Quick Start & Installation
 
-### Option 1: Web Browser Flashing (Recommended — 2 Minutes)
+### Option 1: 1-Click Web Installer at somnotrace.com (Recommended — Under 1 Minute)
 
-You do **not** need to install any programming tools or compilers. You can flash SomnoTrace directly from **Google Chrome** or **Microsoft Edge**:
+No software, drivers, command line, or file downloads required. Install SomnoTrace directly from your browser (**Google Chrome**, **Microsoft Edge**, **Brave**, or **Opera**):
 
-1. Download the latest **`-full.bin`** file (e.g., `somnotrace-v1.0.2-full.bin`) from the **[Releases Page](https://github.com/ilyakruchinin/SomnoTrace/releases)**.
-   - ⚠️ **Do NOT download the `-ota.bin` file** — that is for over-the-air updates from within the web interface only, and cannot be used for initial flashing.
-2. Connect your Waveshare board to your computer with a USB-C data cable.
-3. Open the **[Web Flashing Guide](docs/flashing.md)** and follow the 5 simple steps.
-4. Connect to the `SomnoTrace-Setup` Wi-Fi hotspot from your phone to enter your home Wi-Fi details.
+1. Plug your Waveshare board into your computer with a **USB-C data cable**.
+2. Visit **[somnotrace.com](https://somnotrace.com)**.
+3. It takes literally **3 clicks**:
+   - Click **Install SomnoTrace**
+   - Select **USB JTAG/serial debug unit** in the browser popup
+   - Click **Connect**
 
-👉 **[Read the Full Step-by-Step Flashing Guide](docs/flashing.md)**
+That's it! The web flasher automatically fetches the latest stable release, switches the board into download mode, flashes the firmware, and reboots the device into SomnoTrace.
+
+Once rebooted, connect your phone or computer to the **`SomnoTrace-Setup`** Wi-Fi network to complete Wi-Fi setup.
+
+👉 **[Detailed Web Flashing & Setup Guide](docs/flashing.md)**
 
 ---
 
