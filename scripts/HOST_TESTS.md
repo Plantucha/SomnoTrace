@@ -22,7 +22,7 @@ that is wanted; nothing here depends on running there.
 | `scripts/test_include/` | one-file stand-ins for `esp_log.h`, `esp_err.h`, `esp_timer.h`, `esp_heap_caps.h`, `cJSON.h` |
 | `scripts/edf_gen_test.c` | `#include`s the five `edf_*.c` modules — tests the real converter end to end (SNT files in, EDF bytes out) |
 | `scripts/as11_time_test.c` | AS11 epoch / noon-day arithmetic |
-| `scripts/as11_events_test.c` | event parser (tests a copy of the parser, not the real one) |
+| `scripts/as11_events_test.c` | AS11 event parser and lifecycle state machine (`main/as11_events.c`) |
 | `scripts/vld3_decoder_test.c` | oximeter VLD3 decoder |
 | `scripts/mutants.py` | plants one-line bugs into a copy of `main/`, expects the suite to fail |
 | `scripts/mutants_probe.py` | optional: asks a local model for more bugs, measures them the same way |
