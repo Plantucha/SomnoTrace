@@ -149,6 +149,7 @@ typedef enum {
 
 static SemaphoreHandle_t s_state_mutex = NULL;  /* protects all shared state below */
 static disp_mode_t s_mode = DISP_MODE_STATUS;
+static bool s_therapy_active = false;           /* true when CPAP therapy session is active */
 static bool s_status_dirty = true;              /* status content changed, force redraw */
 
 /* Status-screen content (copied from callers) */
@@ -196,6 +197,9 @@ void bsp_display_set_therapy_active(bool active)
     const device_settings_t *dev = device_settings_get();
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool was_active = s_therapy_active;
+    s_therapy_active = active;
+
     disp_mode_t new_mode;
     if (active) {
         if (dev->therapy_screen == THERAPY_SCREEN_INFO)
@@ -207,13 +211,19 @@ void bsp_display_set_therapy_active(bool active)
     } else {
         new_mode = DISP_MODE_STATUS;
     }
+
+    if (active && !was_active) {
+        /* Only reset flow buffer and leak accumulators at the start of a session;
+         * preserve them if the user changes screen preferences mid-session. */
+        s_flow_head = 0;
+        s_flow_count = 0;
+        s_leak_sum = 0.0;
+        s_leak_count = 0;
+    }
+
     if (s_mode != new_mode) {
         s_mode = new_mode;
         if (active) {
-            s_flow_head = 0;
-            s_flow_count = 0;
-            s_leak_sum = 0.0;
-            s_leak_count = 0;
             ESP_LOGI(TAG, "therapy mode enabled: %s (display_task=%s)",
                      new_mode == DISP_MODE_INFO ? "info" :
                      new_mode == DISP_MODE_STATUS ? "status" : "graph",
@@ -223,10 +233,15 @@ void bsp_display_set_therapy_active(bool active)
             ESP_LOGI(TAG, "therapy mode disabled");
         }
     } else {
-        ESP_LOGD(TAG, "set_therapy_active(%s) — mode already %s, no-op",
-                 active ? "true" : "false",
-                 s_mode == DISP_MODE_GRAPH ? "GRAPH" :
-                 s_mode == DISP_MODE_INFO ? "INFO" : "STATUS");
+        if (was_active && !active) {
+            s_status_dirty = true;
+            ESP_LOGI(TAG, "therapy mode disabled");
+        } else {
+            ESP_LOGD(TAG, "set_therapy_active(%s) — mode already %s, no-op",
+                     active ? "true" : "false",
+                     s_mode == DISP_MODE_GRAPH ? "GRAPH" :
+                     s_mode == DISP_MODE_INFO ? "INFO" : "STATUS");
+        }
     }
     xSemaphoreGive(s_state_mutex);
 
@@ -249,7 +264,7 @@ bool bsp_display_is_therapy_active(void)
 {
     if (!s_state_mutex) return false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    bool active = (s_mode == DISP_MODE_GRAPH || s_mode == DISP_MODE_INFO);
+    bool active = s_therapy_active;
     xSemaphoreGive(s_state_mutex);
     return active;
 }

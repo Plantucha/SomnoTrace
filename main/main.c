@@ -481,11 +481,9 @@ void app_main(void)
             bsp_display_set_battery(batt.percent, batt.charging, batt.valid);
         } else {
             /* Update battery indicator every second (immediate redraw only on state change) */
-            if (!bsp_display_is_therapy_active()) {
-                bsp_battery_t batt;
-                bsp_power_battery_get(&batt);
-                bsp_display_set_battery(batt.percent, batt.charging, batt.valid);
-            }
+            bsp_battery_t batt;
+            bsp_power_battery_get(&batt);
+            bsp_display_set_battery(batt.percent, batt.charging, batt.valid);
 
             /* Connected mode: refresh status display every 3 s.
              * Skipped during therapy (graph mode owns the display). */
