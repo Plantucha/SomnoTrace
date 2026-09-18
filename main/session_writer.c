@@ -153,7 +153,7 @@ typedef struct __attribute__((packed)) {
 /* A StreamData discontinuity at least this long is not compensated — the
  * session is split so the gap is never rendered as continuous samples. */
 #ifndef SW_SPLIT_GAP_MS
-#define SW_SPLIT_GAP_MS         120000   /* 2 min */
+#define SW_SPLIT_GAP_MS         10000    /* 10 s: >= 50 missing notifications */
 #endif
 
 /* Ignore a repeated TherapyStart this soon after a session started; it is
@@ -2059,13 +2059,17 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     stream_batch_t *b = s->fill;
 
     /* ── Missing-packet compensation ───────────────────────────────
-     * Short gaps hold the previous value (visually indistinguishable and
-     * matching AS11 conventions).  Long gaps are NOT padded: minutes of
-     * fabricated data would be worse than an honest boundary, so they are
-     * counted and — beyond SW_SPLIT_GAP_MS — the session is split. */
+     * Short gaps (< 10 s / < 50 notifications) hold the previous value,
+     * absorbing AirSense 11 internal SD card write latency (cluster allocation,
+     * directory updates, flash erase/write stalls) without losing 25 Hz waveform
+     * phase. Long gaps (>= 10 s) are true radio dropouts and are NOT padded:
+     * fabricated physiological data would manufacture artificial apneas in
+     * clinical scoring (OSCAR / SleepHQ). Beyond SW_SPLIT_GAP_MS the session
+     * is split. */
     bool want_split = false;
+    int64_t gap = 0;
     if (cur_stream_ms >= 0 && s->prev_stream_ms_valid) {
-        int64_t gap = cur_stream_ms - s->prev_stream_ms;
+        gap = cur_stream_ms - s->prev_stream_ms;
         if (gap < 0) gap += 86400000;
         if (gap > 280) {
             int missing = (int)((gap - 100) / 200);
@@ -2137,11 +2141,17 @@ void session_writer_on_stream_data_raw(const char *json, int len)
 
     if (want_split) {
         /* Split rather than emit a continuous-looking timeline across a
-         * multi-minute hole.  .snt assumes uniform sampling, so a gap this
-         * large cannot be represented honestly inside one session. */
+         * radio drop.  .snt assumes uniform sampling, so a gap this large
+         * cannot be represented honestly inside one session without
+         * fabricating false physiological data. */
         xSemaphoreGive(s->fill_mutex);
-        ESP_LOGW(TAG, "splitting session at long gap");
-        sw_request_finalize(s, "split", (int64_t)time(NULL) * 1000, true);
+        ESP_LOGW(TAG, "splitting session at long gap (%lld ms)", (long long)gap);
+        int64_t now_ms = (int64_t)time(NULL) * 1000;
+        int64_t end_epoch_ms = now_ms - gap;
+        if (end_epoch_ms < s->start_epoch_ms) {
+            end_epoch_ms = s->start_epoch_ms;
+        }
+        sw_request_finalize(s, "split", end_epoch_ms, true);
         s = session_writer_start();
         if (!s) return;
         xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
