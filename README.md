@@ -20,7 +20,7 @@ SomnoTrace is the **first and only** open-source project that delivers:
 - 🚨 **Interrupted Therapy Alerts (Insurance Compliance & Safety):**  
   If your mask slips off or therapy stops unexpectedly during the night, SomnoTrace alerts you immediately. It sends a push notification to your phone, smartwatch (Apple Watch, Garmin, WearOS), or smart bed shaker via [ntfy](https://ntfy.sh). If unacknowledged, an escalating audible alarm sounds on the device speaker, helping you preserve required insurance compliance hours and prevent unmanaged apnea.
 - ⚡ **ResMed BLE → Wi-Fi Bridge & Smart Home Automations:**  
-  SomnoTrace bridges the machine's encrypted Bluetooth link to your local Wi-Fi network. You can query machine settings, start/stop therapy remotely, or build rich [Home Assistant automations](docs/automations.md) (e.g. automatically turn off bedroom lights when you start therapy).
+  SomnoTrace bridges the machine's encrypted Bluetooth link to your local Wi-Fi network. You can query machine settings, start/stop therapy remotely, or build rich [Home Assistant automations](docs/automations.md) (e.g. automatically turn off bedroom lights when you start therapy). A built-in **MQTT client** publishes real-time therapy events and device telemetry, with Home Assistant Auto-Discovery for zero-configuration entity setup.
 
 ---
 
@@ -36,7 +36,7 @@ SomnoTrace is the **first and only** open-source project that delivers:
 
 ## Hardware
 
-<img src="https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-lcd-1.54-1.jpg" alt="Waveshare ESP32-S3 Touch LCD 1.54 Front" width="260" align="right" />
+<img src="assets/images/waveshare.jpeg" alt="Waveshare ESP32-S3 Touch LCD 1.54 Front" width="260" align="right" />
 
 SomnoTrace runs on a compact, affordable, all-in-one development board:
 
@@ -287,6 +287,7 @@ OSCAR takes a session's extent from the recording files themselves, not from the
 | **BLE → Wi-Fi RPC Proxy** | ✅ Implemented | Local HTTP endpoint for remote machine queries and smart home control. |
 | **FTP File Server** | ✅ Implemented | Download EDF and session files directly from the MicroSD card using any FTP client (e.g., FileZilla). |
 | **O2 Ring Bluetooth Sync** | ✅ Implemented | Downloads stored oximetry recordings from Viatom O2 Ring (Gen1 & Gen2) over Bluetooth, with automatic upload to SMB and SleepHQ. |
+| **MQTT & Home Assistant** | ✅ Implemented | Publishes real-time therapy start/stop events, alert state, BLE connection status, and device telemetry over a single persistent MQTT connection. Home Assistant MQTT Auto-Discovery provisions all entities automatically; bidirectional command topics allow remote therapy start/stop and alarm acknowledgement. |
 | **Cross-Noon Sessions** | ✅ Implemented | Therapy spanning midday is recorded as one continuous session instead of being split at noon the way the AS10/AS11 split it. |
 
 ---
