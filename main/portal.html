@@ -929,6 +929,54 @@ Therapy Interruption Alerts
 </div>
 </div>
 
+<!-- MQTT & Home Assistant Config -->
+<div class="card" id="mqtt-card">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+MQTT &amp; Home Assistant
+</div>
+<div class="toggle-row">
+<label for="mqtt-enabled">Enable MQTT Integration <span id="mqtt-save-status" class="setting-status"></span></label>
+<label class="toggle"><input type="checkbox" id="mqtt-enabled" onchange="autoSaveMqtt();toggleCardDisabled('mqtt-card','mqtt-enabled')"><span class="toggle-slider"></span></label>
+</div>
+<p class="card-desc">Publish real-time therapy events (start, stop, alarms, device health) and enable Home Assistant Auto-Discovery.</p>
+<div style="display:flex;align-items:center;gap:8px;margin-top:6px;font-size:0.85rem">
+<span style="color:var(--text-muted)">Status:</span>
+<span id="mqtt-status-badge" class="badge badge-gray" style="font-size:0.75rem">Disabled</span>
+</div>
+<div class="form-group" style="margin-top:12px">
+<label>Broker URL</label>
+<input type="text" id="mqtt-broker-uri" class="form-control" placeholder="mqtt://192.168.1.50:1883 or mqtts://..." spellcheck="false" autocapitalize="none" onchange="autoSaveMqtt()">
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+<div class="form-group">
+<label>Username (optional)</label>
+<input type="text" id="mqtt-username" class="form-control" placeholder="homeassistant" spellcheck="false" autocapitalize="none" onchange="autoSaveMqtt()">
+</div>
+<div class="form-group">
+<label>Password (optional)</label>
+<input type="password" id="mqtt-password" class="form-control" placeholder="••••••••" spellcheck="false" autocapitalize="none" oninput="this.setAttribute('data-dirty','true')" onchange="autoSaveMqtt()">
+</div>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+<div class="form-group">
+<label>Topic Prefix</label>
+<input type="text" id="mqtt-prefix" class="form-control" placeholder="somnotrace" spellcheck="false" autocapitalize="none" onchange="autoSaveMqtt()">
+</div>
+<div class="form-group" style="display:flex;flex-direction:column;justify-content:center">
+<label for="mqtt-discovery" style="margin-bottom:6px">Home Assistant Discovery</label>
+<div style="display:flex;align-items:center;gap:8px">
+<label class="toggle"><input type="checkbox" id="mqtt-discovery" checked onchange="autoSaveMqtt()"><span class="toggle-slider"></span></label>
+<span style="font-size:0.8rem;color:var(--text-muted)">Auto-configure entities</span>
+</div>
+</div>
+</div>
+<div style="margin-top:12px">
+<button type="button" class="btn btn-sm" onclick="saveMqttNow()">Save &amp; Connect</button>
+<span id="mqtt-status" class="status-msg" style="margin-left:8px"></span>
+</div>
+</div>
+
 <!-- Sticky Floating Save & Reboot Bar -->
 <div id="save-footer" class="save-footer">
 <div class="save-info">
@@ -1052,6 +1100,7 @@ Upload Progress
 <div class="info-row"><span class="info-label">SD Card Free</span><span class="info-value" id="status-sd">--</span></div>
 <div class="info-row"><span class="info-label">Paired data source</span><span class="info-value" id="status-ble">--</span></div>
 <div class="info-row"><span class="info-label">O2 Ring</span><span class="info-value" id="status-ox">--</span></div>
+<div class="info-row"><span class="info-label">MQTT</span><span class="info-value" id="status-mqtt">--</span></div>
 </div>
 <div class="card info-list">
 <div class="card-title">Device Telemetry</div>
@@ -1263,6 +1312,7 @@ function switchTab(tabId) {
       if (d.uploads) renderUploadConfig(d.uploads);
       if (d.device) renderDeviceSettings(d.device);
       if (d.alert) renderAlertConfig(d.alert);
+      if (d.mqtt) renderMqttConfig(d.mqtt);
       if (d.status) loadStatus(d.status);
     }).catch(function() {
       if (!PORTAL_MODE) {
@@ -1272,10 +1322,12 @@ function switchTab(tabId) {
       }
       loadDeviceSettings();
       loadAlertConfig();
+      loadMqttConfig();
       loadStatus();
     }).then(function() {
       setLoading('display-sound-card', false);
       setLoading('alert-card', false);
+      setLoading('mqtt-card', false);
       setLoading('upload-cards-grid', false);
       setLoading('upload-window-card', false);
       setLoading('ftp-card', false);
@@ -1904,6 +1956,18 @@ function loadStatusTab(d) {
   updateOxUI(d.oximeter);
 
   setEl('status-sd', formatSdSpace(d.sd_total, d.sd_free));
+
+  var mqttEl = document.getElementById('status-mqtt');
+  if (mqttEl && d.mqtt) {
+    var mst = d.mqtt.enabled ? d.mqtt.state : 'disabled';
+    var mlabels = { 'disabled': 'Disabled', 'disconnected': 'Disconnected', 'connecting': 'Connecting…', 'connected': 'Connected' };
+    var mcolors = { 'disabled': 'var(--text-muted)', 'disconnected': 'var(--warning)', 'connecting': 'var(--warning)', 'connected': 'var(--success)' };
+    mqttEl.textContent = mlabels[mst] || mst;
+    mqttEl.style.color = mcolors[mst] || 'var(--text-muted)';
+  }
+  if (d.mqtt) {
+    updateMqttStatusBadge(d.mqtt.state, d.mqtt.enabled);
+  }
 
   setEl('stat-ih-free', fmtBytes(d.ih_free));
   setEl('stat-ih-min', fmtBytes(d.ih_min));
@@ -2600,6 +2664,114 @@ function sendAlertTestPush() {
   }).catch(function() {
     if (st) { st.textContent = 'Network error'; st.style.color = 'var(--danger)'; }
   });
+}
+
+/* ── MQTT & Home Assistant Config ──────────────────────────────── */
+var mqttSaveTimer = null;
+
+function renderMqttConfig(d) {
+  if (!d) return;
+  var en = document.getElementById('mqtt-enabled');
+  if (en) en.checked = !!d.enabled;
+
+  var uri = document.getElementById('mqtt-broker-uri');
+  if (uri && d.broker_uri !== undefined) uri.value = d.broker_uri;
+
+  var user = document.getElementById('mqtt-username');
+  if (user && d.username !== undefined) user.value = d.username;
+
+  var pass = document.getElementById('mqtt-password');
+  if (pass) {
+    pass.value = '';
+    pass.removeAttribute('data-dirty');
+    pass.placeholder = d.has_password ? '•••••••• (saved)' : '';
+  }
+
+  var pfx = document.getElementById('mqtt-prefix');
+  if (pfx && d.topic_prefix !== undefined) pfx.value = d.topic_prefix || 'somnotrace';
+
+  var disc = document.getElementById('mqtt-discovery');
+  if (disc && d.discovery_en !== undefined) disc.checked = !!d.discovery_en;
+
+  updateMqttStatusBadge(d.state, d.enabled);
+  toggleCardDisabled('mqtt-card', 'mqtt-enabled');
+}
+
+function updateMqttStatusBadge(state, enabled) {
+  var b = document.getElementById('mqtt-status-badge');
+  if (!b) return;
+  if (!enabled || state === 'disabled') {
+    b.className = 'badge badge-gray';
+    b.textContent = 'Disabled';
+  } else if (state === 'connected') {
+    b.className = 'badge badge-green';
+    b.textContent = 'Connected';
+  } else if (state === 'connecting') {
+    b.className = 'badge badge-blue';
+    b.textContent = 'Connecting...';
+  } else {
+    b.className = 'badge badge-orange';
+    b.textContent = 'Disconnected';
+  }
+}
+
+function autoSaveMqtt() {
+  setStatus('mqtt-save-status', '…', null);
+  if (mqttSaveTimer) clearTimeout(mqttSaveTimer);
+  mqttSaveTimer = setTimeout(function() {
+    saveMqttNow();
+  }, 400);
+}
+
+function saveMqttNow() {
+  var st = document.getElementById('mqtt-status');
+  if (st) { st.textContent = 'Saving...'; st.style.color = 'var(--text-muted)'; }
+
+  var body = {
+    enabled: !!(document.getElementById('mqtt-enabled') || {}).checked,
+    broker_uri: ((document.getElementById('mqtt-broker-uri') || {}).value || '').trim(),
+    username: ((document.getElementById('mqtt-username') || {}).value || '').trim(),
+    topic_prefix: ((document.getElementById('mqtt-prefix') || {}).value || '').trim() || 'somnotrace',
+    discovery_en: !!(document.getElementById('mqtt-discovery') || {}).checked
+  };
+  var passEl = document.getElementById('mqtt-password');
+  if (passEl && passEl.getAttribute('data-dirty') === 'true') {
+    body.password = passEl.value;
+  }
+
+  fetch('/api/mqtt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function(r) {
+    if (r.ok) {
+      setStatus('mqtt-save-status', '✓', true);
+      if (st) {
+        st.textContent = 'Saved';
+        st.style.color = 'var(--success)';
+        setTimeout(function(){ if (st) st.textContent = ''; }, 3000);
+      }
+      setTimeout(loadMqttConfig, 800);
+    } else {
+      setStatus('mqtt-save-status', '✗', false);
+      if (st) {
+        st.textContent = 'Save failed';
+        st.style.color = 'var(--danger)';
+      }
+    }
+  }).catch(function() {
+    setStatus('mqtt-save-status', '✗', false);
+    if (st) {
+      st.textContent = 'Network error';
+      st.style.color = 'var(--danger)';
+    }
+  });
+}
+
+function loadMqttConfig() {
+  fetch('/api/mqtt').then(function(r){ return r.json(); }).then(function(d) {
+    renderMqttConfig(d);
+  }).catch(function() {});
 }
 
 /* ── Upload "Test connection" ──────────────────────────────────── */

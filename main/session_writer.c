@@ -67,6 +67,7 @@
 #include "uploader.h"
 #include "time_sync.h"
 #include "therapy_alert.h"
+#include "mqtt_manager.h"
 #include "crash_diag.h"
 #include "snt_format.h"
 #include "as11_events.h"
@@ -1785,6 +1786,15 @@ session_writer_t *session_writer_get_active(void)
     return s_active;
 }
 
+uint32_t session_writer_get_duration_min(void)
+{
+    session_writer_t *s = s_active;
+    if (!s || !s->active) return 0;
+    int64_t dur_us = esp_timer_get_time() - s->start_time_us;
+    if (dur_us < 0) return 0;
+    return (uint32_t)(dur_us / 60000000ULL);
+}
+
 void session_writer_set_device_info(const char *addr, const char *client_id)
 {
     if (addr) strlcpy(s_device_addr, addr, sizeof(s_device_addr));
@@ -2040,6 +2050,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
         bsp_display_set_therapy_active(true);
         bsp_display_set_therapy_start_time(esp_timer_get_time());
+        mqtt_manager_on_therapy_start();
         s = session_writer_start();
         if (s) {
             s_started_from_event = false;
@@ -2255,6 +2266,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             s_in_mask_fit = false;
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
+            mqtt_manager_on_therapy_stop();
             if (s && s->active) {
                 write_event(s, msg);
                 sw_request_finalize(s, "completed",
@@ -2272,6 +2284,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             therapy_alert_on_therapy_start();
             bsp_display_set_therapy_active(true);
             bsp_display_set_therapy_start_time(esp_timer_get_time());
+            mqtt_manager_on_therapy_start();
 
             int64_t now_us = esp_timer_get_time();
             bool duplicate = false;
@@ -2315,6 +2328,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             ESP_LOGI(TAG, ">>> MASK FIT / DIAGNOSTIC START detected (suppressing therapy)");
             s_in_mask_fit = true;
             bsp_display_set_therapy_active(false);
+            mqtt_manager_on_therapy_stop();
             /* If a session was started by flow heuristic within the last 15 seconds
              * before the MaskFit event arrived, abort the false session. */
             if (s && s->active && !s_started_from_event) {
@@ -2340,6 +2354,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
             s_therapy_stopped = true;
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
+            mqtt_manager_on_therapy_stop();
             if (s && s->active) {
                 ESP_LOGI(TAG, "finalizing therapy session on CooldownStarted");
                 write_event(s, msg);
@@ -2361,6 +2376,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                 s_therapy_stopped = true;
                 bsp_display_set_therapy_active(false);
                 therapy_alert_on_therapy_stop();
+                mqtt_manager_on_therapy_stop();
                 write_event(s, msg);
                 sw_request_finalize(s, "completed",
                                     (int64_t)time(NULL) * 1000, true);

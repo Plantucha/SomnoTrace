@@ -72,6 +72,7 @@
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "mdns.h"
+#include "mqtt_manager.h"
 
 static const char *TAG = "netprov";
 
@@ -1071,6 +1072,11 @@ cJSON *netprov_build_status_json(void)
     /* Therapy alert state */
     cJSON *alert = cJSON_AddObjectToObject(resp, "alert");
     cJSON_AddStringToObject(alert, "state", therapy_alert_state_str(therapy_alert_get_state()));
+
+    /* MQTT status */
+    cJSON *mqtt = cJSON_AddObjectToObject(resp, "mqtt");
+    cJSON_AddBoolToObject(mqtt, "enabled", mqtt_manager_is_enabled());
+    cJSON_AddStringToObject(mqtt, "state", mqtt_manager_state_str(mqtt_manager_get_state()));
 
     {
         char *pending = NULL;
@@ -2080,6 +2086,55 @@ static esp_err_t alert_test_push_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── MQTT config endpoints ─────────────────────────────────────────── */
+
+static esp_err_t mqtt_config_get_handler(httpd_req_t *req)
+{
+    char *json = NULL;
+    if (mqtt_manager_get_config_json(&json) != ESP_OK || !json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_config_post_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 2048) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_FAIL;
+    }
+    char *body = heap_caps_malloc((size_t)total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = malloc((size_t)total + 1);
+    if (!body) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    if (mqtt_manager_save_config_json(body) != ESP_OK) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid config");
+        return ESP_FAIL;
+    }
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 /* ── Device settings endpoints (cont'd) ────────────────────────────── */
 
 static esp_err_t device_settings_get_handler(httpd_req_t *req)
@@ -2123,6 +2178,13 @@ static esp_err_t settings_all_get_handler(httpd_req_t *req)
         cJSON *parsed = cJSON_Parse(alert_json);
         if (parsed) cJSON_AddItemToObject(root, "alert", parsed);
         free(alert_json);
+    }
+
+    char *mqtt_json = NULL;
+    if (mqtt_manager_get_config_json(&mqtt_json) == ESP_OK && mqtt_json) {
+        cJSON *parsed = cJSON_Parse(mqtt_json);
+        if (parsed) cJSON_AddItemToObject(root, "mqtt", parsed);
+        free(mqtt_json);
     }
 
     cJSON *st = netprov_build_status_json();
@@ -3250,6 +3312,12 @@ static esp_err_t start_webserver(void)
     reg_uri(s_httpd, &alert_cfg_get);
     reg_uri(s_httpd, &alert_cfg_post);
     reg_uri(s_httpd, &alert_test);
+
+    /* MQTT & Home Assistant config endpoints */
+    httpd_uri_t mqtt_cfg_get = { .uri = "/api/mqtt", .method = HTTP_GET, .handler = mqtt_config_get_handler };
+    httpd_uri_t mqtt_cfg_post = { .uri = "/api/mqtt", .method = HTTP_POST, .handler = mqtt_config_post_handler };
+    reg_uri(s_httpd, &mqtt_cfg_get);
+    reg_uri(s_httpd, &mqtt_cfg_post);
 
     /* Reboot endpoint */
     httpd_uri_t reboot_post = { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler };

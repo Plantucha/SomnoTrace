@@ -50,10 +50,12 @@ static const char *TAG = "therapy_alert";
 static alert_beep_fn_t          s_beep_fn  = NULL;
 static alert_nvs_exec_fn_t       s_nvs_exec = NULL;
 static alert_therapy_active_fn_t s_therapy_active_fn = NULL;
+static alert_state_change_cb_t   s_state_change_cb   = NULL;
 
 void therapy_alert_set_beep_fn(alert_beep_fn_t fn)    { s_beep_fn = fn; }
 void therapy_alert_set_nvs_executor(alert_nvs_exec_fn_t fn) { s_nvs_exec = fn; }
 void therapy_alert_set_therapy_active_fn(alert_therapy_active_fn_t fn) { s_therapy_active_fn = fn; }
+void therapy_alert_set_state_change_cb(alert_state_change_cb_t cb)     { s_state_change_cb = cb; }
 
 /* ── Concurrency model ──────────────────────────────────────────────────
  *
@@ -237,6 +239,9 @@ static void set_state(alert_state_t st)
     if (s_state == st) return;
     s_state = st;
     ESP_LOGI(TAG, "state → %s", therapy_alert_state_str(st));
+    if (s_state_change_cb) {
+        s_state_change_cb(st);
+    }
 }
 
 /* ── NVS config persistence ─────────────────────────────────────────── */

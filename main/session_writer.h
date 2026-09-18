@@ -64,6 +64,9 @@ bool session_writer_is_active(const session_writer_t *s);
 /* Get the current active session handle (or NULL). */
 session_writer_t *session_writer_get_active(void);
 
+/* Get the duration in minutes of the current active session (or 0 if none). */
+uint32_t session_writer_get_duration_min(void);
+
 /* Set the AS11 device address and client ID for session metadata. */
 void session_writer_set_device_info(const char *addr, const char *client_id);
 
