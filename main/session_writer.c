@@ -1788,9 +1788,17 @@ session_writer_t *session_writer_get_active(void)
 
 uint32_t session_writer_get_duration_min(void)
 {
-    session_writer_t *s = s_active;
-    if (!s || !s->active) return 0;
-    int64_t dur_us = esp_timer_get_time() - s->start_time_us;
+    /* s_active is finalized and freed on other tasks — snapshot under
+     * s_active_mutex so we never dereference a struct being released. */
+    int64_t start_us = 0;
+    if (s_active_mutex &&
+        xSemaphoreTake(s_active_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        session_writer_t *s = s_active;
+        if (s && s->active) start_us = s->start_time_us;
+        xSemaphoreGive(s_active_mutex);
+    }
+    if (!start_us) return 0;
+    int64_t dur_us = esp_timer_get_time() - start_us;
     if (dur_us < 0) return 0;
     return (uint32_t)(dur_us / 60000000ULL);
 }

@@ -33,11 +33,13 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_timer.h"
+#include "esp_mac.h"
 #include "esp_wifi.h"
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
@@ -68,10 +70,22 @@ static const char *TAG = "mqtt";
 #define NVS_KEY_USER         "mqtt_user"
 #define NVS_KEY_PASS         "mqtt_pass"
 #define NVS_KEY_PREFIX       "mqtt_prefix"
-#define NVS_KEY_DISCOVERY    "mqtt_disc"
+#define NVS_KEY_DISCOVERY    "mqtt_discovery"
 
 /* Fixed 60s telemetry timer (non-configurable for 2.4 GHz radio coexistence). */
 #define TELEMETRY_INTERVAL_MS (60 * 1000)
+
+/* Commands received on subscribed topics are deferred to the telemetry task:
+ * as11_ble_start/stop_therapy() are blocking RPCs (up to 10 s) and must not
+ * run inside the esp-mqtt client task. */
+typedef enum {
+    MQTT_CMD_THERAPY_START = 0,
+    MQTT_CMD_THERAPY_STOP,
+    MQTT_CMD_ALERT_ACK,
+    MQTT_CMD_UPLOAD_SCAN,
+} mqtt_cmd_t;
+
+#define MQTT_CMD_QUEUE_LEN 4
 
 /* Internal state */
 static SemaphoreHandle_t        s_mtx = NULL;
@@ -79,6 +93,7 @@ static mqtt_config_t            s_cfg;
 static mqtt_conn_state_t        s_conn_state = MQTT_STATE_DISABLED;
 static esp_mqtt_client_handle_t s_client = NULL;
 static TaskHandle_t             s_telemetry_task = NULL;
+static QueueHandle_t            s_cmd_q = NULL;
 static char                     s_lwt_topic[64] = {0};
 static char                     s_state_topic[64] = {0};
 static char                     s_cmd_therapy_topic[64] = {0};
@@ -105,8 +120,8 @@ static void init_device_id(void)
 {
     if (s_device_id[0] != '\0') return;
     uint8_t mac[6] = {0};
-    if (esp_wifi_get_mac(WIFI_IF_STA, mac) != ESP_OK) {
-        /* Fallback if Wi-Fi MAC read fails */
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+        /* Fallback if MAC read fails */
         snprintf(s_device_id, sizeof(s_device_id), "somnotrace_default");
         return;
     }
@@ -228,8 +243,15 @@ esp_err_t mqtt_manager_start(void)
     xSemaphoreTake(s_mtx, portMAX_DELAY);
 
     if (!s_cfg.enabled || s_cfg.broker_uri[0] == '\0') {
+        esp_mqtt_client_handle_t stale = s_client;
+        s_client = NULL;
         s_conn_state = MQTT_STATE_DISABLED;
         xSemaphoreGive(s_mtx);
+        if (stale) {
+            /* Defensive: a running client must not survive a disabled config. */
+            esp_mqtt_client_stop(stale);
+            esp_mqtt_client_destroy(stale);
+        }
         return ESP_OK;
     }
 
@@ -271,8 +293,10 @@ esp_err_t mqtt_manager_start(void)
     mqtt_cfg.session.keepalive = 60;
     mqtt_cfg.task.stack_size = 8192;
     mqtt_cfg.task.priority = 5;
-    mqtt_cfg.buffer.size = 2048;
-    mqtt_cfg.buffer.out_size = 2048;
+    /* Largest payload is a ~600 B discovery config; 1 KiB buffers halve the
+     * internal-RAM footprint vs the default 2 KiB. */
+    mqtt_cfg.buffer.size = 1024;
+    mqtt_cfg.buffer.out_size = 1024;
 
     if (strncmp(s_cfg.broker_uri, "mqtts://", 8) == 0 || strncmp(s_cfg.broker_uri, "ssl://", 6) == 0) {
         mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
@@ -311,11 +335,21 @@ esp_err_t mqtt_manager_stop(void)
     if (!s_mtx) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     esp_mqtt_client_handle_t old_client = s_client;
+    bool was_connected = (s_conn_state == MQTT_STATE_CONNECTED);
     s_client = NULL;
     s_conn_state = s_cfg.enabled ? MQTT_STATE_DISCONNECTED : MQTT_STATE_DISABLED;
     xSemaphoreGive(s_mtx);
 
     if (old_client) {
+        /* A clean disconnect never triggers the LWT, so the broker would keep
+         * the retained "online" forever. Publish "offline" first; the publish
+         * is only enqueued by esp-mqtt, so give the client task a moment to
+         * actually transmit it before stopping. Harmless when the link is
+         * already down (Wi-Fi-loss path): the message just never sends. */
+        if (was_connected) {
+            esp_mqtt_client_publish(old_client, s_lwt_topic, "offline", 7, 1, 1);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
         esp_mqtt_client_stop(old_client);
         esp_mqtt_client_destroy(old_client);
     }
@@ -340,28 +374,42 @@ static void handle_command_message(const char *topic, int topic_len, const char 
 
     ESP_LOGI(TAG, "incoming command on '%s': '%s'", tbuf, payload);
 
+    mqtt_cmd_t cmd;
     if (strcmp(tbuf, s_cmd_therapy_topic) == 0) {
-        if (strstr(payload, "START") || strstr(payload, "ON") || strcmp(payload, "1") == 0) {
-            ESP_LOGI(TAG, "cmd: Start Therapy requested");
-            as11_ble_start_therapy();
-        } else if (strstr(payload, "STOP") || strstr(payload, "OFF") || strcmp(payload, "0") == 0) {
-            ESP_LOGI(TAG, "cmd: Stop Therapy requested");
-            as11_ble_stop_therapy();
+        if (strcmp(payload, "START") == 0 || strcmp(payload, "ON") == 0 || strcmp(payload, "1") == 0) {
+            cmd = MQTT_CMD_THERAPY_START;
+        } else if (strcmp(payload, "STOP") == 0 || strcmp(payload, "OFF") == 0 || strcmp(payload, "0") == 0) {
+            cmd = MQTT_CMD_THERAPY_STOP;
+        } else {
+            ESP_LOGW(TAG, "unrecognized therapy command '%s'", payload);
+            return;
         }
-        mqtt_manager_publish_state(true);
     } else if (strcmp(tbuf, s_cmd_alert_topic) == 0) {
-        if (strstr(payload, "ACK") || strstr(payload, "SILENCE") || strstr(payload, "PRESS")) {
-            ESP_LOGI(TAG, "cmd: Silence/Acknowledge Alert requested");
-            therapy_alert_acknowledge();
-            mqtt_manager_publish_state(true);
+        if (strcmp(payload, "ACK") == 0 || strcmp(payload, "SILENCE") == 0 || strcmp(payload, "PRESS") == 0) {
+            cmd = MQTT_CMD_ALERT_ACK;
+        } else {
+            ESP_LOGW(TAG, "unrecognized alert command '%s'", payload);
+            return;
         }
     } else if (strcmp(tbuf, s_cmd_uploader_topic) == 0) {
-        if (strstr(payload, "SCAN") || strstr(payload, "RETRY") || strstr(payload, "PRESS")) {
-            ESP_LOGI(TAG, "cmd: Scan/Retry Uploads requested");
-            upload_sched_request_scan();
-            mqtt_manager_publish_state(true);
+        if (strcmp(payload, "SCAN") == 0 || strcmp(payload, "RETRY") == 0 || strcmp(payload, "PRESS") == 0) {
+            cmd = MQTT_CMD_UPLOAD_SCAN;
+        } else {
+            ESP_LOGW(TAG, "unrecognized uploader command '%s'", payload);
+            return;
         }
+    } else {
+        return;
     }
+
+    /* Defer execution to the telemetry task: the therapy RPCs block for up to
+     * 10 s and must not stall the esp-mqtt client task (which would also stall
+     * esp_mqtt_client_stop() and its callers — the event loop and httpd). */
+    if (!s_cmd_q || xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "command queue full — dropping cmd %d", (int)cmd);
+        return;
+    }
+    if (s_telemetry_task) xTaskNotifyGive(s_telemetry_task);
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
@@ -375,20 +423,21 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGI(TAG, "MQTT connected to broker");
             if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY);
             s_conn_state = MQTT_STATE_CONNECTED;
+            bool disc_en = s_cfg.discovery_en;
             if (s_mtx) xSemaphoreGive(s_mtx);
 
             /* Publish online availability (retained) */
-            esp_mqtt_client_publish(s_client, s_lwt_topic, "online", 6, 1, 1);
+            esp_mqtt_client_publish(event->client, s_lwt_topic, "online", 6, 1, 1);
 
             /* Publish discovery payloads if configured */
-            if (s_cfg.discovery_en) {
+            if (disc_en) {
                 publish_discovery_payloads();
             }
 
             /* Subscribe to bidirectional command topics */
-            esp_mqtt_client_subscribe(s_client, s_cmd_therapy_topic, 1);
-            esp_mqtt_client_subscribe(s_client, s_cmd_alert_topic, 1);
-            esp_mqtt_client_subscribe(s_client, s_cmd_uploader_topic, 1);
+            esp_mqtt_client_subscribe(event->client, s_cmd_therapy_topic, 1);
+            esp_mqtt_client_subscribe(event->client, s_cmd_alert_topic, 1);
+            esp_mqtt_client_subscribe(event->client, s_cmd_uploader_topic, 1);
 
             /* Trigger initial state publish in telemetry worker task */
             if (s_telemetry_task) {
@@ -406,6 +455,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             break;
 
         case MQTT_EVENT_DATA:
+            /* A retained message on a command topic would replay on every
+             * reconnect and toggle therapy — commands must be live only. */
+            if (event->retain) {
+                ESP_LOGW(TAG, "ignoring retained command message");
+                break;
+            }
             handle_command_message(event->topic, event->topic_len, event->data, event->data_len);
             break;
 
@@ -498,7 +553,7 @@ static void do_publish_state(void)
     cJSON_AddNumberToObject(root, "therapy_duration_min", session_writer_get_duration_min());
 
     /* 8. uptime_s */
-    uint32_t uptime_s = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
+    uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000LL);
     cJSON_AddNumberToObject(root, "uptime_s", uptime_s);
 
     /* 9. upload status & pending */
@@ -529,12 +584,45 @@ static void do_publish_state(void)
     cJSON_free(json);
 }
 
+static void execute_command(mqtt_cmd_t cmd)
+{
+    switch (cmd) {
+        case MQTT_CMD_THERAPY_START:
+            ESP_LOGI(TAG, "cmd: Start Therapy requested");
+            as11_ble_start_therapy();
+            break;
+        case MQTT_CMD_THERAPY_STOP:
+            ESP_LOGI(TAG, "cmd: Stop Therapy requested");
+            as11_ble_stop_therapy();
+            break;
+        case MQTT_CMD_ALERT_ACK:
+            ESP_LOGI(TAG, "cmd: Silence/Acknowledge Alert requested");
+            therapy_alert_acknowledge();
+            break;
+        case MQTT_CMD_UPLOAD_SCAN:
+            ESP_LOGI(TAG, "cmd: Scan/Retry Uploads requested");
+            upload_sched_request_scan();
+            break;
+        default:
+            break;
+    }
+}
+
 static void mqtt_telemetry_task(void *arg)
 {
     (void)arg;
     while (1) {
         /* Wait for 60s telemetry tick or an immediate event notification */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
+
+        /* Execute any deferred command-topic messages first. Blocking BLE
+         * RPCs are safe here — this is our own worker, not the MQTT task. */
+        if (s_cmd_q) {
+            mqtt_cmd_t cmd;
+            while (xQueueReceive(s_cmd_q, &cmd, 0) == pdTRUE) {
+                execute_command(cmd);
+            }
+        }
 
         if (mqtt_manager_get_state() == MQTT_STATE_CONNECTED) {
             do_publish_state();
@@ -865,10 +953,13 @@ esp_err_t mqtt_manager_save_config_json(const char *json_str)
     cJSON *root = cJSON_Parse(json_str);
     if (!root) return ESP_ERR_INVALID_ARG;
 
+    /* Merge onto the persisted config rather than s_cfg: in SoftAP mode
+     * mqtt_manager_init() never ran, so s_cfg is a zeroed struct whose
+     * discovery_en=false would clobber the intended default. */
     mqtt_config_t new_cfg;
-    if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY);
-    new_cfg = s_cfg;
-    if (s_mtx) xSemaphoreGive(s_mtx);
+    if (mqtt_manager_load_config(&new_cfg) != ESP_OK) {
+        new_cfg = (mqtt_config_t)MQTT_CONFIG_DEFAULTS;
+    }
 
     cJSON *item = cJSON_GetObjectItem(root, "enabled");
     if (item && cJSON_IsBool(item)) new_cfg.enabled = cJSON_IsTrue(item);
@@ -890,6 +981,15 @@ esp_err_t mqtt_manager_save_config_json(const char *json_str)
 
     item = cJSON_GetObjectItem(root, "topic_prefix");
     if (item && cJSON_IsString(item) && item->valuestring[0] != '\0') {
+        /* Topic names must not contain spaces, wildcards or separators. */
+        bool valid = strlen(item->valuestring) < sizeof(new_cfg.topic_prefix);
+        for (const char *c = item->valuestring; valid && *c; c++) {
+            if (!isalnum((unsigned char)*c) && *c != '_' && *c != '-') valid = false;
+        }
+        if (!valid) {
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_ARG;
+        }
         strlcpy(new_cfg.topic_prefix, item->valuestring, sizeof(new_cfg.topic_prefix));
     }
 
@@ -935,6 +1035,11 @@ esp_err_t mqtt_manager_init(void)
         s_cfg = (mqtt_config_t)MQTT_CONFIG_DEFAULTS;
     }
     update_topic_strings(s_cfg.topic_prefix);
+
+    /* Command queue: command-topic messages are deferred here and executed
+     * by the telemetry task (blocking BLE RPCs must not run in the MQTT task). */
+    if (!s_cmd_q) s_cmd_q = xQueueCreate(MQTT_CMD_QUEUE_LEN, sizeof(mqtt_cmd_t));
+    if (!s_cmd_q) ESP_LOGE(TAG, "failed to create command queue");
 
     /* Create background telemetry worker task in PSRAM */
     if (!s_telemetry_task) {

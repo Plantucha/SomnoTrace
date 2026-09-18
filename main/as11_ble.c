@@ -2995,16 +2995,25 @@ esp_err_t as11_ble_stop_therapy(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Serialize on the shared RPC channel: clear_response()/wait_response()
+     * own s_resp_json and must not interleave with other callers. */
+    if (xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        ESP_LOGW(TAG, "stop_therapy: BLE command bus busy");
+        return ESP_ERR_TIMEOUT;
+    }
+
     const char *rpc = "{\"id\":50,\"jsonrpc\":\"1.0\",\"method\":\"EnterStandby\"}";
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {
         ESP_LOGW(TAG, "stop_therapy: send failed");
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_FAIL;
     }
 
     cJSON *resp = wait_response(10000);
     if (!resp) {
         ESP_LOGW(TAG, "stop_therapy: timeout");
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_ERR_TIMEOUT;
     }
 
@@ -3014,11 +3023,13 @@ esp_err_t as11_ble_stop_therapy(void)
         ESP_LOGW(TAG, "stop_therapy: RPC error: %s", s ? s : "?");
         if (s) free(s);
         cJSON_Delete(resp);
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "stop_therapy: EnterStandby accepted");
     cJSON_Delete(resp);
+    xSemaphoreGive(s_cmd_mtx);
     return ESP_OK;
 }
 
@@ -3029,16 +3040,25 @@ esp_err_t as11_ble_start_therapy(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Serialize on the shared RPC channel: clear_response()/wait_response()
+     * own s_resp_json and must not interleave with other callers. */
+    if (xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        ESP_LOGW(TAG, "start_therapy: BLE command bus busy");
+        return ESP_ERR_TIMEOUT;
+    }
+
     const char *rpc = "{\"id\":51,\"jsonrpc\":\"1.0\",\"method\":\"EnterTherapy\"}";
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {
         ESP_LOGW(TAG, "start_therapy: send failed");
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_FAIL;
     }
 
     cJSON *resp = wait_response(10000);
     if (!resp) {
         ESP_LOGW(TAG, "start_therapy: timeout");
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_ERR_TIMEOUT;
     }
 
@@ -3048,11 +3068,13 @@ esp_err_t as11_ble_start_therapy(void)
         ESP_LOGW(TAG, "start_therapy: RPC error: %s", s ? s : "?");
         if (s) free(s);
         cJSON_Delete(resp);
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "start_therapy: EnterTherapy accepted");
     cJSON_Delete(resp);
+    xSemaphoreGive(s_cmd_mtx);
     return ESP_OK;
 }
 

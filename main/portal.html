@@ -947,6 +947,7 @@ MQTT &amp; Home Assistant
 <div class="form-group" style="margin-top:12px">
 <label>Broker URL</label>
 <input type="text" id="mqtt-broker-uri" class="form-control" placeholder="mqtt://192.168.1.50:1883 or mqtts://..." spellcheck="false" autocapitalize="none" onchange="autoSaveMqtt()">
+<p class="card-desc" style="margin-top:4px">mqtts:// requires a broker certificate signed by a public CA — self-signed LAN certificates are not supported.</p>
 </div>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
 <div class="form-group">
@@ -961,7 +962,7 @@ MQTT &amp; Home Assistant
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
 <div class="form-group">
 <label>Topic Prefix</label>
-<input type="text" id="mqtt-prefix" class="form-control" placeholder="somnotrace" spellcheck="false" autocapitalize="none" onchange="autoSaveMqtt()">
+<input type="text" id="mqtt-prefix" class="form-control" placeholder="somnotrace" pattern="[A-Za-z0-9_-]+" maxlength="31" spellcheck="false" autocapitalize="none" onchange="autoSaveMqtt()">
 </div>
 <div class="form-group" style="display:flex;flex-direction:column;justify-content:center">
 <label for="mqtt-discovery" style="margin-bottom:6px">Home Assistant Discovery</label>

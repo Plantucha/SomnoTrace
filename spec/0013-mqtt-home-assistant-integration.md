@@ -138,6 +138,13 @@ Home Assistant can control the CPAP or acknowledge alarms without opening the So
 | `<base_topic>/cmd/alert` | `ACK` or `SILENCE` | Invokes `therapy_alert_acknowledge()` to silence buzzer when mask-off is intentional. |
 | `<base_topic>/cmd/uploader` | `SCAN` or `RETRY` | Invokes `upload_sched_request_scan()` to immediately retry pending uploads. |
 
+Commands are matched on exact payloads (case-insensitive) and are **deferred to the
+telemetry worker task** — `EnterTherapy`/`EnterStandby` are blocking RPCs (up to 10 s)
+and must not run inside the MQTT client task. **Retained command messages are ignored**:
+a retained `START`/`STOP` would otherwise replay on every reconnect. The BLE RPC channel
+is serialized internally (`s_cmd_mtx`), so MQTT, physical-button, and other RPC callers
+cannot interleave on the shared response buffer.
+
 ---
 
 ### 4.5 Configuration & NVS Schema
@@ -179,13 +186,14 @@ sensor:
 - [ ] Publishes `alert_state` transitions immediately when `therapy_alert` state changes.
 - [ ] Responds to `<prefix>/cmd/therapy` commands (`START`/`STOP`) by calling the RPC bridge.
 - [ ] Silences therapy alert buzzer when `<prefix>/cmd/alert` receives `ACK`.
-- [ ] No allocations from internal SRAM (`DIRAM`); client stack and buffers allocate from PSRAM.
+- [ ] Memory: the telemetry worker task stack and HTTP request buffers allocate from PSRAM. The esp-mqtt client's own task stack (~8 KiB) and its 1 KiB RX/TX buffers allocate from internal RAM — the esp-mqtt API offers no PSRAM-stack option, so this footprint is a documented limitation rather than a defect.
 
 ---
 
 ## 7. Security / Privacy Considerations
 
 - **Confidentiality on LAN:** SomnoTrace transmits medical state (therapy active, alert status). Users should configure an authenticated broker on a private local network or use TLS (`mqtts://`).
+- **TLS limitation:** `mqtts://` verifies the broker certificate against the ESP-IDF CA certificate bundle only. Brokers using self-signed certificates (typical for a LAN Mosquitto with TLS) cannot be verified and will fail to connect; use `mqtt://` on the trusted LAN, or a broker with a publicly-trusted certificate.
 - **No Patient Data:** No patient names, serial numbers, clinical notes, or raw physiological waveforms are published over MQTT.
 - **NVS Protection:** MQTT broker passwords stored in NVS are never displayed or returned in `/api/status`.
 
