@@ -210,6 +210,7 @@ typedef struct {
     uint32_t brp_samples;
     uint32_t brp_mm_samples;
     uint32_t pld_samples;
+    uint32_t sa2_samples;
     long brp_bytes;
     long brp_mm_bytes;
     int fmt;                    /* session format: 2=flow/press split, 1=legacy brp */
@@ -303,6 +304,7 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         cJSON *j_brp = cJSON_GetObjectItem(j, "brp_samples");
         cJSON *j_brp_mm = cJSON_GetObjectItem(j, "brp_mm_samples");
         cJSON *j_pld = cJSON_GetObjectItem(j, "pld_samples");
+        cJSON *j_sa2 = cJSON_GetObjectItem(j, "sa2_samples");
         cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
         cJSON *j_drift_valid = cJSON_GetObjectItem(j, "clock_drift_valid");
         cJSON *j_fmt = cJSON_GetObjectItem(j, "fmt");
@@ -356,6 +358,7 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         s->brp_samples = j_brp ? (uint32_t)j_brp->valuedouble : 0;
         s->brp_mm_samples = j_brp_mm ? (uint32_t)j_brp_mm->valuedouble : 0;
         s->pld_samples = j_pld ? (uint32_t)j_pld->valuedouble : 0;
+        s->sa2_samples = j_sa2 ? (uint32_t)j_sa2->valuedouble : 0;
         s->clock_drift_ms = j_drift ? (int64_t)j_drift->valuedouble : 0;
         s->clock_drift_valid = j_drift_valid ? cJSON_IsTrue(j_drift_valid) : (j_drift != NULL);
         s->fmt = j_fmt ? (int)j_fmt->valuedouble : 1;  /* default v1 if absent */
@@ -388,8 +391,8 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
     if (count > 1)
         qsort(sessions, count, sizeof(session_manifest_t), compare_session_start);
 
-    /* Build JSON response with dynamic buffer */
-    int json_cap = count * 400 + 64;
+    /* Build JSON response with dynamic buffer (512 bytes headroom per session) */
+    int json_cap = count * 512 + 64;
     char *json = heap_caps_malloc(json_cap, MALLOC_CAP_SPIRAM);
     if (!json) { free(sessions); httpd_resp_send_500(req); return ESP_FAIL; }
     int pos = 0;
@@ -397,7 +400,7 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
 
     for (int i = 0; i < count; i++) {
         session_manifest_t *s = &sessions[i];
-        if (pos > json_cap - 400) {
+        if (pos > json_cap - 512) {
             json_cap *= 2;
             char *tmp = heap_caps_realloc(json, json_cap, MALLOC_CAP_SPIRAM);
             if (!tmp) { free(json); free(sessions); httpd_resp_send_500(req); return ESP_FAIL; }
@@ -408,13 +411,13 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
             "{\"id\":\"%s\",\"state\":\"%s\",\"partial\":%s,"
             "\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,"
             "\"clock_drift_ms\":%lld,\"clock_drift_valid\":%s,"
-            "\"brp_samples\":%u,\"brp_mm_samples\":%u,\"pld_samples\":%u,"
+            "\"brp_samples\":%u,\"brp_mm_samples\":%u,\"pld_samples\":%u,\"sa2_samples\":%u,"
             "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld,"
             "\"fmt\":%d,\"stream_notifications\":%u,\"gap_events\":%u,\"gap_missing\":%u}",
             s->id, s->state, s->partial ? "true" : "false",
             (long long)s->start_epoch_ms, (long long)s->end_epoch_ms,
             (long long)s->clock_drift_ms, s->clock_drift_valid ? "true" : "false",
-            (unsigned)s->brp_samples, (unsigned)s->brp_mm_samples, (unsigned)s->pld_samples,
+            (unsigned)s->brp_samples, (unsigned)s->brp_mm_samples, (unsigned)s->pld_samples, (unsigned)s->sa2_samples,
             s->brp_bytes, s->brp_mm_bytes,
             s->fmt, (unsigned)s->stream_notifications, (unsigned)s->gap_events, (unsigned)s->gap_missing);
     }

@@ -1009,10 +1009,14 @@ Save &amp; Reboot
 <div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:4px"></div>
 </div>
 <div id="dash-stream-quality" class="card" style="display:none;padding:12px 16px;font-size:.8rem;color:var(--text-muted);line-height:1.6"></div>
-<div class="dash-options-bar" style="margin-top:12px">
+<div class="dash-options-bar" style="margin-top:12px;display:flex;flex-wrap:wrap;gap:16px">
 <label class="dash-toggle-row" title="When enabled, the time axis and oximetry data are clamped to CPAP therapy start/end times only">
 <input type="checkbox" id="dash-clamp-cpap" onchange="onDashClampCpapChange()">
 <span>Show SpO₂ only inside CPAP therapy times</span>
+</label>
+<label id="dash-prefer-as11-row" class="dash-toggle-row" style="display:none" title="When both AirSense 11 (Nonin) and O2 Ring data exist for the same day, choose which to plot">
+<input type="checkbox" id="dash-prefer-as11-oxi" onchange="onDashPreferAs11OxiChange()">
+<span>Prefer AirSense 11 oximetry over O2 Ring</span>
 </label>
 </div>
 </section>
@@ -3522,6 +3526,11 @@ var oxDiagnostics = [];
  * Persisted in localStorage as 'somnotrace_clamp_cpap'. */
 var dashClampToCpap = false;
 
+/* When true, AirSense 11 oximetry (Nonin) is preferred over O2 Ring when
+ * both are present on the same day. Persisted in localStorage as
+ * 'somnotrace_prefer_as11_oxi'. */
+var dashPreferAs11Oxi = false;
+
 function parseOximetrySnt(buf) {
   if (!buf || buf.byteLength < 64) return null;
   var d = new DataView(buf);
@@ -3738,7 +3747,7 @@ function sigColor(sig) {
 function dashHasData() {
   for (var i = 0; i < dashSessionData.length; i++) {
     var d = dashSessionData[i];
-    if (d && ((d.brp && d.brp.ready) || (d.pld && d.pld.ready))) return true;
+    if (d && ((d.brp && d.brp.ready) || (d.pld && d.pld.ready) || (d.sa2 && d.sa2.ready))) return true;
   }
   if (oxData && oxData.length) return true;
   return false;
@@ -4018,6 +4027,88 @@ function parseSntPld(buf) {
            leak: leak, snore: snore, flowlim: flowlim, ready: true };
 }
 
+/* Parse an SA2 .snt file (tier=0, 1.0 Hz, 2 ch/record: pulse, spo2).
+ * Missing-data sentinel -> NaN.
+ * Scaling: pulse dig*0.01 = bpm, spo2 dig*0.01 = %. */
+function parseSntSa2(buf) {
+  var h = readSntHeader(buf);
+  if (!h || h.nCh < 2) return null;
+  var dv = h.dv, n = h.n, missing = h.missing, rb = h.recBytes;
+  var t = new Float64Array(n);
+  var pulse = new Float64Array(n), spo2 = new Float64Array(n);
+  for (var i = 0; i < n; i++) {
+    var off = h.dataOff + i * rb;
+    var hr = dv.getInt16(off, true);
+    var sp = dv.getInt16(off + 2, true);
+    pulse[i] = (hr === missing || hr <= 0) ? NaN : hr * 0.01;
+    spo2[i]  = (sp === missing || sp <= 0) ? NaN : sp * 0.01;
+    t[i] = h.startMs + i * h.msPerRec;
+  }
+  return { t: t, pulse: pulse, spo2: spo2, ready: true };
+}
+
+function hasAs11OxiData() {
+  if (!dashSessionData || !dashSessionData.length) return false;
+  for (var i = 0; i < dashSessionData.length; i++) {
+    var s = dashSessionData[i];
+    if (s && s.sa2 && s.sa2.ready && s.sa2.t && s.sa2.t.length) return true;
+  }
+  return false;
+}
+
+function hasO2RingData(full) {
+  if (!oxData || !oxData.length) return false;
+  if (dashClampToCpap && full) {
+    return oxData.some(function(rec) {
+      return rec && rec.t && rec.t.length &&
+             rec.t[0] <= full.max && rec.t[rec.t.length - 1] >= full.min;
+    });
+  }
+  return true;
+}
+
+function useAs11ForVitals() {
+  var as11 = hasAs11OxiData();
+  if (!as11) return false;
+  var ring = hasO2RingData();
+  if (!ring) return true;
+  return dashPreferAs11Oxi;
+}
+
+function getOxiSlices(sigKey) {
+  if (sigKey === 'motion') {
+    var slices = [];
+    if (oxData && oxData.length) {
+      for (var oi = 0; oi < oxData.length; oi++) {
+        var orec = oxData[oi];
+        if (orec && orec.t && orec.t.length && orec.motion) slices.push(orec);
+      }
+    }
+    return slices;
+  }
+  if (useAs11ForVitals()) {
+    var slices = [];
+    if (dashSessionData && dashSessionData.length) {
+      for (var i = 0; i < dashSessionData.length; i++) {
+        var s = dashSessionData[i];
+        if (s && !s.noTherapy && s.sa2 && s.sa2.ready && s.sa2.t && s.sa2.t.length && s.sa2[sigKey]) {
+          slices.push(s.sa2);
+        }
+      }
+    }
+    return slices;
+  }
+  var slices = [];
+  if (oxData && oxData.length) {
+    for (var oi = 0; oi < oxData.length; oi++) {
+      var orec = oxData[oi];
+      if (!orec || !orec.t || !orec.t.length || !orec[sigKey]) continue;
+      slices.push(orec);
+    }
+  }
+  return slices;
+}
+
 /* Lower-bound binary search: first index i in t[] with t[i] >= target. */
 function dashLowerBound(t, target) {
   var lo = 0, hi = t.length;
@@ -4056,9 +4147,10 @@ function buildSignalData(sig, range, cols) {
    * start (ascending) so later sessions overwrite earlier ones per column. */
   var slices = [];
   if (sig.src === 'oxi') {
-    if (!oxData || !oxData.length) return null;
-    for (var oi = 0; oi < oxData.length; oi++) {
-      var orec = oxData[oi];
+    var candSlices = getOxiSlices(sig.ch);
+    if (!candSlices || !candSlices.length) return null;
+    for (var oi = 0; oi < candSlices.length; oi++) {
+      var orec = candSlices[oi];
       if (!orec || !orec.t || !orec.t.length || !orec[sig.ch]) continue;
       if (orec.t[orec.t.length - 1] < vMin || orec.t[0] > vMax) continue;
       slices.push(orec);
@@ -4678,11 +4770,12 @@ function spo2ColorHook(u) {
 var oxiAvgColors = { spo2: '#60a5fa', pulse: '#f87171' };
 function oxiAverageHook(sigKey, unit) {
   return function(u) {
-    if (!oxData || !oxData.length) return;
+    var candSlices = getOxiSlices(sigKey);
+    if (!candSlices || !candSlices.length) return;
     var xmin = u.scales.x.min, xmax = u.scales.x.max;
     var sum = 0, count = 0;
-    for (var i = 0; i < oxData.length; i++) {
-      var rec = oxData[i];
+    for (var i = 0; i < candSlices.length; i++) {
+      var rec = candSlices[i];
       if (!rec || !rec.t || !rec[sigKey]) continue;
       for (var j = 0; j < rec.t.length; j++) {
         var t = rec.t[j];
@@ -4901,24 +4994,39 @@ function loadDashboardData() {
       if (myLoadId === dashLoadId)
         dashProgShow('Loading leak/snore...', W_EVENTS + W_BRP_MM, true);
 
-      /* Step 2: PLD (leak, flow limit, snore) — one small 0.5 Hz file per
-       * session, no MinMax tier needed. Fetched after the breathing overview
-       * so those panels light up early. */
+      /* Step 2: PLD (leak, flow limit, snore) + SA2 (if present) — fetched
+       * after the breathing overview so those panels light up early. */
       var pldDone = 0;
       var pldChain = Promise.resolve();
       dashSessions.forEach(function(s, idx) {
         pldChain = pldChain.then(function() {
           if (myLoadId !== dashLoadId) return;  /* cancelled */
           if (dashSessionData[idx].noTherapy) return;
-          return fetchSntFile(s.id, noonDay, 'pld');
-        }).then(function(buf) {
-          if (myLoadId !== dashLoadId) return;  /* cancelled */
-          if (buf) {
-            var parsed = gateTrim(parseSntPld(buf), dashSessionData[idx].gate);
+          var fetchPld = fetchSntFile(s.id, noonDay, 'pld');
+          var fetchSa2 = (s.sa2_samples && s.sa2_samples > 0)
+            ? fetchSntFile(s.id, noonDay, 'sa2')
+            : Promise.resolve(null);
+          return Promise.all([fetchPld, fetchSa2]);
+        }).then(function(res) {
+          if (myLoadId !== dashLoadId || !res) return;  /* cancelled */
+          var pldBuf = res[0], sa2Buf = res[1];
+          if (pldBuf) {
+            var parsed = gateTrim(parseSntPld(pldBuf), dashSessionData[idx].gate);
             if (parsed && parsed.t.length) {
               dashSessionData[idx].pld = parsed;
-              updateDashView();
             }
+          }
+          if (sa2Buf) {
+            var parsedSa2 = gateTrim(parseSntSa2(sa2Buf), dashSessionData[idx].gate);
+            if (parsedSa2 && parsedSa2.t.length) {
+              dashSessionData[idx].sa2 = parsedSa2;
+            }
+          }
+          var hasOxiPanels = dashActiveSignals.some(function(sig) { return sig.src === 'oxi'; });
+          if (dashCharts.length && !hasOxiPanels && hasAs11OxiData()) {
+            renderDashboardCharts();
+          } else {
+            updateDashView();
           }
           pldDone++;
           if (myLoadId === dashLoadId)
@@ -5158,16 +5266,18 @@ function renderDashboardCharts() {
    * oximetry panels.  dashSessions.length is the right check because data
    * loads asynchronously — brp/pld may not be ready yet on first render. */
   var hasCpap = dashSessions && dashSessions.length > 0;
-  var hasOxi = oxData && oxData.length > 0;
-  /* When clamping to CPAP times, only show oximetry panels if the oximetry
-   * data actually overlaps the CPAP therapy time window. */
-  if (hasOxi && dashClampToCpap && full) {
-    hasOxi = oxData.some(function(rec) {
-      return rec && rec.t && rec.t.length &&
-             rec.t[0] <= full.max && rec.t[rec.t.length - 1] >= full.min;
-    });
+  var as11Oxi = hasAs11OxiData();
+  var ringOxi = hasO2RingData(full);
+  var hasOxi = as11Oxi || ringOxi;
+
+  /* Sync the preference toggle visibility: unhide only when both sources exist */
+  var preferRow = document.getElementById('dash-prefer-as11-row');
+  if (preferRow) {
+    preferRow.style.display = (as11Oxi && ringOxi) ? 'inline-flex' : 'none';
   }
+
   var signals = DASH_SIGNALS.filter(function(sig) {
+    if (sig.key === 'motion') return ringOxi;
     if (sig.src === 'oxi') return hasOxi;
     return hasCpap;
   });
@@ -5178,7 +5288,17 @@ function renderDashboardCharts() {
     row.className = 'dash-signal-row';
     var lbl = document.createElement('div');
     lbl.className = 'dash-signal-label';
-    lbl.textContent = sig.unit ? (sig.label + ' (' + sig.unit + ')') : sig.label;
+    var labelText = sig.label;
+    if (sig.src === 'oxi') {
+      if (sig.key === 'motion') {
+        labelText += ' (O2 Ring)';
+      } else if (useAs11ForVitals()) {
+        labelText += ' (Nonin 3150)';
+      } else if (ringOxi) {
+        labelText += ' (O2 Ring)';
+      }
+    }
+    lbl.textContent = sig.unit ? (labelText + ' (' + sig.unit + ')') : labelText;
     lbl.style.color = sigColor(sig);
     var chartEl = document.createElement('div');
     chartEl.id = 'chart-' + sig.key;
@@ -5475,6 +5595,15 @@ function onDashClampCpapChange() {
   renderDashboardCharts();
 }
 
+function onDashPreferAs11OxiChange() {
+  var cb = document.getElementById('dash-prefer-as11-oxi');
+  if (!cb) return;
+  dashPreferAs11Oxi = cb.checked;
+  localStorage.setItem('somnotrace_prefer_as11_oxi', dashPreferAs11Oxi ? '1' : '0');
+  dashXRange = null;
+  renderDashboardCharts();
+}
+
 function dashboardZoomIn() {
   if (!dashCharts.length) return;
   var full = dashFullRange(); if (!full) return;
@@ -5547,6 +5676,10 @@ window.onload = function() {
   dashClampToCpap = savedClamp === null ? true : savedClamp === '1';
   var clampCb = document.getElementById('dash-clamp-cpap');
   if (clampCb) clampCb.checked = dashClampToCpap;
+  var savedPrefer = localStorage.getItem('somnotrace_prefer_as11_oxi');
+  dashPreferAs11Oxi = savedPrefer === '1';
+  var preferCb = document.getElementById('dash-prefer-as11-oxi');
+  if (preferCb) preferCb.checked = dashPreferAs11Oxi;
   applyPortalMode();
   connectWs();
   loadStatus();
