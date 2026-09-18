@@ -346,7 +346,7 @@ esp_err_t mqtt_manager_stop(void)
          * is only enqueued by esp-mqtt, so give the client task a moment to
          * actually transmit it before stopping. Harmless when the link is
          * already down (Wi-Fi-loss path): the message just never sends. */
-        if (was_connected) {
+        if (was_connected && is_network_up()) {
             esp_mqtt_client_publish(old_client, s_lwt_topic, "offline", 7, 1, 1);
             vTaskDelay(pdMS_TO_TICKS(200));
         }
