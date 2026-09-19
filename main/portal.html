@@ -1456,12 +1456,40 @@ var connectedSSID = '';   /* SSID the device is currently associated with */
 
 var tzData = null;
 
+/* Rebuild the select's option list from the cached zones DB, with a leading
+ * placeholder so the "no timezone" state is representable in a loaded list. */
+function populateTzOptions(sel) {
+  sel.innerHTML = '<option value="">Select timezone…</option>';
+  var keys = Object.keys(tzData).sort();
+  for (var i = 0; i < keys.length; i++) {
+    var o = document.createElement('option');
+    o.value = keys[i];
+    o.textContent = keys[i];
+    sel.appendChild(o);
+  }
+}
+
 function loadTimezones(savedTzName) {
   var sel = document.getElementById('tz-select');
   if (!sel) return;
 
-  /* Show current timezone immediately from /api/status data */
-  if (savedTzName && savedTzName.length > 0) {
+  sel.onfocus = function() { if (!tzData) loadTimezoneList(this.value); };
+  sel.onchange = function() { markDirty(this); updateTzStr(); };
+
+  /* Never rebuild while the user is interacting with the select or has an
+   * unsaved change — a status refresh must not clobber an in-progress pick.
+   * Still sync the hidden tz-str field so it can't diverge from the select. */
+  if (document.activeElement === sel || sel.getAttribute('data-dirty') === 'true') {
+    updateTzStr();
+    return;
+  }
+
+  if (tzData) {
+    /* Full list already fetched — keep it usable, just reflect the saved value. */
+    populateTzOptions(sel);
+    sel.value = (savedTzName && tzData[savedTzName]) ? savedTzName : '';
+  } else if (savedTzName && savedTzName.length > 0) {
+    /* Show current timezone immediately from /api/status data */
     sel.innerHTML = '';
     var o = document.createElement('option');
     o.value = savedTzName;
@@ -1471,8 +1499,7 @@ function loadTimezones(savedTzName) {
   } else {
     sel.innerHTML = '<option value="">Select timezone…</option>';
   }
-  sel.onfocus = function() { if (!tzData) loadTimezoneList(this.value); };
-  sel.onchange = function() { markDirty(this); updateTzStr(); };
+  updateTzStr();
 }
 
 function loadTimezoneList(savedTzName) {
@@ -1481,15 +1508,8 @@ function loadTimezoneList(savedTzName) {
 
   fetch('/api/tz').then(function(r) { return r.json(); }).then(function(data) {
     tzData = data;
-    var keys = Object.keys(data).sort();
     var currentVal = sel.value;
-    sel.innerHTML = '';
-    for (var i = 0; i < keys.length; i++) {
-      var o = document.createElement('option');
-      o.value = keys[i];
-      o.textContent = keys[i];
-      sel.appendChild(o);
-    }
+    populateTzOptions(sel);
 
     var target = savedTzName && savedTzName.length > 0 ? savedTzName : '';
     if (!target) {
@@ -1497,9 +1517,12 @@ function loadTimezoneList(savedTzName) {
     }
     if (target && data[target]) {
       sel.value = target;
-    } else if (currentVal) {
+    } else if (currentVal && data[currentVal]) {
       sel.value = currentVal;
     }
+    /* A browser-guessed or preserved selection is what the user sees — mark
+     * it dirty so what the select displays is what gets saved. */
+    if (sel.value && sel.value !== savedTzName) markDirty(sel);
     updateTzStr();
   }).catch(function() {
     /* Keep the single-option display if full list fails to load */
@@ -2009,8 +2032,11 @@ function saveAll() {
     }
     var tzSel = document.getElementById('tz-select');
     var tzHidden = document.getElementById('tz-str');
-    if (tzSel && tzSel.value) body += '&tz_name=' + encodeURIComponent(tzSel.value);
-    if (tzHidden && tzHidden.value) body += '&tz_str=' + encodeURIComponent(tzHidden.value);
+    /* tz_name/tz_str are a pair — send both or neither, never a split state. */
+    if (tzSel && tzSel.value && tzHidden && tzHidden.value) {
+      body += '&tz_name=' + encodeURIComponent(tzSel.value);
+      body += '&tz_str=' + encodeURIComponent(tzHidden.value);
+    }
     var ntpInput = document.getElementById('ntp-server');
     if (ntpInput) body += '&ntp_srv=' + encodeURIComponent(ntpInput.value.trim());
     var mdnsInput = document.getElementById('mdns-name');
@@ -2025,8 +2051,11 @@ function saveAll() {
     var tzHidden = document.getElementById('tz-str');
     var ntpInput = document.getElementById('ntp-server');
     var tzBody = '';
-    if (tzSel && tzSel.value) tzBody += '&tz_name=' + encodeURIComponent(tzSel.value);
-    if (tzHidden && tzHidden.value) tzBody += '&tz_str=' + encodeURIComponent(tzHidden.value);
+    /* tz_name/tz_str are a pair — send both or neither, never a split state. */
+    if (tzSel && tzSel.value && tzHidden && tzHidden.value) {
+      tzBody += '&tz_name=' + encodeURIComponent(tzSel.value);
+      tzBody += '&tz_str=' + encodeURIComponent(tzHidden.value);
+    }
     if (ntpInput) tzBody += '&ntp_srv=' + encodeURIComponent(ntpInput.value.trim());
     var mdnsInput = document.getElementById('mdns-name');
     if (mdnsInput) tzBody += '&mdns_name=' + encodeURIComponent(mdnsInput.value.trim().toLowerCase());

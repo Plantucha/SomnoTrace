@@ -1592,6 +1592,9 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     char tz_name_val[40] = { 0 };
     if (form_get(body, "tz_str", tz_str_val, sizeof(tz_str_val)) && tz_str_val[0] != '\0') {
         form_get(body, "tz_name", tz_name_val, sizeof(tz_name_val));
+        if (tz_name_val[0] == '\0') {
+            ESP_LOGW(TAG, "tz_str posted without tz_name — display name will be derived");
+        }
         time_sync_set_timezone(tz_str_val, tz_name_val);
         ESP_LOGI(TAG, "saved timezone %s (%s)", tz_name_val, tz_str_val);
     }

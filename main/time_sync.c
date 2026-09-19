@@ -108,8 +108,14 @@ static esp_err_t do_set_timezone(void *arg)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
     err = nvs_set_str(h, NVS_KEY_TZ_STR, tz_str);
-    if (err == ESP_OK && tz_name[0]) {
-        nvs_set_str(h, NVS_KEY_TZ_NAME, tz_name);
+    if (err == ESP_OK) {
+        if (tz_name[0]) {
+            nvs_set_str(h, NVS_KEY_TZ_NAME, tz_name);
+        } else {
+            /* Empty name: drop the key so the tz_str/tz_name pair can't
+             * diverge (NOT_FOUND is fine — nothing to erase). */
+            nvs_erase_key(h, NVS_KEY_TZ_NAME);
+        }
     }
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
@@ -174,9 +180,52 @@ void time_sync_get_timezone(char *tz_str, size_t tz_str_len)
     read_nvs_string(NVS_KEY_TZ_STR, tz_str, tz_str_len);
 }
 
+/* Embedded IANA→POSIX timezone database (flat {"name":"posix", …} map). */
+extern const char _binary_zones_json_start[];
+extern const char _binary_zones_json_end[];
+
+/* Reverse-map a POSIX TZ rule back to an IANA display name. */
+static bool tz_db_name_for_posix(const char *posix, char *out, size_t out_len)
+{
+    if (!posix || posix[0] == '\0' || !out || out_len == 0) return false;
+    size_t json_len = (size_t)(_binary_zones_json_end - _binary_zones_json_start);
+    cJSON *root = cJSON_ParseWithLength(_binary_zones_json_start, json_len);
+    if (!root) return false;
+    bool found = false;
+    for (const cJSON *it = root->child; it; it = it->next) {
+        if (cJSON_IsString(it) && it->string &&
+            strcmp(it->valuestring, posix) == 0) {
+            strlcpy(out, it->string, out_len);
+            found = true;
+            break;
+        }
+    }
+    cJSON_Delete(root);
+    return found;
+}
+
 void time_sync_get_tz_name(char *tz_name, size_t tz_name_len)
 {
+    if (!tz_name || tz_name_len == 0) return;
     read_nvs_string(NVS_KEY_TZ_NAME, tz_name, tz_name_len);
+    if (tz_name[0]) return;
+
+    /* Self-heal: tz_str can be persisted without a display name (a tz_str-only
+     * POST, or a name that pre-dates the IANA database).  Derive the name from
+     * zones.json, persist it, and fall back to the raw POSIX rule so the UI
+     * never shows a misleading "UTC" for a configured zone. */
+    char tz_str[TZ_STR_MAX];
+    time_sync_get_timezone(tz_str, sizeof(tz_str));
+    if (tz_str[0] == '\0') return;
+    char derived[TZ_NAME_MAX];
+    if (tz_db_name_for_posix(tz_str, derived, sizeof(derived))) {
+        strlcpy(tz_name, derived, tz_name_len);
+        /* Persist via the normal setter: rewrites the same tz_str (harmless)
+         * and records the name so future reads hit NVS directly. */
+        time_sync_set_timezone(tz_str, derived);
+    } else {
+        strlcpy(tz_name, tz_str, tz_name_len);
+    }
 }
 
 static esp_err_t do_set_ntp_server(void *arg)
