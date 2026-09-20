@@ -1056,6 +1056,88 @@ static void test_maskoff_end_adds_the_clock_drift(void)
     free(bg); free(bungated);
 }
 
+/* The entry guard refuses a call missing any ONE of its three required
+ * pointers.  Replacing || with && would demand all three be absent before
+ * refusing, so a single NULL walked straight into the body.  Nothing tested
+ * it, because every existing caller passes all three. */
+static void test_a_single_null_argument_is_refused(void)
+{
+    set_tz("UTC");
+    char root[300], sd[400], out[400];
+    snprintf(root, sizeof(root), "%s/nullargs", g_root);
+    build_session(root, 2, SA2_N, sd, sizeof(sd));
+    snprintf(out, sizeof(out), "%s/out", root);
+    const int64_t end = START_MS + SA2_N * 1000LL;
+
+    CHECK(edf_gen_generate_ex(NULL, sd, SID, START_MS, end, 0, EDF_GEN_PER_SESSION)
+              == ESP_ERR_INVALID_ARG, "a NULL out_root must be refused on its own");
+    CHECK(edf_gen_generate_ex(out, NULL, SID, START_MS, end, 0, EDF_GEN_PER_SESSION)
+              == ESP_ERR_INVALID_ARG, "a NULL session_dir must be refused on its own");
+    CHECK(edf_gen_generate_ex(out, sd, NULL, START_MS, end, 0, EDF_GEN_PER_SESSION)
+              == ESP_ERR_INVALID_ARG, "a NULL session_id must be refused on its own");
+}
+
+/* The timestamp guard exists because crash recovery on a 0-byte .snt yields a
+ * start near the epoch and a 19691231 folder.  Its bound is EXCLUSIVE: the
+ * first instant of 2000 is a legitimate start, not a corrupt one.  Only a
+ * start exactly on the bound separates < from <=, and no test used one. */
+static void test_the_year_2000_guard_excludes_only_what_precedes_it(void)
+{
+    set_tz("UTC");
+    char rootA[300], sdA[400], outA[400];
+    char rootB[300], sdB[400], outB[400];
+    snprintf(rootA, sizeof(rootA), "%s/y2k_before", g_root);
+    snprintf(rootB, sizeof(rootB), "%s/y2k_on", g_root);
+    build_session(rootA, 2, SA2_N, sdA, sizeof(sdA));
+    build_session(rootB, 2, SA2_N, sdB, sizeof(sdB));
+    snprintf(outA, sizeof(outA), "%s/out", rootA);
+    snprintf(outB, sizeof(outB), "%s/out", rootB);
+
+    const int64_t Y2K = 946684800000LL;          /* 2000-01-01T00:00:00Z */
+    const int64_t dur = SA2_N * 1000LL;
+
+    CHECK(edf_gen_generate_ex(outA, sdA, SID, Y2K - 1, Y2K - 1 + dur, 0,
+                              EDF_GEN_PER_SESSION) == ESP_ERR_INVALID_ARG,
+          "one millisecond before 2000 is a corrupt start and must be refused");
+    /* Asserted as "not refused for THIS reason" rather than ESP_OK: whether a
+     * Y2K session exports cleanly is a different question from whether the
+     * guard lets it through. */
+    CHECK(edf_gen_generate_ex(outB, sdB, SID, Y2K, Y2K + dur, 0,
+                              EDF_GEN_PER_SESSION) != ESP_ERR_INVALID_ARG,
+          "midnight on 2000-01-01 is a valid start and must not hit the guard");
+}
+
+/* The DATALOG day folder is a noon-to-noon day in the AS11's clock, not the
+ * host's, so the drift is SUBTRACTED to get there — the opposite direction
+ * from every other use of it in this file, which is exactly why it is worth
+ * pinning.  Adding it instead shifts the instant by twice the drift.
+ *
+ * Only a drift large enough to carry the session across a noon boundary can
+ * show which direction was taken, so the 12 h here is chosen for observability
+ * rather than realism: the session starts at 22:00Z, so subtracting lands at
+ * 10:00 on the same date (the noon-day that BEGAN the previous midday) while
+ * adding lands at 10:00 the next date (the following noon-day). */
+static void test_the_day_folder_is_computed_in_the_as11_clock(void)
+{
+    set_tz("UTC");
+    char root[300], sd[400], out[400], p[600];
+    struct stat st;
+    snprintf(root, sizeof(root), "%s/dayfolder", g_root);
+    build_session(root, 2, SA2_N, sd, sizeof(sd));
+
+    CHECK(generate_drift(root, sd, out, sizeof(out), 12 * 3600 * 1000LL) == ESP_OK,
+          "generate with a 12 h drift failed");
+
+    snprintf(p, sizeof(p), "%s/DATALOG/20260228", out);
+    CHECK(stat(p, &st) == 0,
+          "no DATALOG/20260228 — the drift was not subtracted, so the folder "
+          "was computed in the host clock instead of the AS11's");
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301", out);
+    CHECK(stat(p, &st) != 0,
+          "DATALOG/20260301 exists — the drift was ADDED, putting the session "
+          "a whole noon-day late");
+}
+
 static void test_channel_count_mismatch_is_refused(void)
 {
     set_tz("UTC");
@@ -1794,6 +1876,11 @@ int main(void)
         test_maskon_fallback_adds_the_clock_drift, NULL);
     run("MaskOff applies the AS11->NTP clock drift when ending the export",
         test_maskoff_end_adds_the_clock_drift, NULL);
+    run("a single NULL argument is refused", test_a_single_null_argument_is_refused, NULL);
+    run("the year-2000 guard excludes only what precedes it",
+        test_the_year_2000_guard_excludes_only_what_precedes_it, NULL);
+    run("the DATALOG day folder is computed in the AS11 clock",
+        test_the_day_folder_is_computed_in_the_as11_clock, NULL);
     run("a .snt with the wrong channel count is refused",
         test_channel_count_mismatch_is_refused, NULL);
     run("a PLD .snt shorter than its channel map is refused",
