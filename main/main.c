@@ -53,6 +53,8 @@
 #include "therapy_alert.h"
 #include "mqtt_manager.h"
 #include "nvs_flash.h"
+#include "somno_ml.h"
+#include "oximetry_canonical.h"
 
 
 static const char *TAG = "somnotrace";
@@ -140,6 +142,12 @@ void app_main(void)
      * (e.g. 20260807_200019 for a session that really began 06:00 local). */
     time_sync_apply_saved_timezone();
 
+    /* 4b-0. SomnoStage model: decrypt the embedded blob NOW, before any
+     * flash-writing task exists (nvs_writer, session writer, OTA).  The blob
+     * is memory-mapped flash; reading it while another task writes flash can
+     * fault with cache-disabled errors.  Decrypted model lives in PSRAM. */
+    somno_ml_init();
+
     /* 4b. Initialise SD card storage and session writer BEFORE BLE.
      *
      * Ordering is load-bearing, not cosmetic.  as11_ble_init() starts
@@ -208,6 +216,14 @@ void app_main(void)
     /* 4c-ter. Initialise O2 Ring oximeter (shares NimBLE host with AS11). */
     if (oximeter_init() != ESP_OK) {
         ESP_LOGE(TAG, "Oximeter init failed; O2 Ring sync unavailable");
+    }
+
+    /* 4c-quat. SomnoStage reconcile: backfill .sst stage sidecars for
+     * recordings that predate the model (or whose scoring was interrupted).
+     * No-op on stub builds and when the queue is saturated. */
+    if (sd_ret == ESP_OK) {
+        oximetry_canonical_ensure_dirs();
+        somno_ml_reconcile();
     }
 
     /* 4c-bis. BLE startup has begun, so reconnect can now establish whether

@@ -23,6 +23,7 @@
 #include "oximetry_http.h"
 #include "oximetry_canonical.h"
 #include "upload_ox.h"
+#include "somno_ml.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -185,6 +186,32 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
     return e;
 }
 
+/* GET /api/somnostage/state — ML availability + provisional live state.
+ * Stub/fork builds return available=false; the "live" block is RAM-only,
+ * rough, and never a substitute for a completed .sst hypnogram. */
+static esp_err_t somnostage_state_handler(httpd_req_t *req)
+{
+    somno_ml_live_state_t st;
+    somno_ml_live_state(&st);
+    char body[320];
+    int n;
+    if (!somno_ml_available()) {
+        n = snprintf(body, sizeof(body),
+                     "{\"available\":false}");
+    } else {
+        n = snprintf(body, sizeof(body),
+                     "{\"available\":true,\"model\":\"%s\",\"active\":%s"
+                     ",\"stage\":%d,\"confidence\":%.3f,\"provisional\":true}",
+                     somno_ml_model_semver(),
+                     st.active ? "true" : "false",
+                     st.stage, (double)st.confidence);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, body, n);
+    return ESP_OK;
+}
+
 void oximetry_http_register_handlers(httpd_handle_t server)
 {
     httpd_uri_t list = {
@@ -215,6 +242,10 @@ void oximetry_http_register_handlers(httpd_handle_t server)
         .uri = "/api/oximetry/days", .method = HTTP_GET,
         .handler = oximetry_days_handler,
     };
+    httpd_uri_t sst_state = {
+        .uri = "/api/somnostage/state", .method = HTTP_GET,
+        .handler = somnostage_state_handler,
+    };
     httpd_register_uri_handler(server, &list);
     httpd_register_uri_handler(server, &days);
     httpd_register_uri_handler(server, &recording);
@@ -222,4 +253,5 @@ void oximetry_http_register_handlers(httpd_handle_t server)
     httpd_register_uri_handler(server, &diagnostics);
     httpd_register_uri_handler(server, &file);
     httpd_register_uri_handler(server, &file_head);
+    httpd_register_uri_handler(server, &sst_state);
 }
