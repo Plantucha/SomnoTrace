@@ -26,6 +26,10 @@
  * engine + packed-model inference + decoder, and compares against the Python
  * reference (SSTR) and feature dump (SSTX). Exit 0 = pass.
  *
+ * The artifact dir comes from argv[1], or SOMNO_ML_ARTIFACTS when run through
+ * scripts/run_host_tests.sh (which invokes test binaries with no arguments).
+ * Artifacts live in the training repo — never committed here.
+ *
  * Build:
  *   cc -std=c11 -Wall -Wextra -Werror -Icomponents/somno_ml/include \
  *      -Icomponents/somno_ml \
@@ -169,9 +173,14 @@ static int run_case(const char *dir, const char *tag, const somno_model_t *m)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) { fprintf(stderr, "usage: %s <dev-artifact-dir>\n", argv[0]); return 2; }
+    const char *dir = (argc > 1) ? argv[1] : getenv("SOMNO_ML_ARTIFACTS");
+    if (!dir || !*dir) {
+        fprintf(stderr, "usage: %s <dev-artifact-dir>  (or set SOMNO_ML_ARTIFACTS)\n",
+                argv[0]);
+        return 2;
+    }
     char path[512];
-    snprintf(path, sizeof(path), "%s/model.sstp", argv[1]);
+    snprintf(path, sizeof(path), "%s/model.sstp", dir);
     size_t mlen; void *mb = read_file(path, &mlen);
     somno_model_t *m = somno_ml_model_load(mb, mlen);
     if (!m) { fprintf(stderr, "model parse failed\n"); return 1; }
@@ -179,9 +188,9 @@ int main(int argc, char **argv)
            somno_ml_model_semver_of(m), somno_ml_model_n_features(m));
 
     int fail = 0;
-    fail |= run_case(argv[1], "a", m);
-    fail |= run_case(argv[1], "b", m);
-    fail |= run_case(argv[1], "c", m);
+    fail |= run_case(dir, "a", m);
+    fail |= run_case(dir, "b", m);
+    fail |= run_case(dir, "c", m);
     somno_ml_model_destroy(m);
     free(mb);
     printf(fail ? "PARITY: FAIL\n" : "PARITY: PASS\n");

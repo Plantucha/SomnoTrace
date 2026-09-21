@@ -180,6 +180,23 @@ else
     skip_test mutate_host_self_test "no python3"
 fi
 
+# somno_ml_test is a parity harness for the SomnoStage C runtime.  Its
+# fixtures (model.sstp + SSTF/SSTR/SSTX cases) are exported by the training
+# repo and are never present in this repo or CI, so the runnable form is
+# gated on SOMNO_ML_ARTIFACTS.  Without it the suite still compiles and links
+# the harness — the part that would otherwise bit-rot silently against the
+# component headers — but executes nothing.
+if [ -n "${SOMNO_ML_ARTIFACTS:-}" ] && [ -d "$SOMNO_ML_ARTIFACTS" ]; then
+    run_test somno_ml_test -Icomponents/somno_ml/include -Icomponents/somno_ml \
+        components/somno_ml/somno_ml_features.c components/somno_ml/somno_ml_model.c \
+        scripts/somno_ml_test.c -lm
+else
+    run_check somno_ml_test $CC $CFLAGS \
+        -Icomponents/somno_ml/include -Icomponents/somno_ml \
+        components/somno_ml/somno_ml_features.c components/somno_ml/somno_ml_model.c \
+        scripts/somno_ml_test.c -lm -o "$OUT/somno_ml_test"
+fi
+
 # Roster check: a test file that exists but is not wired in here would never
 # run and nobody would notice.  Discovered from the tree, not from a list.
 for src in scripts/*_test.c; do
