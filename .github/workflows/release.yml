@@ -38,11 +38,83 @@ jobs:
           # release would be published as somnotrace-0.0.0+1.g<sha>-full.bin.
           fetch-depth: 0
 
+      - name: Fetch the SomnoStage model bundle
+        # The model lives in the PRIVATE somnostage-distrib repo so this public repo
+        # stays free of model artifacts and forks keep working (stub build). This job
+        # already refuses to run anywhere but the upstream repository, so the secret
+        # below only ever exists where it should.
+        #
+        # The ref is a PINNED TAG, not a branch: which model a release ships must be a
+        # deliberate edit in this file, not whatever happens to be on main. Bump it in
+        # the same commit that blesses a new model.
+        uses: actions/checkout@v4
+        with:
+          repository: ilyakruchinin/somnostage-distrib
+          ref: v4.2.3-dev
+          path: .somnostage-distrib
+          token: ${{ secrets.SOMNOSTAGE_DISTRIB_TOKEN }}
+          # The token grants read on a repo holding key material; do not leave it
+          # sitting in .git/config for later steps. Depth 1: the bundle's history
+          # is not needed to build from it.
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Inject the model and verify it is the blessed artifact
+        # Three layers, on purpose:
+        #   1. SHA256SUMS.txt inside the bundle — catches corruption in transit.
+        #   2. The pins below, recorded in THIS repository — catch tampering. They
+        #      have to live here: the bundle's own checksum file travels with the
+        #      files it verifies, so a moved tag plus a swapped key would satisfy it.
+        #      Releasing a different artifact therefore requires editing this file,
+        #      and the blessing lives in the public repo's history, not the private
+        #      one's.
+        #   3. inject-model.sh proves key.dev.h actually decrypts model.enc — the
+        #      check that catches a bundle hand-assembled from mismatched exports,
+        #      where every hash is self-consistent but the model never decrypts on
+        #      the device.
+        env:
+          SOMNO_MODEL_SHA256: 5c6cfe0a8b52c72bf4dd2c79371f62c4d4e0badfe2ccf6d31a9b8180f77e64b1
+          SOMNO_KEY_SHA256:   e40ebddb461bd5c28bebed1d0803f61808a9a54e2b02acd5d4dd10dd013c6f97
+          SOMNO_MASK_SHA256:  1c0c4e478471c1a235eafdb83ffcd9b5f1f444dfad2902d4577d934a8ded7b43
+        run: |
+          B=.somnostage-distrib/v4.2.3-dev
+          (cd "$B" && sha256sum -c SHA256SUMS.txt)
+          check() { echo "$1  $2" | sha256sum -c -; }
+          check "$SOMNO_MODEL_SHA256" "$B/model.enc"
+          check "$SOMNO_KEY_SHA256"   "$B/key.dev.h"
+          check "$SOMNO_MASK_SHA256"  "$B/mask.dev.h"
+          ./scripts/inject-model.sh "$B"
+          # The injected split halves under components/somno_ml/ are what the build
+          # needs; the full key.dev.h in the checkout is not. Less on disk, less to
+          # leak into a log or artifact by accident.
+          rm -rf .somnostage-distrib
+
       - name: Build the distributable images
         run: |
           set -o pipefail
           ./scripts/build-dist.sh 2>&1 | tee release-build.log
           ls -l dist/
+
+      - name: Confirm the images actually contain the model
+        # A release that silently built the fork-safe stub is the failure this
+        # catches. Deliberately NOT a grep of the build log: build-dist.sh does an
+        # incremental build by default, so the component's CMake status line is
+        # only printed when a configure happens to run. Instead search the produced
+        # image for the exact injected blob — EMBED_FILES places it verbatim, so
+        # containment is a direct proof of what shipped.
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          blob = pathlib.Path("components/somno_ml/model.enc").read_bytes()
+          images = sorted(pathlib.Path("dist").glob("*-full.bin"))
+          for img in images:
+              if blob in img.read_bytes():
+                  print(f"{img.name}: model.enc embedded verbatim ({len(blob)} bytes)")
+                  break
+          else:
+              sys.exit(f"::error::no -full.bin contains model.enc — release built the stub "
+                       f"(checked: {[i.name for i in images]})")
+          PY
 
       - name: Confirm both images exist, and name them for attestation
         # A release step that exits 0 having published nothing is the failure this

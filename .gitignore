@@ -35,6 +35,8 @@ dependencies.lock
 /components/somno_ml/*.lgbm
 /components/somno_ml/*.lgbm.txt
 /components/somno_ml/*.bin
+# private model-distribution checkout (CI fetches it here; must never be committed)
+/.somnostage-distrib/
 
 # --- Private agent guidance (kept at repo root for tool discovery, not shared) ---
 /AGENTS.md

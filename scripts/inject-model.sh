@@ -1,8 +1,9 @@
 #!/bin/bash
 # SomnoTrace - inject a locally-generated SomnoStage dev model into the build
 #
-# Usage: scripts/inject-model.sh <training-dev-artifact-dir>
-#   e.g.: scripts/inject-model.sh /opt/shared/somnostage-training/.ai/somno-dev-model
+# Usage: scripts/inject-model.sh <artifact-dir>
+#   e.g.: scripts/inject-model.sh .somnostage-distrib/v4.2.3-dev
+#   The dir must contain model.enc, manifest.json, key.dev.h, mask.dev.h.
 #
 # Copies model.enc into components/somno_ml/ (gitignored), derives the split
 # key halves key_a.inc/key_b.inc from the dev key + mask, and verifies the
@@ -27,17 +28,57 @@ for f in model.enc manifest.json key.dev.h mask.dev.h; do
     fi
 done
 
-# verify model.enc matches the manifest
+# verify model.enc matches the manifest, and that the key in this dir actually
+# decrypts it.  The second check is the one that catches a bundle assembled by
+# hand from mismatched exports: hashes can all be self-consistent while the key
+# is from a different model, which builds fine and fails on the device.
 python3 - "$SRC" <<'PY'
-import hashlib, json, sys, pathlib
+import hashlib, json, re, struct, subprocess, sys, pathlib
+
 src = pathlib.Path(sys.argv[1])
 manifest = json.loads((src / "manifest.json").read_text())
-want = manifest["model_enc_sha256"]
-got = hashlib.sha256((src / "model.enc").read_bytes()).hexdigest()
-if got != want:
-    sys.exit(f"model.enc sha256 mismatch: {got} != {want}")
+enc = (src / "model.enc").read_bytes()
+got = hashlib.sha256(enc).hexdigest()
+if got != manifest["model_enc_sha256"]:
+    sys.exit(f"model.enc sha256 mismatch: {got} != {manifest['model_enc_sha256']}")
+
+# SSTG envelope: 4s magic, u16 version, u16 header_size, 32s semver, 32s build_id,
+# 40s target_commit, 32s release_id, u32 plaintext_size, 32s plaintext_sha256, 16s iv
+if enc[:4] != b"SSTG":
+    sys.exit("model.enc: bad magic (not an SSTG envelope)")
+header_size = struct.unpack_from("<H", enc, 6)[0]
+plain_size = struct.unpack_from("<I", enc, 144)[0]
+plain_sha = enc[148:180]
+iv = enc[180:196]
+
+key = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", (src / "key.dev.h").read_text()))
+if len(key) != 32:
+    sys.exit(f"key.dev.h: expected 32 bytes, got {len(key)}")
+
+# openssl rather than a python crypto dependency: present on every dev machine
+# and on the CI runner, and this is a one-shot decrypt of a 493 KB blob.
+try:
+    pt = subprocess.run(
+        ["openssl", "enc", "-d", "-aes-256-cbc", "-K", key.hex(),
+         "-iv", iv.hex(), "-nopad"],
+        input=enc[header_size:], capture_output=True, check=True).stdout
+except FileNotFoundError:
+    sys.exit("openssl not found — required to verify the key decrypts model.enc")
+except subprocess.CalledProcessError as e:
+    sys.exit(f"key does not decrypt model.enc: {e.stderr.decode().strip()}")
+
+pad = pt[-1] if pt else 0
+if not 1 <= pad <= 16:
+    sys.exit(f"key does not decrypt model.enc: bad PKCS7 padding byte {pad}")
+payload = pt[:-pad]
+if len(payload) != plain_size:
+    sys.exit(f"key does not decrypt model.enc: got {len(payload)} B, header says {plain_size}")
+if hashlib.sha256(payload).digest() != plain_sha:
+    sys.exit("key does not decrypt model.enc: payload sha256 does not match the header")
+
 print(f"manifest verified: payload {manifest['payload_bytes']} B, "
       f"semver {manifest['model_semver']}")
+print(f"key verified: decrypts model.enc to {len(payload)} B, sha256 matches header")
 PY
 
 # split the dev key into the two injected halves: key_a = key XOR mask, key_b = mask
