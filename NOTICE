@@ -61,6 +61,18 @@ basis. For commercial licensing enquiries, contact the copyright holder via
 https://github.com/ilyakruchinin.
 
 ================================================================================
+SOMNOSTAGE MODEL (OPTIONAL COMPONENT)
+================================================================================
+
+Official binaries may include the SomnoStage model under a separate
+proprietary license; it is not covered by GPLv3 and is excluded from source
+builds (source builds compile a functional stub instead, and all other
+SomnoTrace functionality remains available without it). For the model
+licensing terms and enquiries, see:
+
+    https://github.com/ilyakruchinin/somnostage
+
+================================================================================
 THIRD-PARTY MATERIAL
 ================================================================================
 

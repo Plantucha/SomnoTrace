@@ -326,6 +326,8 @@ SomnoTrace is free software released under the **GNU General Public License v3.0
 Any redistributed or derivative works must remain licensed under GPLv3 and preserve the author attribution notice:  
 > *"Based on SomnoTrace, originally created by Ilya Kruchinin (https://github.com/ilyakruchinin)."*
 
+**Optional model component:** official binaries may include the SomnoStage sleep-staging model under a separate proprietary license. The model is not covered by GPLv3 and is excluded from source builds (which compile a functional stub instead). See [somnostage](https://github.com/ilyakruchinin/somnostage) for licensing.
+
 ---
 
 ## Medical Disclaimer
