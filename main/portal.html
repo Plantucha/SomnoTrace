@@ -1077,6 +1077,7 @@ Save &amp; Reboot
 <span>Prefer AirSense 11 oximetry over O2 Ring</span>
 </label>
 </div>
+<div id="somnostage-credit" style="display:none;font-size:.75rem;color:var(--text-muted);margin-top:10px;line-height:1.6"></div>
 </section>
 
 <!-- ═══════════════ STATUS TAB ═══════════════ -->
@@ -6087,6 +6088,31 @@ function resizeDashboardChart() {
 window.addEventListener('resize', resizeDashboardChart);
 
 /* ── Boot ──────────────────────────────────────────────────────── */
+/* SomnoStage attribution.  Rendered only when the firmware reports the model is
+ * actually present — a stub/fork build produces no sleep stages at all, so
+ * crediting the model there would simply be false.  The model's licence asks
+ * that material derived from its output credit SomnoStage, and its output is
+ * an estimate, which the same line says. */
+function loadSomnostageCredit() {
+  var el = document.getElementById('somnostage-credit');
+  if (!el) return;
+  fetch('/api/somnostage/state', { cache: 'no-store' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.available) { el.style.display = 'none'; return; }
+      el.innerHTML = 'Sleep stages are estimated by the SomnoStage model' +
+        '<span id="somnostage-ver"></span> \u2014 informational only, not clinical ' +
+        'sleep staging or a medical device. Powered by ' +
+        '<a href="https://github.com/ilyakruchinin/somnostage" target="_blank" ' +
+        'rel="noopener" style="color:var(--accent,#a78bfa);text-decoration:underline">SomnoStage</a>.';
+      /* Version is firmware-supplied: set it as text, never as markup. */
+      var ver = document.getElementById('somnostage-ver');
+      if (ver && d.model && d.model !== '-') ver.textContent = ' ' + d.model;
+      el.style.display = '';
+    })
+    .catch(function() { el.style.display = 'none'; });
+}
+
 window.onload = function() {
   setTheme(localStorage.getItem('somnotrace_theme') || 'night');
   var savedClamp = localStorage.getItem('somnotrace_clamp_cpap');
@@ -6100,6 +6126,7 @@ window.onload = function() {
   applyPortalMode();
   connectWs();
   loadStatus();
+  loadSomnostageCredit();
 
   var picker = document.getElementById('session-date');
   var today = new Date();
