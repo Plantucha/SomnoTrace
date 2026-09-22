@@ -5686,7 +5686,16 @@ function renderDashboardCharts() {
     var lbl = document.createElement('div');
     lbl.className = 'dash-signal-label';
     var labelText = sig.label;
-    if (sig.src === 'oxi') {
+    if (sig.key === 'sleep') {
+      /* The hypnogram is a model ESTIMATE, not clinical sleep staging (see the
+       * Medical Disclaimer and the model licence's no-medical-use clause), so
+       * the label says so.  It also names the oximetry source, because the two
+       * are not equivalent to the model: O2 Ring supplies SpO2 + PR + motion,
+       * AS11 sa2 supplies SpO2 + PR only, and only the ring modality is
+       * benchmarked. */
+      var stgSrc = useAs11ForVitals() ? 'Nonin 3150' : (ringOxi ? 'O2 Ring' : '');
+      labelText += ' (estimate' + (stgSrc ? ' \u00B7 ' + stgSrc : '') + ')';
+    } else if (sig.src === 'oxi') {
       if (sig.key === 'motion') {
         labelText += ' (O2 Ring)';
       } else if (useAs11ForVitals()) {
@@ -5699,6 +5708,8 @@ function renderDashboardCharts() {
     lbl.style.color = sigColor(sig);
     if (sig.key === 'sleep') {
       lbl.id = 'dash-sleep-label';
+      lbl.title = 'Estimated sleep stages from oximetry by the SomnoStage model — '
+                + 'informational only, not clinical sleep staging, not a medical device.';
       lbl.style.color = cssVar('--text-muted');   /* sig.color is 'transparent' — keep the label visible */
     }
     var chartEl = document.createElement('div');
