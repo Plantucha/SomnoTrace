@@ -29,9 +29,7 @@ main/edf_gen.c:161:arithmetic:-→+                    # as11_time_noon_day(star
 main/edf_gen.c:245:relational:<→<=                   # if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms)
 main/edf_gen.c:258:relational:>→>=                   # if (zle_ntp > 0) {
 main/edf_gen.c:269:relational:>→>=                   # if (maskon_as11 > 0) {
-main/edf_gen.c:270:arithmetic:+→-                    # int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
 main/edf_gen.c:271:relational:<→<=                   # if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
 main/edf_gen.c:309:relational:<=→<                   # if (end_ntp <= 0) {
 main/edf_gen.c:311:relational:>→>=                   # if (maskoff_as11 > 0) {
-main/edf_gen.c:312:arithmetic:+→-                    # end_ntp = maskoff_as11 + clock_drift_ms;
 main/edf_gen.c:316:relational:>→>=                   # if (end_ntp > 0) {

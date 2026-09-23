@@ -951,6 +951,111 @@ static void test_pld_channel_map_out_of_range_is_refused(void)
 /* A file whose header disagrees with the signal set it is being exported as
  * must be refused, not exported with the channels silently misaligned.  (A
  * firmware that adds a channel produces exactly this file.) */
+/* The MaskOn fallback runs whenever _ZLE is absent - older firmware, a failed
+ * subscription, a night the AS11 never gated.  Its timestamp is in the AS11
+ * clock just like _ZLE's, so it needs the same correction, but until now only
+ * the _ZLE path had a test that could tell the two directions apart.  Adding
+ * the drift where it should be subtracted moves the gate the wrong way by
+ * twice the drift, and every existing test still passed.
+ *
+ * MaskOn at AS11 +7 s with a +3 s drift gates at NTP +10 s.  Reversing the
+ * sign would gate at +4 s, so the wrong instant is named explicitly and
+ * asserted absent: a test that only checks the right file exists would still
+ * pass if the exporter wrote both. */
+static void test_maskon_fallback_adds_the_clock_drift(void)
+{
+    set_tz("UTC");
+    char rootg[300], sdg[400], outg[400];
+    char root0[300], sd0[400], out0[400], p[600];
+    snprintf(rootg, sizeof(rootg), "%s/mon_drift", g_root);
+    snprintf(root0, sizeof(root0), "%s/mon_drift_ref", g_root);
+    build_session(rootg, 2, SA2_N, sdg, sizeof(sdg));
+    build_session(root0, 2, SA2_N, sd0, sizeof(sd0));
+    write_events(sdg, 7000, -1);            /* AS11 +7 s, no MaskOff */
+
+    CHECK(generate_drift(rootg, sdg, outg, sizeof(outg), 3000) == ESP_OK,
+          "gated generate failed");
+    CHECK(generate(root0, sd0, out0, sizeof(out0)) == ESP_OK, "reference generate failed");
+
+    size_t ng = 0, n0 = 0, nwrong = 0;
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220010_BRP.edf", outg);
+    uint8_t *bg = read_file(p, &ng);
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220004_BRP.edf", outg);
+    uint8_t *bwrong = read_file(p, &nwrong);
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", out0, SID);
+    uint8_t *b0 = read_file(p, &n0);
+
+    CHECK(bg != NULL, "no BRP.edf at the drift-corrected MaskOn time (22:00:10)");
+    CHECK(bwrong == NULL,
+          "an export exists at 22:00:04 - the drift was SUBTRACTED from the "
+          "AS11 MaskOn time instead of added");
+    CHECK(b0 != NULL, "reference BRP.edf missing");
+
+    /* The ungated export is the oracle, so no expected sample value is pinned
+     * here: whatever the reference holds 10 s in is what the gated one must
+     * start with. */
+    if (bg && b0) {
+        edf_t eg, eu;
+        if (edf_parse(bg, ng, &eg) && edf_parse(b0, n0, &eu)) {
+            for (int i = 0; i < eg.spr[0]; i++) {
+                int j = i + 250;                     /* 10 s at 25 Hz */
+                int16_t g = edf_sample(bg, &eg, 0, 0, i);
+                int16_t u = edf_sample(b0, &eu, j / eu.spr[0], 0, j % eu.spr[0]);
+                if (g != u) {
+                    CHECK(false, "flow sample %d: gated %d != ungated sample %d (%d)",
+                          i, g, j, u);
+                    break;
+                }
+            }
+        }
+    }
+    free(bg); free(b0); free(bwrong);
+}
+
+/* MaskOff ends the export, and its timestamp needs the same AS11->NTP
+ * correction as MaskOn.  Reversing it truncates the night early while leaving
+ * the start untouched, which no filename reveals - so this one is observed
+ * through the record count instead.
+ *
+ * The 30 s drift is chosen so each possible error has its own signature rather
+ * than because it is typical: with MaskOn at AS11 +30 s and MaskOff at +150 s,
+ * the correct export runs NTP +60 s to +180 s, which is two records.  Reverse
+ * the MaskOff sign and it ends at +120 s, giving one.  Reverse the MaskOn sign
+ * instead and the gate lands on the session start, is rejected as out of
+ * range, and the export is never gated at all - a different filename. */
+static void test_maskoff_end_adds_the_clock_drift(void)
+{
+    set_tz("UTC");
+    char rootg[300], sdg[400], outg[400], p[600];
+    snprintf(rootg, sizeof(rootg), "%s/moff_drift", g_root);
+    build_session(rootg, 2, SA2_N, sdg, sizeof(sdg));
+    write_events(sdg, 30000, 150000);       /* AS11 +30 s on, +150 s off */
+
+    CHECK(generate_drift(rootg, sdg, outg, sizeof(outg), 30000) == ESP_OK,
+          "gated generate failed");
+
+    size_t ng = 0, nungated = 0;
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220100_BRP.edf", outg);
+    uint8_t *bg = read_file(p, &ng);
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", outg, SID);
+    uint8_t *bungated = read_file(p, &nungated);
+
+    CHECK(bg != NULL, "no BRP.edf at the drift-corrected MaskOn time (22:01:00)");
+    CHECK(bungated == NULL,
+          "an ungated export exists at %s - the drift was subtracted from the "
+          "AS11 MaskOn time, putting the gate outside the session", SID);
+    if (bg) {
+        edf_t eg;
+        if (edf_parse(bg, ng, &eg)) {
+            CHECK(eg.ndr == 2,
+                  "records: got %d want 2 - NTP +60 s to +180 s is two 60 s "
+                  "records; one means MaskOff ended the export 2x the drift early",
+                  eg.ndr);
+        }
+    }
+    free(bg); free(bungated);
+}
+
 static void test_channel_count_mismatch_is_refused(void)
 {
     set_tz("UTC");
@@ -1685,6 +1790,10 @@ int main(void)
     run("MaskOff ends the export", test_maskoff_truncates_the_export, NULL);
     run("the _ZLE gate applies the AS11->NTP clock drift",
         test_zle_gate_applies_clock_drift, NULL);
+    run("the MaskOn fallback applies the AS11->NTP clock drift",
+        test_maskon_fallback_adds_the_clock_drift, NULL);
+    run("MaskOff applies the AS11->NTP clock drift when ending the export",
+        test_maskoff_end_adds_the_clock_drift, NULL);
     run("a .snt with the wrong channel count is refused",
         test_channel_count_mismatch_is_refused, NULL);
     run("a PLD .snt shorter than its channel map is refused",
