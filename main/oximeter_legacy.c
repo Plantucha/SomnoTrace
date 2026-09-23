@@ -28,6 +28,7 @@
 
 #include "oximeter.h"
 #include "oximeter_internal.h"
+#include "legacy_file_list.h"
 #include "sd_storage.h"
 #include "as11_ble.h"
 #include "psram_task.h"
@@ -807,7 +808,8 @@ static esp_err_t legacy_request(uint8_t cmd, uint16_t block,
 static esp_err_t legacy_get_info(char *serial, size_t serial_sz,
                                   char *firmware, size_t fw_sz,
                                   char *file_list, size_t file_list_sz,
-                                  char *current_time, size_t current_time_sz)
+                                  char *current_time, size_t current_time_sz,
+                                  bool *file_list_truncated)
 {
     if (legacy_request(CMD_INFO, 0, NULL, 0, true, 5000) != ESP_OK)
         return ESP_FAIL;
@@ -839,8 +841,21 @@ static esp_err_t legacy_get_info(char *serial, size_t serial_sz,
     if (fw && cJSON_IsString(fw) && firmware)
         strlcpy(firmware, fw->valuestring, fw_sz);
     cJSON *fl = cJSON_GetObjectItem(j, "FileList");
-    if (fl && cJSON_IsString(fl) && file_list)
+    if (fl && cJSON_IsString(fl) && file_list) {
+        /* strlcpy truncates in silence, and its return value — the length it
+         * WANTED — is the only evidence that happened.  A cut list ends
+         * mid-name, so this is not cosmetic: the fragment left behind would be
+         * pulled as if it were a recording.  Report it and let the parser drop
+         * it (legacy_parse_file_list). */
+        size_t want = strlen(fl->valuestring);
+        if (want >= file_list_sz) {
+            ESP_LOGW(TAG, "CMD_INFO: FileList truncated (%u bytes into %u) — "
+                          "recordings on the ring are not visible to this sync",
+                     (unsigned)want, (unsigned)file_list_sz);
+            if (file_list_truncated) *file_list_truncated = true;
+        }
         strlcpy(file_list, fl->valuestring, file_list_sz);
+    }
     cJSON *ct = cJSON_GetObjectItem(j, "CurTIME");
     if (ct && cJSON_IsString(ct) && current_time)
         strlcpy(current_time, ct->valuestring, current_time_sz);
@@ -904,7 +919,7 @@ static esp_err_t legacy_sync_time_if_needed(const char *ring_time,
 
     char serial[32] = {0}, verify_time[32] = {0};
     if (legacy_get_info(serial, sizeof(serial), NULL, 0, NULL, 0,
-                        verify_time, sizeof(verify_time)) != ESP_OK ||
+                        verify_time, sizeof(verify_time), NULL) != ESP_OK ||
         !expected_serial || strcmp(serial, expected_serial) != 0)
         return ESP_FAIL;
     device = legacy_time_value(verify_time);
@@ -918,28 +933,6 @@ static esp_err_t legacy_sync_time_if_needed(const char *ring_time,
 }
 
 /* ── File download: FILE_OPEN / FILE_READ / FILE_CLOSE ─────────────── */
-
-/* Parse the FileList from CMD_INFO into individual filenames.
- * Returns the number of filenames parsed. */
-static int parse_file_list(const char *file_list,
-                            char names[][32], int max_count)
-{
-    if (!file_list || !file_list[0]) return 0;
-    int count = 0;
-    const char *p = file_list;
-    while (count < max_count && *p) {
-        const char *comma = strchr(p, ',');
-        int len = comma ? (int)(comma - p) : (int)strlen(p);
-        if (len > 0 && len < 32) {
-            memcpy(names[count], p, len);
-            names[count][len] = '\0';
-            count++;
-        }
-        if (!comma) break;
-        p = comma + 1;
-    }
-    return count;
-}
 
 static esp_err_t legacy_convert_stored(const char *name)
 {
@@ -1195,8 +1188,10 @@ static void pair_task(void *arg)
 
     /* No AUTH/SETUP needed for Legacy — just CMD_INFO */
     char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0}, ring_time[32] = {0};
+    bool fl_truncated = false;
     if (legacy_get_info(serial, sizeof(serial), firmware, sizeof(firmware),
-                        file_list, sizeof(file_list), ring_time, sizeof(ring_time)) != ESP_OK) {
+                        file_list, sizeof(file_list), ring_time, sizeof(ring_time),
+                        &fl_truncated) != ESP_OK) {
         set_error("get_info failed");
         do_disconnect();
         free(pa);
@@ -1345,8 +1340,10 @@ static bool do_pull_and_mark(bool *pulled_any)
 
     /* Get device info with file list */
     char serial[32] = {0}, firmware[16] = {0}, file_list[512] = {0}, ring_time[32] = {0};
+    bool fl_truncated = false;
     if (legacy_get_info(serial, sizeof(serial), firmware, sizeof(firmware),
-                        file_list, sizeof(file_list), ring_time, sizeof(ring_time)) != ESP_OK) {
+                        file_list, sizeof(file_list), ring_time, sizeof(ring_time),
+                        &fl_truncated) != ESP_OK) {
         ESP_LOGW(TAG, "CMD_INFO failed during pull");
         return false;
     }
@@ -1360,10 +1357,20 @@ static bool do_pull_and_mark(bool *pulled_any)
     if (legacy_sync_time_if_needed(ring_time, serial) != ESP_OK)
         ESP_LOGW(TAG, "ring clock sync unavailable — files will retain source time provenance");
 
-    /* Parse file list */
-    char names[32][32];
-    int count = parse_file_list(file_list, names, 32);
+    /* Parse file list.  Gen1 has no delete command, so the ring's list grows
+     * until its own retention prunes it — every ceiling here is reachable, and
+     * each one used to lose recordings without a word in the log. */
+    char names[32][LEGACY_FILE_NAME_MAX];
+    legacy_file_list_stats_t fl_stats;
+    int count = legacy_parse_file_list(file_list, fl_truncated, names, 32, &fl_stats);
     ESP_LOGI(TAG, "file list: %d files", count);
+    if (!legacy_file_list_complete(&fl_stats)) {
+        ESP_LOGW(TAG, "file list INCOMPLETE: %s%s%d unusable entr%s — the ring "
+                      "holds recordings this sync cannot fetch",
+                 fl_stats.source_truncated ? "response truncated; " : "",
+                 fl_stats.overflow ? "more files than the parser can hold; " : "",
+                 fl_stats.skipped, fl_stats.skipped == 1 ? "y" : "ies");
+    }
 
     bool pull_ok = true;
     for (int i = 0; i < count; i++) {

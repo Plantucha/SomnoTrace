@@ -98,6 +98,19 @@ MUTANTS = [
      "if (tod < 43200) days -= 1;",
      "if (tod <= 43200) days -= 1;",
      "AS11-side noon put on the previous day"),
+    # The Gen1 FileList parser.  Both of these are the pre-extraction behaviour
+    # of oximeter_legacy.c's static parse_file_list — i.e. bugs that shipped —
+    # so they are regressions, not hypotheticals.
+    ("filelist-fragment-kept", "legacy_file_list.c",
+     "if (!comma && source_truncated) {",
+     "if (false) {",
+     "a name left half-received by a truncated CMD_INFO is pulled as if real, "
+     "and the failed transfer aborts the whole sync"),
+    ("filelist-overflow-silent", "legacy_file_list.c",
+     "local.overflow = true;",
+     "local.overflow = false;",
+     "a ring holding more recordings than the parser can carry reports a short "
+     "list as if it were the whole list"),
     # The four below were found by scripts/mutants_probe.py as survivors, then
     # killed by tests written for them.  They stay here as the regression.
     ("avail-off-by-one", "edf_waveform.c",
