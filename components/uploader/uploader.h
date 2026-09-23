@@ -45,7 +45,10 @@
  *
  *   session_begin()
  *     day_begin(day)                      for each day with pending groups
- *       put_group(day, group)             for each pending group only
+ *       put_group(day, group)             pending groups only for an
+ *                                         incremental backend, or every
+ *                                         group on the card for an
+ *                                         atomic_day one
  *       put_bundle(day, bundle, changed)  root files (see note below)
  *     day_end(day, any_uploaded)
  *   session_end()
@@ -85,6 +88,21 @@ typedef struct {
      * since a genuinely changed STR.edf with no new sessions only happens
      * when the AS11 revises an earlier day's summary. */
     bool bundle_only_ok;
+
+    /* If true, every visit to a day must carry the complete day: put_group()
+     * is called for each session group on the card, including ones already
+     * marked uploaded.
+     *
+     * True for SleepHQ: its CPAP pipeline interprets a day's session EDFs
+     * through the STR.edf in the same import, so an import that carries only
+     * a new fragment can leave an earlier fragment invisible.  Re-sending is
+     * still bounded — a group that keeps failing is parked after
+     * UPLOAD_MAX_GROUP_ATTEMPTS tries so it cannot keep the day pending and
+     * drag every sibling through an endless re-upload.
+     *
+     * False for a plain file tree like SMB, where each file is independent
+     * and only the pending delta needs to go out. */
+    bool atomic_day;
 
     /* Check if this backend has valid configuration (config keys in NVS). */
     bool (*is_configured)(void);
@@ -170,9 +188,10 @@ esp_err_t uploader_init(void);
 /* ── Event triggers ───────────────────────────────────────────────────
  * All are safe to call from any task; they only post to the scheduler. */
 
-/* An export finished for this noon-day.  The day is rescanned and only the
- * groups that are new (or previously failed) are uploaded — unlike the old
- * day-level tracker, an already-uploaded session is not re-sent. */
+/* An export finished for this noon-day.  The day is rescanned and the
+ * groups that are new (or previously failed) become pending.  Incremental
+ * backends then send just those; an atomic_day backend sends the complete
+ * day, so a second SleepHQ import still describes every session of it. */
 void uploader_on_export_complete(const char *day_folder);
 
 /* This day's exported files were replaced (rebuild-day / recreate-edfs), so

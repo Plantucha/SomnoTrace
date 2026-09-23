@@ -83,6 +83,12 @@ void upload_sched_request_reset(void);
 typedef bool (*upload_sched_busy_fn_t)(void);
 void upload_sched_set_busy_fn(upload_sched_busy_fn_t fn);
 
+/* Optional hook: return true while a therapy session is live.  Whole upload
+ * passes are deferred then — event-driven ones included — so no Wi-Fi burst
+ * ever shares the radio with the BLE links carrying the data.  Pending work
+ * stays in the index and goes out on the first pass after therapy ends. */
+void upload_sched_set_therapy_fn(upload_sched_busy_fn_t fn);
+
 /* True while any backend is inside a run (connected and transferring), so a
  * "Test connection" probe does not open a second transport alongside it. */
 bool upload_sched_uploading(void);

@@ -51,6 +51,15 @@ static const char *TAG = "up_sched";
 #define FAILS_BEFORE_SWITCH        2   /* then move to the next backend     */
 #define LEASE_WAIT_MS           5000
 
+/* Groups that fail this many times are parked: they no longer count toward
+ * "pending", so one permanently bad file cannot keep its day on the upload
+ * list forever.  Under atomic_day this matters twice over — every visit to
+ * the day re-sends all of its healthy groups, so an unparked failure would
+ * be a retry storm of full-day re-uploads.  The status stays UG_FAILED for
+ * the UI.  A parked group revives when the reconcile sees its file set
+ * change (status/attempts reset to pending) or the day is invalidated. */
+#define UPLOAD_MAX_GROUP_ATTEMPTS    5
+
 /* Per-backend cooldown ladder, minutes. Reset on any success. */
 static const int COOLDOWN_MIN[] = { 1, 5, 15, 30, 60 };
 #define N_COOLDOWN (int)(sizeof(COOLDOWN_MIN) / sizeof(COOLDOWN_MIN[0]))
@@ -102,6 +111,16 @@ static TaskHandle_t  s_task;
 static SemaphoreHandle_t s_lock;      /* guards s_rt + s_status for the API */
 
 static upload_sched_busy_fn_t s_busy_fn;
+
+/* While this returns true the scheduler defers whole upload passes: a live
+ * therapy session owns the 2.4 GHz front-end, and a Wi-Fi burst shares it
+ * with the BLE links carrying the data.  Unlike s_busy_fn (which only skips
+ * the SD-scan half of the tick) this also covers event-driven uploads —
+ * pending groups simply accumulate in the index and the first post-therapy
+ * pass sends them complete.  Reconciliation scans still run: they only read
+ * the card, so a group finalized mid-therapy is already indexed when its
+ * turn comes. */
+static upload_sched_busy_fn_t s_therapy_fn;
 
 /* "Test connection" probe claim (#214.1), guarded by s_lock like s_rt.  The
  * timestamp is not decoration: it is what stops a probe that never released
@@ -207,13 +226,17 @@ static bool run_backend(backend_rt_t *r, int max_days)
     for (int i = 0; i < n_index && i < max_days; i++) {
         upload_day_t *d = upload_index_day_at(i);
         if (!d) continue;
-        int pend = 0;
+        int pend = 0, sendable = 0;
         for (int g = 0; g < d->n_groups; g++) {
-            if (d->groups[g].be[r->slot].status != UG_OK) pend++;
+            const upload_unit_t *u = &d->groups[g].be[r->slot];
+            if (u->status == UG_FAILED && u->attempts >= UPLOAD_MAX_GROUP_ATTEMPTS)
+                continue;   /* parked — see UPLOAD_MAX_GROUP_ATTEMPTS */
+            if (u->status != UG_OK) pend++;
+            if (be->atomic_day || u->status != UG_OK) sendable++;
         }
         if (pend > 0) {
             days[n_days++] = d->day;
-            n_units += pend;
+            n_units += sendable;
         }
     }
 
@@ -365,21 +388,33 @@ static bool run_backend(backend_rt_t *r, int max_days)
         bool day_any = false;
         for (int gi = 0; gi < n_refs && fails < FAILS_BEFORE_SWITCH; gi++) {
             upload_group_t *g = upload_index_group(d, refs[gi].prefix_sec, false);
-            if (!g || g->be[r->slot].status == UG_OK) continue;
+            if (!g) continue;
+            upload_unit_t *u = &g->be[r->slot];
+            if (u->status == UG_FAILED && u->attempts >= UPLOAD_MAX_GROUP_ATTEMPTS)
+                continue;   /* parked — see UPLOAD_MAX_GROUP_ATTEMPTS */
+            if (!be->atomic_day && u->status == UG_OK) continue;
 
+            /* On an atomic_day backend a group that already succeeded is sent
+             * again: SleepHQ interprets a day's sessions through the STR.edf
+             * in the same import, so every visit must carry the complete day,
+             * not just the delta.  attempts stays a failure count — bumping
+             * it for a re-sent good file would erode UPLOAD_MAX_GROUP_ATTEMPTS
+             * bookkeeping — so only the first post-OK failure and every
+             * non-OK attempt count. */
+            bool was_ok = (u->status == UG_OK);
             res = be->put_group(daystr, &refs[gi]);
-            g->be[r->slot].attempts++;
-            g->be[r->slot].last_try_s = now_s();
+            if (!was_ok) u->attempts++;
+            u->last_try_s = now_s();
 
             if (res == UPLOAD_OK) {
                 /* Only now is the unit durable-good: every file landed. */
-                g->be[r->slot].status = UG_OK;
+                u->status = UG_OK;
                 day_any = true;
                 any_ok = true;
                 r->cur_unit++;
                 r->last_ok_s = now_s();
             } else {
-                g->be[r->slot].status = UG_FAILED;
+                u->status = UG_FAILED;
                 fails++;
                 ESP_LOGW(TAG, "%s: group %s failed (%d/%d)", be->id,
                          refs[gi].prefix, fails, FAILS_BEFORE_SWITCH);
@@ -567,6 +602,15 @@ static void run_pass(void)
      * contention this is meant to prevent. */
     if (probe_in_flight()) {
         ESP_LOGD(TAG, "upload pass deferred: a connection test is in flight");
+        return;
+    }
+
+    if (s_therapy_fn && s_therapy_fn()) {
+        /* One choke point again: deferring here covers the periodic tick,
+         * EV_EXPORT, EV_SCAN and manual requests alike.  The index keeps
+         * accumulating pending groups; nothing is lost.  Deliberately no
+         * status write — the accurate badge stays "N parts pending". */
+        ESP_LOGD(TAG, "upload pass deferred: therapy in progress");
         return;
     }
 
@@ -798,6 +842,7 @@ void upload_sched_request_scan(void)              { post(EV_SCAN, 0); }
 void upload_sched_request_reset(void)             { post(EV_RESET, 0); }
 
 void upload_sched_set_busy_fn(upload_sched_busy_fn_t fn) { s_busy_fn = fn; }
+void upload_sched_set_therapy_fn(upload_sched_busy_fn_t fn) { s_therapy_fn = fn; }
 
 bool upload_sched_uploading(void)
 {
