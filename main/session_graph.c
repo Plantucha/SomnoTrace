@@ -1117,13 +1117,15 @@ esp_err_t session_file_handler(httpd_req_t *req)
     if (strcmp(type, "brp") != 0 && strcmp(type, "brp_mm") != 0 &&
         strcmp(type, "flow") != 0 && strcmp(type, "flow_mm") != 0 &&
         strcmp(type, "pld") != 0 && strcmp(type, "sa2") != 0 &&
-        strcmp(type, "events") != 0 && strcmp(type, "press") != 0) {
+        strcmp(type, "events") != 0 && strcmp(type, "press") != 0 &&
+        strcmp(type, "stages") != 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid type");
         return ESP_FAIL;
     }
 
     char file_path[400];
-    snprintf(file_path, sizeof(file_path), "%s/%s_%s.snt", day_dir, session_id, type);
+    snprintf(file_path, sizeof(file_path), "%s/%s_%s.%s", day_dir, session_id,
+             type, strcmp(type, "stages") == 0 ? "sst" : "snt");
 
     FILE *f = fopen(file_path, "rb");
     if (!f) {

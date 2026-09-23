@@ -8,6 +8,10 @@ sudo apt-get install -y libcjson-dev   # or: export CJSON_DIR=/path/to/cJSON
 scripts/run_host_tests.sh              # build + run everything
 scripts/run_host_tests.sh --only edf_gen_test
 python3 scripts/mutants.py             # does the suite notice planted bugs?
+
+# SomnoStage parity test: compile-checked always; runs the real fixture
+# comparison only when pointed at a dev-model export (never in this repo):
+SOMNO_ML_ARTIFACTS=/path/to/somno-dev-model scripts/run_host_tests.sh --only somno_ml_test
 ```
 
 Both are plain commands with no repo-specific setup, so they drop into CI as
@@ -24,6 +28,7 @@ that is wanted; nothing here depends on running there.
 | `scripts/as11_time_test.c` | AS11 epoch / noon-day arithmetic |
 | `scripts/as11_events_test.c` | AS11 event parser and lifecycle state machine (`main/as11_events.c`) |
 | `scripts/vld3_decoder_test.c` | oximeter VLD3 decoder |
+| `scripts/somno_ml_test.c` | SomnoStage C-runtime parity vs the Python reference (features → boosters → decode). Needs a dev-model artifact dir that is never in this repo: compiled+linked on every run, executed only when `SOMNO_ML_ARTIFACTS=<dir>` points at a local export |
 | `scripts/mutants.py` | plants one-line bugs into a copy of `main/`, expects the suite to fail |
 | `scripts/mutants_probe.py` | optional: asks a local model for more bugs, measures them the same way |
 

@@ -56,6 +56,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -367,6 +368,95 @@ bool netprov_is_link_up(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Memory telemetry                                                   */
+/* ------------------------------------------------------------------ */
+/* One [MEM-BASE] line once the boot churn has settled (the first period
+ * ends well past init), then a compact [MEM] every MEM_TELEM_PERIOD_S:
+ * internal/DMA/PSRAM free/minimum/largest-free-block, allocated-block
+ * counts, task count, and deltas against that baseline.  A leak shows as
+ * falling free bytes together with rising block counts; fragmentation as
+ * a falling largest-free-block while totals hold.  The per-task dump stays
+ * on-demand at /api/heap — this path allocates nothing except a transient
+ * PSRAM array for the low-stack canary. */
+#define MEM_TELEM_PERIOD_S   900
+#define MEM_LOW_STACK_BYTES  512
+
+static uint32_t s_mem_base_ifree, s_mem_base_iblks;
+static uint32_t s_mem_base_pfree, s_mem_base_pblks;
+static bool     s_mem_base_valid;
+
+static void mem_telemetry_tick(uint32_t *elapsed_s)
+{
+    if (++*elapsed_s < MEM_TELEM_PERIOD_S) return;
+    *elapsed_s = 0;
+
+    multi_heap_info_t inf, psr;
+    heap_caps_get_info(&inf, MALLOC_CAP_INTERNAL);
+    heap_caps_get_info(&psr, MALLOC_CAP_SPIRAM);
+    unsigned up_min = (unsigned)(esp_timer_get_time() / 60000000);
+
+    if (!s_mem_base_valid) {
+        s_mem_base_valid  = true;
+        s_mem_base_ifree  = inf.total_free_bytes;
+        s_mem_base_iblks  = inf.allocated_blocks;
+        s_mem_base_pfree  = psr.total_free_bytes;
+        s_mem_base_pblks  = psr.allocated_blocks;
+        ESP_LOGI(TAG, "[MEM-BASE] up=%um int=%u/%u/%u dma=%u/%u "
+                      "psram=%u/%u/%u tasks=%u iblks=%u pblks=%u",
+                 up_min,
+                 (unsigned)inf.total_free_bytes,
+                 (unsigned)inf.minimum_free_bytes,
+                 (unsigned)inf.largest_free_block,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+                 (unsigned)psr.total_free_bytes,
+                 (unsigned)psr.minimum_free_bytes,
+                 (unsigned)psr.largest_free_block,
+                 (unsigned)uxTaskGetNumberOfTasks(),
+                 (unsigned)inf.allocated_blocks,
+                 (unsigned)psr.allocated_blocks);
+    } else {
+        ESP_LOGI(TAG, "[MEM] up=%um int=%u/%u/%u dma=%u/%u "
+                      "psram=%u/%u/%u tasks=%u iblks=%u pblks=%u "
+                      "d_if=%+d d_ib=%+d d_pf=%+d d_pb=%+d",
+                 up_min,
+                 (unsigned)inf.total_free_bytes,
+                 (unsigned)inf.minimum_free_bytes,
+                 (unsigned)inf.largest_free_block,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+                 (unsigned)psr.total_free_bytes,
+                 (unsigned)psr.minimum_free_bytes,
+                 (unsigned)psr.largest_free_block,
+                 (unsigned)uxTaskGetNumberOfTasks(),
+                 (unsigned)inf.allocated_blocks,
+                 (unsigned)psr.allocated_blocks,
+                 (int)inf.total_free_bytes - (int)s_mem_base_ifree,
+                 (int)inf.allocated_blocks  - (int)s_mem_base_iblks,
+                 (int)psr.total_free_bytes - (int)s_mem_base_pfree,
+                 (int)psr.allocated_blocks  - (int)s_mem_base_pblks);
+    }
+
+    /* Stack-sizing canary: warn about any task whose high-water mark fell
+     * below MEM_LOW_STACK_BYTES.  Repeats while it persists — a task that
+     * is permanently near the edge is exactly the one worth seeing. */
+    UBaseType_t n_tasks = uxTaskGetNumberOfTasks();
+    TaskStatus_t *ts = heap_caps_malloc(n_tasks * sizeof(TaskStatus_t),
+                                        MALLOC_CAP_SPIRAM);
+    if (ts) {
+        UBaseType_t n = uxTaskGetSystemState(ts, n_tasks, NULL);
+        for (UBaseType_t i = 0; i < n; i++) {
+            if (ts[i].usStackHighWaterMark < MEM_LOW_STACK_BYTES) {
+                ESP_LOGW(TAG, "[MEM] low stack: '%s' hwm=%u B",
+                         ts[i].pcTaskName,
+                         (unsigned)ts[i].usStackHighWaterMark);
+            }
+        }
+        free(ts);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Link supervisor: autonomous failover between configured networks   */
 /* ------------------------------------------------------------------ */
 /* esp_wifi_connect() only ever retries the SSID currently programmed into
@@ -377,8 +467,10 @@ bool netprov_is_link_up(void)
 static void link_supervisor_task(void *arg)
 {
     (void)arg;
+    uint32_t mem_elapsed_s = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        mem_telemetry_tick(&mem_elapsed_s);
 
         if (!s_rescan_requested || s_portal_mode || s_connected) continue;
         s_rescan_requested = false;
@@ -3180,6 +3272,10 @@ static esp_err_t start_webserver(void)
     /* Periodic upload scans yield to a live therapy recording; event-driven
      * uploads still run, since they matter more than a housekeeping scan. */
     upload_sched_set_busy_fn(sd_storage_recording_active);
+    /* Whole upload passes yield to a live therapy session too: the Wi-Fi
+     * burst shares the 2.4 GHz front-end with the BLE links carrying the
+     * data, and the night's complete-day upload is still correct afterwards. */
+    upload_sched_set_therapy_fn(bsp_display_is_therapy_active);
     /* Guards s_format_progress between format_sd_task and the progress handler.
      * Created here so it exists before any request can reach the handler. */
     if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();

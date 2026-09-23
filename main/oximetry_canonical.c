@@ -24,6 +24,7 @@
 #include "oximetry_canonical.h"
 #include "oximetry_vld3.h"
 #include "sd_storage.h"
+#include "somno_ml.h"
 #include "time_sync.h"
 #include "as11_time.h"
 
@@ -876,6 +877,9 @@ esp_err_t oximetry_canonical_convert_vld3(const char *device_id,
         return ESP_FAIL;
     }
     ret = ESP_OK;
+    /* Recording published: queue post-session sleep staging (no-op on stub
+     * builds or when the queue is full). */
+    somno_ml_enqueue_ring(recording_id);
     free(p);
     return ret;
 }
@@ -1092,6 +1096,9 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
         return ESP_FAIL;
     }
     ret = ESP_OK;
+    /* Recording published: queue post-session sleep staging (no-op on stub
+     * builds or when the queue is full). */
+    somno_ml_enqueue_ring(recording_id);
     free(p);
     return ret;
 }
@@ -1412,7 +1419,8 @@ esp_err_t oximetry_canonical_resolve_track(const char *recording_id,
 {
     if (!track_id || !safe_component(track_id, 32) ||
         (strcmp(track_id, "vitals") != 0 && strcmp(track_id, "pleth") != 0 &&
-         strcmp(track_id, "pleth_mm") != 0 && strcmp(track_id, "events") != 0))
+         strcmp(track_id, "pleth_mm") != 0 && strcmp(track_id, "events") != 0 &&
+         strcmp(track_id, "stages") != 0))
         return ESP_ERR_INVALID_ARG;
     char dir[OXIMETRY_CANONICAL_MAX_PATH];
     esp_err_t e = oximetry_canonical_resolve_recording(recording_id, dir, sizeof(dir));
@@ -1425,7 +1433,8 @@ esp_err_t oximetry_canonical_resolve_track(const char *recording_id,
     int generation = cJSON_IsNumber(gen) ? gen->valueint : 0;
     cJSON_Delete(p);
     if (generation <= 0 || generation > 100000) return ESP_ERR_NOT_FOUND;
-    const char *ext = strcmp(track_id, "events") == 0 ? "jsonl" : "snt";
+    const char *ext = strcmp(track_id, "events") == 0 ? "jsonl"
+                    : strcmp(track_id, "stages") == 0 ? "sst" : "snt";
     if (snprintf(out_path, out_path_size, "%s/%s/%d/data/%s.%s", dir, OX_GEN,
                  generation, track_id, ext) >= (int)out_path_size)
         return ESP_ERR_INVALID_SIZE;

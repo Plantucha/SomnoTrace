@@ -176,8 +176,31 @@ fi
 # no test could ever kill. Needs no compiler, so it runs wherever python3 does.
 if command -v python3 >/dev/null 2>&1; then
     run_check mutate_host_self_test python3 scripts/mutate_host.py --self-test
+    # In-process SleepHQ contract check (no network): the atomic_day policy
+    # must keep a split night's day self-complete under either server-side
+    # reconcile semantics, and the parked-group guard must stop retry storms.
+    run_check sleephq_atomic_day_contract_test \
+        python3 scripts/sleephq_atomic_day_contract_test.py
 else
     skip_test mutate_host_self_test "no python3"
+    skip_test sleephq_atomic_day_contract_test "no python3"
+fi
+
+# somno_ml_test is a parity harness for the SomnoStage C runtime.  Its
+# fixtures (model.sstp + SSTF/SSTR/SSTX cases) are exported by the training
+# repo and are never present in this repo or CI, so the runnable form is
+# gated on SOMNO_ML_ARTIFACTS.  Without it the suite still compiles and links
+# the harness — the part that would otherwise bit-rot silently against the
+# component headers — but executes nothing.
+if [ -n "${SOMNO_ML_ARTIFACTS:-}" ] && [ -d "$SOMNO_ML_ARTIFACTS" ]; then
+    run_test somno_ml_test -Icomponents/somno_ml/include -Icomponents/somno_ml \
+        components/somno_ml/somno_ml_features.c components/somno_ml/somno_ml_model.c \
+        scripts/somno_ml_test.c -lm
+else
+    run_check somno_ml_test $CC $CFLAGS \
+        -Icomponents/somno_ml/include -Icomponents/somno_ml \
+        components/somno_ml/somno_ml_features.c components/somno_ml/somno_ml_model.c \
+        scripts/somno_ml_test.c -lm -o "$OUT/somno_ml_test"
 fi
 
 # Roster check: a test file that exists but is not wired in here would never

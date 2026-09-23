@@ -50,7 +50,13 @@ typedef struct {
     char remote[OX_MAX_BACKENDS_LOCAL][64];
 } ox_state_t;
 
-static ox_state_t s_states[UPLOAD_OX_MAX_UNITS];
+/* Allocated in PSRAM by upload_ox_init(): 64 × ~368 B of pure bookkeeping is
+ * the uploader's largest static internal-RAM consumer, and it is only ever
+ * touched from the scheduler task context — never an ISR, never with the
+ * cache disabled — so there is no reason to keep it internal.  NULL until
+ * init succeeds; every entry point tolerates that (state lookups fail, so
+ * oximetry units read as pending and marks are dropped). */
+static ox_state_t *s_states;
 static bool s_loaded;
 
 static bool safe_component(const char *s, size_t max_len)
@@ -109,6 +115,7 @@ static uint64_t file_fp(uint64_t h, const char *name, const char *path)
 
 static int state_find(const char *id, uint32_t generation)
 {
+    if (!s_states) return -1;
     for (int i = 0; i < UPLOAD_OX_MAX_UNITS; i++)
         if (s_states[i].used && s_states[i].generation == generation &&
             strcmp(s_states[i].id, id) == 0) return i;
@@ -117,6 +124,7 @@ static int state_find(const char *id, uint32_t generation)
 
 static int state_get(const upload_ox_ref_t *ref, bool create)
 {
+    if (!s_states) return -1;
     int i = state_find(ref->recording_id, ref->generation);
     if (i >= 0 || !create) return i;
     for (i = 0; i < UPLOAD_OX_MAX_UNITS; i++) {
@@ -160,7 +168,13 @@ static cJSON *read_state(void)
 esp_err_t upload_ox_init(void)
 {
     if (s_loaded) return ESP_OK;
-    memset(s_states, 0, sizeof(s_states));
+    if (!s_states) {
+        s_states = heap_caps_calloc(UPLOAD_OX_MAX_UNITS, sizeof(ox_state_t),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_states)
+            s_states = calloc(UPLOAD_OX_MAX_UNITS, sizeof(ox_state_t));
+        if (!s_states) return ESP_ERR_NO_MEM;
+    }
     cJSON *root = read_state();
     cJSON *units = root ? cJSON_GetObjectItem(root, "units") : NULL;
     if (units && cJSON_IsArray(units)) {
@@ -201,7 +215,7 @@ esp_err_t upload_ox_init(void)
 
 esp_err_t upload_ox_save(void)
 {
-    if (!s_loaded) return ESP_ERR_INVALID_STATE;
+    if (!s_loaded || !s_states) return ESP_ERR_INVALID_STATE;
     cJSON *root = cJSON_CreateObject(); if (!root) return ESP_ERR_NO_MEM;
     cJSON_AddNumberToObject(root, "version", 1);
     cJSON *units = cJSON_AddArrayToObject(root, "units");

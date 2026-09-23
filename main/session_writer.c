@@ -71,6 +71,7 @@
 #include "crash_diag.h"
 #include "snt_format.h"
 #include "as11_events.h"
+#include "somno_ml.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1547,6 +1548,10 @@ static void sw_post_task(void *arg)
             ESP_LOGW(TAG, "post: BLE unavailable, skipping spool collection for %s",
                      session_id);
         }
+
+        /* 4b. Queue post-session sleep staging for the finalized sa2 stream
+         * (no-op on stub builds; the worker re-validates the .sst marker). */
+        somno_ml_enqueue_as11(session_dir, session_id);
 
         /* 5. EDF generation + upload trigger.  Runs here rather than in a
          * per-stop task: one persistent worker means no allocation can fail

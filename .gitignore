@@ -20,6 +20,24 @@ dependencies.lock
 # --- AI agent scratch / idea-sharing folder (local only, never committed) ---
 /.ai/
 
+# --- SomnoStage model artifacts (injected locally or by release pipeline;
+#     never committed — see .ai/MODEL-CONSUME-v2.MD) ---
+# Directory-scoped broad patterns so any current or future artifact name
+# (blob, plaintext payload, key material, manifests, boosters, fixtures) is
+# caught without relying on an exact filename list. No tracked source file
+# matches these — component sources are .c/.h/CMakeLists.txt only.
+/components/somno_ml/*.enc
+/components/somno_ml/*.sst*
+/components/somno_ml/*manifest*.json
+/components/somno_ml/*.inc
+/components/somno_ml/key*.h
+/components/somno_ml/mask*.h
+/components/somno_ml/*.lgbm
+/components/somno_ml/*.lgbm.txt
+/components/somno_ml/*.bin
+# private model-distribution checkout (CI fetches it here; must never be committed)
+/.somnostage-distrib/
+
 # --- Private agent guidance (kept at repo root for tool discovery, not shared) ---
 /AGENTS.md
 
