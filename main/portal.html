@@ -210,8 +210,17 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .stat-card-usage .stat-card-title{color:#34d399}
 .stat-card-leak .stat-card-title{color:#fbbf24}
 .stat-card-press .stat-card-title{color:#fb7185}
-.dash-signal-row{position:relative;margin-top:12px}
-.dash-signal-label{font-size:.72rem;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.02em;min-height:24px;display:flex;align-items:center;padding-right:148px}
+.dash-signal-row{position:relative;margin-top:12px;transition:margin .2s ease}
+.dash-signal-row.dash-row-collapsed{margin-top:6px;margin-bottom:2px;background:var(--input-bg);border:1px solid var(--card-border);border-radius:8px;padding:3px 10px}
+.dash-signal-label{font-size:.72rem;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.02em;min-height:24px;display:inline-flex;align-items:center;gap:6px;padding-right:148px;cursor:pointer;user-select:none;transition:color .15s ease}
+.dash-signal-label:hover{color:var(--text)}
+.dash-signal-row.dash-row-collapsed .dash-signal-label{padding-right:0;min-height:22px;width:100%}
+.dash-collapse-icon{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;flex-shrink:0;color:currentColor;opacity:.75;transition:transform .2s ease,opacity .15s ease}
+.dash-signal-label:hover .dash-collapse-icon{opacity:1}
+.dash-row-collapsed .dash-collapse-icon{transform:rotate(-90deg)}
+.dash-signal-row.dash-row-collapsed .panel-ctrls,
+.dash-signal-row.dash-row-collapsed [id^="chart-"],
+.dash-signal-row.dash-row-collapsed .sleep-stage-legend{display:none!important}
 /* Sleep-stage totals legend: its own row under the panel title so the
  * duration/percentage chips wrap freely instead of being crammed into the
  * title line (which is width-constrained by the panel control cluster and
@@ -1068,7 +1077,7 @@ Save &amp; Reboot
 </div>
 <div id="dash-stream-quality" class="card" style="display:none;padding:12px 16px;font-size:.8rem;color:var(--text-muted);line-height:1.6"></div>
 <div class="dash-options-bar" style="margin-top:12px;display:flex;flex-wrap:wrap;gap:16px">
-<label class="dash-toggle-row" title="When enabled, the time axis and oximetry data are clamped to CPAP therapy start/end times only">
+<label id="dash-clamp-row" class="dash-toggle-row" style="display:none" title="When enabled, the time axis and oximetry data are clamped to CPAP therapy start/end times only">
 <input type="checkbox" id="dash-clamp-cpap" onchange="onDashClampCpapChange()">
 <span>Show SpO₂ only inside CPAP therapy times</span>
 </label>
@@ -1076,6 +1085,11 @@ Save &amp; Reboot
 <input type="checkbox" id="dash-prefer-as11-oxi" onchange="onDashPreferAs11OxiChange()">
 <span>Prefer AirSense 11 oximetry over O2 Ring</span>
 </label>
+<div class="dash-collapse-all-row" style="display:inline-flex;gap:6px;align-items:center;font-size:.78rem;color:var(--text-muted);user-select:none">
+<button type="button" class="btn-input-toggle" onclick="dashCollapseAll(true)">Collapse all</button>
+<span style="opacity:.4">&middot;</span>
+<button type="button" class="btn-input-toggle" onclick="dashCollapseAll(false)">Expand all</button>
+</div>
 </div>
 <div id="somnostage-credit" style="display:none;font-size:.75rem;color:var(--text-muted);margin-top:10px;line-height:1.6"></div>
 </section>
@@ -3754,17 +3768,20 @@ function parseOximetrySnt(buf) {
   if (hlen < 64 || bytes !== 2 || nCh < 2 || nCh > 16 || periodNum < 1 ||
       periodDen < 1 || count > 1000000 || hlen + count * nCh * bytes > buf.byteLength ||
       dataBytes !== count * nCh * bytes) return null;
-  var out = {t:[], spo2:[], pulse:[], motion:[], status:[]};
+  var out = {t:[], spo2:[], pulse:[], motion:[], status:[], validCount: 0};
   var off = hlen;
   for (var i = 0; i < count; i++) {
     out.t.push(start + i * (periodNum / periodDen) / 1000);
     var vals = [];
     for (var c = 0; c < nCh; c++) vals.push(d.getInt16(off + (c * 2), true));
     off += nCh * 2;
-    out.spo2.push(vals[0] === SNT_MISSING_V2 ? NaN : vals[0] / 100);
-    out.pulse.push(vals[1] === SNT_MISSING_V2 ? NaN : vals[1] / 100);
+    var sp = vals[0] === SNT_MISSING_V2 ? NaN : vals[0] / 100;
+    var hr = vals[1] === SNT_MISSING_V2 ? NaN : vals[1] / 100;
+    out.spo2.push(sp);
+    out.pulse.push(hr);
     out.motion.push(nCh > 2 && vals[2] !== SNT_MISSING_V2 ? vals[2] : NaN);
     out.status.push(nCh > 3 ? vals[3] : 0);
+    if (!isNaN(sp) || !isNaN(hr)) out.validCount++;
   }
   return out;
 }
@@ -3948,12 +3965,13 @@ function loadOximetryData(noonDay) {
       if (oxDiagnostics.length) parts.push(oxDiagnostics.length + ' downloaded but awaiting conversion');
       status.textContent = parts.join(' · ');
     }
-    /* If charts already exist and include oximetry panels, just push new data.
-     * If no charts exist or oximetry panels aren't present yet (signal set
-     * changed), rebuild from scratch to add them. */
+    /* If charts already exist and match active oximetry/sleep requirements,
+     * just push new data. Otherwise rebuild from scratch to add or remove panels. */
     var hasOxiPanels = dashActiveSignals.some(function(s) { return s.src === 'oxi'; });
     var hasSleepPanel = dashActiveSignals.some(function(s) { return s.key === 'sleep'; });
-    if (dashCharts.length && hasOxiPanels && (hasSleepPanel || !hasStageData())) {
+    var needOxi = hasAs11OxiData() || hasO2RingData(dashFullRange());
+    var needSleep = hasStageData();
+    if (dashCharts.length && (hasOxiPanels === needOxi) && (hasSleepPanel === needSleep)) {
       updateDashView();
     } else {
       dashXRange = null;
@@ -3980,10 +3998,6 @@ function loadOximetryData(noonDay) {
  */
 var DASH_LINE_WIDTH = 0.75;   /* CSS px; all dashboard signal lines share this */
 var DASH_SIGNALS = [
-  /* Hypnogram: rendered entirely by hypnogramHook from .sst sidecars; the
-   * series itself is a dummy (transparent stroke) — see buildSignalData. */
-  { key:'sleep',   label:'Sleep Stage', unit:'',    src:'oxi', ch:'stg',
-    minKey:null, maxKey:null,            color:'transparent',   y:{min:0,max:4}, height:200, decimals:0 },
   { key:'flow',    label:'Breathing',  unit:'L/min', src:'brp', ch:'flow',
     minKey:'flowMin',  maxKey:'flowMax',  color:'#3b82f6',          y:{min:-150,max:150}, height:200, decimals:1 },
   { key:'press',   label:'Pressure',   unit:'cmH\u2082O', src:'pld', ch:'press',
@@ -3995,6 +4009,10 @@ var DASH_SIGNALS = [
     minKey:null, maxKey:null,            color:'--color-flowlim',   y:{min:0,max:null},   height:200, decimals:2 },
   { key:'snore',   label:'Snore',      unit:'',      src:'pld', ch:'snore',
     minKey:null, maxKey:null,            color:'--color-snore',     y:{min:0,max:null},   height:200, decimals:2 },
+  /* Hypnogram: rendered entirely by hypnogramHook from .sst sidecars; the
+   * series itself is a dummy (transparent stroke) — see buildSignalData. */
+  { key:'sleep',   label:'Sleep Stage', unit:'',    src:'oxi', ch:'stg',
+    minKey:null, maxKey:null,            color:'transparent',   y:{min:0,max:4}, height:200, decimals:0 },
   { key:'spo2',    label:'SpO\u2082',      unit:'%',     src:'oxi', ch:'spo2',
     minKey:null, maxKey:null,            color:'#60a5fa',           y:{range:function(u,dMin,dMax){if(dMin==null||!isFinite(dMin))return[90,100];var pad=Math.max(2,(dMax-dMin)*0.15);return[Math.max(50,Math.floor(dMin-pad)),Math.min(100,Math.ceil(dMax+pad))];}}, height:200, decimals:0 },
   { key:'pulse',   label:'Pulse Rate',  unit:'bpm',   src:'oxi', ch:'pulse',
@@ -4103,9 +4121,9 @@ function sigColor(sig) {
 function dashHasData() {
   for (var i = 0; i < dashSessionData.length; i++) {
     var d = dashSessionData[i];
-    if (d && ((d.brp && d.brp.ready) || (d.pld && d.pld.ready) || (d.sa2 && d.sa2.ready))) return true;
+    if (d && ((d.brp && d.brp.ready) || (d.pld && d.pld.ready) || (d.sa2 && d.sa2.ready && hasValidSa2Samples(d.sa2)))) return true;
   }
-  if (oxData && oxData.length) return true;
+  if (hasO2RingData()) return true;
   return false;
 }
 
@@ -4241,7 +4259,7 @@ function dashFullRange() {
   if (oxData && !dashClampToCpap) {
     for (var oi = 0; oi < oxData.length; oi++) {
       var r = oxData[oi];
-      if (r && r.t && r.t.length) {
+      if (r && r.t && r.t.length && (r.validCount === undefined || r.validCount > 0)) {
         if (r.t[0] < lo) lo = r.t[0];
         if (r.t[r.t.length - 1] > hi) hi = r.t[r.t.length - 1];
       }
@@ -4392,35 +4410,67 @@ function parseSntSa2(buf) {
   var dv = h.dv, n = h.n, missing = h.missing, rb = h.recBytes;
   var t = new Float64Array(n);
   var pulse = new Float64Array(n), spo2 = new Float64Array(n);
+  var validCount = 0;
   for (var i = 0; i < n; i++) {
     var off = h.dataOff + i * rb;
     var hr = dv.getInt16(off, true);
     var sp = dv.getInt16(off + 2, true);
-    pulse[i] = (hr === missing || hr <= 0) ? NaN : hr * 0.01;
-    spo2[i]  = (sp === missing || sp <= 0) ? NaN : sp * 0.01;
+    var p = (hr === missing || hr <= 0) ? NaN : hr * 0.01;
+    var s = (sp === missing || sp <= 0) ? NaN : sp * 0.01;
+    pulse[i] = p;
+    spo2[i]  = s;
+    if (!isNaN(p) || !isNaN(s)) validCount++;
     t[i] = h.startMs + i * h.msPerRec;
   }
-  return { t: t, pulse: pulse, spo2: spo2, ready: true };
+  return { t: t, pulse: pulse, spo2: spo2, validCount: validCount, ready: true };
+}
+
+function hasValidSa2Samples(sa2) {
+  if (!sa2 || !sa2.t || !sa2.t.length || !sa2.spo2 || !sa2.pulse) return false;
+  if (sa2.validCount === 0) return false;
+  var sp = sa2.spo2, pr = sa2.pulse;
+  for (var i = 0; i < sp.length; i++) {
+    if (!isNaN(sp[i]) || !isNaN(pr[i])) return true;
+  }
+  return false;
 }
 
 function hasAs11OxiData() {
   if (!dashSessionData || !dashSessionData.length) return false;
   for (var i = 0; i < dashSessionData.length; i++) {
     var s = dashSessionData[i];
-    if (s && s.sa2 && s.sa2.ready && s.sa2.t && s.sa2.t.length) return true;
+    if (s && !s.noTherapy && s.sa2 && s.sa2.ready && hasValidSa2Samples(s.sa2)) return true;
+  }
+  return false;
+}
+
+function hasValidOxiRecord(rec, full) {
+  if (!rec || !rec.t || !rec.t.length) return false;
+  if (rec.validCount !== undefined && rec.validCount === 0) return false;
+  if (dashClampToCpap && full) {
+    if (rec.t[0] > full.max || rec.t[rec.t.length - 1] < full.min) return false;
+  }
+  var sp = rec.spo2, pr = rec.pulse;
+  if (!sp || !pr) return false;
+  if (rec.validCount !== undefined && rec.validCount > 0 && !(dashClampToCpap && full)) return true;
+  var i0 = 0, i1 = rec.t.length;
+  if (dashClampToCpap && full) {
+    i0 = dashLowerBound(rec.t, full.min);
+    i1 = dashLowerBound(rec.t, full.max);
+    if (i1 < rec.t.length && rec.t[i1] <= full.max) i1++;
+  }
+  for (var i = i0; i < i1; i++) {
+    if (!isNaN(sp[i]) || !isNaN(pr[i])) return true;
   }
   return false;
 }
 
 function hasO2RingData(full) {
   if (!oxData || !oxData.length) return false;
-  if (dashClampToCpap && full) {
-    return oxData.some(function(rec) {
-      return rec && rec.t && rec.t.length &&
-             rec.t[0] <= full.max && rec.t[rec.t.length - 1] >= full.min;
-    });
+  for (var i = 0; i < oxData.length; i++) {
+    if (hasValidOxiRecord(oxData[i], full)) return true;
   }
-  return true;
+  return false;
 }
 
 function useAs11ForVitals() {
@@ -4447,7 +4497,7 @@ function getOxiSlices(sigKey) {
     if (dashSessionData && dashSessionData.length) {
       for (var i = 0; i < dashSessionData.length; i++) {
         var s = dashSessionData[i];
-        if (s && !s.noTherapy && s.sa2 && s.sa2.ready && s.sa2.t && s.sa2.t.length && s.sa2[sigKey]) {
+        if (s && !s.noTherapy && s.sa2 && s.sa2.ready && hasValidSa2Samples(s.sa2) && s.sa2[sigKey]) {
           slices.push(s.sa2);
         }
       }
@@ -4459,7 +4509,7 @@ function getOxiSlices(sigKey) {
     for (var oi = 0; oi < oxData.length; oi++) {
       var orec = oxData[oi];
       if (!orec || !orec.t || !orec.t.length || !orec[sigKey]) continue;
-      slices.push(orec);
+      if (hasValidOxiRecord(orec)) slices.push(orec);
     }
   }
   return slices;
@@ -5392,11 +5442,12 @@ function loadDashboardData() {
           }
           var hasOxiPanels = dashActiveSignals.some(function(sig) { return sig.src === 'oxi'; });
           var hasSleepPanel = dashActiveSignals.some(function(sig) { return sig.key === 'sleep'; });
-          if (dashCharts.length && ((!hasOxiPanels && hasAs11OxiData()) ||
-                                    (!hasSleepPanel && hasStageData()))) {
-            renderDashboardCharts();
-          } else {
+          var needOxi = hasAs11OxiData() || hasO2RingData(dashFullRange());
+          var needSleep = hasStageData();
+          if (dashCharts.length && (hasOxiPanels === needOxi) && (hasSleepPanel === needSleep)) {
             updateDashView();
+          } else {
+            renderDashboardCharts();
           }
           pldDone++;
           if (myLoadId === dashLoadId)
@@ -5673,6 +5724,12 @@ function renderDashboardCharts() {
     preferRow.style.display = (as11Oxi && ringOxi) ? 'inline-flex' : 'none';
   }
 
+  /* Sync the CPAP clamp toggle visibility: unhide only when oximetry data exists */
+  var clampRow = document.getElementById('dash-clamp-row');
+  if (clampRow) {
+    clampRow.style.display = hasOxi ? 'inline-flex' : 'none';
+  }
+
   var signals = DASH_SIGNALS.filter(function(sig) {
     if (sig.key === 'sleep') return hasStageData();
     if (sig.key === 'motion') return ringOxi;
@@ -5680,12 +5737,22 @@ function renderDashboardCharts() {
     return hasCpap;
   });
   dashActiveSignals = signals;
+  var collapsedSignals = getCollapsedSignals();
 
   signals.forEach(function(sig) {
+    var isCollapsed = collapsedSignals.indexOf(sig.key) >= 0;
     var row = document.createElement('div');
-    row.className = 'dash-signal-row';
+    row.id = 'dash-row-' + sig.key;
+    row.className = 'dash-signal-row' + (isCollapsed ? ' dash-row-collapsed' : '');
     var lbl = document.createElement('div');
     lbl.className = 'dash-signal-label';
+    lbl.onclick = function() { toggleDashSignalCollapse(sig.key); };
+
+    var collapseIcon = document.createElement('span');
+    collapseIcon.className = 'dash-collapse-icon';
+    collapseIcon.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z"/></svg>';
+    lbl.appendChild(collapseIcon);
+
     var labelText = sig.label;
     if (sig.key === 'sleep') {
       /* The hypnogram is a model ESTIMATE, not clinical sleep staging (see the
@@ -5705,13 +5772,20 @@ function renderDashboardCharts() {
         labelText += ' (O2 Ring)';
       }
     }
-    lbl.textContent = sig.unit ? (labelText + ' (' + sig.unit + ')') : labelText;
+    var titleSpan = document.createElement('span');
+    titleSpan.className = 'dash-signal-title';
+    titleSpan.textContent = sig.unit ? (labelText + ' (' + sig.unit + ')') : labelText;
+    lbl.appendChild(titleSpan);
+
     lbl.style.color = sigColor(sig);
     if (sig.key === 'sleep') {
       lbl.id = 'dash-sleep-label';
-      lbl.title = 'Estimated sleep stages from oximetry by the SomnoStage model — '
+      lbl.title = 'Click to collapse / expand. '
+                + 'Estimated sleep stages from oximetry by the SomnoStage model \u2014 '
                 + 'informational only, not clinical sleep staging, not a medical device.';
       lbl.style.color = cssVar('--text-muted');   /* sig.color is 'transparent' — keep the label visible */
+    } else {
+      lbl.title = 'Click to collapse / expand';
     }
     var chartEl = document.createElement('div');
     chartEl.id = 'chart-' + sig.key;
@@ -6056,6 +6130,76 @@ function toggleDashScroll() {
   for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', dashScrollMode);
 }
 
+/* ── Collapsible dashboard panels ──────────────────────────────── */
+function getCollapsedSignals() {
+  try {
+    var raw = localStorage.getItem('somnotrace_collapsed_signals');
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveCollapsedSignals(arr) {
+  try {
+    localStorage.setItem('somnotrace_collapsed_signals', JSON.stringify(arr));
+  } catch (e) {}
+}
+
+function toggleDashSignalCollapse(key) {
+  var row = document.getElementById('dash-row-' + key);
+  if (!row) return;
+  var isCollapsed = row.classList.toggle('dash-row-collapsed');
+
+  var set = getCollapsedSignals();
+  var idx = set.indexOf(key);
+  if (isCollapsed && idx < 0) {
+    set.push(key);
+  } else if (!isCollapsed && idx >= 0) {
+    set.splice(idx, 1);
+  }
+  saveCollapsedSignals(set);
+
+  if (!isCollapsed) {
+    var sigIdx = -1;
+    for (var i = 0; i < dashActiveSignals.length; i++) {
+      if (dashActiveSignals[i].key === key) { sigIdx = i; break; }
+    }
+    if (sigIdx >= 0 && dashCharts[sigIdx]) {
+      var chartEl = document.getElementById('chart-' + key);
+      if (chartEl) {
+        var sig = dashActiveSignals[sigIdx];
+        dashCharts[sigIdx].setSize({
+          width: dashChartWidth(chartEl),
+          height: dashPanelHeight(sig)
+        });
+      }
+    }
+    updateDashView();
+  }
+}
+
+function dashCollapseAll(collapse) {
+  var set = [];
+  for (var i = 0; i < dashActiveSignals.length; i++) {
+    var sig = dashActiveSignals[i];
+    var row = document.getElementById('dash-row-' + sig.key);
+    if (!row) continue;
+    if (collapse) {
+      row.classList.add('dash-row-collapsed');
+      set.push(sig.key);
+    } else {
+      row.classList.remove('dash-row-collapsed');
+    }
+  }
+  saveCollapsedSignals(set);
+  if (!collapse) {
+    requestAnimationFrame(function() {
+      resizeDashboardChart();
+    });
+  }
+}
+
 /* ── SoftAP Mode ───────────────────────────────────────────────── */
 function applyPortalMode() {
   if (!PORTAL_MODE) return;
@@ -6078,9 +6222,10 @@ function resizeDashboardChart() {
   for (var i = 0; i < dashCharts.length; i++) {
     var chart = dashCharts[i];
     if (!chart) continue;
-    var el = document.getElementById('chart-' + DASH_SIGNALS[i].key);
+    var sig = dashActiveSignals[i] || DASH_SIGNALS[i];
+    var el = document.getElementById('chart-' + sig.key);
     if (el && el.clientWidth > 0) {
-      chart.setSize({ width: dashChartWidth(el), height: dashPanelHeight(DASH_SIGNALS[i]) });
+      chart.setSize({ width: dashChartWidth(el), height: dashPanelHeight(sig) });
     }
   }
   updateDashView();
