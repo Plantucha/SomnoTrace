@@ -22,6 +22,7 @@
  */
 
 #include "oximetry_canonical.h"
+#include "oxyii_trailer.h"
 #include "oximetry_vld3.h"
 #include "sd_storage.h"
 #include "somno_ml.h"
@@ -326,9 +327,25 @@ static bool file_crc_size(const char *path, uint32_t *out_crc, uint64_t *out_siz
     return ok;
 }
 
+/* Read the trailer that closes a Format-A file. The file states its own
+ * cadence and length there; the size alone cannot. */
+static bool read_format_a_trailer(const char *path, oxyii_trailer_t *out)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < OX_SOURCE_HEADER + OX_SOURCE_TRAILER)
+        return false;
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    uint8_t raw[OXYII_TRAILER_BYTES];
+    bool read_ok = fseek(f, st.st_size - OX_SOURCE_TRAILER, SEEK_SET) == 0 &&
+                   fread(raw, 1, sizeof(raw), f) == sizeof(raw);
+    fclose(f);
+    return read_ok && oxyii_trailer_parse(raw, sizeof(raw), out);
+}
+
 static bool write_snt3_format_a(const char *src, const char *dst,
-                                int64_t start_ms, uint32_t *out_count,
-                                uint32_t *out_crc)
+                                int64_t start_ms, uint32_t period_us,
+                                uint32_t *out_count, uint32_t *out_crc)
 {
     struct stat st;
     if (stat(src, &st) != 0 || st.st_size < OX_SOURCE_HEADER + OX_SOURCE_TRAILER)
@@ -353,7 +370,7 @@ static bool write_snt3_format_a(const char *src, const char *dst,
     hdr.n_channels = OXIMETRY_CANONICAL_VITALS_CHANNELS;
     hdr.sample_bytes = sizeof(int16_t);
     hdr.header_bytes = OX_SNT_HEADER_BYTES;
-    hdr.period_num_us = 1000000;
+    hdr.period_num_us = period_us;
     hdr.period_den = 1;
     hdr.start_epoch_ms = start_ms;
     hdr.sample_count = (uint32_t)(body / 3);
@@ -894,7 +911,8 @@ static esp_err_t build_generation_manifest(const char *path, const char *device_
                                            const char *source_name,
                                            int64_t start_ms, int64_t end_ms,
                                            uint32_t source_size, uint32_t source_crc,
-                                           uint32_t sample_count, uint32_t data_crc)
+                                           uint32_t sample_count, uint32_t period_us,
+                                           uint32_t data_crc)
 {
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
@@ -946,7 +964,7 @@ static esp_err_t build_generation_manifest(const char *path, const char *device_
     cJSON_AddStringToObject(track, "id", "vitals");
     cJSON_AddStringToObject(track, "path", "data/vitals.snt");
     cJSON_AddStringToObject(track, "timing", "uniform");
-    cJSON_AddNumberToObject(track, "period_num_us", 1000000);
+    cJSON_AddNumberToObject(track, "period_num_us", period_us);
     cJSON_AddNumberToObject(track, "period_den", 1);
     cJSON_AddNumberToObject(track, "sample_count", sample_count);
     cJSON_AddNumberToObject(track, "data_crc32", data_crc);
@@ -991,7 +1009,27 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     if (stat(source_path, &st) != 0 || st.st_size > OXIMETRY_CANONICAL_MAX_SOURCE_BYTES)
         return ESP_ERR_INVALID_SIZE;
     uint32_t count = (uint32_t)(((uint64_t)st.st_size - OX_SOURCE_HEADER - OX_SOURCE_TRAILER) / 3);
-    int64_t end_ms = start_utc_ms + (int64_t)(count - 1) * 1000;
+
+    /* Prefer what the file says about itself over what its size implies. The
+     * interval is a device setting, so 1 Hz is a default and not a law; and a
+     * stated count that disagrees with the body length is a truncation the
+     * size alone cannot reveal. Neither is fatal - the body remains the
+     * authority for how many samples were actually read - but a silent
+     * disagreement is exactly the kind that surfaces months later. */
+    oxyii_trailer_t trailer;
+    uint32_t period_us = 1000000;
+    if (read_format_a_trailer(source_path, &trailer)) {
+        period_us = trailer.period_us;
+        if (!trailer.interval_valid)
+            ESP_LOGW(TAG, "convert %s: trailer interval %u implausible, assuming 1 Hz",
+                     recording_id, (unsigned)trailer.interval_s);
+        if (trailer.sample_count != count)
+            ESP_LOGW(TAG, "convert %s: trailer states %u samples, body holds %u",
+                     recording_id, (unsigned)trailer.sample_count, (unsigned)count);
+    } else {
+        ESP_LOGW(TAG, "convert %s: trailer unreadable, assuming 1 Hz", recording_id);
+    }
+    int64_t end_ms = start_utc_ms + (int64_t)(count - 1) * (int64_t)(period_us / 1000);
 
     /* Heap-allocate path buffers to avoid ~8 KB of stack usage. */
     convert_ctx_t *p = heap_caps_malloc(sizeof(*p), MALLOC_CAP_SPIRAM);
@@ -1063,11 +1101,13 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     else
         source_ok = copy_file_crc(source_path, p->stage_source, &source_crc, &source_size);
     if (!source_ok || source_size != (uint64_t)st.st_size ||
-        !write_snt3_format_a(source_path, p->stage_track_tmp, start_utc_ms, &count, &track_crc) ||
+        !write_snt3_format_a(source_path, p->stage_track_tmp, start_utc_ms, period_us,
+                             &count, &track_crc) ||
         (unlink(p->stage_track), rename(p->stage_track_tmp, p->stage_track) != 0) ||
         build_generation_manifest(p->stage_gen_manifest, device_id, recording_id,
                                   basename_safe(source_path), start_utc_ms, end_ms,
-                                  (uint32_t)source_size, source_crc, count, track_crc) != ESP_OK) {
+                                  (uint32_t)source_size, source_crc, count, period_us,
+                                  track_crc) != ESP_OK) {
         ESP_LOGW(TAG, "convert %s: conversion step failed", recording_id);
         unlink(p->stage_track_tmp);
         free(p);
