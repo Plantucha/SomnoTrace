@@ -3906,10 +3906,11 @@ function refreshSleepStageTotals() {
   host.innerHTML = el ? el.innerHTML : '';
 }
 
-/* uPlot draw hook for the Sleep Stage panel: paints continuous solid blocks
+/* uPlot draw hook for the Sleep Stage panel: paints continuous connected ribbon
  * per stage in AASM order top→bottom: Wake, REM, Light, Deep.
- * Contiguous epochs of the same stage are merged into a single unbroken
- * block, eliminating moiré patterns and subpixel aliasing. */
+ * Contiguous epochs of the same stage are merged into unbroken blocks.
+ * Bars are vertically sized to 80% of lane height, and adjacent stages
+ * are linked by crisp hairline transition lines with vertical color gradients. */
 var SST_ROW_Y = [3, 1, 0, 2];           /* stage idx -> row: W=3 R=2 L=1 D=0 */
 var SST_COLORS = ['#f59e0b', '#93c5fd', '#1e3a8a', '#34d399'];  /* W,L,D,R */
 var SST_NAMES  = ['Deep', 'Light', 'REM', 'Wake'];              /* y 0.5..3.5 */
@@ -3920,10 +3921,15 @@ function hypnogramHook(u) {
   var ctx = u.ctx, pr = u.pxRatio || 1;
   var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
   var xmin = u.scales.x.min, xmax = u.scales.x.max;
+  var barRatio = 0.80;
+  var lineW = Math.max(1, Math.round(1.5 * pr));
+
   ctx.save();
   ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
+
   for (var s = 0; s < slices.length; s++) {
     var st = slices[s];
+    var segs = [];
     var i = 0;
     while (i < st.n) {
       var v = st.stages[i];
@@ -3939,13 +3945,66 @@ function hypnogramHook(u) {
       var x0 = u.valToPos(t0, 'x', true);
       var x1 = u.valToPos(t1, 'x', true);
       if (x1 - x0 < pr) x1 = x0 + pr;
-      var yRow = SST_ROW_Y[v];
-      var yTop = u.valToPos(yRow + 1, 'sleep', true);
-      var yBot = u.valToPos(yRow, 'sleep', true);
-      ctx.fillStyle = SST_COLORS[v];
-      ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
+      segs.push({
+        stage: v,
+        row: SST_ROW_Y[v],
+        x0: x0,
+        x1: x1,
+        startIdx: startIdx,
+        endIdx: endIdx
+      });
+    }
+
+    if (!segs.length) continue;
+
+    var yTop0 = u.valToPos(1, 'sleep', true);
+    var yBot0 = u.valToPos(0, 'sleep', true);
+    var rowH = Math.abs(yBot0 - yTop0);
+    var barH = rowH * barRatio;
+
+    /* Pass 1: Draw thin vertical gradient hairlines between adjacent stages */
+    for (var j = 0; j < segs.length - 1; j++) {
+      var s1 = segs[j], s2 = segs[j + 1];
+      if (s1.row === s2.row || s2.startIdx !== s1.endIdx) continue;
+
+      var x = s1.x1;
+      var yMid1 = u.valToPos(s1.row + 0.5, 'sleep', true);
+      var yMid2 = u.valToPos(s2.row + 0.5, 'sleep', true);
+
+      var yA = yMid1 < yMid2 ? (yMid1 - barH / 2) : (yMid1 + barH / 2);
+      var yB = yMid1 < yMid2 ? (yMid2 + barH / 2) : (yMid2 - barH / 2);
+      var topY = Math.min(yA, yB);
+      var botY = Math.max(yA, yB);
+
+      var minAdjW = Math.min(s1.x1 - s1.x0, s2.x1 - s2.x0);
+      var wLine = Math.max(pr, Math.min(lineW, minAdjW));
+
+      var grad = ctx.createLinearGradient(0, yMid1, 0, yMid2);
+      grad.addColorStop(0, SST_COLORS[s1.stage]);
+      grad.addColorStop(1, SST_COLORS[s2.stage]);
+
+      ctx.fillStyle = grad;
+      ctx.fillRect(Math.round(x - wLine / 2), topY, wLine, botY - topY);
+    }
+
+    /* Pass 2: Draw horizontal stage bars over the lines */
+    for (var k = 0; k < segs.length; k++) {
+      var seg = segs[k];
+      var yCenter = u.valToPos(seg.row + 0.5, 'sleep', true);
+      var yBarTop = yCenter - barH / 2;
+      var barW = Math.max(pr, seg.x1 - seg.x0);
+
+      ctx.fillStyle = SST_COLORS[seg.stage];
+      if (barW > 4 * pr && ctx.roundRect) {
+        ctx.beginPath();
+        ctx.roundRect(seg.x0, yBarTop, barW, barH, 2 * pr);
+        ctx.fill();
+      } else {
+        ctx.fillRect(seg.x0, yBarTop, barW, barH);
+      }
     }
   }
+
   ctx.restore();
 }
 
