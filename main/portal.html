@@ -5740,6 +5740,8 @@ function makeDashPanel(sig, el, cur) {
         return vals.map(function(v) { return SST_NAMES[Math.round(v - 0.5)] || ''; });
       };
       ax.grid.show = false;
+      ax.gap = 2;
+      ax.ticks = { size: 3, stroke: cssVar('--card-border'), width: 0.5 };
       return ax;
     }),
     cursor: {
