@@ -25,9 +25,10 @@
 A test that asserts a constant copied from the implementation passes forever,
 bug included.  This script plants a short list of *plausible* bugs — each one
 a mistake this code base has had, nearly had, or could have with a one-line
-slip — into a copy of main/, runs scripts/run_host_tests.sh against the copy,
-and reports which mutants the suite killed.  A surviving mutant is a hole in
-the tests, not (necessarily) a bug in the code.
+slip — into a copy of main/ (and components/uploader/), runs
+scripts/run_host_tests.sh against the copy, and reports which mutants the
+suite killed.  A surviving mutant is a hole in the tests, not (necessarily) a
+bug in the code.
 
 Two controls decide whether the numbers mean anything at all:
 
@@ -98,6 +99,17 @@ MUTANTS = [
      "if (tod < 43200) days -= 1;",
      "if (tod <= 43200) days -= 1;",
      "AS11-side noon put on the previous day"),
+    # Upload group parking.  The second is exactly the divergence the old
+    # Python-only model had: signed age keeps a group parked after a clock
+    # step backward instead of reviving it.
+    ("park-revive-boundary", "uploader/upload_park.h",
+     "return (uint32_t)(now_s - last_try_s) < UPLOAD_PARK_REVIVE_S;",
+     "return (uint32_t)(now_s - last_try_s) <= UPLOAD_PARK_REVIVE_S;",
+     "a parked group waits one second longer than the window says"),
+    ("park-age-signed", "uploader/upload_park.h",
+     "return (uint32_t)(now_s - last_try_s) < UPLOAD_PARK_REVIVE_S;",
+     "return (int64_t)now_s - (int64_t)last_try_s < (int64_t)UPLOAD_PARK_REVIVE_S;",
+     "after a clock step backward the group stays parked on a future timestamp"),
     # The StreamData gap policy.  Both of these are #279 in miniature: the
     # session is rendered as continuous breathing across a radio dropout.
     ("gap-split-boundary-off", "session_gap.h",
@@ -191,7 +203,9 @@ SUMMARY_RE = re.compile(r"^host tests: (\d+) run, (\d+) failed, (\d+) skipped$",
 
 def apply(mutant, main_dir):
     _, fname, find, repl, _ = mutant
-    path = os.path.join(main_dir, fname)
+    # "uploader/x" targets the copy of components/uploader beside main/.
+    base = os.path.dirname(main_dir) if fname.startswith("uploader/") else main_dir
+    path = os.path.join(base, fname)
     with open(path, encoding="utf-8") as f:
         src = f.read()
     n = src.count(find)
@@ -205,7 +219,8 @@ def apply(mutant, main_dir):
 def run_suite(main_dir, out_dir):
     """Returns (verdict, detail, output).  verdict: PASS, FAIL, BUILD-FAIL,
     INCONCLUSIVE (no summary line / timeout)."""
-    env = dict(os.environ, MAIN_DIR=main_dir, OUT=out_dir)
+    env = dict(os.environ, MAIN_DIR=main_dir, OUT=out_dir,
+               UPLOADER_DIR=os.path.join(os.path.dirname(main_dir), "uploader"))
     try:
         rc = subprocess.run([RUNNER, "--quiet"], env=env, cwd=ROOT,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -242,6 +257,9 @@ def main():
     def tree(mid):
         mdir = os.path.join(work, mid)
         shutil.copytree(src_main, os.path.join(mdir, "main"),
+                        ignore=shutil.ignore_patterns("*.o", "CMakeLists.txt"))
+        shutil.copytree(os.path.join(ROOT, "components", "uploader"),
+                        os.path.join(mdir, "uploader"),
                         ignore=shutil.ignore_patterns("*.o", "CMakeLists.txt"))
         return os.path.join(mdir, "main"), os.path.join(mdir, "out")
 

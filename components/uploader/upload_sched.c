@@ -26,6 +26,7 @@
 #include "upload_index.h"
 #include "upload_scan.h"
 #include "upload_ox.h"
+#include "upload_park.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,17 +52,8 @@ static const char *TAG = "up_sched";
 #define FAILS_BEFORE_SWITCH        2   /* then move to the next backend     */
 #define LEASE_WAIT_MS           5000
 
-/* Groups that fail this many times are parked: they no longer count toward
- * "pending", so one permanently bad file cannot keep its day on the upload
- * list forever.  The status stays UG_FAILED for the UI.  Parking is
- * time-limited: the check itself goes stale after UPLOAD_PARK_REVIVE_S, so a
- * transient server outage cannot strand a day, while a truly bad file costs
- * at most one send per window (last_try_s refreshes on every try, which
- * self-paces the retries).  A parked group also revives immediately when the
- * reconcile sees its file set change (status/attempts reset to pending) or
- * the day is invalidated. */
-#define UPLOAD_MAX_GROUP_ATTEMPTS    5
-#define UPLOAD_PARK_REVIVE_S     86400u   /* parked groups retry once a day */
+/* Group parking (UPLOAD_MAX_GROUP_ATTEMPTS, UPLOAD_PARK_REVIVE_S) lives in
+ * upload_park.h so the host test links the real decision. */
 
 /* Per-backend cooldown ladder, minutes. Reset on any success. */
 static const int COOLDOWN_MIN[] = { 1, 5, 15, 30, 60 };
@@ -145,17 +137,11 @@ static char    s_status[64] = "Starting up";
 static int64_t now_us(void) { return esp_timer_get_time(); }
 static uint32_t now_s(void) { return (uint32_t)time(NULL); }
 
-/* A group is parked once it has failed UPLOAD_MAX_GROUP_ATTEMPTS times —
- * until the parking goes stale, after which it gets one retry per window.
- * The wall-clock guard skips the staleness test while time is unsynced; a
- * 1970-era last_try_s (failure before NTP sync) reads as ancient and revives
- * immediately, which is the desired behaviour anyway. */
+/* See upload_park_active() in upload_park.h. */
 static bool group_parked(const upload_unit_t *u)
 {
-    if (u->status != UG_FAILED || u->attempts < UPLOAD_MAX_GROUP_ATTEMPTS)
-        return false;
-    if (now_s() < 1700000000u) return true;
-    return (now_s() - u->last_try_s) < UPLOAD_PARK_REVIVE_S;
+    return upload_park_active(u->status == UG_FAILED, u->attempts,
+                              u->last_try_s, now_s());
 }
 
 static void set_status(const char *fmt, ...)

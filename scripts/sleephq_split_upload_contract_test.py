@@ -66,10 +66,24 @@ import urllib.request
 
 BASE = "https://sleephq.com"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_MAX_GROUP_ATTEMPTS = 5        # mirrors upload_sched.c
-UPLOAD_PARK_REVIVE_S = 86400         # mirrors upload_sched.c
+PARK_HEADER = os.path.join(REPO, "components", "uploader", "upload_park.h")
+
+
+def _park_define(name):
+    """Read a parking constant from upload_park.h, so a retune in C cannot
+    leave this model on the old value.  The decision itself is tested
+    against the real header by scripts/upload_park_test.c."""
+    m = re.search(r"^#define\s+%s\s+(\d+)u?\b" % name,
+                  open(PARK_HEADER).read(), re.M)
+    if not m:
+        sys.exit(f"FAIL: {name} not found in {PARK_HEADER}")
+    return int(m.group(1))
+
+
+UPLOAD_MAX_GROUP_ATTEMPTS = _park_define("UPLOAD_MAX_GROUP_ATTEMPTS")
+UPLOAD_PARK_REVIVE_S = _park_define("UPLOAD_PARK_REVIVE_S")
+EPOCH_SYNCED_S = _park_define("UPLOAD_CLOCK_SYNCED_S")
 UPLOAD_THERAPY_GRACE_MS = 60 * 60 * 1000   # mirrors net_provision.c
-EPOCH_SYNCED_S = 1700000000          # clock guard in group_parked()
 
 # Standard ResMed group suffixes, matching kind_from_name() in upload_scan.c.
 GROUP_SUFFIXES = ("BRP", "PLD", "SA2", "EVE", "CSL")
@@ -82,17 +96,18 @@ GROUP_SUFFIXES = ("BRP", "PLD", "SA2", "EVE", "CSL")
 # model gets re-synced.
 
 def parked(group, now_s, clock_ok=True):
-    """group_parked(): parked until the parking itself goes stale.
+    """upload_park_active(): parked until the parking itself goes stale.
 
     While the wall clock is unsynced the group stays parked.  A 1970-era
     last_try (failure before NTP) reads as ancient and revives at once —
-    intentional, matching the C comment."""
+    intentional, matching the C comment.  The age is uint32_t in C, so a
+    last_try in the future (clock stepped back) wraps and revives."""
     if not (group["status"] == "failed"
             and group["attempts"] >= UPLOAD_MAX_GROUP_ATTEMPTS):
         return False
     if not clock_ok:
         return True
-    return (now_s - group["last_try"]) < UPLOAD_PARK_REVIVE_S
+    return ((now_s - group["last_try"]) & 0xFFFFFFFF) < UPLOAD_PARK_REVIVE_S
 
 
 def day_pending(groups, now_s, clock_ok=True):
@@ -297,6 +312,13 @@ def scenario_parked_revive():
     reconcile_file_change(groups[0])
     if run_day(groups, t + 2 * UPLOAD_PARK_REVIVE_S) != [FRAG1]:
         return "file-change reset did not revive the group"
+    # Clock stepped backward: last_try is in the future.  C's unsigned age
+    # wraps and revives (one early send) rather than trusting it.
+    g3 = make_group(FRAG2)
+    g3["status"], g3["attempts"], g3["last_try"] = \
+        "failed", UPLOAD_MAX_GROUP_ATTEMPTS, t + 3600
+    if parked(g3, t):
+        return "clock stepped back kept the group parked"
     return None
 
 
@@ -313,6 +335,7 @@ def check_source_flags():
     smb = read("components/uploader/uploader_smb.c")
     prov = read("main/net_provision.c")
     sdh = read("main/sd_storage.h")
+    park = read("components/uploader/upload_park.h")
 
     # The whole-day resend design is gone — there is no consumer left.
     for name, text in (("uploader.h", hdr), ("upload_sched.c", sched),
@@ -321,9 +344,10 @@ def check_source_flags():
             failures.append(f"{name} still references atomic_day")
 
     for needle, where, what in (
-            ("group_parked", sched, "staleness-aware park check"),
-            ("UPLOAD_PARK_REVIVE_S", sched, "parked-revive window"),
-            ("UPLOAD_MAX_GROUP_ATTEMPTS", sched, "attempt cap"),
+            ("upload_park_active(", sched, "scheduler uses the shared park rule"),
+            ("upload_park_active(", park, "staleness-aware park check"),
+            ("UPLOAD_PARK_REVIVE_S", park, "parked-revive window"),
+            ("UPLOAD_MAX_GROUP_ATTEMPTS", park, "attempt cap"),
             ("upload_capture_hold", prov, "capture-hold hook"),
             ("upload_sched_set_therapy_fn(upload_capture_hold)", prov,
              "gate wiring"),

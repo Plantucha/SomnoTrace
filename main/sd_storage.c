@@ -258,8 +258,18 @@ bool sd_storage_recording_active(void)
 
 int64_t sd_storage_ms_since_recording_end(void)
 {
-    if (s_rec_end_us < 0) return INT64_MAX;
-    return (esp_timer_get_time() - s_rec_end_us) / 1000;
+    /* int64_t is two 32-bit accesses on Xtensa; read under the writer's lock
+     * so a concurrent recording_end() cannot hand back a torn value. */
+    int64_t end_us;
+    if (s_lease_mutex) {
+        xSemaphoreTake(s_lease_mutex, portMAX_DELAY);
+        end_us = s_rec_end_us;
+        xSemaphoreGive(s_lease_mutex);
+    } else {
+        end_us = s_rec_end_us;
+    }
+    if (end_us < 0) return INT64_MAX;
+    return (esp_timer_get_time() - end_us) / 1000;
 }
 
 bool sd_storage_lease_acquire(sd_lease_t role, uint32_t timeout_ms)
