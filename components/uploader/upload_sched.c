@@ -53,12 +53,15 @@ static const char *TAG = "up_sched";
 
 /* Groups that fail this many times are parked: they no longer count toward
  * "pending", so one permanently bad file cannot keep its day on the upload
- * list forever.  Under atomic_day this matters twice over — every visit to
- * the day re-sends all of its healthy groups, so an unparked failure would
- * be a retry storm of full-day re-uploads.  The status stays UG_FAILED for
- * the UI.  A parked group revives when the reconcile sees its file set
- * change (status/attempts reset to pending) or the day is invalidated. */
+ * list forever.  The status stays UG_FAILED for the UI.  Parking is
+ * time-limited: the check itself goes stale after UPLOAD_PARK_REVIVE_S, so a
+ * transient server outage cannot strand a day, while a truly bad file costs
+ * at most one send per window (last_try_s refreshes on every try, which
+ * self-paces the retries).  A parked group also revives immediately when the
+ * reconcile sees its file set change (status/attempts reset to pending) or
+ * the day is invalidated. */
 #define UPLOAD_MAX_GROUP_ATTEMPTS    5
+#define UPLOAD_PARK_REVIVE_S     86400u   /* parked groups retry once a day */
 
 /* Per-backend cooldown ladder, minutes. Reset on any success. */
 static const int COOLDOWN_MIN[] = { 1, 5, 15, 30, 60 };
@@ -114,12 +117,15 @@ static upload_sched_busy_fn_t s_busy_fn;
 
 /* While this returns true the scheduler defers whole upload passes: a live
  * therapy session owns the 2.4 GHz front-end, and a Wi-Fi burst shares it
- * with the BLE links carrying the data.  Unlike s_busy_fn (which only skips
- * the SD-scan half of the tick) this also covers event-driven uploads —
- * pending groups simply accumulate in the index and the first post-therapy
- * pass sends them complete.  Reconciliation scans still run: they only read
- * the card, so a group finalized mid-therapy is already indexed when its
- * turn comes. */
+ * with the BLE links carrying the data.  The hook is a capture hold, not a
+ * snapshot of recording state — the implementation in net_provision.c also
+ * holds through a bounded grace after a timed-out session, so fragments of
+ * a therapy interrupted by a BLE dropout still leave in one import.
+ * Unlike s_busy_fn (which only skips the SD-scan half of the tick) this
+ * covers event-driven uploads too — pending groups simply accumulate in the
+ * index and the first unheld pass sends them complete.  Reconciliation
+ * scans still run: they only read the card, so a group finalized mid-
+ * therapy is already indexed when its turn comes. */
 static upload_sched_busy_fn_t s_therapy_fn;
 
 /* "Test connection" probe claim (#214.1), guarded by s_lock like s_rt.  The
@@ -138,6 +144,19 @@ static char    s_status[64] = "Starting up";
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 static uint32_t now_s(void) { return (uint32_t)time(NULL); }
+
+/* A group is parked once it has failed UPLOAD_MAX_GROUP_ATTEMPTS times —
+ * until the parking goes stale, after which it gets one retry per window.
+ * The wall-clock guard skips the staleness test while time is unsynced; a
+ * 1970-era last_try_s (failure before NTP sync) reads as ancient and revives
+ * immediately, which is the desired behaviour anyway. */
+static bool group_parked(const upload_unit_t *u)
+{
+    if (u->status != UG_FAILED || u->attempts < UPLOAD_MAX_GROUP_ATTEMPTS)
+        return false;
+    if (now_s() < 1700000000u) return true;
+    return (now_s() - u->last_try_s) < UPLOAD_PARK_REVIVE_S;
+}
 
 static void set_status(const char *fmt, ...)
 {
@@ -226,17 +245,15 @@ static bool run_backend(backend_rt_t *r, int max_days)
     for (int i = 0; i < n_index && i < max_days; i++) {
         upload_day_t *d = upload_index_day_at(i);
         if (!d) continue;
-        int pend = 0, sendable = 0;
+        int pend = 0;
         for (int g = 0; g < d->n_groups; g++) {
             const upload_unit_t *u = &d->groups[g].be[r->slot];
-            if (u->status == UG_FAILED && u->attempts >= UPLOAD_MAX_GROUP_ATTEMPTS)
-                continue;   /* parked — see UPLOAD_MAX_GROUP_ATTEMPTS */
+            if (group_parked(u)) continue;   /* see UPLOAD_MAX_GROUP_ATTEMPTS */
             if (u->status != UG_OK) pend++;
-            if (be->atomic_day || u->status != UG_OK) sendable++;
         }
         if (pend > 0) {
             days[n_days++] = d->day;
-            n_units += sendable;
+            n_units += pend;
         }
     }
 
@@ -390,20 +407,15 @@ static bool run_backend(backend_rt_t *r, int max_days)
             upload_group_t *g = upload_index_group(d, refs[gi].prefix_sec, false);
             if (!g) continue;
             upload_unit_t *u = &g->be[r->slot];
-            if (u->status == UG_FAILED && u->attempts >= UPLOAD_MAX_GROUP_ATTEMPTS)
-                continue;   /* parked — see UPLOAD_MAX_GROUP_ATTEMPTS */
-            if (!be->atomic_day && u->status == UG_OK) continue;
+            if (group_parked(u)) continue;   /* see UPLOAD_MAX_GROUP_ATTEMPTS */
+            /* Incremental only, verified on live SleepHQ: a later import
+             * reconciles an earlier lone fragment — sessions stay visible
+             * and usage sums exactly.  Resending UG_OK groups only burns
+             * bandwidth; re-uploaded boundary changes double-count. */
+            if (u->status == UG_OK) continue;
 
-            /* On an atomic_day backend a group that already succeeded is sent
-             * again: SleepHQ interprets a day's sessions through the STR.edf
-             * in the same import, so every visit must carry the complete day,
-             * not just the delta.  attempts stays a failure count — bumping
-             * it for a re-sent good file would erode UPLOAD_MAX_GROUP_ATTEMPTS
-             * bookkeeping — so only the first post-OK failure and every
-             * non-OK attempt count. */
-            bool was_ok = (u->status == UG_OK);
             res = be->put_group(daystr, &refs[gi]);
-            if (!was_ok) u->attempts++;
+            if (u->attempts < UINT8_MAX) u->attempts++;
             u->last_try_s = now_s();
 
             if (res == UPLOAD_OK) {

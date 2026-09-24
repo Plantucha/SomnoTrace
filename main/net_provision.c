@@ -68,6 +68,9 @@
 #include "cJSON.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/udp.h"
+#include "lwip/igmp.h"
+#include "esp_netif_net_stack.h"
 #include "psram_task.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -93,6 +96,20 @@ static const char *TAG = "netprov";
  * one dead SSID forever and never fails over. */
 #define RECONNECT_TRIES_BEFORE_RESCAN  5
 
+/* mDNS self-heal: the espressif/mdns component's link-event recovery is
+ * fire-and-forget (a dropped or failed enable action leaves the responder
+ * dead until reboot — see .ai/mdns-issue/INVESTIGATION.md).  We poll the
+ * observable lwIP end state and restart mdns on repeated failure. */
+#define MDNS_HEALTH_PERIOD_S   60
+#define MDNS_STABLE_MS         15000
+#define MDNS_RESTART_MIN_S     600
+#define MDNS_FAIL_STRIKES      2
+#define MDNS_UDP_PORT          5353
+#define MDNS_FAIL_NOT_UP       0x01
+#define MDNS_FAIL_EXEC         0x02
+#define MDNS_FAIL_IGMP         0x04
+#define MDNS_FAIL_PCB          0x08
+
 static EventGroupHandle_t s_wifi_events;
 static int s_retry_num = 0;
 static volatile bool s_connecting = false;
@@ -112,6 +129,18 @@ static volatile bool s_rescan_requested = false;
 /* Copy of the credentials kept for autonomous failover rescans. */
 static struct netprov_config s_link_cfg;
 static bool s_link_cfg_valid = false;
+
+/* mDNS watchdog state.  Written by link_sup, read by /api/status — 32-bit
+ * values are single-writer and atomic on Xtensa; millisecond stamps use
+ * wrap-safe unsigned subtraction. */
+static bool     s_mdns_managed;
+static bool     s_mdns_up;
+static uint32_t s_link_up_ms;
+static uint32_t s_mdns_restarts;
+static uint32_t s_mdns_last_fail_ms;
+static uint32_t s_mdns_last_restart_ms;
+static uint8_t  s_mdns_fail_streak;
+static uint8_t  s_mdns_last_reason;
 
 static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap = NULL;
@@ -269,6 +298,7 @@ static void link_mark_up(const char *ip)
 
     if (s_link_mutex) xSemaphoreTake(s_link_mutex, portMAX_DELAY);
     s_connected = true;
+    s_link_up_ms = (uint32_t)(esp_timer_get_time() / 1000);
     strlcpy(s_connected_ip, ip, sizeof(s_connected_ip));
     if (have_ap && ap) {
         strlcpy(s_link_ssid, (const char *)ap->ssid, sizeof(s_link_ssid));
@@ -457,6 +487,77 @@ static void mem_telemetry_tick(uint32_t *elapsed_s)
 }
 
 /* ------------------------------------------------------------------ */
+/*  mDNS watchdog: detect a dead responder and restart it              */
+/* ------------------------------------------------------------------ */
+/* Runs from link_sup (off the event loop).  The check reads the state the
+ * failure corrupts — the :5353 UDP PCB and the STA IGMP membership — inside
+ * the TCPIP thread, so it cannot false-fail on a healthy device. */
+static esp_err_t mdns_health_cb(void *ctx)
+{
+    uint8_t *fail = ctx;
+    struct netif *nif = esp_netif_get_netif_impl(s_netif_sta);
+    ip4_addr_t grp;
+    IP4_ADDR(&grp, 224, 0, 0, 251);
+    if (!nif || igmp_lookfor_group(nif, &grp) == NULL)
+        *fail |= MDNS_FAIL_IGMP;
+    bool bound = false;
+    for (struct udp_pcb *p = udp_pcbs; p; p = p->next) {
+        if (p->local_port == MDNS_UDP_PORT) {
+            bound = true;
+            break;
+        }
+    }
+    if (!bound) *fail |= MDNS_FAIL_PCB;
+    return ESP_OK;
+}
+
+static void mdns_start(void)
+{
+    s_mdns_up = mdns_init() == ESP_OK
+             && mdns_hostname_set(netprov_mdns_name_cached()) == ESP_OK
+             && mdns_service_add("SomnoTrace", "_http", "_tcp", 80, NULL, 0) == ESP_OK;
+    ESP_LOGI(TAG, "mDNS %s: %s.local",
+             s_mdns_up ? "started" : "start FAILED", netprov_mdns_name_cached());
+}
+
+static void mdns_health_tick(void)
+{
+    if (!s_mdns_managed || s_portal_mode || !s_connected) return;
+    if ((uint32_t)(esp_timer_get_time() / 1000) - s_link_up_ms < MDNS_STABLE_MS)
+        return;
+
+    uint8_t fail = s_mdns_up ? 0 : MDNS_FAIL_NOT_UP;
+    if (!fail && esp_netif_tcpip_exec(mdns_health_cb, &fail) != ESP_OK)
+        fail |= MDNS_FAIL_EXEC;
+
+    if (!fail) {
+        if (s_mdns_fail_streak) {
+            s_mdns_fail_streak = 0;
+            ESP_LOGI(TAG, "mDNS healthy again");
+        }
+        return;
+    }
+
+    s_mdns_last_reason = fail;
+    s_mdns_last_fail_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (++s_mdns_fail_streak < MDNS_FAIL_STRIKES) return;
+
+    if (s_mdns_last_restart_ms &&
+        s_mdns_last_fail_ms - s_mdns_last_restart_ms < MDNS_RESTART_MIN_S * 1000U)
+        return;                                     /* cooldown: stay down */
+    s_mdns_last_restart_ms = s_mdns_last_fail_ms;
+    s_mdns_restarts++;
+    /* mdns_free() vTaskDeletes the engine task outright if its stop action
+     * can't be queued; safe here since the action queue is idle on a stable
+     * link.  mdns_init() then enables the up interface synchronously,
+     * bypassing the droppable action queue that lost the original enable. */
+    ESP_LOGW(TAG, "mDNS unhealthy (reason=0x%x), restarting", fail);
+    mdns_free();
+    mdns_start();
+    s_mdns_fail_streak = 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Link supervisor: autonomous failover between configured networks   */
 /* ------------------------------------------------------------------ */
 /* esp_wifi_connect() only ever retries the SSID currently programmed into
@@ -468,9 +569,14 @@ static void link_supervisor_task(void *arg)
 {
     (void)arg;
     uint32_t mem_elapsed_s = 0;
+    uint32_t mdns_elapsed_s = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         mem_telemetry_tick(&mem_elapsed_s);
+        if (++mdns_elapsed_s >= MDNS_HEALTH_PERIOD_S) {
+            mdns_elapsed_s = 0;
+            mdns_health_tick();
+        }
 
         if (!s_rescan_requested || s_portal_mode || s_connected) continue;
         s_rescan_requested = false;
@@ -578,6 +684,7 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
         strlcpy(s_connected_ip, s_got_ip, sizeof(s_connected_ip));
         strlcpy(s_link_ssid, ssid, sizeof(s_link_ssid));
         s_connected = true;
+        s_link_up_ms = (uint32_t)(esp_timer_get_time() / 1000);
         if (s_link_mutex) xSemaphoreGive(s_link_mutex);
         s_reconnect_tries = 0;
         ESP_LOGI(TAG, "connected to '%s', ip=%s", ssid, ip_out);
@@ -1078,6 +1185,13 @@ cJSON *netprov_build_status_json(void)
     cJSON_AddStringToObject(resp, "tz_name", s_status_cache.tz_name);
     cJSON_AddStringToObject(resp, "ntp_server", s_status_cache.ntp_srv);
     cJSON_AddStringToObject(resp, "mdns_name", netprov_mdns_name_cached());
+    {
+        cJSON *md = cJSON_AddObjectToObject(resp, "mdns");
+        cJSON_AddBoolToObject(md, "ok", s_mdns_up);
+        cJSON_AddNumberToObject(md, "restarts", s_mdns_restarts);
+        cJSON_AddNumberToObject(md, "last_fail_s", s_mdns_last_fail_ms / 1000U);
+        cJSON_AddNumberToObject(md, "last_reason", s_mdns_last_reason);
+    }
     cJSON_AddBoolToObject(resp, "ntp_synced", time_sync_is_synced());
     const char *src_str = "none";
     switch (time_source_get()) {
@@ -3250,6 +3364,23 @@ static inline esp_err_t reg_uri(httpd_handle_t handle, const httpd_uri_t *uri_ha
     return err;
 }
 
+/* Hold upload passes while raw capture is live — or while a therapy session
+ * that lost BLE might still resume.  A timed-out session releases the
+ * recording flag but the display flag stays set, so the grace window keeps
+ * fragments of one therapy together (effective coverage is the 10-min stale
+ * timeout plus this).  An AS11 gone for good is released after the grace.
+ * The hold is a bandwidth/cleanliness choice, not a correctness one: a
+ * fragment that escapes it (long dropout, mid-therapy reboot) still
+ * reconciles when the next incremental import lands, so nothing beyond
+ * the grace is needed. */
+#define UPLOAD_THERAPY_GRACE_MS  (60LL * 60 * 1000)
+static bool upload_capture_hold(void)
+{
+    if (sd_storage_recording_active()) return true;
+    return bsp_display_is_therapy_active() &&
+           sd_storage_ms_since_recording_end() < UPLOAD_THERAPY_GRACE_MS;
+}
+
 static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
@@ -3272,10 +3403,11 @@ static esp_err_t start_webserver(void)
     /* Periodic upload scans yield to a live therapy recording; event-driven
      * uploads still run, since they matter more than a housekeeping scan. */
     upload_sched_set_busy_fn(sd_storage_recording_active);
-    /* Whole upload passes yield to a live therapy session too: the Wi-Fi
-     * burst shares the 2.4 GHz front-end with the BLE links carrying the
-     * data, and the night's complete-day upload is still correct afterwards. */
-    upload_sched_set_therapy_fn(bsp_display_is_therapy_active);
+    /* Whole upload passes yield to live capture too: the Wi-Fi burst shares
+     * the 2.4 GHz front-end with the BLE links carrying the data.  The hold
+     * also covers brief BLE dropouts, so fragments of an interrupted night
+     * leave together in one import — with no whole-day resend. */
+    upload_sched_set_therapy_fn(upload_capture_hold);
     /* Guards s_format_progress between format_sd_task and the progress handler.
      * Created here so it exists before any request can reach the handler. */
     if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
@@ -3610,7 +3742,7 @@ void netprov_start_link_supervisor(void)
 {
     static bool supervisor_started = false;
     if (supervisor_started) return;
-    psram_task_create(link_supervisor_task, "link_sup", 4096,
+    psram_task_create(link_supervisor_task, "link_sup", 6144,
                       NULL, 3, tskNO_AFFINITY, NULL, NULL);
     supervisor_started = true;
 }
@@ -3630,16 +3762,11 @@ esp_err_t netprov_start_connected_server(const char *ip)
      * failed reconnects to the current SSID. */
     netprov_start_link_supervisor();
 
-    /* Start mDNS so the device is reachable as <name>.local */
-    char mdns_name[MDNS_NAME_MAX];
-    netprov_get_mdns_name(mdns_name, sizeof(mdns_name));
-    if (mdns_init() == ESP_OK) {
-        mdns_hostname_set(mdns_name);
-        mdns_service_add("SomnoTrace", "_http", "_tcp", 80, NULL, 0);
-        ESP_LOGI(TAG, "mDNS started: %s.local", mdns_name);
-    } else {
-        ESP_LOGW(TAG, "mDNS init failed");
-    }
+    /* Start mDNS so the device is reachable as <name>.local.  From here on
+     * the link supervisor owns its health: if the responder dies (a dropped
+     * or failed enable action after a link flap), it is restarted. */
+    s_mdns_managed = true;
+    mdns_start();
 
     return start_webserver();
 }

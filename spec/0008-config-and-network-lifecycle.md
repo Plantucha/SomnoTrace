@@ -194,3 +194,7 @@ Previously-open questions, now resolved:
 - **AP security:** **open** SoftAP, for lowest onboarding friction.
 - **mDNS:** enabled in **STA / normal operation only** (`${hostname}.local`);
   **not** used in SoftAP mode.
+- **mDNS self-heal:** the link supervisor detects a dead responder (lost
+  UDP PCB / IGMP membership, e.g. after a link flap) and restarts mDNS —
+  60 s checks, two strikes, 10-minute restart cooldown. Health is exposed
+  in `/api/status` (`mdns.ok`, `mdns.restarts`, `mdns.last_reason`).

@@ -98,6 +98,17 @@ MUTANTS = [
      "if (tod < 43200) days -= 1;",
      "if (tod <= 43200) days -= 1;",
      "AS11-side noon put on the previous day"),
+    # The StreamData gap policy.  Both of these are #279 in miniature: the
+    # session is rendered as continuous breathing across a radio dropout.
+    ("gap-split-boundary-off", "session_gap.h",
+     "if (gap_ms >= SW_SPLIT_GAP_MS) return SW_GAP_SPLIT;",
+     "if (gap_ms > SW_SPLIT_GAP_MS) return SW_GAP_SPLIT;",
+     "a gap of exactly the threshold is padded instead of split"),
+    ("gap-pad-outranks-split", "session_gap.h",
+     "if (gap_ms >= SW_SPLIT_GAP_MS) return SW_GAP_SPLIT;\n    if (missing > 0)               return SW_GAP_PAD;",
+     "if (missing > 0)               return SW_GAP_PAD;\n    if (gap_ms >= SW_SPLIT_GAP_MS) return SW_GAP_SPLIT;",
+     "#279 restored: any long dropout has a positive notification count, so "
+     "padding wins and ~10 s of held waveform is written over the gap"),
     # The Gen1 FileList parser.  Both of these are the pre-extraction behaviour
     # of oximeter_legacy.c's static parse_file_list — i.e. bugs that shipped —
     # so they are regressions, not hypotheticals.

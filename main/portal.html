@@ -3832,6 +3832,29 @@ function getStageSlices() {
 
 function hasStageData() { return getStageSlices().length > 0; }
 
+/* Stage lookup for hover tooltip: returns {stage, name, color, conf} at timestamp ts. */
+function getStageAtTime(ts) {
+  var slices = getStageSlices();
+  for (var s = 0; s < slices.length; s++) {
+    var st = slices[s];
+    if (ts < st.t0 || ts >= st.t0 + st.n * st.epMs) continue;
+    var idx = Math.floor((ts - st.t0) / st.epMs);
+    if (idx >= 0 && idx < st.n) {
+      var v = st.stages[idx];
+      if (v <= 3) {
+        var names = ['Wake', 'Light', 'Deep', 'REM'];
+        return {
+          stage: v,
+          name: names[v],
+          color: SST_COLORS[v],
+          conf: st.conf ? st.conf[idx] : 255
+        };
+      }
+    }
+  }
+  return null;
+}
+
 /* Total time + share per sleep stage across all .sst slices, rendered as the
  * Sleep Stage legend chips (hypnogram order top→bottom: Wake, REM, Light,
  * Deep).  Only epochs overlapping the visible window are counted, so the
@@ -3883,9 +3906,11 @@ function refreshSleepStageTotals() {
   host.innerHTML = el ? el.innerHTML : '';
 }
 
-/* uPlot draw hook for the Sleep Stage panel: paints one filled block per
- * 30 s epoch in its stage row (AASM order top→bottom: Wake, REM, Light,
- * Deep).  Blocks are alpha-blended by epoch confidence. */
+/* uPlot draw hook for the Sleep Stage panel: paints continuous connected ribbon
+ * per stage in AASM order top→bottom: Wake, REM, Light, Deep.
+ * Contiguous epochs of the same stage are merged into unbroken blocks.
+ * Bars are vertically sized to 80% of lane height, and adjacent stages
+ * are linked by crisp hairline transition lines with vertical color gradients. */
 var SST_ROW_Y = [3, 1, 0, 2];           /* stage idx -> row: W=3 R=2 L=1 D=0 */
 var SST_COLORS = ['#f59e0b', '#93c5fd', '#1e3a8a', '#34d399'];  /* W,L,D,R */
 var SST_NAMES  = ['Deep', 'Light', 'REM', 'Wake'];              /* y 0.5..3.5 */
@@ -3896,29 +3921,90 @@ function hypnogramHook(u) {
   var ctx = u.ctx, pr = u.pxRatio || 1;
   var left = u.bbox.left, top = u.bbox.top, wid = u.bbox.width, hgt = u.bbox.height;
   var xmin = u.scales.x.min, xmax = u.scales.x.max;
+  var barRatio = 0.80;
+  var lineW = Math.max(1, Math.round(1.5 * pr));
+
   ctx.save();
   ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
+
   for (var s = 0; s < slices.length; s++) {
     var st = slices[s];
-    for (var i = 0; i < st.n; i++) {
+    var segs = [];
+    var i = 0;
+    while (i < st.n) {
       var v = st.stages[i];
-      if (v > 3) continue;
-      var t0 = st.t0 + i * st.epMs, t1 = t0 + st.epMs;
+      if (v > 3) { i++; continue; }
+      var startIdx = i;
+      while (i < st.n && st.stages[i] === v) {
+        i++;
+      }
+      var endIdx = i;
+      var t0 = st.t0 + startIdx * st.epMs;
+      var t1 = st.t0 + endIdx * st.epMs;
       if (t1 < xmin || t0 > xmax) continue;
       var x0 = u.valToPos(t0, 'x', true);
       var x1 = u.valToPos(t1, 'x', true);
       if (x1 - x0 < pr) x1 = x0 + pr;
-      var yRow = SST_ROW_Y[v];
-      var yTop = u.valToPos(yRow + 1, 'sleep', true);
-      var yBot = u.valToPos(yRow, 'sleep', true);
-      /* Confidence 0..255 -> alpha floor 0.45 so low-conf epochs stay visible
-       * but read as less certain. */
-      ctx.globalAlpha = 0.45 + 0.55 * (st.conf[i] / 255);
-      ctx.fillStyle = SST_COLORS[v];
-      ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
+      segs.push({
+        stage: v,
+        row: SST_ROW_Y[v],
+        x0: x0,
+        x1: x1,
+        startIdx: startIdx,
+        endIdx: endIdx
+      });
+    }
+
+    if (!segs.length) continue;
+
+    var yTop0 = u.valToPos(1, 'sleep', true);
+    var yBot0 = u.valToPos(0, 'sleep', true);
+    var rowH = Math.abs(yBot0 - yTop0);
+    var barH = rowH * barRatio;
+
+    /* Pass 1: Draw thin vertical gradient hairlines between adjacent stages */
+    for (var j = 0; j < segs.length - 1; j++) {
+      var s1 = segs[j], s2 = segs[j + 1];
+      if (s1.row === s2.row || s2.startIdx !== s1.endIdx) continue;
+
+      var x = s1.x1;
+      var yMid1 = u.valToPos(s1.row + 0.5, 'sleep', true);
+      var yMid2 = u.valToPos(s2.row + 0.5, 'sleep', true);
+
+      var yA = yMid1 < yMid2 ? (yMid1 - barH / 2) : (yMid1 + barH / 2);
+      var yB = yMid1 < yMid2 ? (yMid2 + barH / 2) : (yMid2 - barH / 2);
+      var topY = Math.min(yA, yB);
+      var botY = Math.max(yA, yB);
+
+      var minAdjW = Math.min(s1.x1 - s1.x0, s2.x1 - s2.x0);
+      var wLine = Math.max(pr, Math.min(lineW, minAdjW));
+
+      var grad = ctx.createLinearGradient(0, yMid1, 0, yMid2);
+      grad.addColorStop(0, SST_COLORS[s1.stage]);
+      grad.addColorStop(1, SST_COLORS[s2.stage]);
+
+      ctx.fillStyle = grad;
+      ctx.fillRect(Math.round(x - wLine / 2), topY, wLine, botY - topY);
+    }
+
+    /* Pass 2: Draw horizontal stage bars over the lines */
+    for (var k = 0; k < segs.length; k++) {
+      var seg = segs[k];
+      var yCenter = u.valToPos(seg.row + 0.5, 'sleep', true);
+      var yBarTop = yCenter - barH / 2;
+      var barW = Math.max(pr, seg.x1 - seg.x0);
+
+      ctx.fillStyle = SST_COLORS[seg.stage];
+      if (barW > 4 * pr && ctx.roundRect) {
+        ctx.beginPath();
+        ctx.roundRect(seg.x0, yBarTop, barW, barH, 2 * pr);
+        ctx.fill();
+      } else {
+        ctx.fillRect(seg.x0, yBarTop, barW, barH);
+      }
     }
   }
-  ctx.globalAlpha = 1;
+
   ctx.restore();
 }
 
@@ -5654,6 +5740,8 @@ function makeDashPanel(sig, el, cur) {
         return vals.map(function(v) { return SST_NAMES[Math.round(v - 0.5)] || ''; });
       };
       ax.grid.show = false;
+      ax.gap = 2;
+      ax.ticks = { size: 3, stroke: cssVar('--card-border'), width: 0.5 };
       return ax;
     }),
     cursor: {
@@ -5840,6 +5928,27 @@ function dashShowTip(chart, over, sig, clientX, clientY) {
    * right edge.  We then linear-scan for the nearest non-null data point. */
   var targetTs = chart.posToVal(cx, 'x');
   if (targetTs == null || isNaN(targetTs)) { tip.style.display = 'none'; return; }
+
+  /* Hypnogram tooltip: resolve sleep stage and confidence directly from .sst */
+  if (sig.key === 'sleep') {
+    var stg = getStageAtTime(targetTs);
+    if (!stg) { tip.style.display = 'none'; return; }
+    var stgSwatch = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + stg.color + ';margin-right:5px"></span>';
+    var confPct = Math.round(stg.conf * 100 / 255);
+    var stgHtml = stgSwatch + 'Stage: <b>' + stg.name + '</b> <span style="opacity:.7;font-size:0.75rem">(' + confPct + '% conf)</span>';
+    tip.innerHTML = stgHtml + '<div style="opacity:.6;margin-top:2px">' + dashTimeFmt(chart)(targetTs) + '</div>';
+    tip.style.display = 'block';
+    var tW = tip.offsetWidth, tH = tip.offsetHeight;
+    var lPx = rect.left + cx + 12;
+    if (lPx + tW > window.innerWidth) lPx = rect.left + cx - 12 - tW;
+    if (lPx < 0) lPx = 0;
+    var tPx = rect.top + cy - 40;
+    if (tPx < 0) tPx = rect.top + cy + 12;
+    tip.style.left = (window.pageXOffset + lPx) + 'px';
+    tip.style.top = (window.pageYOffset + tPx) + 'px';
+    return;
+  }
+
   var data = chart.data;
   var bestIdx = -1, bestDist = Infinity;
   for (var i = 0; i < data[0].length; i++) {

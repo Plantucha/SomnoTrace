@@ -24,6 +24,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #define SD_MOUNT_POINT   "/somnotrace"
@@ -105,6 +106,12 @@ typedef enum {
 void sd_storage_recording_begin(void);
 void sd_storage_recording_end(void);
 bool sd_storage_recording_active(void);
+
+/* Milliseconds since the last recording_end() call (monotonic, so SNTP
+ * steps cannot skew it), or INT64_MAX if recording never ended.  Used by
+ * the upload capture-hold gate to cover BLE dropouts after a timed-out
+ * session while therapy may still resume. */
+int64_t sd_storage_ms_since_recording_end(void);
 
 /* Acquire/release a storage lease.  timeout_ms may be 0 to fail fast.
  * Returns false if the lease could not be acquired (busy, or refused

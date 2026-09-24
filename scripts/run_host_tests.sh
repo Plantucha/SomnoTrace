@@ -148,6 +148,7 @@ run_test as11_time_test    -I"$SHIM" -I"$MAIN_DIR" scripts/as11_time_test.c "$MA
 run_test as11_events_test  -I"$SHIM" -I"$MAIN_DIR" scripts/as11_events_test.c "$MAIN_DIR/as11_events.c"
 run_test vld3_decoder_test -I"$SHIM" -I"$MAIN_DIR" scripts/vld3_decoder_test.c "$MAIN_DIR/oximetry_vld3.c"
 run_test oxyii_trailer_test -I"$SHIM" -I"$MAIN_DIR" scripts/oxyii_trailer_test.c "$MAIN_DIR/oxyii_trailer.c"
+run_test session_gap_test -I"$SHIM" -I"$MAIN_DIR" scripts/session_gap_test.c
 run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_test.c "$MAIN_DIR/legacy_file_list.c"
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test as11_adv_test       -I"$SHIM" -I"$MAIN_DIR" scripts/as11_adv_test.c "$MAIN_DIR/as11_adv.c"
@@ -178,14 +179,15 @@ fi
 # no test could ever kill. Needs no compiler, so it runs wherever python3 does.
 if command -v python3 >/dev/null 2>&1; then
     run_check mutate_host_self_test python3 scripts/mutate_host.py --self-test
-    # In-process SleepHQ contract check (no network): the atomic_day policy
-    # must keep a split night's day self-complete under either server-side
-    # reconcile semantics, and the parked-group guard must stop retry storms.
-    run_check sleephq_atomic_day_contract_test \
-        python3 scripts/sleephq_atomic_day_contract_test.py
+    # In-process SleepHQ contract check (no network): the capture-hold gate
+    # must keep a split night's fragments together in one incremental import
+    # under either server-side reconcile semantics, and the parked-group
+    # guard must bound retries without stranding a day.
+    run_check sleephq_split_upload_contract_test \
+        python3 scripts/sleephq_split_upload_contract_test.py
 else
     skip_test mutate_host_self_test "no python3"
-    skip_test sleephq_atomic_day_contract_test "no python3"
+    skip_test sleephq_split_upload_contract_test "no python3"
 fi
 
 # somno_ml_test is a parity harness for the SomnoStage C runtime.  Its

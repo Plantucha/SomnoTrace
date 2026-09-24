@@ -47,6 +47,7 @@ sensor:
       - battery
       - alert
       - uptime
+      - mdns
     value_template: "{{ value_json.ble.state }}"
 
   - platform: template

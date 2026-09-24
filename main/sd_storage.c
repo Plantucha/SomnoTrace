@@ -26,10 +26,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <dirent.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
@@ -64,6 +66,7 @@ static SemaphoreHandle_t s_lease_mutex = NULL;   /* guards the counters  */
 static SemaphoreHandle_t s_export_sem = NULL;    /* EXPORT/DESTRUCTIVE   */
 static volatile int s_recording = 0;
 static volatile int s_uploading = 0;
+static volatile int64_t s_rec_end_us = -1;   /* last recording_end, -1 = never */
 
 static void lease_init_once(void)
 {
@@ -237,15 +240,26 @@ void sd_storage_recording_begin(void)
 
 void sd_storage_recording_end(void)
 {
-    if (!s_lease_mutex) { if (s_recording > 0) s_recording--; return; }
+    if (!s_lease_mutex) {
+        if (s_recording > 0) s_recording--;
+        s_rec_end_us = esp_timer_get_time();
+        return;
+    }
     xSemaphoreTake(s_lease_mutex, portMAX_DELAY);
     if (s_recording > 0) s_recording--;
+    s_rec_end_us = esp_timer_get_time();
     xSemaphoreGive(s_lease_mutex);
 }
 
 bool sd_storage_recording_active(void)
 {
     return s_recording > 0;
+}
+
+int64_t sd_storage_ms_since_recording_end(void)
+{
+    if (s_rec_end_us < 0) return INT64_MAX;
+    return (esp_timer_get_time() - s_rec_end_us) / 1000;
 }
 
 bool sd_storage_lease_acquire(sd_lease_t role, uint32_t timeout_ms)

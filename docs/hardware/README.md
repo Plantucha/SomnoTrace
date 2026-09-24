@@ -152,6 +152,18 @@ VBAT/3.  Key constraints and mitigations:
   rescan itself is blocking (~1–2 s active scan) and runs off the event
   loop in the supervisor task.
 
+- **mDNS self-heal.** The `espressif/mdns` component's link-event
+  recovery is fire-and-forget: if the enable action after a disconnect
+  is dropped or fails, the responder (`<hostname>.local`) stays dead
+  until reboot while everything else keeps working.  `link_sup` checks
+  every 60 s (STA-connected, link stable ≥ 15 s, not SoftAP) that the
+  `:5353` UDP PCB exists and the IGMP membership is held; after two
+  failed checks it runs `mdns_free()` + re-init, at most once per
+  10 minutes.  State is exposed in `/api/status` under `mdns`
+  (`ok`, `restarts`, `last_fail_s`, `last_reason`).  The component is
+  pinned to exactly `1.11.3` — the analysis behind the checks is
+  version-specific.
+
 ## Further reading (fetch only if needed)
 
 - Main docs: <https://docs.waveshare.com/ESP32-S3-Touch-LCD-1.54>
