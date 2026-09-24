@@ -149,6 +149,7 @@ run_test as11_events_test  -I"$SHIM" -I"$MAIN_DIR" scripts/as11_events_test.c "$
 run_test vld3_decoder_test -I"$SHIM" -I"$MAIN_DIR" scripts/vld3_decoder_test.c "$MAIN_DIR/oximetry_vld3.c"
 run_test oxyii_trailer_test -I"$SHIM" -I"$MAIN_DIR" scripts/oxyii_trailer_test.c "$MAIN_DIR/oxyii_trailer.c"
 run_test session_gap_test -I"$SHIM" -I"$MAIN_DIR" scripts/session_gap_test.c
+run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_test.c "$MAIN_DIR/legacy_file_list.c"
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test as11_adv_test       -I"$SHIM" -I"$MAIN_DIR" scripts/as11_adv_test.c "$MAIN_DIR/as11_adv.c"
 
