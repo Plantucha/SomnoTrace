@@ -284,8 +284,20 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .dash-stats-tbl th,.dash-stats-tbl td{text-align:right;padding:3px 6px}
 .dash-stats-tbl th:first-child,.dash-stats-tbl td:first-child{text-align:left;color:var(--text-muted)}
 .dash-stats-tbl thead th{color:var(--text-muted);font-weight:600;border-bottom:1px solid var(--card-border)}
-.dash-sessions-popover{position:absolute;top:calc(100% + 4px);left:0;z-index:100;background:var(--card-bg);border:1px solid var(--card-border);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.35);padding:8px 12px;min-width:210px;font-size:.78rem;font-weight:400;color:var(--text);line-height:1.5;white-space:nowrap}
+.dash-sessions-popover{position:absolute;top:calc(100% + 4px);left:0;z-index:100;background:var(--card-bg);border:1px solid var(--card-border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.45);padding:10px 14px;min-width:270px;font-size:.78rem;font-weight:400;color:var(--text);line-height:1.5;white-space:nowrap}
+.dash-sessions-popover::before{content:'';position:absolute;top:-6px;left:0;right:0;height:6px}
 .dash-sessions-clickable{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px}
+.dash-sessions-clickable:hover{color:var(--text)}
+.dash-session-row{cursor:pointer;padding:5px 8px;margin:2px -8px;border-radius:6px;display:flex;align-items:center;gap:7px;transition:background .15s ease,color .15s ease}
+.dash-session-row:hover{background:rgba(59,130,246,0.16)}
+.dash-session-row:hover .dash-session-link{color:#93c5fd}
+.dash-session-row:hover .dash-session-icon{color:#60a5fa}
+.dash-session-icon{flex:none;color:#60a5fa;display:flex;align-items:center}
+.dash-session-link{color:#60a5fa;font-weight:600;text-decoration:underline;text-underline-offset:2.5px;flex:none}
+.dash-session-meta{color:var(--text);white-space:nowrap}
+.dash-session-dur{color:var(--text-muted);font-size:.74rem;margin-left:3px}
+.dash-session-divider{border-top:1px solid var(--card-border);margin:6px -8px 4px;padding-top:5px}
+#dash-chart-stack{scroll-margin-top:64px}
 /* Chart zoom/pan toolbar. Desktop: sticky just under the sticky 56px header so
  * it stays in view while scrolling the tall panel stack. Mobile: fixed
  * bottom-right for thumb reach (won't scroll away). */
@@ -3657,7 +3669,6 @@ function renderCalendar() {
   el.innerHTML = html;
 }
 
-/* Close the calendar and sessions popover when clicking outside */
 /* Close the calendar and sessions popover when clicking/tapping outside */
 function closePopoversIfOutside(e) {
   var cal = document.getElementById('dash-calendar');
@@ -3668,31 +3679,56 @@ function closePopoversIfOutside(e) {
   var pop = document.getElementById('dash-sessions-popover');
   if (pop && pop.style.display !== 'none') {
     var wrap = e.target.closest ? e.target.closest('.dash-sessions-wrap') : null;
-    if (!wrap) pop.style.display = 'none';
+    if (!wrap) hideSessionsPopover(true);
   }
 }
 document.addEventListener('click', closePopoversIfOutside);
 document.addEventListener('pointerdown', closePopoversIfOutside);
 
+var sessPopPinned = false;
+var sessPopTimer = null;
+
+function hideSessionsPopover(force) {
+  if (sessPopTimer) { clearTimeout(sessPopTimer); sessPopTimer = null; }
+  if (force) sessPopPinned = false;
+  if (!sessPopPinned) {
+    var pop = document.getElementById('dash-sessions-popover');
+    if (pop) pop.style.display = 'none';
+  }
+}
+
+function showSessionsPopover() {
+  if (sessPopTimer) { clearTimeout(sessPopTimer); sessPopTimer = null; }
+  var pop = document.getElementById('dash-sessions-popover');
+  if (pop && dashSessions && dashSessions.length >= 1) pop.style.display = 'block';
+}
+
 function toggleSessionsPopover(e) {
   if (e && e.stopPropagation) e.stopPropagation();
+  if (sessPopTimer) { clearTimeout(sessPopTimer); sessPopTimer = null; }
   var pop = document.getElementById('dash-sessions-popover');
   if (!pop || !dashSessions || dashSessions.length === 0) return;
-  pop.style.display = (pop.style.display === 'none' || !pop.style.display) ? 'block' : 'none';
+  sessPopPinned = !sessPopPinned;
+  pop.style.display = sessPopPinned ? 'block' : 'none';
 }
 
 var sessWrap = document.querySelector('.dash-sessions-wrap');
 if (sessWrap) {
-  /* Mouse-only hover preview; touch devices use click/tap */
+  /* Mouse hover preview on desktop; click/tap pins or toggles */
   sessWrap.addEventListener('pointerenter', function(e) {
     if (e.pointerType && e.pointerType !== 'mouse') return;
-    var pop = document.getElementById('dash-sessions-popover');
-    if (pop && dashSessions && dashSessions.length >= 1) pop.style.display = 'block';
+    showSessionsPopover();
   });
   sessWrap.addEventListener('pointerleave', function(e) {
     if (e.pointerType && e.pointerType !== 'mouse') return;
-    var pop = document.getElementById('dash-sessions-popover');
-    if (pop) pop.style.display = 'none';
+    if (sessPopPinned) return;
+    if (sessPopTimer) clearTimeout(sessPopTimer);
+    sessPopTimer = setTimeout(function() {
+      if (!sessPopPinned) {
+        var pop = document.getElementById('dash-sessions-popover');
+        if (pop) pop.style.display = 'none';
+      }
+    }, 250);
   });
 }
 
@@ -4835,7 +4871,8 @@ function clearSummary() {
   ['stat-ahi-badge','stat-usage-badge','stat-leak-badge','stat-press-badge'].forEach(function(id){
     setBadge(id, 'badge-gray', '--');
   });
-  var pop = document.getElementById('dash-sessions-popover'); if (pop) { pop.style.display = 'none'; pop.innerHTML = ''; }
+  hideSessionsPopover(true);
+  var pop = document.getElementById('dash-sessions-popover'); if (pop) pop.innerHTML = '';
   var s = document.getElementById('dash-summary'); if (s) s.style.display = 'none';
 }
 var dashSummary = null;   /* last /api/summary response for the current day */
@@ -5032,20 +5069,35 @@ function renderSummary() {
       sc.className = 'dash-summary-sessions dash-sessions-clickable';
       if (pop) {
         var hdr = count === 1 ? 'Session for this day' : 'Sessions for this day (' + count + ')';
-        pop.innerHTML = '<div style="font-weight:600;margin-bottom:4px;color:var(--text)">' + hdr + '</div>' +
+        var zoomIcon = '<span class="dash-session-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg></span>';
+        var allIcon = '<span style="display:flex;align-items:center;color:var(--text-muted)"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg></span>';
+        pop.innerHTML =
+          '<div style="font-weight:600;margin-bottom:8px;color:var(--text);display:flex;align-items:center;gap:6px">' +
+            '<span>' + hdr + '</span>' +
+            '<span style="color:var(--card-border)">|</span>' +
+            '<span style="color:#60a5fa;font-weight:600;font-size:.76rem">Zoom to:</span>' +
+          '</div>' +
           dashSessions.map(function(s, i) {
             var durMin = Math.round(((s.end_epoch_ms || 0) - (s.start_epoch_ms || 0)) / 60000);
-            var prefix = count === 1 ? '• ' : '• <strong>Session ' + (i + 1) + ':</strong> ';
-            return '<div style="padding:2px 0">' + prefix +
-                   fmtTime(s.start_epoch_ms) + ' – ' + fmtTime(s.end_epoch_ms) +
-                   ' (' + fmtUsage(durMin) + (s.partial ? '<span style="color:var(--danger)"> · incomplete</span>' : '') + ')</div>';
-          }).join('');
+            var sName = 'Session ' + (i + 1);
+            return '<div class="dash-session-row" title="Zoom to ' + sName + '" onclick="dashZoomToSession(' + i + ')">' +
+                   zoomIcon +
+                   '<span class="dash-session-link">' + sName + '</span>' +
+                   '<span class="dash-session-meta">' + fmtTime(s.start_epoch_ms) + ' – ' + fmtTime(s.end_epoch_ms) +
+                   '<span class="dash-session-dur">(' + fmtUsage(durMin) + (s.partial ? '<span style="color:var(--danger)"> · incomplete</span>' : '') + ')</span></span></div>';
+          }).join('') +
+          '<div class="dash-session-divider"></div>' +
+          '<div class="dash-session-row" title="Show the whole day" onclick="dashZoomWholeDay()">' +
+            '<span class="dash-session-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg></span>' +
+            '<span class="dash-session-link">View whole day</span>' +
+          '</div>';
       }
       sc.textContent = txt;
     } else {
       sc.className = 'dash-summary-sessions';
       sc.textContent = '';
-      if (pop) { pop.style.display = 'none'; pop.innerHTML = ''; }
+      hideSessionsPopover(true);
+      if (pop) pop.innerHTML = '';
     }
   }
 
@@ -5611,6 +5663,39 @@ function dashApplyXRange(min, max) {
   if (max - min >= full.max - full.min - 1000) { dashXRange = null; }
   else { dashXRange = {min: min, max: max}; }
   updateDashView();
+}
+
+/* Zoom every panel to one session's exact window. Uses the AS11 gating window when
+ * it has loaded (same source dashFullRange prefers), else the manifest times.
+ * Reset zoom or "View whole day" restores the full range. */
+function dashZoomToSession(i) {
+  var s = dashSessions && dashSessions[i];
+  if (!s || !s.start_epoch_ms) return;
+  var d = dashSessionData && dashSessionData[i];
+  var gate = d && d.gate;
+  var st = (gate && gate.start != null) ? gate.start : s.start_epoch_ms;
+  var en = (gate && gate.end != null) ? gate.end
+                                     : (s.end_epoch_ms || s.start_epoch_ms);
+  if (en <= st) {
+    if (s.end_epoch_ms && s.end_epoch_ms > st) en = s.end_epoch_ms;
+    else return;
+  }
+  var full = dashFullRange();
+  if (full) {
+    st = Math.max(full.min, st);
+    en = Math.min(full.max, en);
+  }
+  dashApplyXRange(st, en);
+  hideSessionsPopover(true);
+  var stack = document.getElementById('dash-chart-stack');
+  if (stack && stack.scrollIntoView) stack.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+function dashZoomWholeDay() {
+  dashboardZoomReset();
+  hideSessionsPopover(true);
+  var stack = document.getElementById('dash-chart-stack');
+  if (stack && stack.scrollIntoView) stack.scrollIntoView({behavior: 'smooth', block: 'start'});
 }
 
 /* Choose a time formatter based on the current x span (seconds shown when
@@ -6221,8 +6306,8 @@ function dashboardZoomOut() {
   var cur = dashXRange || full;
   var span = cur.max - cur.min;
   var center = (cur.min + cur.max) / 2;
-  var newSpan = Math.min((full.max - full.min) * 1.5, span * 1.35);
-  if (newSpan >= full.max - full.min || span/60000 >= 180) {
+  var newSpan = span * 1.35;
+  if (newSpan >= (full.max - full.min) - 1000) {
     dashboardZoomReset();
     return;
   }
