@@ -3832,6 +3832,29 @@ function getStageSlices() {
 
 function hasStageData() { return getStageSlices().length > 0; }
 
+/* Stage lookup for hover tooltip: returns {stage, name, color, conf} at timestamp ts. */
+function getStageAtTime(ts) {
+  var slices = getStageSlices();
+  for (var s = 0; s < slices.length; s++) {
+    var st = slices[s];
+    if (ts < st.t0 || ts >= st.t0 + st.n * st.epMs) continue;
+    var idx = Math.floor((ts - st.t0) / st.epMs);
+    if (idx >= 0 && idx < st.n) {
+      var v = st.stages[idx];
+      if (v <= 3) {
+        var names = ['Wake', 'Light', 'Deep', 'REM'];
+        return {
+          stage: v,
+          name: names[v],
+          color: SST_COLORS[v],
+          conf: st.conf ? st.conf[idx] : 255
+        };
+      }
+    }
+  }
+  return null;
+}
+
 /* Total time + share per sleep stage across all .sst slices, rendered as the
  * Sleep Stage legend chips (hypnogram order top→bottom: Wake, REM, Light,
  * Deep).  Only epochs overlapping the visible window are counted, so the
@@ -3883,9 +3906,10 @@ function refreshSleepStageTotals() {
   host.innerHTML = el ? el.innerHTML : '';
 }
 
-/* uPlot draw hook for the Sleep Stage panel: paints one filled block per
- * 30 s epoch in its stage row (AASM order top→bottom: Wake, REM, Light,
- * Deep).  Blocks are alpha-blended by epoch confidence. */
+/* uPlot draw hook for the Sleep Stage panel: paints continuous solid blocks
+ * per stage in AASM order top→bottom: Wake, REM, Light, Deep.
+ * Contiguous epochs of the same stage are merged into a single unbroken
+ * block, eliminating moiré patterns and subpixel aliasing. */
 var SST_ROW_Y = [3, 1, 0, 2];           /* stage idx -> row: W=3 R=2 L=1 D=0 */
 var SST_COLORS = ['#f59e0b', '#93c5fd', '#1e3a8a', '#34d399'];  /* W,L,D,R */
 var SST_NAMES  = ['Deep', 'Light', 'REM', 'Wake'];              /* y 0.5..3.5 */
@@ -3900,10 +3924,17 @@ function hypnogramHook(u) {
   ctx.beginPath(); ctx.rect(left, top, wid, hgt); ctx.clip();
   for (var s = 0; s < slices.length; s++) {
     var st = slices[s];
-    for (var i = 0; i < st.n; i++) {
+    var i = 0;
+    while (i < st.n) {
       var v = st.stages[i];
-      if (v > 3) continue;
-      var t0 = st.t0 + i * st.epMs, t1 = t0 + st.epMs;
+      if (v > 3) { i++; continue; }
+      var startIdx = i;
+      while (i < st.n && st.stages[i] === v) {
+        i++;
+      }
+      var endIdx = i;
+      var t0 = st.t0 + startIdx * st.epMs;
+      var t1 = st.t0 + endIdx * st.epMs;
       if (t1 < xmin || t0 > xmax) continue;
       var x0 = u.valToPos(t0, 'x', true);
       var x1 = u.valToPos(t1, 'x', true);
@@ -3911,14 +3942,10 @@ function hypnogramHook(u) {
       var yRow = SST_ROW_Y[v];
       var yTop = u.valToPos(yRow + 1, 'sleep', true);
       var yBot = u.valToPos(yRow, 'sleep', true);
-      /* Confidence 0..255 -> alpha floor 0.45 so low-conf epochs stay visible
-       * but read as less certain. */
-      ctx.globalAlpha = 0.45 + 0.55 * (st.conf[i] / 255);
       ctx.fillStyle = SST_COLORS[v];
       ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
     }
   }
-  ctx.globalAlpha = 1;
   ctx.restore();
 }
 
@@ -5840,6 +5867,27 @@ function dashShowTip(chart, over, sig, clientX, clientY) {
    * right edge.  We then linear-scan for the nearest non-null data point. */
   var targetTs = chart.posToVal(cx, 'x');
   if (targetTs == null || isNaN(targetTs)) { tip.style.display = 'none'; return; }
+
+  /* Hypnogram tooltip: resolve sleep stage and confidence directly from .sst */
+  if (sig.key === 'sleep') {
+    var stg = getStageAtTime(targetTs);
+    if (!stg) { tip.style.display = 'none'; return; }
+    var stgSwatch = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:' + stg.color + ';margin-right:5px"></span>';
+    var confPct = Math.round(stg.conf * 100 / 255);
+    var stgHtml = stgSwatch + 'Stage: <b>' + stg.name + '</b> <span style="opacity:.7;font-size:0.75rem">(' + confPct + '% conf)</span>';
+    tip.innerHTML = stgHtml + '<div style="opacity:.6;margin-top:2px">' + dashTimeFmt(chart)(targetTs) + '</div>';
+    tip.style.display = 'block';
+    var tW = tip.offsetWidth, tH = tip.offsetHeight;
+    var lPx = rect.left + cx + 12;
+    if (lPx + tW > window.innerWidth) lPx = rect.left + cx - 12 - tW;
+    if (lPx < 0) lPx = 0;
+    var tPx = rect.top + cy - 40;
+    if (tPx < 0) tPx = rect.top + cy + 12;
+    tip.style.left = (window.pageXOffset + lPx) + 'px';
+    tip.style.top = (window.pageYOffset + tPx) + 'px';
+    return;
+  }
+
   var data = chart.data;
   var bestIdx = -1, bestDist = Infinity;
   for (var i = 0; i < data[0].length; i++) {
