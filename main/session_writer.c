@@ -58,6 +58,7 @@
  * ──────────────────────────────────────────────────────────────────── */
 
 #include "session_writer.h"
+#include "session_gap.h"
 #include "sd_storage.h"
 #include "as11_ble.h"
 #include "bsp_display.h"
@@ -152,11 +153,8 @@ typedef struct __attribute__((packed)) {
 #define SW_STALE_TIMEOUT_MS     600000   /* 10 min */
 #endif
 
-/* A StreamData discontinuity at least this long is not compensated — the
- * session is split so the gap is never rendered as continuous samples. */
-#ifndef SW_SPLIT_GAP_MS
-#define SW_SPLIT_GAP_MS         10000    /* 10 s */
-#endif
+/* SW_SPLIT_GAP_MS and the gap policy it belongs to live in session_gap.h, so
+ * the pad ceiling and the split threshold cannot drift apart again (#279). */
 
 /* Ignore a repeated TherapyStart this soon after a session started; it is
  * an echo, not a new therapy cycle. */
@@ -2095,9 +2093,10 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     if (cur_stream_ms >= 0 && s->prev_stream_ms_valid) {
         gap = cur_stream_ms - s->prev_stream_ms;
         if (gap < 0) gap += 86400000;
-        if (gap > 280) {
-            int missing = (int)((gap - 100) / 200);
-            if (missing > 0 && gap < SW_SPLIT_GAP_MS) {
+        int missing = 0;
+        sw_gap_action_t action = sw_gap_action(gap, &missing);
+        if (action != SW_GAP_NONE) {
+            if (action == SW_GAP_PAD) {
                 ESP_LOGW(TAG, "StreamData gap: %lldms (%d missing notifications), "
                          "inserting compensation", (long long)gap, missing);
                 s->gap_events++;
@@ -2143,7 +2142,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
                         s->pld_countdown--;
                     }
                 }
-            } else if (gap >= SW_SPLIT_GAP_MS) {
+            } else if (action == SW_GAP_SPLIT) {
                 /* Uncompensated discontinuity — record it honestly. */
                 int64_t offset_ms = s->start_epoch_ms > 0
                     ? (esp_timer_get_time() - s->start_time_us) / 1000 : 0;
