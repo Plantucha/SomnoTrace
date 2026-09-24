@@ -177,14 +177,15 @@ fi
 # no test could ever kill. Needs no compiler, so it runs wherever python3 does.
 if command -v python3 >/dev/null 2>&1; then
     run_check mutate_host_self_test python3 scripts/mutate_host.py --self-test
-    # In-process SleepHQ contract check (no network): the atomic_day policy
-    # must keep a split night's day self-complete under either server-side
-    # reconcile semantics, and the parked-group guard must stop retry storms.
-    run_check sleephq_atomic_day_contract_test \
-        python3 scripts/sleephq_atomic_day_contract_test.py
+    # In-process SleepHQ contract check (no network): the capture-hold gate
+    # must keep a split night's fragments together in one incremental import
+    # under either server-side reconcile semantics, and the parked-group
+    # guard must bound retries without stranding a day.
+    run_check sleephq_split_upload_contract_test \
+        python3 scripts/sleephq_split_upload_contract_test.py
 else
     skip_test mutate_host_self_test "no python3"
-    skip_test sleephq_atomic_day_contract_test "no python3"
+    skip_test sleephq_split_upload_contract_test "no python3"
 fi
 
 # somno_ml_test is a parity harness for the SomnoStage C runtime.  Its

@@ -1114,7 +1114,6 @@ const upload_backend_t sleephq_backend = {
     .id = "sleephq",
     .label = "SleepHQ Cloud",
     .bundle_only_ok = false,    /* would create an import with no sessions */
-    .atomic_day = true,         /* every import must carry the complete day */
     .is_configured = shq_is_configured,
     .session_begin = shq_session_begin,
     .day_begin = shq_day_begin,

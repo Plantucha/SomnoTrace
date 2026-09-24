@@ -3250,6 +3250,23 @@ static inline esp_err_t reg_uri(httpd_handle_t handle, const httpd_uri_t *uri_ha
     return err;
 }
 
+/* Hold upload passes while raw capture is live — or while a therapy session
+ * that lost BLE might still resume.  A timed-out session releases the
+ * recording flag but the display flag stays set, so the grace window keeps
+ * fragments of one therapy together (effective coverage is the 10-min stale
+ * timeout plus this).  An AS11 gone for good is released after the grace.
+ * The hold is a bandwidth/cleanliness choice, not a correctness one: a
+ * fragment that escapes it (long dropout, mid-therapy reboot) still
+ * reconciles when the next incremental import lands, so nothing beyond
+ * the grace is needed. */
+#define UPLOAD_THERAPY_GRACE_MS  (60LL * 60 * 1000)
+static bool upload_capture_hold(void)
+{
+    if (sd_storage_recording_active()) return true;
+    return bsp_display_is_therapy_active() &&
+           sd_storage_ms_since_recording_end() < UPLOAD_THERAPY_GRACE_MS;
+}
+
 static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
@@ -3272,10 +3289,11 @@ static esp_err_t start_webserver(void)
     /* Periodic upload scans yield to a live therapy recording; event-driven
      * uploads still run, since they matter more than a housekeeping scan. */
     upload_sched_set_busy_fn(sd_storage_recording_active);
-    /* Whole upload passes yield to a live therapy session too: the Wi-Fi
-     * burst shares the 2.4 GHz front-end with the BLE links carrying the
-     * data, and the night's complete-day upload is still correct afterwards. */
-    upload_sched_set_therapy_fn(bsp_display_is_therapy_active);
+    /* Whole upload passes yield to live capture too: the Wi-Fi burst shares
+     * the 2.4 GHz front-end with the BLE links carrying the data.  The hold
+     * also covers brief BLE dropouts, so fragments of an interrupted night
+     * leave together in one import — with no whole-day resend. */
+    upload_sched_set_therapy_fn(upload_capture_hold);
     /* Guards s_format_progress between format_sd_task and the progress handler.
      * Created here so it exists before any request can reach the handler. */
     if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
