@@ -15,6 +15,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
 # System event task (sys_evt) stack: default 2304 is too small for Wi-Fi/IP event handlers
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3584
 
+# Inter-processor call tasks (ipc0/ipc1): default 1280 left ~430-500 B
+# headroom at peak (cross-core flash/PHY calls are IDF-deep, not ours).
+CONFIG_ESP_IPC_TASK_STACK_SIZE=1536
+
 # -O2 rather than debug -Og.  Recovers IRAM/DRAM from unoptimized copies
 # without the -Os inlining that turns snprintf into -Werror=format-truncation.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
