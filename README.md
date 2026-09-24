@@ -21,6 +21,8 @@ SomnoTrace is the **first and only** open-source project that delivers:
   If your mask slips off or therapy stops unexpectedly during the night, SomnoTrace alerts you immediately. It sends a push notification to your phone, smartwatch (Apple Watch, Garmin, WearOS), or smart bed shaker via [ntfy](https://ntfy.sh). If unacknowledged, an escalating audible alarm sounds on the device speaker, helping you preserve required insurance compliance hours and prevent unmanaged apnea.
 - ⚡ **ResMed BLE → Wi-Fi Bridge & Smart Home Automations:**  
   SomnoTrace bridges the machine's encrypted Bluetooth link to your local Wi-Fi network. You can query machine settings, start/stop therapy remotely, or build rich [Home Assistant automations](docs/automations.md) (e.g. automatically turn off bedroom lights when you start therapy). A built-in **MQTT client** publishes real-time therapy events and device telemetry, with Home Assistant Auto-Discovery for zero-configuration entity setup.
+- 🧠 **On-Device Sleep Staging (Official Builds):**  
+  Official SomnoTrace builds include **SomnoStage**, an on-device machine learning engine that classifies every 30-second epoch into **Wake, REM, Light, or Deep sleep** directly on the ESP32-S3 using synchronized pulse oximetry (SpO₂, pulse rate, motion). It runs 100% locally with zero cloud dependencies or subscriptions. *(Note: The model is proprietary licensed and bundled in official release builds only; source builds compile a clean, functional stub — see [somnostage](https://github.com/ilyakruchinin/somnostage)).*
 
 ---
 
@@ -183,6 +185,7 @@ Access the built-in web portal from any device on your Wi-Fi network without ins
 </p>
 
 - **Interactive Sleep Graphs:** High-resolution zoomable graphs for Breathing Flow, Mask Pressure, Leak Rate, Respiratory Rate, and Flow Limitation.
+- **Sleep Stage Hypnogram (Official Builds):** Visualizes your night's sleep architecture (Wake, REM, Light, Deep) with connected stage ribbons, transition analytics, and per-stage duration & percentage totals.
 - **Clinical Sleep Metrics:** AHI, Obstructive Apnea (OA), Central Apnea (CA), Hypopnea (H), RERA, and 95th percentile pressure & leak stats.
 - **One-Click Wi-Fi & Device Setup:** Configure Wi-Fi networks, upload destinations, screen brightness, and alert settings with simple toggles.
 - **Over-the-Air (OTA) Updates:** Update firmware directly through the web interface with a single click.
@@ -289,6 +292,7 @@ OSCAR takes a session's extent from the recording files themselves, not from the
 | **O2 Ring Bluetooth Sync** | ✅ Implemented | Downloads stored oximetry recordings from Viatom O2 Ring (Gen1 & Gen2) over Bluetooth, with automatic upload to SMB and SleepHQ. |
 | **MQTT & Home Assistant** | ✅ Implemented | Publishes real-time therapy start/stop events, alert state, BLE connection status, and device telemetry over a single persistent MQTT connection. Home Assistant MQTT Auto-Discovery provisions all entities automatically; bidirectional command topics allow remote therapy start/stop and alarm acknowledgement. |
 | **Cross-Noon Sessions** | ✅ Implemented | Therapy spanning midday is recorded as one continuous session instead of being split at noon the way the AS10/AS11 split it. |
+| **On-Device Sleep Staging (SomnoStage)** | 🌟 Official Builds | Post-night 4-stage sleep scoring (Wake, REM, Light, Deep) running locally on the ESP32-S3 from continuous oximetry. Proprietary model included in official release builds (and flashed via somnotrace.com); source builds compile with a clean stub. |
 
 ---
 
@@ -326,7 +330,8 @@ SomnoTrace is free software released under the **GNU General Public License v3.0
 Any redistributed or derivative works must remain licensed under GPLv3 and preserve the author attribution notice:  
 > *"Based on SomnoTrace, originally created by Ilya Kruchinin (https://github.com/ilyakruchinin)."*
 
-**Optional model component:** official binaries may include the SomnoStage sleep-staging model under a separate proprietary license. The model is not covered by GPLv3 and is excluded from source builds (which compile a functional stub instead). See [somnostage](https://github.com/ilyakruchinin/somnostage) for licensing.
+**Optional SomnoStage Model Component:**  
+Official release builds (published on GitHub Releases and flashed via the 1-click web installer at [somnotrace.com](https://somnotrace.com)) bundle the **SomnoStage** sleep-staging model under a separate, closed-source proprietary license (free for personal use on official builds). The model is not covered by GPLv3 and its weights are not stored in this repository. Compiling SomnoTrace from source automatically builds a functional stub without the proprietary model. Full model details, PSG benchmark accuracy, and licensing terms are documented at [ilyakruchinin/somnostage](https://github.com/ilyakruchinin/somnostage).
 
 ---
 
