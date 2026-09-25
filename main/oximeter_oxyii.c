@@ -35,6 +35,7 @@
 #include "time_sync.h"
 #include "upload_sched.h"
 #include "log_stream.h"
+#include "oxyii_codec.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -87,8 +88,6 @@ bool ox_store_promote(const char *serial, const char *name);
 void ox_store_part_remove(const char *name);
 
 /* ── OxyII protocol constants ──────────────────────────────────────── */
-#define OXYII_LEAD         0xA5
-#define OXYII_HEADER_LEN   7
 #define OXYII_MAX_FRAME    2048
 
 #define OP_GET_CONFIG      0x00
@@ -106,11 +105,7 @@ void ox_store_part_remove(const char *name);
 #define MFG_OXYII          0xF34E
 #define MFG_RECORDING      0x036F
 
-/* MD5("lepucloud") = c2a7cf50dafed885a8f8f7eac44335f3 */
-static const uint8_t LEPUCLOUD_MD5[16] = {
-    0xc2, 0xa7, 0xcf, 0x50, 0xda, 0xfe, 0xd8, 0x85,
-    0xa8, 0xf8, 0xf7, 0xea, 0xc4, 0x43, 0x35, 0xf3,
-};
+/* LEPUCLOUD_MD5 is defined in oxyii_codec.c (declared in oxyii_codec.h). */
 
 /* OxyII GATT UUIDs (128-bit, stored little-endian for NimBLE) */
 static const ble_uuid128_t OXYII_SVC_UUID =
@@ -123,69 +118,8 @@ static const ble_uuid128_t OXYII_NOTIFY_UUID =
     BLE_UUID128_INIT(0x48, 0x12, 0xd0, 0x41, 0x29, 0x4e, 0x1b, 0x83,
                      0xf9, 0x98, 0x4b, 0xa1, 0x03, 0x00, 0xfb, 0xe8);
 
-/* ── CRC8 (poly=0x07, init=0) ──────────────────────────────────────── */
-static uint8_t oxyii_crc8(const uint8_t *data, int len)
-{
-    uint8_t crc = 0;
-    for (int i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 0x80) crc = (crc << 1) ^ 0x07;
-            else            crc <<= 1;
-        }
-    }
-    return crc;
-}
-
-/* ── Frame codec ───────────────────────────────────────────────────── */
-/* Encode an OxyII frame into buf.  Returns total frame length. */
-static int oxyii_encode(uint8_t *buf, int bufsz, uint8_t op,
-                         uint8_t flag, uint8_t seq,
-                         const uint8_t *payload, int payload_len)
-{
-    int total = OXYII_HEADER_LEN + payload_len + 1;
-    if (total > bufsz) return -1;
-
-    buf[0] = OXYII_LEAD;
-    buf[1] = op;
-    buf[2] = ~op;
-    buf[3] = flag;
-    buf[4] = seq;
-    buf[5] = payload_len & 0xFF;
-    buf[6] = (payload_len >> 8) & 0xFF;
-    if (payload && payload_len > 0)
-        memcpy(buf + 7, payload, payload_len);
-    buf[total - 1] = oxyii_crc8(buf, total - 1);
-    return total;
-}
-
-/* Try to decode a frame from buf.  Returns total frame length on success,
- * -1 if incomplete (need more data), -2 if invalid (bad lead/crc). */
-static int oxyii_try_decode(const uint8_t *buf, int len,
-                             uint8_t *op, uint8_t *flag, uint8_t *seq,
-                             uint8_t *payload, int *payload_len,
-                             int payload_cap)
-{
-    if (len < OXYII_HEADER_LEN) return -1;
-    if (buf[0] != OXYII_LEAD) return -2;
-    if ((uint8_t)(~buf[1]) != buf[2]) return -2;
-
-    int plen = buf[5] | (buf[6] << 8);
-    int total = OXYII_HEADER_LEN + plen + 1;
-    if (len < total) return -1;
-
-    if (oxyii_crc8(buf, total - 1) != buf[total - 1]) return -2;
-
-    if (op)   *op = buf[1];
-    if (flag) *flag = buf[3];
-    if (seq)  *seq = buf[4];
-    if (payload && payload_cap > 0) {
-        int n = plen < payload_cap ? plen : payload_cap;
-        memcpy(payload, buf + 7, n);
-    }
-    if (payload_len) *payload_len = plen;
-    return total;
-}
+/* The frame codec (oxyii_crc8, oxyii_encode, oxyii_try_decode) lives in
+ * oxyii_codec.c, where scripts/oxyii_codec_test.c can reach it. */
 
 /* Forward declaration for auth payload derivation */
 static char s_serial[32];
@@ -259,23 +193,11 @@ static int oxyii_aes_decrypt_inplace(uint8_t *in_out, int in_len)
 /* Derive session key and XOR with LEPUCLOUD_MD5 to produce auth payload. */
 static void oxyii_auth_payload(uint8_t *out16)
 {
-    uint8_t key[16];
-    /* key[0..7] = LEPUCLOUD_MD5 even-indexed bytes */
-    for (int i = 0; i < 8; i++)
-        key[i] = LEPUCLOUD_MD5[i * 2];
-    /* key[8..11] = first 4 chars of device SN if known, else "0000" */
-    if (s_serial[0] >= '0' && s_serial[0] <= '9' && strlen(s_serial) >= 4) {
-        memcpy(key + 8, s_serial, 4);
-    } else {
-        memcpy(key + 8, "0000", 4);
-    }
-    /* key[12..15] = little-endian uint32 Unix timestamp (now >> (i * 8)) */
-    time_t now = time(NULL);
-    for (int i = 0; i < 4; i++)
-        key[12 + i] = (now >> (i * 8)) & 0xFF;
-    /* auth = key XOR LEPUCLOUD_MD5 */
-    for (int i = 0; i < 16; i++)
-        out16[i] = key[i] ^ LEPUCLOUD_MD5[i];
+    /* The derivation is oxyii_auth_payload_for() in oxyii_codec.c, which
+     * takes the serial and time as arguments so the #177 known-answer
+     * vectors can test it.  time_t was only ever used for its low 32
+     * bits here, so the cast changes no byte. */
+    oxyii_auth_payload_for(s_serial, (uint32_t)time(NULL), out16);
 }
 
 /* ── SET_UTC_TIME payload (8 bytes) ────────────────────────────────── */

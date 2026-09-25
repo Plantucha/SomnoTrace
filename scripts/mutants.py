@@ -99,6 +99,22 @@ MUTANTS = [
      "if (tod < 43200) days -= 1;",
      "if (tod <= 43200) days -= 1;",
      "AS11-side noon put on the previous day"),
+    # The OxyII codec.  The first is #177 itself — the bug that shipped and
+    # was fixed in 14bea1b with nothing to hold the fix.
+    ("oxyii-auth-ts-shift", "oxyii_codec.c",
+     "(ts >> (i * 8))",
+     "(ts >> i)",
+     "#177 restored: the auth timestamp packed by bit index, not byte, so three "
+     "of the last four payload bytes are wrong and the ring rejects the key"),
+    ("oxyii-crc-poly", "oxyii_codec.c",
+     "^ 0x07",
+     "^ 0x05",
+     "wrong CRC-8 polynomial: every frame carries a bad check byte and the ring "
+     "drops it — invisible to a test that only compares against its own encoder"),
+    ("oxyii-decode-skips-crc", "oxyii_codec.c",
+     "if (oxyii_crc8(buf, total - 1) != buf[total - 1]) return -2;",
+     "(void)0;",
+     "a frame corrupted in transit is decoded as good"),
     # Upload group parking.  The second is exactly the divergence the old
     # Python-only model had: signed age keeps a group parked after a clock
     # step backward instead of reviving it.
