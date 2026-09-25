@@ -1666,6 +1666,86 @@ static void reboot_task(void *arg)
     esp_restart();
 }
 
+/* ── Experimental BLE mitigations (Phase D, opt-in) ───────────────────
+ * GET  /api/ble/experimental  → current flag values
+ * POST /api/ble/experimental  → {"supv_timeout_ms": 0|1000..32000,
+ *                                "coex_fix": true|false}
+ *
+ * These exist so the reason-520 mitigations can be trialled on a single
+ * device without reflashing.  Both default OFF and are persisted in NVS;
+ * they apply to future BLE connections, not the active one. */
+static esp_err_t ble_experimental_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"supv_timeout_ms\":%u,\"coex_fix\":%s}",
+             as11_ble_exp_supv_timeout_ms(),
+             as11_ble_exp_coex_fix() ? "true" : "false");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t ble_experimental_post_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 512) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_FAIL;
+    }
+
+    char *body = heap_caps_malloc(total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    cJSON *j = cJSON_Parse(body);
+    free(body);
+    if (!j) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = ESP_OK;
+    cJSON *supv = cJSON_GetObjectItem(j, "supv_timeout_ms");
+    if (supv && cJSON_IsNumber(supv)) {
+        double v = supv->valuedouble;
+        if (v < 0 || v > 65535) {
+            err = ESP_ERR_INVALID_ARG;
+        } else {
+            err = as11_ble_exp_supv_timeout_set((uint16_t)v);
+        }
+    }
+    cJSON *coex = cJSON_GetObjectItem(j, "coex_fix");
+    if (err == ESP_OK && coex && cJSON_IsBool(coex)) {
+        err = as11_ble_exp_coex_fix_set(cJSON_IsTrue(coex));
+    }
+    cJSON_Delete(j);
+
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid value\"}");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"supv_timeout_ms\":%u,\"coex_fix\":%s}",
+             as11_ble_exp_supv_timeout_ms(),
+             as11_ble_exp_coex_fix() ? "true" : "false");
+    return httpd_resp_sendstr(req, buf);
+}
+
 static esp_err_t heap_stats_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -3486,11 +3566,15 @@ static esp_err_t start_webserver(void)
     httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
     httpd_uri_t ble_forget = { .uri = "/api/ble/forget", .method = HTTP_POST, .handler = ble_forget_handler };
     httpd_uri_t ble_pass = { .uri = "/api/ble/passthrough", .method = HTTP_POST, .handler = ble_passthrough_handler };
+    httpd_uri_t ble_exp_get = { .uri = "/api/ble/experimental", .method = HTTP_GET, .handler = ble_experimental_get_handler };
+    httpd_uri_t ble_exp_post = { .uri = "/api/ble/experimental", .method = HTTP_POST, .handler = ble_experimental_post_handler };
     reg_uri(s_httpd, &ble_scan);
     reg_uri(s_httpd, &ble_pair);
     reg_uri(s_httpd, &ble_conf);
     reg_uri(s_httpd, &ble_forget);
     reg_uri(s_httpd, &ble_pass);
+    reg_uri(s_httpd, &ble_exp_get);
+    reg_uri(s_httpd, &ble_exp_post);
 
     /* Oximeter (O2 Ring) BLE pairing endpoints (status folded into /api/status) */
     httpd_uri_t ox_scan = { .uri = "/api/ox/scan", .method = HTTP_GET, .handler = ox_scan_handler };

@@ -64,6 +64,16 @@ bool session_writer_is_active(const session_writer_t *s);
 /* Get the current active session handle (or NULL). */
 session_writer_t *session_writer_get_active(void);
 
+/* True while the post worker is inside the BLE post-therapy collection
+ * for a finalized session (spool pulls + Get RPCs).  Used by the
+ * disconnect-context telemetry and to defer incident diagnostics so two
+ * BLE collection flows never overlap. */
+bool session_writer_post_active(void);
+
+/* Start epoch (ms) of the active session, if any.  Returns false when no
+ * session is active. */
+bool session_writer_active_start_epoch_ms(int64_t *out);
+
 /* Get the duration in minutes of the current active session (or 0 if none). */
 uint32_t session_writer_get_duration_min(void);
 

@@ -45,12 +45,17 @@
 #include "bsp_display.h"
 #include "time_sync.h"
 #include "therapy_alert.h"
+#include "net_provision.h"
+#include "oximeter.h"
+#include "upload_sched.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <ctype.h>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -58,6 +63,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "esp_rom_crc.h"
 #include "esp_heap_caps.h"
 #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
@@ -186,11 +192,12 @@ static TaskHandle_t  s_notif_task  = NULL;
 /* ── Spool fragment collector ────────────────────────────────────────
  * When a spool pull is in progress, s_spool_collector is non-NULL and
  * handle_notify() routes SpoolFragment notifications to it instead of
- * the normal notification dispatch.  This is set/cleared only by
- * as11_ble_spool_pull() which runs in the same notif_proc_task context
- * (via stop_task → post_therapy), so no extra locking is needed — the
- * collector pointer is written before PullSpoolFragments is sent and
- * cleared after the last fragment is received. */
+ * the normal notification dispatch.  All arming callers hold s_cmd_mtx
+ * for the whole request+collect cycle, so a second pull or a concurrent
+ * passthrough RPC cannot overwrite the pointer mid-pull.  The pointer is
+ * written (before PullSpoolFragments is sent) and read (by
+ * notif_proc_task) as a single aligned word, which is sufficient on
+ * Xtensa given the command mutex serializes arming. */
 #define SPOOL_MAX_FRAGS   32
 #define SPOOL_FRAG_MAX    2808          /* matches AS11 max fragment size */
 
@@ -205,7 +212,10 @@ typedef struct {
     int      frag_count;
     char     status[48];                /* SPOOL_INCOMPLETE / SPOOL_COMPLETE / ... */
     char     next_addr_json[256];       /* nextSpoolAddress for multi-round pulls */
+    char     spool_hash_hex[65];        /* spoolHash on terminal fragment */
     bool     done;                      /* set when status != SPOOL_INCOMPLETE */
+    bool     error;                     /* ERROR_* status seen */
+    bool     timed_out;                 /* fragment wait hit the deadline */
     SemaphoreHandle_t sem;              /* given when done */
 } spool_collector_t;
 
@@ -232,6 +242,176 @@ static struct {
     char pair_key[65];
     bool valid;
 } s_pair_cache;
+
+/* ── Incident latch ───────────────────────────────────────────────────
+ * Set on a supervision-timeout disconnect (HCI 0x08) or on an unfillable
+ * long gap (marked by session_writer).  Consumed at the next post-therapy
+ * pass that finds therapy fully stopped, where the deferred diagnostic
+ * spool pull runs (see .ai/RECONNECT/PLAN.md Phase C).  RAM-only by
+ * design: a reboot clears it so a stale flag can never trigger BLE work
+ * long after the incident it refers to. */
+static bool     s_incident_pending = false;
+static char     s_incident_kind[16];
+static int64_t  s_incident_time_ms;
+static int      s_incident_attempts;
+
+/* Set by the disconnect handler when reason==BLE_ERR_CONN_SPVN_TMO so the
+ * reconnect task (which runs in its own context, off the GAP callback)
+ * logs a bounded local-state context line. */
+static bool s_supv_tmo_context_pending;
+
+/* Once-per-connection flag so an experimental supervision-timeout update
+ * is attempted at most once per link (see Phase D in the plan). */
+static bool s_supv_update_sent;
+
+/* Experimental flags, persisted in NVS (loaded lazily). */
+#define EXP_NVS_NS         "as11exp"
+#define EXP_KEY_SUPV_MS    "supv_ms"
+#define EXP_KEY_COEX_FIX   "coexfix"
+static int  s_exp_supv_timeout_ms = -1;   /* -1 = not yet loaded */
+static int  s_exp_coex_fix = -1;
+
+/* Decode a BLE disconnect/notify reason into a short name.  The reason
+ * carries the HCI status code in its low byte (e.g. 520 = 0x208 = NimBLE
+ * base | 0x08 supervision timeout).  Same pattern as oximeter_oxyii.c —
+ * kept file-local like the existing copies; a shared helper belongs in a
+ * common header if a third user appears. */
+static const char *hci_err_str(int reason)
+{
+    switch (reason & 0xFF) {
+    case 0x08: return "Connection Timeout";
+    case 0x0B: return "Conn Already Exists";
+    case 0x13: return "Remote User Terminated";
+    case 0x16: return "Terminated by Local Host";
+    case 0x22: return "LMP Response Timeout";
+    case 0x28: return "Instant Passed";
+    case 0x3B: return "Unacceptable Connection Parameters";
+    case 0x44: return "Conn Fail to Be Established";
+    default:   return "Unknown";
+    }
+}
+
+/* ── Incident latch (public API, see header) ──────────────────────────
+ * Plain globals, no lock: writers are the GAP callback and
+ * session_writer, readers run in post-therapy — they never race
+ * destructively, and worst case a mark lands while a diagnostic pull is
+ * already in flight (it is simply picked up at the next stop). */
+void as11_ble_incident_mark(const char *kind)
+{
+    if (!s_incident_pending) {
+        s_incident_pending = true;
+        s_incident_time_ms = (int64_t)time(NULL) * 1000;
+        s_incident_attempts = 0;
+        strlcpy(s_incident_kind, kind ? kind : "unknown",
+                sizeof(s_incident_kind));
+        ESP_LOGI(TAG, "incident: marked (%s)", s_incident_kind);
+    }
+}
+
+bool as11_ble_incident_pending(void)      { return s_incident_pending; }
+int64_t as11_ble_incident_time_ms(void)   { return s_incident_time_ms; }
+int as11_ble_incident_attempts(void)      { return s_incident_attempts; }
+
+void as11_ble_incident_note_attempt(void) { s_incident_attempts++; }
+void as11_ble_incident_clear(void)
+{
+    s_incident_pending = false;
+    s_incident_kind[0] = '\0';
+    s_incident_attempts = 0;
+}
+
+/* ── Experimental flags (Phase D) ─────────────────────────────────────
+ * Read lazily from NVS, cached for the process lifetime.  Writes persist
+ * via nvs_writer (the async NVS queue used everywhere else) so the HTTP
+ * path never blocks on flash. */
+static void exp_flags_load(void)
+{
+    if (s_exp_supv_timeout_ms >= 0 && s_exp_coex_fix >= 0) {
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(EXP_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        uint16_t v;
+        uint8_t b;
+        if (s_exp_supv_timeout_ms < 0) {
+            s_exp_supv_timeout_ms = (nvs_get_u16(h, EXP_KEY_SUPV_MS, &v) == ESP_OK)
+                                    ? (int)v : 0;
+        }
+        if (s_exp_coex_fix < 0) {
+            s_exp_coex_fix = (nvs_get_u8(h, EXP_KEY_COEX_FIX, &b) == ESP_OK)
+                             ? (int)b : 0;
+        }
+        nvs_close(h);
+    } else {
+        if (s_exp_supv_timeout_ms < 0) s_exp_supv_timeout_ms = 0;
+        if (s_exp_coex_fix < 0)        s_exp_coex_fix = 0;
+    }
+}
+
+uint16_t as11_ble_exp_supv_timeout_ms(void)
+{
+    exp_flags_load();
+    return (uint16_t)s_exp_supv_timeout_ms;
+}
+
+bool as11_ble_exp_coex_fix(void)
+{
+    exp_flags_load();
+    return s_exp_coex_fix != 0;
+}
+
+/* NVS write helper for the experimental flags.  Runs inside the
+ * nvs_writer proxy (see nvs_writer_run) so it is safe to call from any
+ * task including httpd workers with PSRAM stacks. */
+typedef struct {
+    const char *key;
+    uint32_t    value;
+    bool        is_u8;
+} exp_nvs_write_t;
+
+static esp_err_t do_exp_nvs_write(void *arg)
+{
+    const exp_nvs_write_t *w = arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(EXP_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = w->is_u8 ? nvs_set_u8(h, w->key, (uint8_t)w->value)
+                   : nvs_set_u16(h, w->key, (uint16_t)w->value);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t as11_ble_exp_supv_timeout_set(uint16_t ms)
+{
+    /* Validate against the BLE spec range before persisting: supervision
+     * timeout is 100 ms units, 0x000A..0x0C80 => 1000..32000 ms.
+     * 0 disables the experiment. */
+    if (ms != 0 && (ms < 1000 || ms > 32000)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    exp_nvs_write_t w = { .key = EXP_KEY_SUPV_MS, .value = ms, .is_u8 = false };
+    esp_err_t err = nvs_writer_run(do_exp_nvs_write, &w);
+    if (err == ESP_OK) {
+        s_exp_supv_timeout_ms = (int)ms;
+        ESP_LOGW(TAG, "experimental: supervision timeout target = %u ms "
+                 "(applies to future connections)", ms);
+    }
+    return err;
+}
+
+esp_err_t as11_ble_exp_coex_fix_set(bool on)
+{
+    exp_nvs_write_t w = { .key = EXP_KEY_COEX_FIX, .value = on ? 1 : 0,
+                          .is_u8 = true };
+    esp_err_t err = nvs_writer_run(do_exp_nvs_write, &w);
+    if (err == ESP_OK) {
+        s_exp_coex_fix = on ? 1 : 0;
+        ESP_LOGW(TAG, "experimental: coex status-bit fix %s "
+                 "(applies to future connections)", on ? "ON" : "OFF");
+    }
+    return err;
+}
 
 static char s_target_name[32];
 static ble_addr_t s_target_addr;
@@ -851,6 +1031,23 @@ static void handle_notify(const uint8_t *data, int len)
                                 free(ns);
                             }
                         }
+                        /* Capture spoolHash — documented (rpc_protocol.md)
+                         * as the SHA-256 of the concatenated raw fragment
+                         * data, sent on the terminal fragment.  Verified
+                         * after concatenation in spool_one_round(). */
+                        cJSON *hash_j = cJSON_GetObjectItem(params, "spoolHash");
+                        if (hash_j && cJSON_IsString(hash_j)) {
+                            strlcpy(s_spool_collector->spool_hash_hex,
+                                    hash_j->valuestring,
+                                    sizeof(s_spool_collector->spool_hash_hex));
+                        }
+                        /* ERROR_* statuses are terminal failures, not
+                         * completion — record them so the pull can tell
+                         * "no more data" apart from "device refused"
+                         * (e.g. ERROR_DATA_UNAVAILABLE). */
+                        if (strncmp(status_j->valuestring, "ERROR_", 6) == 0) {
+                            s_spool_collector->error = true;
+                        }
                         if (strcmp(status_j->valuestring, "SPOOL_INCOMPLETE") != 0) {
                             s_spool_collector->done = true;
                             xSemaphoreGive(s_spool_collector->sem);
@@ -976,12 +1173,68 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             s_manual_disconnect = false;
+            s_supv_update_sent = false;   /* per-connection Phase-D attempt */
+            s_supv_tmo_context_pending = false;
         }
         xSemaphoreGive(s_connect_sem);
         return 0;
 
-    case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGW(TAG, "disconnected (reason=%d)", event->disconnect.reason);
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        /* Fires after every applied parameter change — the AS11's own
+         * L2CAP request and any update we initiated.  The desc is the
+         * negotiated result, logged in natural units. */
+        if (event->conn_update.status == 0) {
+            struct ble_gap_conn_desc d;
+            if (ble_gap_conn_find(event->conn_update.conn_handle, &d) == 0) {
+                ESP_LOGI(TAG, "conn params updated: itvl=%u (%.1fms) lat=%u "
+                         "timeout=%u (%ums)",
+                         d.conn_itvl, d.conn_itvl * 1.25, d.conn_latency,
+                         d.supervision_timeout, d.supervision_timeout * 10);
+            }
+        } else {
+            ESP_LOGW(TAG, "conn params update failed (status=%d)",
+                     event->conn_update.status);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_LINK_ESTAB:
+        /* A fully-established link — log the parameters we ended up with
+         * (the initial values come from ble_gap_connect's defaults, the
+         * AS11 usually re-negotiates immediately afterwards). */
+        if (event->link_estab.status == 0) {
+            struct ble_gap_conn_desc d;
+            if (ble_gap_conn_find(event->link_estab.conn_handle, &d) == 0) {
+                ESP_LOGI(TAG, "link established: handle=%u itvl=%u (%.1fms) "
+                         "lat=%u timeout=%u (%ums)",
+                         d.conn_handle, d.conn_itvl, d.conn_itvl * 1.25,
+                         d.conn_latency, d.supervision_timeout,
+                         d.supervision_timeout * 10);
+            }
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT: {
+        /* Forensics for the reason-520 investigation
+         * (.ai/RECONNECT/PLAN.md Phase A): the event carries a snapshot of
+         * the negotiated parameters, so we can finally replace the
+         * inferred "~3 s" timeout with the real value. */
+        const struct ble_gap_conn_desc *dc = &event->disconnect.conn;
+        ESP_LOGW(TAG, "disconnected (reason=%d / %s) handle=%u "
+                 "itvl=%u (%.1fms) lat=%u timeout=%u (%ums)",
+                 event->disconnect.reason,
+                 hci_err_str(event->disconnect.reason),
+                 dc->conn_handle, dc->conn_itvl, dc->conn_itvl * 1.25,
+                 dc->conn_latency, dc->supervision_timeout,
+                 dc->supervision_timeout * 10);
+        if ((event->disconnect.reason & 0xFF) == 0x08) {
+            /* Connection supervision timeout — the failure mode under
+             * investigation.  Latch it for the deferred diagnostic pull
+             * and arm the bounded context line that auto_reconnect_task
+             * emits (it runs off this callback, so it can afford Wi-Fi
+             * and heap queries that are unsafe here). */
+            as11_ble_incident_mark("supv_timeout");
+            s_supv_tmo_context_pending = true;
+        }
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_session_encrypted = false;
         therapy_alert_on_ble_disconnect();
@@ -1014,6 +1267,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         }
         s_manual_disconnect = false;
         return 0;
+    }
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "Encryption change: status=%d", event->enc_change.status);
@@ -1079,8 +1333,37 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     }
 
     case BLE_GAP_EVENT_L2CAP_UPDATE_REQ:
-        ESP_LOGI(TAG, "Accepting Connection Parameter Update from peer");
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ:
+        /* The AS11 asked for new connection parameters — either over
+         * L2CAP (BLE_GAP_EVENT_L2CAP_UPDATE_REQ) or via the Link-Layer
+         * Connection Parameters Request procedure (CONN_UPDATE_REQ).
+         * Both share the conn_update_req union member; peer_params
+         * carries what it asked for and returning 0 accepts it (NimBLE
+         * then issues the HCI update and reports the negotiated result
+         * via BLE_GAP_EVENT_CONN_UPDATE, logged above).
+         *
+         * We deliberately do NOT rewrite self_params here: on the L2CAP
+         * path NimBLE does not use it, and on the LL path modifying
+         * inside the callback is untested against the AS11.  An
+         * experimental timeout raise is applied separately once the
+         * peer's own update settles (Phase D in .ai/RECONNECT/PLAN.md). */
+        ESP_LOGI(TAG, "peer conn-param request (event %d): itvl=%u-%u "
+                 "lat=%u timeout=%u (%ums) — accepting",
+                 event->type,
+                 event->conn_update_req.peer_params->itvl_min,
+                 event->conn_update_req.peer_params->itvl_max,
+                 event->conn_update_req.peer_params->latency,
+                 event->conn_update_req.peer_params->supervision_timeout,
+                 event->conn_update_req.peer_params->supervision_timeout * 10);
         return 0; /* 0 to accept, non-zero to reject */
+
+    case BLE_GAP_EVENT_DATA_LEN_CHG:
+        ESP_LOGI(TAG, "DLE changed: tx=%u octets/%u us rx=%u octets/%u us",
+                 event->data_len_chg.max_tx_octets,
+                 event->data_len_chg.max_tx_time,
+                 event->data_len_chg.max_rx_octets,
+                 event->data_len_chg.max_rx_time);
+        return 0;
 
     default:
         ESP_LOGW(TAG, "Unhandled GAP event: type=%d", event->type);
@@ -1226,6 +1509,33 @@ static cJSON *wait_response(int timeout_ms)
     cJSON *j = s_resp_json;
     s_resp_json = NULL;
     return j;
+}
+
+/* ── RPC response-channel serialization ───────────────────────────────
+ * The shared response channel (s_resp_sem / s_resp_json) carries exactly
+ * one outstanding request.  Every caller performing a
+ * clear_response() → send → wait_response() cycle MUST hold s_cmd_mtx
+ * for the whole cycle; otherwise a concurrent caller (e.g. an HTTP
+ * passthrough RPC racing the post-therapy spool pull) can drain the
+ * semaphore or overwrite s_resp_json mid-flight and both sides see
+ * garbage or timeouts.
+ *
+ * Scope rules (see .ai/RECONNECT/PLAN.md Phase B.2):
+ *  - Lock at operation granularity around each send/wait triplet.
+ *  - NEVER hold the mutex across a call into another public RPC
+ *    function (they lock internally; s_cmd_mtx is not recursive).
+ *    reconnect_task is the main example: it wraps each of its three
+ *    triplets individually and lets as11_ble_get_datetime() take the
+ *    lock itself in between.
+ *  - spool_one_round() is internal and expects the caller to hold the
+ *    mutex for the whole multi-round pull. */
+static bool rpc_channel_lock(int timeout_ms)
+{
+    return xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+static void rpc_channel_unlock(void)
+{
+    xSemaphoreGive(s_cmd_mtx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1640,10 +1950,22 @@ static void pair_task(void *arg)
     snprintf(json, 800,
              "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"StartKeyExchange\","
              "\"params\":{\"clientPk\":\"%s\"}}", A_hex);
+    /* Hold the RPC channel lock across the whole send+wait cycle — the
+     * response arrives on the shared characteristic and must not be
+     * consumed by another RPC user (pairing is user-interactive and
+     * rare, but a concurrent post-therapy pull would otherwise corrupt
+     * both flows). */
+    if (!rpc_channel_lock(30000)) {
+        set_error("RPC channel busy during pairing");
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        vTaskDelete(NULL);
+        return;
+    }
     clear_response();
     esp_err_t se = send_fig(FIG_VCID_TX, json);
     free(json);
     if (se != ESP_OK) {
+        rpc_channel_unlock();
         set_error("StartKeyExchange send failed");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         vTaskDelete(NULL);
@@ -1661,6 +1983,7 @@ static void pair_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     cJSON *resp = wait_response(30000);
+    rpc_channel_unlock();
     if (!resp) {
         set_error("no StartKeyExchange response");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -1720,8 +2043,15 @@ static void confirm_task(void *arg)
     snprintf(json, sizeof(json),
              "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ConfirmKeyExchange\","
              "\"params\":{\"clientConfirmation\":\"%s\"}}", m1_hex);
+    if (!rpc_channel_lock(20000)) {
+        set_error("RPC channel busy during confirm");
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        vTaskDelete(NULL);
+        return;
+    }
     clear_response();
     if (send_fig(FIG_VCID_TX, json) != ESP_OK) {
+        rpc_channel_unlock();
         set_error("ConfirmKeyExchange send failed");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         vTaskDelete(NULL);
@@ -1731,6 +2061,7 @@ static void confirm_task(void *arg)
 
     int64_t resp_t0 = esp_timer_get_time();
     cJSON *resp = wait_response(15000);
+    rpc_channel_unlock();
     ESP_LOGI(TAG, "confirm_task: wait_response took %lld ms", (esp_timer_get_time() - resp_t0) / 1000);
     if (!resp) {
         set_error("no ConfirmKeyExchange response");
@@ -1834,15 +2165,22 @@ static esp_err_t do_setup_encrypted_session(const char *cid_str,
     snprintf(rpc, 512,
              "{\"id\":10,\"jsonrpc\":\"2.0\",\"method\":\"RequestSession\","
              "\"params\":{\"clientId\":\"%s\"}}", cid_str);
+    if (!rpc_channel_lock(15000)) {
+        free(rpc);
+        ESP_LOGW(TAG, "reconnect: RPC channel busy (RequestSession)");
+        return ESP_ERR_TIMEOUT;
+    }
     clear_response();
     esp_err_t se = send_fig(FIG_VCID_TX, rpc);
     free(rpc);
     if (se != ESP_OK) {
+        rpc_channel_unlock();
         ESP_LOGW(TAG, "reconnect: RequestSession send failed");
         return ESP_FAIL;
     }
 
     cJSON *resp = wait_response(10000);
+    rpc_channel_unlock();
     if (!resp) {
         ESP_LOGW(TAG, "reconnect: RequestSession timeout");
         return ESP_ERR_TIMEOUT;
@@ -1891,16 +2229,24 @@ static esp_err_t do_setup_encrypted_session(const char *cid_str,
     snprintf(rpc, 512,
              "{\"id\":11,\"jsonrpc\":\"2.0\",\"method\":\"CheckSessionIntegrity\","
              "\"params\":{\"response\":\"%s\"}}", response_hex);
+    if (!rpc_channel_lock(15000)) {
+        free(rpc);
+        cJSON_Delete(resp);
+        ESP_LOGW(TAG, "reconnect: RPC channel busy (CheckSessionIntegrity)");
+        return ESP_ERR_TIMEOUT;
+    }
     clear_response();
     se = send_fig(FIG_VCID_TX, rpc);
     free(rpc);
     cJSON_Delete(resp);
     if (se != ESP_OK) {
+        rpc_channel_unlock();
         ESP_LOGW(TAG, "reconnect: CheckSessionIntegrity send failed");
         return ESP_FAIL;
     }
 
     resp = wait_response(10000);
+    rpc_channel_unlock();
     if (!resp) {
         ESP_LOGW(TAG, "reconnect: CheckSessionIntegrity timeout");
         return ESP_ERR_TIMEOUT;
@@ -1940,6 +2286,56 @@ static esp_err_t do_setup_encrypted_session(const char *cid_str,
 /* ------------------------------------------------------------------ */
 /*  Auto-reconnect (uses saved NVS pairing, no SRP needed)             */
 /* ------------------------------------------------------------------ */
+
+/* Phase D (experimental, opt-in): raise the supervision timeout via a
+ * central-initiated LL_CONNECTION_UPDATE_IND.  As central we send the
+ * update unilaterally — the AS11 cannot negotiate it back; its only outs
+ * are dropping the link or issuing another L2CAP request later, so we
+ * attempt this at most once per connection and never loop.
+ *
+ * Runs in reconnect_task (own task context, NOT the GAP callback): the
+ * call issues an HCI command and waits for the controller's response.
+ * Preserves the AS11's negotiated interval and latency and changes only
+ * the supervision timeout. */
+static void apply_exp_supv_timeout(void)
+{
+    uint16_t target_ms = as11_ble_exp_supv_timeout_ms();
+    if (target_ms == 0 || s_supv_update_sent ||
+        s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    s_supv_update_sent = true;   /* once per connection, success or not */
+
+    struct ble_gap_conn_desc d;
+    if (ble_gap_conn_find(s_conn_handle, &d) != 0) {
+        return;
+    }
+    uint16_t target_units = target_ms / 100;   /* BLE: 10 ms units */
+    if (d.supervision_timeout >= target_units) {
+        ESP_LOGI(TAG, "exp: supervision timeout already %ums >= target %ums",
+                 d.supervision_timeout * 10, target_ms);
+        return;
+    }
+
+    struct ble_gap_upd_params params = {
+        .itvl_min = d.conn_itvl,        /* keep AS11's negotiated timing */
+        .itvl_max = d.conn_itvl,
+        .latency  = d.conn_latency,
+        .supervision_timeout = target_units,
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+    ESP_LOGW(TAG, "exp: requesting supervision timeout %ums (was %ums), "
+             "itvl/latency preserved", target_ms, d.supervision_timeout * 10);
+    int rc = ble_gap_update_params(s_conn_handle, &params);
+    if (rc != 0) {
+        /* BLE_HS_EALREADY = another update still pending — do not retry;
+         * the peer's update wins this connection. */
+        ESP_LOGW(TAG, "exp: ble_gap_update_params rc=%d (EALREADY=%d)",
+                 rc, BLE_HS_EALREADY);
+    }
+}
+
 static void reconnect_task(void *arg)
 {
     (void)arg;
@@ -2136,20 +2532,41 @@ static void reconnect_task(void *arg)
     snprintf(rpc, 512,
              "{\"id\":12,\"jsonrpc\":\"1.0\",\"method\":\"Get\","
              "\"params\":[\"ProductGeographicIdentifier\",\"HardwareIdentifier\"]}");
-    clear_response();
-    if (send_rpc_encrypted(rpc) != ESP_OK) {
-        ESP_LOGW(TAG, "reconnect: Get (test) send failed");
-    } else {
-        resp = wait_response(10000);
-        if (resp) {
-            ESP_LOGI(TAG, "reconnect: Get (test) response received");
-            cJSON_Delete(resp);
+    if (rpc_channel_lock(15000)) {
+        clear_response();
+        if (send_rpc_encrypted(rpc) != ESP_OK) {
+            ESP_LOGW(TAG, "reconnect: Get (test) send failed");
         } else {
-            ESP_LOGW(TAG, "reconnect: Get (test) timeout (non-fatal)");
+            resp = wait_response(10000);
+            if (resp) {
+                ESP_LOGI(TAG, "reconnect: Get (test) response received");
+                cJSON_Delete(resp);
+            } else {
+                ESP_LOGW(TAG, "reconnect: Get (test) timeout (non-fatal)");
+            }
         }
+        rpc_channel_unlock();
+    } else {
+        ESP_LOGW(TAG, "reconnect: RPC channel busy, Get (test) skipped");
     }
     free(rpc);
 after_get_test:
+
+    /* ---- Log AS11 firmware identity (once per connection) ----
+     * GetVersion reports FlowGenerator/BT/Cellular module software
+     * versions.  Correlating this with incidents rules out
+     * firmware-specific behaviour (e.g. the 8.6.0 unit under
+     * investigation).  Non-fatal, sent before StartStream while ACL
+     * buffers are still free. */
+    {
+        char verbuf[512];
+        if (as11_ble_get_version(verbuf, sizeof(verbuf)) == ESP_OK) {
+            ESP_LOGI(TAG, "reconnect: AS11 identity: %s", verbuf);
+        } else {
+            ESP_LOGW(TAG, "reconnect: GetVersion failed (non-fatal)");
+        }
+    }
+
 
     /* ---- Wait for usable time before subscribing to events or
      * starting the data stream.  Therapy recording depends on accurate
@@ -2205,17 +2622,22 @@ after_get_test:
              "\"_SNC\","
              "\"_ZLE\""
              "]}}");
-    clear_response();
-    if (send_rpc_encrypted(rpc) != ESP_OK) {
-        ESP_LOGW(TAG, "reconnect: SubscribeEvent send failed");
-    } else {
-        resp = wait_response(10000);
-        if (resp) {
-            ESP_LOGI(TAG, "reconnect: SubscribeEvent response received");
-            cJSON_Delete(resp);
+    if (rpc_channel_lock(15000)) {
+        clear_response();
+        if (send_rpc_encrypted(rpc) != ESP_OK) {
+            ESP_LOGW(TAG, "reconnect: SubscribeEvent send failed");
         } else {
-            ESP_LOGW(TAG, "reconnect: SubscribeEvent timeout (non-fatal)");
+            resp = wait_response(10000);
+            if (resp) {
+                ESP_LOGI(TAG, "reconnect: SubscribeEvent response received");
+                cJSON_Delete(resp);
+            } else {
+                ESP_LOGW(TAG, "reconnect: SubscribeEvent timeout (non-fatal)");
+            }
         }
+        rpc_channel_unlock();
+    } else {
+        ESP_LOGW(TAG, "reconnect: RPC channel busy, SubscribeEvent skipped");
     }
     free(rpc);
 after_subscribe:
@@ -2234,6 +2656,10 @@ after_subscribe:
             ESP_LOGW(TAG, "reconnect: GetDateTime failed — clock_drift_ms will be unavailable");
         }
     }
+
+    /* Phase D (experimental, opt-in): raise the supervision timeout
+     * before the stream starts, while ACL buffers are free. */
+    apply_exp_supv_timeout();
 
     /* ---- Start data stream (encrypted) ----
      * Uses short tags matching STREAM_EDF_ALIASES in as11_rpc_vars.py:
@@ -2258,31 +2684,90 @@ after_subscribe:
              "\"_SNI\",\"_FFL\",\"_INT\","
              "\"_HRT\",\"_SAO\""
              "],\"sampleIntervalMs\":40,\"reportIntervalMs\":200}}");
-    clear_response();
-    if (send_rpc_encrypted(rpc) != ESP_OK) {
-        ESP_LOGW(TAG, "reconnect: StartStream send failed");
-    } else {
-        resp = wait_response(10000);
-        if (resp) {
-            char *resp_str = cJSON_PrintUnformatted(resp);
-            ESP_LOGI(TAG, "reconnect: StartStream response: %s",
-                     resp_str ? resp_str : "(null)");
-            if (resp_str) free(resp_str);
-            cJSON_Delete(resp);
+    if (rpc_channel_lock(15000)) {
+        clear_response();
+        if (send_rpc_encrypted(rpc) != ESP_OK) {
+            ESP_LOGW(TAG, "reconnect: StartStream send failed");
         } else {
-            ESP_LOGW(TAG, "reconnect: StartStream timeout (non-fatal)");
+            resp = wait_response(10000);
+            if (resp) {
+                char *resp_str = cJSON_PrintUnformatted(resp);
+                ESP_LOGI(TAG, "reconnect: StartStream response: %s",
+                         resp_str ? resp_str : "(null)");
+                if (resp_str) free(resp_str);
+                cJSON_Delete(resp);
+            } else {
+                ESP_LOGW(TAG, "reconnect: StartStream timeout (non-fatal)");
+            }
         }
+        rpc_channel_unlock();
+    } else {
+        ESP_LOGW(TAG, "reconnect: RPC channel busy, StartStream skipped");
     }
     free(rpc);
 after_start_stream:
 
     set_state(AS11_STATUS_PAIRED);
     #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
-    esp_coex_status_bit_set(ESP_COEX_BLE_ST_MESH_TRAFFIC, true);
+    if (as11_ble_exp_coex_fix()) {
+        /* Corrected call: esp_coex_status_bit_set(type, status).  The
+         * historical call below passed the status enum as the type and a
+         * bool as the status, which is an argument inversion (it set
+         * status=1 on type=0x10).  Behind the experimental flag because
+         * it changes radio arbitration behaviour, not just logging
+         * (.ai/RECONNECT/PLAN.md Phase D). */
+        esp_coex_status_bit_set(ESP_COEX_ST_TYPE_BLE,
+                                ESP_COEX_BLE_ST_MESH_TRAFFIC);
+    } else {
+        /* Original (argument-inverted) call kept verbatim for
+         * bug-compatibility while the fix soaks. */
+        esp_coex_status_bit_set(ESP_COEX_BLE_ST_MESH_TRAFFIC, true);
+    }
     #endif
     ESP_LOGI(TAG, "reconnect: connected to %s, session established, streams started", addr_str);
 
     vTaskDelete(NULL);
+}
+
+/* ── Bounded disconnect-context line (Phase A) ─────────────────────────
+ * Emitted by auto_reconnect_task (own task context) when the previous
+ * disconnect was a supervision timeout.  Everything here is a local
+ * query — no BLE traffic, no blocking HCI calls — because the goal is a
+ * snapshot of the ESP's own state at the moment the link died: was Wi-Fi
+ * up, was the O2 link alive, was an upload or post-therapy pull in
+ * flight, how was the heap.  This is what discriminates "AS11 stopped
+ * transmitting" from "our radio starved" the next time reason 520
+ * appears. */
+static void log_disconnect_context(void)
+{
+    netprov_link_t link;
+    netprov_get_link(&link);
+
+    uint8_t channel = 0;
+    int8_t ap_rssi = 0;
+    wifi_ap_record_t ap = {0};
+    if (link.up && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        channel = ap.primary;
+        ap_rssi = ap.rssi;
+    }
+
+    int64_t sess_start = 0;
+    bool have_sess = session_writer_active_start_epoch_ms(&sess_start);
+    int64_t sess_age_s = have_sess ?
+        (((int64_t)time(NULL) * 1000 - sess_start) / 1000) : -1;
+
+    ESP_LOGW(TAG, "520-context: wifi=%s rssi=%d ch=%u o2=%s upload=%d "
+             "post_active=%d session=%s (age=%llds) heap_int=%u heap_min=%u",
+             link.up ? "up" : "down",
+             link.up ? (int)ap_rssi : link.rssi,
+             channel,
+             oximeter_get_status(),
+             upload_sched_uploading() ? 1 : 0,
+             session_writer_post_active() ? 1 : 0,
+             have_sess ? "active" : "none",
+             (long long)sess_age_s,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 }
 
 /* ------------------------------------------------------------------
@@ -2294,6 +2779,13 @@ after_start_stream:
 static void auto_reconnect_task(void *arg)
 {
     (void)arg;
+
+    /* Bounded context line for a supervision-timeout disconnect — log
+     * before the countdown so the timestamp stays close to the event. */
+    if (s_supv_tmo_context_pending) {
+        s_supv_tmo_context_pending = false;
+        log_disconnect_context();
+    }
 
     /* Wait a few seconds before attempting to reconnect.  The AS11
      * typically needs 2-5 seconds after a disconnect before it
@@ -2608,11 +3100,12 @@ esp_err_t as11_ble_get_clock_drift(int64_t *out_drift_ms)
     return ESP_OK;
 }
 
-/* Query the AS11 device clock via GetDateTime RPC.
- * Returns ESP_OK and stores epoch milliseconds in *out_epoch_ms.
- * The response format is {"result":{"dateTime":"2026-06-25T15:08:00.000Z"}}.
- * Returns ESP_FAIL if the RPC fails or the response can't be parsed. */
-esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
+/* Shared implementation for as11_ble_get_datetime / _ex.  Takes the RPC
+ * channel lock for its send+wait cycle (safe to call from any task —
+ * including reconnect_task, which does NOT hold the lock at that point).
+ * out_meas_ms receives the NTP wall-clock midpoint of the round trip:
+ * the instant the returned AS11 reading best corresponds to. */
+static esp_err_t get_datetime_impl(int64_t *out_epoch_ms, int64_t *out_meas_ms)
 {
     if (!out_epoch_ms) return ESP_ERR_INVALID_ARG;
     if (!s_session_encrypted) {
@@ -2620,14 +3113,36 @@ esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Midpoint of the round trip: the AS11 timestamps its reply at some
+     * point between our send and the receive; half the elapsed time is
+     * the best single estimate of when the reading was taken.
+     * gettimeofday (µs wall clock) rather than time(NULL) so the
+     * midpoint carries ms resolution — a 1 s quantisation would be the
+     * dominant drift error on a ~100-300 ms RPC round trip. */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t t_send_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
     const char *rpc = "{\"id\":20,\"jsonrpc\":\"1.0\",\"method\":\"GetDateTime\"}";
+    if (!rpc_channel_lock(8000)) {
+        ESP_LOGW(TAG, "get_datetime: RPC channel busy");
+        return ESP_ERR_TIMEOUT;
+    }
     clear_response();
-    if (send_rpc_encrypted(rpc) != ESP_OK) {
+    esp_err_t send_err = send_rpc_encrypted(rpc);
+    if (send_err != ESP_OK) {
+        rpc_channel_unlock();
         ESP_LOGW(TAG, "get_datetime: send failed");
         return ESP_FAIL;
     }
 
     cJSON *resp = wait_response(5000);
+    rpc_channel_unlock();
+    gettimeofday(&tv, NULL);
+    int64_t t_done_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    if (out_meas_ms) {
+        *out_meas_ms = t_send_ms + (t_done_ms - t_send_ms) / 2;
+    }
     if (!resp) {
         ESP_LOGW(TAG, "get_datetime: timeout");
         return ESP_FAIL;
@@ -2683,6 +3198,79 @@ esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
     return ret;
 }
 
+esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
+{
+    return get_datetime_impl(out_epoch_ms, NULL);
+}
+
+esp_err_t as11_ble_get_datetime_ex(int64_t *out_epoch_ms, int64_t *out_meas_ms)
+{
+    return get_datetime_impl(out_epoch_ms, out_meas_ms);
+}
+
+/* Query AS11 firmware identity via GetVersion and format a compact
+ * one-line summary into buf.  Non-fatal telemetry for incident
+ * correlation (.ai/RECONNECT/PLAN.md Phase A). */
+esp_err_t as11_ble_get_version(char *buf, size_t buflen)
+{
+    if (!buf || buflen == 0) return ESP_ERR_INVALID_ARG;
+    buf[0] = '\0';
+    if (!s_session_encrypted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const char *rpc = "{\"id\":21,\"jsonrpc\":\"2.0\",\"method\":\"GetVersion\"}";
+    if (!rpc_channel_lock(8000)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    clear_response();
+    esp_err_t send_err = send_rpc_encrypted(rpc);
+    if (send_err != ESP_OK) {
+        rpc_channel_unlock();
+        return ESP_FAIL;
+    }
+    cJSON *resp = wait_response(5000);
+    rpc_channel_unlock();
+    if (!resp) return ESP_ERR_TIMEOUT;
+
+    esp_err_t ret = ESP_FAIL;
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    if (cJSON_IsObject(result)) {
+        /* Compact summary: one ApplicationIdentifier per module. */
+        size_t used = 0;
+        buf[0] = '\0';
+        const char *modules[] = { "FlowGenerator", "BluetoothModule",
+                                  "CellularModule", "AlarmModule" };
+        for (size_t i = 0; i < sizeof(modules) / sizeof(modules[0]); i++) {
+            cJSON *mod = cJSON_GetObjectItem(result, modules[i]);
+            if (!cJSON_IsObject(mod)) continue;
+            cJSON *sw = cJSON_GetObjectItem(mod, "IdentificationProfiles");
+            sw = sw ? cJSON_GetObjectItem(sw, "Software") : NULL;
+            cJSON *app = sw ? cJSON_GetObjectItem(sw, "ApplicationIdentifier") : NULL;
+            if (app && cJSON_IsString(app)) {
+                int n = snprintf(buf + used, buflen - used, "%s%s=",
+                                 used ? " " : "", modules[i]);
+                if (n < 0 || (size_t)n >= buflen - used) break;
+                used += n;
+                /* Append the identifier value (bounded). */
+                n = snprintf(buf + used, buflen - used, "%s",
+                             app->valuestring);
+                if (n < 0 || (size_t)n >= buflen - used) break;
+                used += n;
+            }
+        }
+        ret = (used > 0) ? ESP_OK : ESP_FAIL;
+    }
+
+    if (ret != ESP_OK) {
+        char *s = cJSON_Print(resp);
+        ESP_LOGW(TAG, "get_version: unexpected response: %s", s ? s : "?");
+        if (s) free(s);
+    }
+    cJSON_Delete(resp);
+    return ret;
+}
+
 /* ── Spool RPC ────────────────────────────────────────────────────────
  *
  * Post-therapy data collection.  The AS11 stores session summaries, event
@@ -2691,10 +3279,13 @@ esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
  * asynchronously on the same BLE characteristic as StreamData and RPC
  * responses; handle_notify() intercepts them when s_spool_collector is set.
  *
- * The pull function runs in the notif_proc_task context (via stop_task →
- * post_therapy), which is the same task that processes notifications.  This
- * is intentional: it allows SpoolFragment notifications to be handled
- * synchronously while we wait on the collector semaphore.
+ * The pull function runs in the post worker task (session_writer's
+ * sw_post_task → post_therapy_collect), NOT in notif_proc_task — the
+ * comment claiming same-task execution was stale.  SpoolFragment
+ * notifications are processed by notif_proc_task, which routes them into
+ * the collector and signals its semaphore; the puller waits on that
+ * semaphore from its own task.  All arming callers hold s_cmd_mtx for
+ * the whole pull, which is what makes the shared collector pointer safe.
  *
  * Multi-round pulls: if the device returns SPOOL_COMPLETE_MORE_DATA_PENDING,
  * the last fragment includes a nextSpoolAddress JSON object.  We loop with
@@ -2810,12 +3401,35 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     ESP_LOGI(TAG, "spool: collected %d fragments, status=%s",
              coll.frag_count, coll.status);
 
+    /* Device refused the read (e.g. ERROR_DATA_UNAVAILABLE) — terminal
+     * failure, do not treat whatever fragments arrived as valid data. */
+    if (coll.error) {
+        ESP_LOGE(TAG, "spool: device reported %s", coll.status);
+        for (int i = 0; i < coll.frag_count; i++) free(coll.frags[i].data);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     /* 4. Sort fragments by seq and concatenate */
     if (coll.frag_count == 0) {
         return ESP_OK;  /* empty spool — valid (e.g. no events) */
     }
 
     qsort(coll.frags, coll.frag_count, sizeof(spool_frag_t), frag_cmp);
+
+    /* Sequence-continuity check: the AS11 protocol documents fragment
+     * sequence numbers starting at 0 and increasing without gaps
+     * (rpc_protocol.md).  A gap means notifications were lost — the
+     * reassembled payload would be silently corrupt, so fail the round
+     * instead of saving it. */
+    for (int i = 0; i < coll.frag_count; i++) {
+        if (coll.frags[i].seq != i) {
+            ESP_LOGE(TAG, "spool: fragment sequence discontinuity at %d "
+                     "(expected seq %d, got %d) — discarding round",
+                     i, i, coll.frags[i].seq);
+            for (int j = 0; j < coll.frag_count; j++) free(coll.frags[j].data);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
 
     size_t total = 0;
     for (int i = 0; i < coll.frag_count; i++) {
@@ -2837,6 +3451,31 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
         free(coll.frags[i].data);
     }
 
+    /* Integrity check: spoolHash is the SHA-256 of the concatenated raw
+     * fragment data (rpc_protocol.md), sent on the terminal fragment.
+     * Empty hash on a non-empty payload means the device did not send
+     * one — warn but accept (older firmware may omit it); a present but
+     * mismatching hash is corruption — fail the round. */
+    if (total > 0 && coll.spool_hash_hex[0]) {
+        uint8_t hash[32];
+        memset(hash, 0, sizeof(hash));
+        mbedtls_sha256(data, total, hash, 0);
+        char hex[65];
+        for (int i = 0; i < 32; i++) {
+            snprintf(&hex[i * 2], 3, "%02x", hash[i]);
+        }
+        if (strcasecmp(hex, coll.spool_hash_hex) != 0) {
+            ESP_LOGE(TAG, "spool: spoolHash mismatch (calc %s... vs dev %.8s...) "
+                     "— discarding round", hex, coll.spool_hash_hex);
+            free(data);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        ESP_LOGD(TAG, "spool: spoolHash verified (%s...)", hex);
+    } else if (total > 0) {
+        ESP_LOGW(TAG, "spool: no spoolHash in terminal fragment — "
+                 "integrity unverified");
+    }
+
     *round_data = data;
     *round_len = total;
 
@@ -2849,8 +3488,20 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     return ESP_OK;
 }
 
-esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
-                              uint8_t **out_data, size_t *out_len)
+/* Shared pull implementation.  Holds the RPC channel lock for the whole
+ * multi-round pull so no other RPC user (passthrough, get_values, a
+ * concurrent post-therapy pull) can interleave requests on the shared
+ * response channel or overwrite s_spool_collector mid-pull.
+ *
+ * max_bytes bounds the accumulated payload: if the next round would
+ * push the total past it, the pull fails with ESP_ERR_INVALID_SIZE
+ * (caller decides whether to skip or retry).  SIZE_MAX disables the cap.
+ *
+ * NOTE: spool_one_round() is called with the lock already held — it is
+ * internal and does no locking of its own. */
+static esp_err_t spool_pull_locked(const char *spool_type, const char *from_dt,
+                                   uint8_t **out_data, size_t *out_len,
+                                   size_t max_bytes)
 {
     if (!spool_type || !from_dt || !out_data || !out_len) {
         return ESP_ERR_INVALID_ARG;
@@ -2863,6 +3514,11 @@ esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
     *out_data = NULL;
     *out_len = 0;
 
+    if (!rpc_channel_lock(15000)) {
+        ESP_LOGW(TAG, "spool_pull: RPC channel busy (%s)", spool_type);
+        return ESP_ERR_TIMEOUT;
+    }
+
     /* Build initial spool address JSON:
      * {"<spool_type>":{"fromDateTime":"<from_dt>"}} */
     char addr_json[256];
@@ -2874,6 +3530,7 @@ esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
     uint8_t *all_data = NULL;
     size_t all_len = 0;
     int round = 0;
+    esp_err_t status = ESP_OK;
 
     while (addr_json[0]) {
         round++;
@@ -2887,12 +3544,21 @@ esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
                                         next_addr, sizeof(next_addr));
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "spool_pull: round %d failed", round);
-            free(all_data);
+            status = ret;
             free(round_data);
-            return ret;
+            break;
         }
 
         if (round_data && round_len > 0) {
+            if (max_bytes != SIZE_MAX && all_len + round_len > max_bytes) {
+                ESP_LOGW(TAG, "spool_pull: %s exceeds %u-byte cap "
+                         "(%u+%u) — aborting pull",
+                         spool_type, (unsigned)max_bytes,
+                         (unsigned)all_len, (unsigned)round_len);
+                free(round_data);
+                status = ESP_ERR_INVALID_SIZE;
+                break;
+            }
             /* Append to accumulated data */
             uint8_t *new_data = realloc(all_data, all_len + round_len);
             if (!new_data) {
@@ -2900,7 +3566,9 @@ esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
                          (unsigned)(all_len + round_len));
                 free(all_data);
                 free(round_data);
-                return ESP_ERR_NO_MEM;
+                all_data = NULL;
+                status = ESP_ERR_NO_MEM;
+                break;
             }
             memcpy(new_data + all_len, round_data, round_len);
             all_data = new_data;
@@ -2921,11 +3589,37 @@ esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
         }
     }
 
+    rpc_channel_unlock();
+
+    if (status != ESP_OK) {
+        free(all_data);
+        return status;
+    }
+
     *out_data = all_data;
     *out_len = all_len;
     ESP_LOGI(TAG, "spool_pull: %s done, %u bytes in %d round(s)",
              spool_type, (unsigned)all_len, round);
     return ESP_OK;
+}
+
+/* Default cap for unbounded pulls: large enough for any real Summary /
+ * events spool (tens of KB), small enough that a runaway multi-round
+ * pull cannot exhaust the heap. */
+#define SPOOL_PULL_MAX_BYTES  (1u << 20)  /* 1 MiB */
+
+esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
+                              uint8_t **out_data, size_t *out_len)
+{
+    return spool_pull_locked(spool_type, from_dt, out_data, out_len,
+                             SPOOL_PULL_MAX_BYTES);
+}
+
+esp_err_t as11_ble_spool_pull_bounded(const char *spool_type, const char *from_dt,
+                                      uint8_t **out_data, size_t *out_len,
+                                      size_t max_bytes)
+{
+    return spool_pull_locked(spool_type, from_dt, out_data, out_len, max_bytes);
 }
 
 cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
@@ -2958,13 +3652,19 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
              params);
     free(params);
 
+    if (!rpc_channel_lock(15000)) {
+        ESP_LOGW(TAG, "get_values: RPC channel busy");
+        return NULL;
+    }
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {
         ESP_LOGW(TAG, "get_values: send failed");
+        rpc_channel_unlock();
         return NULL;
     }
 
     cJSON *resp = wait_response(10000);
+    rpc_channel_unlock();
     if (!resp) {
         ESP_LOGW(TAG, "get_values: timeout");
         return NULL;
@@ -3093,23 +3793,118 @@ esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_
         return ESP_ERR_TIMEOUT;
     }
 
+    /* PullSpoolFragments special case: the direct response is only an
+     * ack — the actual payload arrives as asynchronous SpoolFragment
+     * notifications.  Arm a local collector so those notifications are
+     * captured and returned to the bridge caller (this is what makes
+     * diagnostic spools retrievable over HTTP, see docs/rpc-bridge.md
+     * and .ai/RECONNECT/PLAN.md Phase C4).  The command mutex is held
+     * for the whole cycle, so no other RPC user can steal the
+     * notifications or overwrite the collector pointer. */
+    bool is_spool_pull = strstr(json_in, "\"PullSpoolFragments\"") != NULL;
+    spool_collector_t coll = {0};
+    if (is_spool_pull) {
+        coll.sem = xSemaphoreCreateBinary();
+        if (!coll.sem) {
+            xSemaphoreGive(s_cmd_mtx);
+            return ESP_ERR_NO_MEM;
+        }
+        s_spool_collector = &coll;
+    }
+
     clear_response();
     if (send_rpc_encrypted(json_in) != ESP_OK) {
         ESP_LOGE(TAG, "passthrough_rpc: send_rpc_encrypted failed");
+        if (is_spool_pull) {
+            s_spool_collector = NULL;
+            vSemaphoreDelete(coll.sem);
+        }
         xSemaphoreGive(s_cmd_mtx);
         return ESP_FAIL;
     }
 
     cJSON *resp = wait_response((int)timeout_ms);
-    if (!resp) {
+    if (is_spool_pull) {
+        /* Wait for the fragment notifications.  This is an additional
+         * window of up to timeout_ms on top of the ack wait (worst case
+         * 2x timeout_ms total); a pull that never completes returns the
+         * ack plus whatever fragments arrived, with "spoolTimedOut":true. */
+        int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+        while (!coll.done &&
+               xSemaphoreTake(coll.sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            if (esp_timer_get_time() >= deadline) {
+                coll.timed_out = true;
+                break;
+            }
+        }
+        s_spool_collector = NULL;   /* detach before teardown */
+    }
+    xSemaphoreGive(s_cmd_mtx);
+
+    if (!resp && !is_spool_pull) {
         ESP_LOGW(TAG, "passthrough_rpc: timeout waiting for AS11 response");
-        xSemaphoreGive(s_cmd_mtx);
         return ESP_ERR_TIMEOUT;
+    }
+
+    if (is_spool_pull) {
+        /* Build the combined response: the ack object plus the collected
+         * fragments (base64 re-encoded, matching the wire format). */
+        cJSON *out = resp ? resp : cJSON_CreateObject();
+        if (!out) {
+            vSemaphoreDelete(coll.sem);
+            for (int i = 0; i < coll.frag_count; i++) free(coll.frags[i].data);
+            return ESP_ERR_NO_MEM;
+        }
+        cJSON *frag_arr = cJSON_AddArrayToObject(out, "spoolFragments");
+        size_t total_bytes = 0;
+        int emitted = 0;
+        for (int i = 0; i < coll.frag_count; i++) {
+            /* Response-size bound: base64 inflates by ~4/3; keep the
+             * JSON under ~96 KB so the HTTP layer and PSRAM stay
+             * comfortable.  Excess fragments are dropped and flagged. */
+            if (total_bytes + (size_t)coll.frags[i].len > 96 * 1024) {
+                cJSON_AddBoolToObject(out, "spoolTruncated", true);
+                break;
+            }
+            cJSON *f = cJSON_CreateObject();
+            if (!f) break;
+            cJSON_AddNumberToObject(f, "seq", coll.frags[i].seq);
+            cJSON_AddNumberToObject(f, "len", coll.frags[i].len);
+            unsigned char b64[4 * ((SPOOL_FRAG_MAX + 2) / 3) + 1];
+            size_t olen = 0;
+            if (mbedtls_base64_encode(b64, sizeof(b64), &olen,
+                                      coll.frags[i].data,
+                                      (size_t)coll.frags[i].len) == 0) {
+                cJSON_AddStringToObject(f, "data", (const char *)b64);
+            }
+            cJSON_AddItemToArray(frag_arr, f);
+            total_bytes += (size_t)coll.frags[i].len;
+            emitted++;
+        }
+        if (coll.status[0]) {
+            cJSON_AddStringToObject(out, "spoolStatus", coll.status);
+        }
+        if (coll.spool_hash_hex[0]) {
+            cJSON_AddStringToObject(out, "spoolHash", coll.spool_hash_hex);
+        }
+        if (coll.timed_out) {
+            cJSON_AddBoolToObject(out, "spoolTimedOut", true);
+        }
+        ESP_LOGI(TAG, "passthrough_rpc: spool pull collected %d frags "
+                 "(%u bytes, status=%s)", emitted, (unsigned)total_bytes,
+                 coll.status[0] ? coll.status : "?");
+        for (int i = 0; i < coll.frag_count; i++) free(coll.frags[i].data);
+        vSemaphoreDelete(coll.sem);
+
+        char *resp_str = cJSON_PrintUnformatted(out);
+        cJSON_Delete(out);
+        if (!resp_str) return ESP_ERR_NO_MEM;
+        *json_out = resp_str;
+        return ESP_OK;
     }
 
     char *resp_str = cJSON_PrintUnformatted(resp);
     cJSON_Delete(resp);
-    xSemaphoreGive(s_cmd_mtx);
 
     if (!resp_str) {
         return ESP_ERR_NO_MEM;

@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
@@ -544,6 +545,143 @@ static esp_err_t refresh_today_summary_spool(int64_t end_epoch_ms,
     return ESP_OK;
 }
 
+/* ── Incident diagnostics (deferred spool pull, Phase C) ───────────────
+ *
+ * When the night had a supervision-timeout disconnect or an unfillable
+ * long gap (incident latch in as11_ble.c), pull the AS11's own
+ * diagnostic event spools — CellularActivityEvents first, then the
+ * system/diagnostic exception families — and store them as raw .bin
+ * files next to the session.  This is what should tell us, next time,
+ * whether the AS11's modem was active, whether it logged an internal
+ * fault, or whether nothing unusual happened on its side at all.
+ *
+ * Trigger rules (see .ai/RECONNECT/PLAN.md):
+ *  - NEVER on the split path: a split finalize is mid-therapy (a new
+ *    session is already active), so the active-session check below
+ *    naturally defers the pull to the night's final post-therapy.
+ *  - Bounded: 8 KiB per spool via as11_ble_spool_pull_bounded; a spool
+ *    larger than that is skipped (ESP_ERR_INVALID_SIZE), not truncated.
+ *  - Raw only: DiagnosticTenMinutePeriodic is Rice-compressed and has no
+ *    validated decoder — it is NOT pulled here.
+ *  - The latch is cleared when the round produced definitive answers
+ *    (data written, empty, oversized, or device-refused).  Transport
+ *    failures keep it pending for the next stop, up to 3 attempts. */
+#define DIAG_SPOOL_MAX_BYTES  8192
+
+static const char *const DIAG_SPOOLS[] = {
+    "CellularActivityEvents",                     /* modem/RF activity     */
+    "SystemExceptionEvents-SystemErrors",
+    "SystemExceptionEvents-RecoverableErrors",
+    "DiagnosticExceptionEvents-ResettableErrors",
+    "DiagnosticExceptionEvents-FatalErrors",
+    "SystemActivityEvents-SporadicActivityEvents",
+    "SystemActivityEvents-FrequentActivityEvents",
+};
+
+/* Sanitize a spool name for use in a filename (keep [A-Za-z0-9-]). */
+static void diag_sanitize_name(const char *in, char *out, size_t out_len)
+{
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 1 < out_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        out[o++] = (isalnum(c) || c == '-') ? (char)c : '-';
+    }
+    out[o] = '\0';
+}
+
+static void collect_incident_diagnostics(const char *dir, const char *prefix,
+                                         int64_t clock_drift_ms)
+{
+    if (!as11_ble_incident_pending()) {
+        return;
+    }
+    /* Defer while therapy is active: a split finalize runs this function
+     * with the replacement session already streaming.  The latch stays
+     * pending and the night's final post-therapy picks it up. */
+    if (session_writer_get_active()) {
+        ESP_LOGI(TAG, "incident diagnostics: therapy active — deferring");
+        return;
+    }
+
+    int64_t incident_ms = as11_ble_incident_time_ms();
+    /* Spool fromDateTime is in AS11 clock time: NTP - drift.  Start the
+     * window 15 min before the incident so pre-incident activity is
+     * captured too. */
+    int64_t from_ms = incident_ms - clock_drift_ms - 15LL * 60 * 1000;
+    if (from_ms < 0) from_ms = 0;
+    char from_dt[32];
+    epoch_ms_to_iso_utc(from_ms, from_dt, sizeof(from_dt));
+
+    ESP_LOGI(TAG, "=== INCIDENT DIAGNOSTICS (%s at %lld ms, from %s) ===",
+             as11_ble_incident_pending() ? "latched" : "?",
+             (long long)incident_ms, from_dt);
+    as11_ble_incident_note_attempt();
+
+    int definitive = 0;   /* spools that returned a conclusive answer */
+    int failures = 0;     /* transport-level failures (retry-worthy)   */
+    int total_bytes = 0;
+
+    for (size_t i = 0; i < sizeof(DIAG_SPOOLS) / sizeof(DIAG_SPOOLS[0]); i++) {
+        const char *spool = DIAG_SPOOLS[i];
+        uint8_t *data = NULL;
+        size_t len = 0;
+        esp_err_t ret = as11_ble_spool_pull_bounded(spool, from_dt,
+                                                    &data, &len,
+                                                    DIAG_SPOOL_MAX_BYTES);
+        char safe_name[48];
+        diag_sanitize_name(spool, safe_name, sizeof(safe_name));
+        char path[330];
+        snprintf(path, sizeof(path), "%s/%s_diag_%s.bin",
+                 dir, prefix, safe_name);
+
+        switch (ret) {
+        case ESP_OK:
+            if (data && len > 0) {
+                if (write_bin_file(path, data, len) == ESP_OK) {
+                    ESP_LOGI(TAG, "incident diag: %s → %s (%u bytes)",
+                             spool, path, (unsigned)len);
+                    total_bytes += (int)len;
+                } else {
+                    ESP_LOGE(TAG, "incident diag: %s write failed", spool);
+                    failures++;
+                }
+            } else {
+                ESP_LOGI(TAG, "incident diag: %s empty", spool);
+            }
+            definitive++;
+            break;
+        case ESP_ERR_INVALID_SIZE:
+            ESP_LOGW(TAG, "incident diag: %s exceeds %d-byte cap — skipped",
+                     spool, DIAG_SPOOL_MAX_BYTES);
+            definitive++;
+            break;
+        case ESP_ERR_INVALID_RESPONSE:
+            /* Device refused (e.g. ERROR_DATA_UNAVAILABLE) or integrity
+             * check failed — conclusive for this spool. */
+            ESP_LOGW(TAG, "incident diag: %s refused/corrupt", spool);
+            definitive++;
+            break;
+        default:
+            ESP_LOGW(TAG, "incident diag: %s pull failed: %s",
+                     spool, esp_err_to_name(ret));
+            failures++;
+            break;
+        }
+        free(data);
+    }
+
+    ESP_LOGI(TAG, "=== INCIDENT DIAGNOSTICS DONE: %d definitive, %d failed, "
+             "%d bytes ===", definitive, failures, total_bytes);
+
+    /* Clear the latch when the round answered conclusively, or after
+     * three attempts so a persistently broken link cannot burn BLE time
+     * at every stop, night after night. */
+    if (failures == 0 || as11_ble_incident_attempts() >= 3) {
+        as11_ble_incident_clear();
+        ESP_LOGI(TAG, "incident diagnostics: latch cleared");
+    }
+}
+
 /* ── Main collection entry point ────────────────────────────────────── */
 
 esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
@@ -593,12 +731,22 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
     bool fresh = summary_spool_is_current(end_epoch_ms, clock_drift_ms);
     if (spool_current) *spool_current = fresh;
 
+    /* 6. Deferred incident diagnostics (Phase C): if the night had a
+     * supervision-timeout disconnect or an unfillable long gap and
+     * therapy is now fully stopped, pull the AS11's diagnostic event
+     * spools once.  The function itself re-checks the latch and the
+     * active-session state, so calling it unconditionally here is safe.
+     * Snapshot the latch state first — a successful round clears it. */
+    bool had_incident = as11_ble_incident_pending();
+    collect_incident_diagnostics(session_dir, file_prefix, clock_drift_ms);
+
     /* Write manifest with clock_drift_ms for EDF generation */
     cJSON *manifest = cJSON_CreateObject();
     cJSON_AddStringToObject(manifest, "collection_time", from_dt);
     cJSON_AddNumberToObject(manifest, "clock_drift_ms", (double)clock_drift_ms);
     cJSON_AddNumberToObject(manifest, "errors", errors);
     cJSON_AddBoolToObject(manifest, "spool_current", fresh);
+    cJSON_AddBoolToObject(manifest, "incident_diagnostics", had_incident);
     char mpath[330];
     snprintf(mpath, sizeof(mpath), "%s/%s_manifest.json", session_dir, file_prefix);
     write_json_file(mpath, manifest);

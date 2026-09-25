@@ -171,6 +171,65 @@ curl -X POST http://somnotrace.local/api/ble/passthrough \
 
 ---
 
+### 7. Pull Diagnostic Spool Data (`StartSpool` + `PullSpoolFragments`)
+
+`PullSpoolFragments` is special: its direct RPC response is only an
+acknowledgement — the actual payload arrives asynchronously as
+`SpoolFragment` notifications on the same BLE characteristic.  The
+passthrough endpoint arms a fragment collector whenever it detects a
+`PullSpoolFragments` request, waits for the notifications, and returns
+them inside the HTTP response.
+
+Typical sequence (two calls, run back-to-back):
+
+```bash
+# 1. Open the spool — returns {"result":{"spoolId":123,...}}
+curl -X POST http://somnotrace.local/api/ble/passthrough \
+  -H "Content-Type: application/json" \
+  -d '{"id":7,"jsonrpc":"1.0","method":"StartSpool",
+       "params":{"spoolAddress":{"CellularActivityEvents":
+         {"fromDateTime":"2026-06-25T00:00:00.000Z"}},"maxSpoolSize":100000}}'
+
+# 2. Pull the fragments using that spoolId
+curl -X POST http://somnotrace.local/api/ble/passthrough \
+  -H "Content-Type: application/json" \
+  -d '{"id":8,"jsonrpc":"1.0","method":"PullSpoolFragments",
+       "params":{"spoolId":123,"maxFragmentSize":2808,"maxNotifications":0}}'
+```
+
+The second call returns the ack object **plus** the collected fragments:
+
+```json
+{
+  "id": 8,
+  "jsonrpc": "1.0",
+  "result": null,
+  "spoolFragments": [
+    {"seq": 0, "len": 2808, "data": "<base64>"},
+    {"seq": 1, "len": 1400, "data": "<base64>"}
+  ],
+  "spoolStatus": "SPOOL_COMPLETE_NO_MORE_DATA",
+  "spoolHash": "<sha256-hex-of-concatenated-raw-data>"
+}
+```
+
+Notes:
+
+- `data` is base64, matching the BLE wire format; concatenate the decoded
+  fragments in `seq` order to reconstruct the raw spool payload.
+- `spoolHash` (when present) is the SHA-256 of that concatenation — verify
+  it after reassembly.
+- If the fragment wait hits the deadline, the response is returned with
+  whatever arrived and `"spoolTimedOut": true`; if the response would
+  exceed ~96 KB, excess fragments are dropped and `"spoolTruncated": true`
+  is set.
+- A `PullSpoolFragments` call holds the shared BLE RPC channel for its
+  whole cycle, so it cannot interleave with the device's own post-therapy
+  spool collection; while it runs, other passthrough requests fail fast
+  with a busy/timeout error.
+
+---
+
 ## Full Protocol Reference
 
 For a complete catalog of supported AirSense 11 JSON-RPC methods, variable keys, and parameters discovered through reverse-engineering research, refer to:

@@ -108,6 +108,20 @@ esp_err_t as11_ble_get_clock_drift(int64_t *out_drift_ms);
  * Requires an active encrypted BLE session with available ACL buffers. */
 esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms);
 
+/* Extended GetDateTime variant.  In addition to the AS11 clock it returns
+ * the NTP wall-clock midpoint of the RPC round trip — the instant the
+ * returned AS11 reading best corresponds to.  This matters on the split
+ * path: the session's back-dated end_epoch_ms is correct as a session
+ * boundary but must NOT be used to measure clock drift, because the AS11
+ * clock read happens several seconds after that boundary
+ * (see .ai/RECONNECT/PLAN.md Phase B.1). */
+esp_err_t as11_ble_get_datetime_ex(int64_t *out_epoch_ms, int64_t *out_meas_ms);
+
+/* Query AS11 firmware identity via GetVersion and write a compact
+ * one-line summary into buf ("FlowGenerator=... BluetoothModule=...").
+ * Requires an active encrypted BLE session. */
+esp_err_t as11_ble_get_version(char *buf, size_t buflen);
+
 /* ── Spool RPC ────────────────────────────────────────────────────────
  * Post-therapy spool data collection.  The AS11 stores session summaries,
  * event logs, and other data in internal "spools" that are retrieved via
@@ -131,6 +145,14 @@ esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms);
 esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
                               uint8_t **out_data, size_t *out_len);
 
+/* Same pull cycle as as11_ble_spool_pull(), but stops accumulation once
+ * the total payload would exceed max_bytes and returns ESP_ERR_INVALID_SIZE
+ * (with *out_data freed).  Used by the deferred diagnostic pull to bound
+ * BLE airtime and RAM use (see .ai/RECONNECT/PLAN.md Phase B.3/C). */
+esp_err_t as11_ble_spool_pull_bounded(const char *spool_type, const char *from_dt,
+                                      uint8_t **out_data, size_t *out_len,
+                                      size_t max_bytes);
+
 /* Send a Get RPC for multiple variable names (encrypted).
  * Returns a cJSON result object (caller must cJSON_Delete) or NULL.
  * The result is the "result" object from the RPC response, mapping
@@ -150,6 +172,37 @@ esp_err_t as11_ble_start_therapy(void);
 /* Generic BLE JSON-RPC passthrough interface.
  * Transmits json_in over the encrypted BLE session, awaits the AS11 response,
  * and returns the decrypted response string in *json_out (malloc'd, caller frees).
- * Requires an active encrypted BLE session. */
+ * Requires an active encrypted BLE session.
+ * A PullSpoolFragments request also arms the fragment collector so the
+ * asynchronous SpoolFragment notifications are returned in *json_out. */
 esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_t timeout_ms);
+
+/* ── Incident latch ───────────────────────────────────────────────────
+ * Set when a supervision-timeout disconnect (HCI 0x08) or an unfillable
+ * long gap occurs.  Checked (and consumed) at the next post-therapy run
+ * that finds therapy fully stopped — this is where the deferred
+ * diagnostic spool pull happens, never on the split path itself
+ * (see .ai/RECONNECT/PLAN.md Phase C).  RAM-only: a reboot intentionally
+ * clears it so a stale flag can never trigger BLE work days later. */
+void    as11_ble_incident_mark(const char *kind);
+bool    as11_ble_incident_pending(void);
+int64_t as11_ble_incident_time_ms(void);   /* 0 = unknown */
+void    as11_ble_incident_note_attempt(void);
+int     as11_ble_incident_attempts(void);
+void    as11_ble_incident_clear(void);
+
+/* ── Experimental mitigations (Phase D, opt-in, persisted in NVS) ─────
+ * supv_timeout_ms: 0 = accept peer-negotiated supervision timeout
+ *                  (default).  Non-zero = after the peer's own parameter
+ *                  update settles, issue a central-initiated
+ *                  LL_CONNECTION_UPDATE_IND raising the supervision
+ *                  timeout to this value (100 ms units applied
+ *                  internally).  Unproven against reason-520 drops.
+ * coex_fix:        false = keep the historical (argument-inverted)
+ *                  esp_coex_status_bit_set call for bug-compat;
+ *                  true  = emit the corrected BLE status bit. */
+uint16_t  as11_ble_exp_supv_timeout_ms(void);
+esp_err_t as11_ble_exp_supv_timeout_set(uint16_t ms);
+bool      as11_ble_exp_coex_fix(void);
+esp_err_t as11_ble_exp_coex_fix_set(bool on);
 

@@ -299,6 +299,13 @@ struct session_writer {
 
 static session_writer_t *s_active = NULL;
 static SemaphoreHandle_t s_active_mutex = NULL;
+
+/* Set while the post worker runs the BLE post-therapy collection for a
+ * finalized session (see session_writer_post_active).  Advisory
+ * telemetry: read without a lock — a bool cannot tear and one cycle of
+ * staleness is harmless for both consumers (disconnect-context line,
+ * incident-diagnostics gating). */
+static volatile bool s_post_active;
 static QueueHandle_t     s_storage_q = NULL;
 static QueueHandle_t     s_post_q = NULL;
 static TaskHandle_t      s_storage_task = NULL;
@@ -1452,7 +1459,16 @@ static void sw_post_task(void *arg)
          *
          * The stop-time GetDateTime RPC is the authoritative source, but it
          * is unavailable exactly when the link dropped — which is the common
-         * case for a timed-out session.  Never block on it there. */
+         * case for a timed-out session.  Never block on it there.
+         *
+         * Drift provenance (Phase B.1 in .ai/RECONNECT/PLAN.md): drift is
+         * "AS11 clock vs NTP clock at the same instant", so it must be
+         * computed from the wall-clock time at which the AS11 reading was
+         * taken — NOT from job.end_epoch_ms.  On the split path end_epoch_ms
+         * is deliberately back-dated to the start of the data gap (the
+         * correct session boundary), which on a 520 incident is ~14 s before
+         * the clock read; pairing the two would fold the whole gap into the
+         * stored drift (ronmis: -201637 saved vs -187863 true). */
         int64_t drift_ms = 0;
         bool drift_valid = false;
         const char *drift_source = "none";
@@ -1460,11 +1476,16 @@ static void sw_post_task(void *arg)
 
         if (job.allow_ble) {
             int64_t as11_ms = 0;
-            if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
-                drift_ms = job.end_epoch_ms - as11_ms;
+            int64_t meas_ms = 0;
+            if (as11_ble_get_datetime_ex(&as11_ms, &meas_ms) == ESP_OK) {
+                drift_ms = meas_ms - as11_ms;
+                drift_at = meas_ms;
                 drift_valid = true;
                 drift_source = "measured_stop";
-                ESP_LOGI(TAG, "clock_drift_ms = %lld (stop-time)", (long long)drift_ms);
+                ESP_LOGI(TAG, "clock_drift_ms = %lld (measured at %lld, "
+                         "session end %lld)",
+                         (long long)drift_ms, (long long)meas_ms,
+                         (long long)job.end_epoch_ms);
             } else if (as11_ble_get_clock_drift(&drift_ms) == ESP_OK) {
                 drift_valid = true;
                 drift_source = "measured_prestream";
@@ -1505,9 +1526,11 @@ static void sw_post_task(void *arg)
         }
 
         /* 3. Persist drift only when the clock was NTP-authoritative, else a
-         * degraded-mode session would feed its own estimate back in. */
+         * degraded-mode session would feed its own estimate back in.
+         * Persisted with drift_at (the measurement instant), not the
+         * back-dated session end — same provenance rule as above. */
         if (drift_valid && time_source_get() == TIME_SRC_NTP) {
-            time_sync_save_drift(drift_ms, job.end_epoch_ms);
+            time_sync_save_drift(drift_ms, drift_at);
         }
 
         char session_dir[MAX_SESSION_DIR_LEN];
@@ -1528,9 +1551,13 @@ static void sw_post_task(void *arg)
             continue;
         }
 
-        /* 4. Post-therapy collection (BLE spool pulls + Get RPC). */
+        /* 4. Post-therapy collection (BLE spool pulls + Get RPC).
+         * s_post_active brackets the BLE work so the disconnect-context
+         * telemetry and the deferred incident diagnostics can see when
+         * this flow is in flight. */
         bool spool_current = false;
         if (job.allow_ble) {
+            s_post_active = true;
             ESP_LOGI(TAG, "post: starting post-therapy collection");
             post_therapy_collect(session_dir, session_id, start_epoch_ms,
                                  drift_ms, end_epoch_ms, &spool_current);
@@ -1542,6 +1569,7 @@ static void sw_post_task(void *arg)
                          fresh ? "CURRENT" : "STALE (timeout)",
                          (long long)elapsed_ms);
             }
+            s_post_active = false;
         } else {
             ESP_LOGW(TAG, "post: BLE unavailable, skipping spool collection for %s",
                      session_id);
@@ -1787,6 +1815,27 @@ bool session_writer_is_active(const session_writer_t *s)
 session_writer_t *session_writer_get_active(void)
 {
     return s_active;
+}
+
+bool session_writer_post_active(void)
+{
+    return s_post_active;
+}
+
+bool session_writer_active_start_epoch_ms(int64_t *out)
+{
+    if (!out) return false;
+    if (s_active_mutex &&
+        xSemaphoreTake(s_active_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        session_writer_t *s = s_active;
+        if (s) {
+            *out = s->start_epoch_ms;
+            xSemaphoreGive(s_active_mutex);
+            return true;
+        }
+        xSemaphoreGive(s_active_mutex);
+    }
+    return false;
 }
 
 uint32_t session_writer_get_duration_min(void)
@@ -2169,6 +2218,15 @@ void session_writer_on_stream_data_raw(const char *json, int len)
          * fabricating false physiological data. */
         xSemaphoreGive(s->fill_mutex);
         ESP_LOGW(TAG, "splitting session at long gap (%lld ms)", (long long)gap);
+        /* Latch the incident for the deferred diagnostic pull (Phase C in
+         * .ai/RECONNECT/PLAN.md).  A gap this large is either a
+         * supervision-timeout drop (already latched by the disconnect
+         * handler — mark() is idempotent) or a silent AS11 stall that
+         * survived without one; both qualify for end-of-night
+         * diagnostics.  Collection itself never happens here — the split
+         * path is mid-therapy and the new session must start streaming
+         * immediately. */
+        as11_ble_incident_mark("long_gap");
         int64_t now_ms = (int64_t)time(NULL) * 1000;
         int64_t end_epoch_ms = now_ms - gap;
         if (end_epoch_ms < s->start_epoch_ms) {
