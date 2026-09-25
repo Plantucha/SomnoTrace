@@ -27,7 +27,11 @@
 #include "esp_err.h"
 #include "upload_index.h"
 
-#define UPLOAD_OX_MAX_UNITS 64
+/* Bounds the ref array returned by upload_ox_scan()/reconcile() — one ref is
+ * ~5.5 KB (paths), allocs are transient PSRAM.  This is NOT a state cap:
+ * upload state is a grow-on-demand list persisted per recording, so exceeding
+ * this only hides the oldest recordings from one pass (a warning is logged). */
+#define UPLOAD_OX_MAX_UNITS 128
 #define UPLOAD_OX_MAX_FILES 8
 #define UPLOAD_OX_ID_LEN 64
 #define UPLOAD_OX_PATH_LEN 512

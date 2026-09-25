@@ -316,8 +316,14 @@ static bool run_backend(backend_rt_t *r, int max_days)
         ESP_LOGI(TAG, "%s: root files changed, attaching to day %08u",
                  be->id, (unsigned)days[0]);
     } else {
-        ESP_LOGI(TAG, "%s: %d day(s), %d unit(s) pending%s", be->id, n_days,
-                 n_units, bundle_changed ? ", root files changed too" : "");
+        /* unit(s) counted EDF groups only; an oximetry-only run used to log
+         * "0 day(s), 0 unit(s) pending" and then upload anyway. */
+        char ox_note[40] = "";
+        if (ox_pending > 0)
+            snprintf(ox_note, sizeof(ox_note), ", %d oximetry", ox_pending);
+        ESP_LOGI(TAG, "%s: %d day(s), %d unit(s) pending%s%s", be->id, n_days,
+                 n_units, ox_note,
+                 bundle_changed ? ", root files changed too" : "");
     }
 
     upload_result_t res = be->session_begin ? be->session_begin() : UPLOAD_OK;

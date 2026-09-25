@@ -60,7 +60,11 @@
  *  main/sd_storage.h (this component does not depend on main).
  * ──────────────────────────────────────────────────────────────────── */
 
+/* Overridable like SD_MOUNT_POINT in upload_paths.h: the oximetry state
+ * test points both at a scratch tree on the host. */
+#ifndef UPLOAD_STATE_DIR
 #define UPLOAD_STATE_DIR          "/somnotrace/.somnotrace/upload_state"
+#endif
 #define UPLOAD_BUNDLE_STATE_PATH  UPLOAD_STATE_DIR "/bundle.json"
 
 #define UPLOAD_MAX_BACKENDS        4

@@ -166,6 +166,7 @@ else
     CJ_INC=""
     skip_test edf_gen_test "no cJSON (apt install libcjson-dev, or set CJSON_DIR=<dir with cJSON.c/.h>)"
     skip_test edf_properties_test "no cJSON"
+    skip_test upload_ox_test "no cJSON"
 fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
@@ -173,6 +174,13 @@ if [ -n "$CJ_INC" ]; then
     # upstream's EDF pipeline property suite (54ae598)
     run_test edf_properties_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+    # Oximetry upload-state store: the 64-slot-table overflow that kept
+    # re-uploading the same recording.  Needs real cJSON (the shim's Parse
+    # returns NULL) and scratch dirs under /tmp for a fake card + state tree.
+    run_test upload_ox_test $CJ_INC -I"$SHIM" -I"$UPLOADER_DIR" \
+        '-DSD_MOUNT_POINT="/tmp/somnotrace_oxt/sd"' \
+        '-DUPLOAD_STATE_DIR="/tmp/somnotrace_oxt/ustate"' \
+        scripts/upload_ox_test.c "$UPLOADER_DIR/upload_ox.c" $CJ_SRC $CJ_LIB
 fi
 
 # The mutation harness's TEXTUAL layer has nothing else to catch a mistake in it. Every

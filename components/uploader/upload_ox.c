@@ -24,6 +24,7 @@
 #include "upload_paths.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,32 +33,65 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "cJSON.h"
 
+static const char *TAG = "up_ox";
+
 #define OX_RECORDINGS_DIR SD_MOUNT_POINT "/.somnotrace/oximetry/recordings"
-#define OX_STATE_PATH UPLOAD_STATE_DIR "/oximetry.json"
-#define OX_STATE_TMP  UPLOAD_STATE_DIR "/oximetry.json.tmp"
+#define OX_STATE_DIR      UPLOAD_STATE_DIR "/ox"
+#define OX_STATE_LEGACY   UPLOAD_STATE_DIR "/oximetry.json"
+#define OX_STATE_LEGACY_DONE UPLOAD_STATE_DIR "/oximetry.json.migrated"
 #define OX_MAX_BACKENDS_LOCAL UPLOAD_MAX_BACKENDS
 
-typedef struct {
-    bool used;
-    char id[UPLOAD_OX_ID_LEN];
+/* ── Per-recording state, modelled on the CPAP day index ──────────────
+ *
+ * One JSON file per recording under upload_state/ox/<recording_id>.json,
+ * backends keyed by NAME — the same convention upload_index.c day files use,
+ * so a change in backend registration order cannot renumber existing state:
+ *
+ *   {"v":1,"id":"20260925033858","day":"20260924","gen":1,"fp":"1d29…",
+ *    "be":{"smb":{"s":"ok","t":1788603621},"sleephq":{"s":"ok",…}}}
+ *
+ * In RAM the states are a linked list grown on demand.  The pre-rewrite
+ * design was a fixed UPLOAD_OX_MAX_UNITS-slot array: once it filled, every
+ * further recording read as pending forever while its "uploaded" mark was
+ * silently dropped — the same file went to SleepHQ on every pass.  A list
+ * plus per-recording files removes the capacity question entirely.
+ *
+ * s_lock guards the list: upload_ox_status_json() runs on the httpd task,
+ * everything else on the scheduler task. */
+typedef struct ox_state_s {
+    struct ox_state_s *next;
+    uint8_t  dirty;         /* needs its file rewritten                   */
+    char     id[UPLOAD_OX_ID_LEN];
+    char     day[12];       /* noon-day folder — for existence checks     */
     uint32_t generation;
     uint64_t fingerprint;
     upload_unit_t backend[OX_MAX_BACKENDS_LOCAL];
-    char remote[OX_MAX_BACKENDS_LOCAL][64];
+    char     remote[OX_MAX_BACKENDS_LOCAL][64];
 } ox_state_t;
 
-/* Allocated in PSRAM by upload_ox_init(): 64 × ~368 B of pure bookkeeping is
- * the uploader's largest static internal-RAM consumer, and it is only ever
- * touched from the scheduler task context — never an ISR, never with the
- * cache disabled — so there is no reason to keep it internal.  NULL until
- * init succeeds; every entry point tolerates that (state lookups fail, so
- * oximetry units read as pending and marks are dropped). */
-static ox_state_t *s_states;
+static ox_state_t *s_states;        /* head of the list, PSRAM nodes     */
+static SemaphoreHandle_t s_lock;
+static portMUX_TYPE s_init_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_loaded;
+
+static bool ox_lock_init(void)
+{
+    if (s_lock) return true;
+    taskENTER_CRITICAL(&s_init_mux);
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    taskEXIT_CRITICAL(&s_init_mux);
+    return s_lock != NULL;
+}
+
+static void ox_lock(void)   { xSemaphoreTake(s_lock, portMAX_DELAY); }
+static void ox_unlock(void) { xSemaphoreGive(s_lock); }
 
 static bool safe_component(const char *s, size_t max_len)
 {
@@ -113,30 +147,44 @@ static uint64_t file_fp(uint64_t h, const char *name, const char *path)
     return h;
 }
 
-static int state_find(const char *id, uint32_t generation)
+static ox_state_t *state_find_id(const char *id)
 {
-    if (!s_states) return -1;
-    for (int i = 0; i < UPLOAD_OX_MAX_UNITS; i++)
-        if (s_states[i].used && s_states[i].generation == generation &&
-            strcmp(s_states[i].id, id) == 0) return i;
-    return -1;
+    for (ox_state_t *u = s_states; u; u = u->next)
+        if (strcmp(u->id, id) == 0) return u;
+    return NULL;
 }
 
-static int state_get(const upload_ox_ref_t *ref, bool create)
+/* Look up the state for a ref, optionally creating it.  One node per
+ * recording_id: a generation bump (re-conversion) resets the node in place —
+ * the unit file is per recording, not per generation. */
+static ox_state_t *state_get(const upload_ox_ref_t *ref, bool create)
 {
-    if (!s_states) return -1;
-    int i = state_find(ref->recording_id, ref->generation);
-    if (i >= 0 || !create) return i;
-    for (i = 0; i < UPLOAD_OX_MAX_UNITS; i++) {
-        if (s_states[i].used) continue;
-        memset(&s_states[i], 0, sizeof(s_states[i]));
-        s_states[i].used = true;
-        strlcpy(s_states[i].id, ref->recording_id, sizeof(s_states[i].id));
-        s_states[i].generation = ref->generation;
-        s_states[i].fingerprint = ref->fingerprint;
-        return i;
+    ox_state_t *u = state_find_id(ref->recording_id);
+    if (u) {
+        if (u->generation != ref->generation) {
+            u->generation = ref->generation;
+            u->fingerprint = ref->fingerprint;
+            memset(u->backend, 0, sizeof(u->backend));
+            memset(u->remote, 0, sizeof(u->remote));
+            u->dirty = true;
+        }
+        if (!u->day[0] && ref->day[0]) {
+            strlcpy(u->day, ref->day, sizeof(u->day));
+            u->dirty = true;
+        }
+        return u;
     }
-    return -1;
+    if (!create) return NULL;
+    u = heap_caps_calloc(1, sizeof(*u), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!u) u = calloc(1, sizeof(*u));
+    if (!u) return NULL;
+    strlcpy(u->id, ref->recording_id, sizeof(u->id));
+    strlcpy(u->day, ref->day, sizeof(u->day));
+    u->generation = ref->generation;
+    u->fingerprint = ref->fingerprint;
+    u->next = s_states;
+    s_states = u;
+    return u;
 }
 
 static const char *status_name(uint8_t status)
@@ -151,104 +199,297 @@ static uint8_t status_parse(const char *name)
     return UG_PENDING;
 }
 
-static cJSON *read_state(void)
+/* ── Persistence ──────────────────────────────────────────────────── */
+
+static bool unit_path(char *out, size_t n, const char *id)
 {
-    FILE *f = fopen(OX_STATE_PATH, "r");
-    if (!f) return NULL;
+    return snprintf(out, n, "%s/%s.json", OX_STATE_DIR, id) < (int)n;
+}
+
+static esp_err_t write_json_atomic(const char *path, const char *json)
+{
+    char tmp[UPLOAD_OX_PATH_LEN];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+        return ESP_ERR_INVALID_SIZE;
+
+    size_t len = strlen(json);
+    bool ok = false;
+    FILE *f = fopen(tmp, "w");
+    if (f) {
+        ok = (fwrite(json, 1, len, f) == len);
+        if (ok && fflush(f) != 0) ok = false;
+        if (ok && fsync(fileno(f)) != 0) ok = false;
+        if (fclose(f) != 0) ok = false;
+    }
+    if (ok) {
+        unlink(path);                     /* FATFS cannot rename-over */
+        if (rename(tmp, path) != 0) ok = false;
+    }
+    if (!ok) {
+        unlink(tmp);
+        ESP_LOGE(TAG, "failed to write %s: %s", path, strerror(errno));
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t save_unit(ox_state_t *u)
+{
+    char path[UPLOAD_OX_PATH_LEN];
+    if (!unit_path(path, sizeof(path), u->id)) return ESP_ERR_INVALID_SIZE;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+    cJSON_AddNumberToObject(root, "v", 1);
+    cJSON_AddStringToObject(root, "id", u->id);
+    if (u->day[0]) cJSON_AddStringToObject(root, "day", u->day);
+    cJSON_AddNumberToObject(root, "gen", (double)u->generation);
+    char fp[17];
+    snprintf(fp, sizeof(fp), "%016llx", (unsigned long long)u->fingerprint);
+    cJSON_AddStringToObject(root, "fp", fp);
+
+    /* Only backends with a recorded outcome are written — the CPAP day-file
+     * convention: a missing backend reads back as pending/0. */
+    cJSON *be = NULL;
+    for (int b = 0; b < upload_index_backend_count() && b < OX_MAX_BACKENDS_LOCAL; b++) {
+        const upload_unit_t *un = &u->backend[b];
+        const char *bname = upload_index_backend_name(b);
+        if (!bname ||
+            (un->status == UG_PENDING && un->attempts == 0 && !u->remote[b][0])) continue;
+        if (!be) be = cJSON_AddObjectToObject(root, "be");
+        cJSON *bo = cJSON_AddObjectToObject(be, bname);
+        cJSON_AddStringToObject(bo, "s", status_name(un->status));
+        if (un->attempts)   cJSON_AddNumberToObject(bo, "a", un->attempts);
+        if (un->last_try_s) cJSON_AddNumberToObject(bo, "t", (double)un->last_try_s);
+        if (u->remote[b][0]) cJSON_AddStringToObject(bo, "r", u->remote[b]);
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return ESP_ERR_NO_MEM;
+    esp_err_t ret = write_json_atomic(path, json);
+    cJSON_free(json);
+    return ret;
+}
+
+static void load_unit_file(const char *path)
+{
+    cJSON *root = read_json_file(path);
+    if (!root) return;
+
+    cJSON *id = cJSON_GetObjectItem(root, "id");
+    cJSON *gen = cJSON_GetObjectItem(root, "gen");
+    cJSON *fp = cJSON_GetObjectItem(root, "fp");
+    if (!cJSON_IsString(id) || !safe_component(id->valuestring, UPLOAD_OX_ID_LEN) ||
+        !cJSON_IsNumber(gen) || !cJSON_IsString(fp)) {
+        ESP_LOGW(TAG, "%s is not a valid unit file — recording re-derives state", path);
+        cJSON_Delete(root);
+        return;
+    }
+
+    upload_ox_ref_t ref;
+    memset(&ref, 0, sizeof(ref));
+    strlcpy(ref.recording_id, id->valuestring, sizeof(ref.recording_id));
+    ref.generation = (uint32_t)gen->valuedouble;
+    cJSON *day = cJSON_GetObjectItem(root, "day");
+    if (cJSON_IsString(day)) strlcpy(ref.day, day->valuestring, sizeof(ref.day));
+
+    ox_state_t *u = state_get(&ref, true);
+    if (!u) { cJSON_Delete(root); return; }
+    u->fingerprint = strtoull(fp->valuestring, NULL, 16);
+
+    cJSON *be = cJSON_GetObjectItem(root, "be");
+    for (cJSON *bo = be ? be->child : NULL; bo; bo = bo->next) {
+        if (!bo->string) continue;
+        int slot = upload_index_backend_slot(bo->string);
+        if (slot < 0 || slot >= OX_MAX_BACKENDS_LOCAL) continue;
+        cJSON *s = cJSON_GetObjectItem(bo, "s");
+        cJSON *a = cJSON_GetObjectItem(bo, "a");
+        cJSON *t = cJSON_GetObjectItem(bo, "t");
+        cJSON *r = cJSON_GetObjectItem(bo, "r");
+        u->backend[slot].status = status_parse(cJSON_IsString(s) ? s->valuestring : NULL);
+        if (cJSON_IsNumber(a)) u->backend[slot].attempts = (uint8_t)a->valueint;
+        if (cJSON_IsNumber(t)) u->backend[slot].last_try_s = (uint32_t)t->valuedouble;
+        if (cJSON_IsString(r)) strlcpy(u->remote[slot], r->valuestring, sizeof(u->remote[slot]));
+    }
+    u->dirty = false;
+    cJSON_Delete(root);
+}
+
+/* Flush every dirty unit.  Caller must hold s_lock. */
+static esp_err_t save_all_locked(void)
+{
+    esp_err_t last = ESP_OK;
+    for (ox_state_t *u = s_states; u; u = u->next) {
+        if (!u->dirty) continue;
+        if (save_unit(u) == ESP_OK) u->dirty = false;
+        else last = ESP_FAIL;
+    }
+    return last;
+}
+
+/* Legacy single-file state (numeric backend slots, cap 64).  Imported once at
+ * init, then renamed aside — kept rather than deleted so a migration fault is
+ * recoverable. */
+static void migrate_legacy(void)
+{
+    FILE *f = fopen(OX_STATE_LEGACY, "r");
+    if (!f) return;
     fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > 256 * 1024) { fclose(f); return NULL; }
+    if (size <= 0 || size > 256 * 1024) { fclose(f); return; }
     char *buf = heap_caps_malloc((size_t)size + 1, MALLOC_CAP_SPIRAM);
     if (!buf) buf = malloc((size_t)size + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t n = fread(buf, 1, (size_t)size, f); fclose(f); buf[n] = '\0';
-    cJSON *root = n == (size_t)size ? cJSON_Parse(buf) : NULL;
-    free(buf); return root;
+    if (!buf) { fclose(f); return; }
+    size_t nr = fread(buf, 1, (size_t)size, f); fclose(f); buf[nr] = '\0';
+    cJSON *root = (nr == (size_t)size) ? cJSON_Parse(buf) : NULL;
+    free(buf);
+    if (!root) return;
+
+    int imported = 0;
+    cJSON *units = cJSON_GetObjectItem(root, "units");
+    cJSON *item;
+    cJSON_ArrayForEach(item, units) {
+        cJSON *id = cJSON_GetObjectItem(item, "recording_id");
+        cJSON *gen = cJSON_GetObjectItem(item, "generation");
+        cJSON *fp = cJSON_GetObjectItem(item, "fingerprint");
+        if (!cJSON_IsString(id) || !cJSON_IsNumber(gen) ||
+            (!cJSON_IsNumber(fp) && !cJSON_IsString(fp))) continue;
+        if (state_find_id(id->valuestring)) continue;   /* new format wins */
+
+        upload_ox_ref_t ref;
+        memset(&ref, 0, sizeof(ref));
+        strlcpy(ref.recording_id, id->valuestring, sizeof(ref.recording_id));
+        ref.generation = (uint32_t)gen->valuedouble;
+        ox_state_t *u = state_get(&ref, true);
+        if (!u) continue;
+        u->fingerprint = cJSON_IsString(fp)
+            ? strtoull(fp->valuestring, NULL, 16)
+            : (uint64_t)fp->valuedouble;
+
+        cJSON *bes = cJSON_GetObjectItem(item, "backends");
+        cJSON *be;
+        cJSON_ArrayForEach(be, bes) {
+            cJSON *bi = cJSON_GetObjectItem(be, "slot");
+            cJSON *bs = cJSON_GetObjectItem(be, "status");
+            if (!cJSON_IsNumber(bi) || !cJSON_IsString(bs) ||
+                bi->valueint < 0 || bi->valueint >= OX_MAX_BACKENDS_LOCAL) continue;
+            int b = bi->valueint;
+            u->backend[b].status = status_parse(bs->valuestring);
+            cJSON *at = cJSON_GetObjectItem(be, "attempts");
+            cJSON *lt = cJSON_GetObjectItem(be, "last_try_s");
+            cJSON *ri = cJSON_GetObjectItem(be, "remote_id");
+            if (cJSON_IsNumber(at)) u->backend[b].attempts = (uint8_t)at->valueint;
+            if (cJSON_IsNumber(lt)) u->backend[b].last_try_s = (uint32_t)lt->valuedouble;
+            if (cJSON_IsString(ri)) strlcpy(u->remote[b], ri->valuestring, sizeof(u->remote[b]));
+        }
+        u->dirty = true;
+        imported++;
+    }
+    cJSON_Delete(root);
+    if (!imported) return;
+
+    ESP_LOGI(TAG, "migrating %d legacy oximetry unit(s) to per-recording files",
+             imported);
+    if (save_all_locked() == ESP_OK &&
+        rename(OX_STATE_LEGACY, OX_STATE_LEGACY_DONE) == 0) {
+        ESP_LOGI(TAG, "legacy oximetry state migrated");
+    } else {
+        /* Retry next boot: state_find_id() dedup makes re-import harmless,
+         * and the legacy file is left untouched so no state is lost. */
+        ESP_LOGW(TAG, "legacy oximetry state migration deferred (SD write failed)");
+    }
+}
+
+/* Legacy units carry no day, so reconcile's existence check can never reach
+ * them.  One pass at init locates each day-less unit's recording dir under
+ * the recordings root; a unit still day-less afterwards belongs to a deleted
+ * recording and is evicted, else it would count as pending forever.  Same
+ * root-guard as reconcile: an unreadable recordings tree proves nothing. */
+static void resolve_orphan_days_locked(void)
+{
+    bool any_orphan = false;
+    for (ox_state_t *u = s_states; u; u = u->next)
+        if (!u->day[0]) { any_orphan = true; break; }
+    if (!any_orphan) return;
+
+    struct stat rst;
+    if (stat(OX_RECORDINGS_DIR, &rst) != 0 || !S_ISDIR(rst.st_mode)) return;
+
+    DIR *root = opendir(OX_RECORDINGS_DIR);
+    if (!root) return;
+    struct dirent *e;
+    while ((e = readdir(root))) {
+        if (!valid_day(e->d_name)) continue;
+        char dpath[UPLOAD_OX_PATH_LEN];
+        if (!join2(dpath, sizeof(dpath), OX_RECORDINGS_DIR, e->d_name)) continue;
+        DIR *dd = opendir(dpath);
+        if (!dd) continue;
+        struct dirent *de;
+        while ((de = readdir(dd))) {
+            ox_state_t *u = state_find_id(de->d_name);
+            if (u && !u->day[0]) {
+                strlcpy(u->day, e->d_name, sizeof(u->day));
+                u->dirty = true;
+            }
+        }
+        closedir(dd);
+    }
+    closedir(root);
+
+    ox_state_t **pp = &s_states;
+    while (*pp) {
+        ox_state_t *u = *pp;
+        if (u->day[0]) {
+            pp = &u->next;
+            continue;
+        }
+        char path[UPLOAD_OX_PATH_LEN];
+        if (unit_path(path, sizeof(path), u->id)) unlink(path);
+        *pp = u->next;
+        free(u);
+    }
 }
 
 esp_err_t upload_ox_init(void)
 {
-    if (s_loaded) return ESP_OK;
-    if (!s_states) {
-        s_states = heap_caps_calloc(UPLOAD_OX_MAX_UNITS, sizeof(ox_state_t),
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_states)
-            s_states = calloc(UPLOAD_OX_MAX_UNITS, sizeof(ox_state_t));
-        if (!s_states) return ESP_ERR_NO_MEM;
-    }
-    cJSON *root = read_state();
-    cJSON *units = root ? cJSON_GetObjectItem(root, "units") : NULL;
-    if (units && cJSON_IsArray(units)) {
-        cJSON *item; cJSON_ArrayForEach(item, units) {
-            cJSON *id = cJSON_GetObjectItem(item, "recording_id");
-            cJSON *gen = cJSON_GetObjectItem(item, "generation");
-            cJSON *fp = cJSON_GetObjectItem(item, "fingerprint");
-            if (!cJSON_IsString(id) || !cJSON_IsNumber(gen) ||
-                (!cJSON_IsNumber(fp) && !cJSON_IsString(fp))) continue;
-            upload_ox_ref_t dummy; memset(&dummy, 0, sizeof(dummy));
-            strlcpy(dummy.recording_id, id->valuestring, sizeof(dummy.recording_id));
-            dummy.generation = (uint32_t)gen->valuedouble;
-            int slot = state_get(&dummy, true); if (slot < 0) continue;
-            s_states[slot].fingerprint = cJSON_IsString(fp)
-                ? strtoull(fp->valuestring, NULL, 16)
-                : (uint64_t)fp->valuedouble;
-            cJSON *bes = cJSON_GetObjectItem(item, "backends");
-            if (!bes || !cJSON_IsArray(bes)) continue;
-            cJSON *be; cJSON_ArrayForEach(be, bes) {
-                cJSON *bi = cJSON_GetObjectItem(be, "slot");
-                cJSON *bs = cJSON_GetObjectItem(be, "status");
-                if (!cJSON_IsNumber(bi) || !cJSON_IsString(bs) || bi->valueint < 0 || bi->valueint >= OX_MAX_BACKENDS_LOCAL) continue;
-                int b = bi->valueint;
-                s_states[slot].backend[b].status = status_parse(bs->valuestring);
-                cJSON *at = cJSON_GetObjectItem(be, "attempts");
-                cJSON *lt = cJSON_GetObjectItem(be, "last_try_s");
-                if (cJSON_IsNumber(at)) s_states[slot].backend[b].attempts = (uint8_t)at->valueint;
-                if (cJSON_IsNumber(lt)) s_states[slot].backend[b].last_try_s = (uint32_t)lt->valuedouble;
-                cJSON *ri = cJSON_GetObjectItem(be, "remote_id");
-                if (cJSON_IsString(ri)) strlcpy(s_states[slot].remote[b], ri->valuestring, sizeof(s_states[slot].remote[b]));
-            }
+    if (!ox_lock_init()) return ESP_ERR_NO_MEM;
+    ox_lock();
+    if (s_loaded) { ox_unlock(); return ESP_OK; }
+
+    mkdir(UPLOAD_STATE_DIR, 0775);
+    mkdir(OX_STATE_DIR, 0775);
+
+    DIR *d = opendir(OX_STATE_DIR);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            const char *n = e->d_name;
+            size_t l = strlen(n);
+            if (l < 6 || strcmp(n + l - 5, ".json") != 0) continue;
+            char path[UPLOAD_OX_PATH_LEN];
+            if (snprintf(path, sizeof(path), "%s/%s", OX_STATE_DIR, n) >=
+                (int)sizeof(path)) continue;
+            load_unit_file(path);
         }
+        closedir(d);
     }
-    if (root) cJSON_Delete(root);
+
+    migrate_legacy();
+    resolve_orphan_days_locked();
+    save_all_locked();
+
     s_loaded = true;
+    ox_unlock();
     return ESP_OK;
 }
 
 esp_err_t upload_ox_save(void)
 {
-    if (!s_loaded || !s_states) return ESP_ERR_INVALID_STATE;
-    cJSON *root = cJSON_CreateObject(); if (!root) return ESP_ERR_NO_MEM;
-    cJSON_AddNumberToObject(root, "version", 1);
-    cJSON *units = cJSON_AddArrayToObject(root, "units");
-    for (int i = 0; i < UPLOAD_OX_MAX_UNITS; i++) {
-        if (!s_states[i].used) continue;
-        cJSON *u = cJSON_CreateObject();
-        cJSON_AddStringToObject(u, "recording_id", s_states[i].id);
-        cJSON_AddNumberToObject(u, "generation", s_states[i].generation);
-        char fp[17];
-        snprintf(fp, sizeof(fp), "%016llx", (unsigned long long)s_states[i].fingerprint);
-        cJSON_AddStringToObject(u, "fingerprint", fp);
-        cJSON *bes = cJSON_AddArrayToObject(u, "backends");
-        for (int b = 0; b < OX_MAX_BACKENDS_LOCAL; b++) {
-            if (s_states[i].backend[b].status == UG_PENDING && s_states[i].backend[b].attempts == 0 && !s_states[i].remote[b][0]) continue;
-            cJSON *be = cJSON_CreateObject();
-            cJSON_AddNumberToObject(be, "slot", b);
-            cJSON_AddStringToObject(be, "status", status_name(s_states[i].backend[b].status));
-            cJSON_AddNumberToObject(be, "attempts", s_states[i].backend[b].attempts);
-            cJSON_AddNumberToObject(be, "last_try_s", s_states[i].backend[b].last_try_s);
-            if (s_states[i].remote[b][0]) cJSON_AddStringToObject(be, "remote_id", s_states[i].remote[b]);
-            cJSON_AddItemToArray(bes, be);
-        }
-        cJSON_AddItemToArray(units, u);
-    }
-    char *text = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-    if (!text) return ESP_ERR_NO_MEM;
-    FILE *f = fopen(OX_STATE_TMP, "w");
-    bool ok = f && fwrite(text, 1, strlen(text), f) == strlen(text) && fflush(f) == 0 && fsync(fileno(f)) == 0;
-    if (f) fclose(f);
-    cJSON_free(text);
-    if (ok) { unlink(OX_STATE_PATH); /* FATFS cannot rename-over */ ok = (rename(OX_STATE_TMP, OX_STATE_PATH) == 0); }
-    if (!ok) { unlink(OX_STATE_TMP); return ESP_FAIL; }
-    return ESP_OK;
+    if (!s_loaded) return ESP_ERR_INVALID_STATE;
+    ox_lock();
+    esp_err_t ret = save_all_locked();
+    ox_unlock();
+    return ret;
 }
 
 static int scan_day(const char *day, upload_ox_ref_t *out, int max_out)
@@ -347,10 +588,13 @@ int upload_ox_scan(upload_ox_ref_t *out, int max_out)
     }
     closedir(root);
 
-    int n = 0;
-    for (int i = 0; i < nd && n < max_out; i++) {
+    int n = 0, i = 0;
+    for (i = 0; i < nd && n < max_out; i++) {
         n += scan_day(days[i], &out[n], max_out - n);
     }
+    if (i < nd)
+        ESP_LOGW(TAG, "more than %d recordings on the card — oldest day(s) "
+                 "not visible to the uploader this pass", max_out);
     free(days);
     return n;
 }
@@ -359,6 +603,11 @@ int upload_ox_reconcile(upload_ox_ref_t *out, int max_out, int max_days)
 {
     int n = upload_ox_scan(out, max_out);
     if (max_days < 1) max_days = 1;
+    if (!ox_lock_init()) {
+        ESP_LOGE(TAG, "state lock unavailable — oximetry pass skipped");
+        return 0;
+    }
+    ox_lock();
     int kept = 0, days_seen = 0; char last_day[12] = {0};
     for (int i = 0; i < n; i++) {
         if (strcmp(last_day, out[i].day) != 0) {
@@ -366,33 +615,96 @@ int upload_ox_reconcile(upload_ox_ref_t *out, int max_out, int max_days)
         }
         if (days_seen > max_days) continue;
         if (kept != i) out[kept] = out[i];
-        int slot = state_get(&out[kept], true); if (slot < 0) { kept++; continue; }
-        if (s_states[slot].fingerprint != out[kept].fingerprint) {
-            s_states[slot].fingerprint = out[kept].fingerprint;
-            memset(s_states[slot].backend, 0, sizeof(s_states[slot].backend));
-            memset(s_states[slot].remote, 0, sizeof(s_states[slot].remote));
+        ox_state_t *u = state_get(&out[kept], true);
+        if (u && u->fingerprint != out[kept].fingerprint) {
+            /* Content changed since last seen — re-upload for all backends. */
+            u->fingerprint = out[kept].fingerprint;
+            memset(u->backend, 0, sizeof(u->backend));
+            memset(u->remote, 0, sizeof(u->remote));
+            u->dirty = true;
         }
         kept++;
     }
-    upload_ox_save(); return kept;
+
+    /* Evict states whose recording no longer exists on the card — otherwise
+     * deleted recordings linger forever (and count as pending in summaries).
+     * Guarded on the recordings ROOT being readable: if the card directory
+     * itself is unavailable, the per-recording stat would falsely report
+     * every recording as gone and wipe all state. */
+    struct stat rst;
+    if (stat(OX_RECORDINGS_DIR, &rst) == 0 && S_ISDIR(rst.st_mode)) {
+        ox_state_t **pp = &s_states;
+        while (*pp) {
+            ox_state_t *u = *pp;
+            bool gone = false;
+            if (u->day[0]) {
+                char dir[UPLOAD_OX_PATH_LEN];
+                snprintf(dir, sizeof(dir), "%s/%s/%s",
+                         OX_RECORDINGS_DIR, u->day, u->id);
+                struct stat st;
+                if (stat(dir, &st) == 0) {
+                    if (!S_ISDIR(st.st_mode)) gone = true;
+                } else if (errno == ENOENT || errno == ENOTDIR) {
+                    gone = true;
+                }
+            }
+            if (gone) {
+                char path[UPLOAD_OX_PATH_LEN];
+                if (unit_path(path, sizeof(path), u->id)) unlink(path);
+                *pp = u->next;
+                free(u);
+            } else {
+                pp = &u->next;
+            }
+        }
+    }
+
+    save_all_locked();
+    ox_unlock();
+    return kept;
 }
 
 int upload_ox_status(const upload_ox_ref_t *ref, int backend_slot)
 {
-    if (!ref || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL) return UG_PENDING;
-    int i = state_get(ref, true); return i < 0 ? UG_PENDING : s_states[i].backend[backend_slot].status;
+    if (!ref || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL ||
+        !ox_lock_init()) return UG_PENDING;
+    /* Lookup only — never creates.  Reconcile is the legitimate creator; a
+     * reader (e.g. the httpd status endpoint) must not mint states. */
+    ox_lock();
+    ox_state_t *u = state_find_id(ref->recording_id);
+    int s = (u && u->generation == ref->generation)
+          ? u->backend[backend_slot].status : UG_PENDING;
+    ox_unlock();
+    return s;
 }
 
 void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
                    upload_unit_status_t status, const char *remote_id)
 {
-    if (!ref || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL) return;
-    int i = state_get(ref, true); if (i < 0) return;
-    s_states[i].backend[backend_slot].status = status;
-    s_states[i].backend[backend_slot].last_try_s = (uint32_t)time(NULL);
-    if (status != UG_OK) s_states[i].backend[backend_slot].attempts++;
-    if (remote_id) strlcpy(s_states[i].remote[backend_slot], remote_id, sizeof(s_states[i].remote[backend_slot]));
-    upload_ox_save();
+    if (!ref || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL ||
+        !ox_lock_init()) return;
+    ox_lock();
+    ox_state_t *u = state_get(ref, true);
+    if (!u) {
+        /* Only reachable on allocation failure — log it: the previous silent
+         * drop is what let a full table re-upload the same file forever. */
+        ESP_LOGW(TAG, "no state for %s — mark for slot %d dropped",
+                 ref->recording_id, backend_slot);
+        ox_unlock();
+        return;
+    }
+    u->backend[backend_slot].status = status;
+    u->backend[backend_slot].last_try_s = (uint32_t)time(NULL);
+    if (status != UG_OK) u->backend[backend_slot].attempts++;
+    if (remote_id) strlcpy(u->remote[backend_slot], remote_id,
+                           sizeof(u->remote[backend_slot]));
+    /* The mark is the durability-critical write: persist immediately rather
+     * than waiting for the next reconcile's flush. */
+    if (save_unit(u) != ESP_OK)
+        u->dirty = true;   /* stays dirty; next save_all_locked() retries */
+    else
+        u->dirty = false;
+    ox_unlock();
 }
 
 int upload_ox_pending(const upload_ox_ref_t *refs, int n_refs, int backend_slot)
@@ -404,12 +716,12 @@ int upload_ox_cached_pending(int backend_slot)
 {
     if (!s_loaded) upload_ox_init();
     if (!s_loaded || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL) return 0;
+    ox_lock();
     int n = 0;
-    for (int i = 0; i < UPLOAD_OX_MAX_UNITS; i++) {
-        if (s_states[i].used && s_states[i].backend[backend_slot].status != UG_OK) {
-            n++;
-        }
+    for (ox_state_t *u = s_states; u; u = u->next) {
+        if (u->backend[backend_slot].status != UG_OK) n++;
     }
+    ox_unlock();
     return n;
 }
 

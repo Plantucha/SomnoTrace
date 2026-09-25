@@ -126,6 +126,24 @@ MUTANTS = [
      "return (uint32_t)(now_s - last_try_s) < UPLOAD_PARK_REVIVE_S;",
      "return (int64_t)now_s - (int64_t)last_try_s < (int64_t)UPLOAD_PARK_REVIVE_S;",
      "after a clock step backward the group stays parked on a future timestamp"),
+    # The oximetry state store.  The first is the 2026-09 incident in
+    # miniature: the fixed 64-slot table dropped every mark past capacity, so
+    # the newest recording re-uploaded forever.
+    ("ox-mark-not-linked", "uploader/upload_ox.c",
+     "    u->next = s_states;\n    s_states = u;\n    return u;",
+     "    u->next = s_states;\n    return u;",
+     "a created state never links into the list — lookups miss it, marks are "
+     "dropped, and the recording reads pending forever (the 64-slot overflow)"),
+    ("ox-fp-reset-lost", "uploader/upload_ox.c",
+     "if (u && u->fingerprint != out[kept].fingerprint) {",
+     "if (u && false) {",
+     "changed recording content never resets backend status — stale OK "
+     "survives a re-conversion and the new data is never uploaded"),
+    ("ox-mark-deferred", "uploader/upload_ox.c",
+     "    if (save_unit(u) != ESP_OK)",
+     "    if (true)",
+     "the durability-critical mark write is deferred — a power cut between "
+     "mark and reconcile loses it and the file re-uploads"),
     # The StreamData gap policy.  Both of these are #279 in miniature: the
     # session is rendered as continuous breathing across a radio dropout.
     ("gap-split-boundary-off", "session_gap.h",
