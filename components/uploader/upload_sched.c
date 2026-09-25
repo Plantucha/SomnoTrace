@@ -725,6 +725,10 @@ static void do_scan(void)
 static void sched_task(void *arg)
 {
     (void)arg;
+    /* Init here, not in upload_sched_init: oximetry state load + legacy
+     * migration walk the SD and print JSON — too much stack for app_main's
+     * main task.  Everything else lazy-inits through scan/status paths. */
+    upload_ox_init();
     ESP_LOGI(TAG, "upload scheduler started on core %d", xPortGetCoreID());
 
     s_next_scan_us = now_us() + (int64_t)FIRST_SCAN_DELAY_MS * 1000;
@@ -808,7 +812,6 @@ esp_err_t upload_sched_init(void)
 
     s_lock = xSemaphoreCreateMutex();
     s_queue = xQueueCreate(SCHED_QUEUE_LEN, sizeof(sched_ev_t));
-    upload_ox_init();
     if (!s_lock || !s_queue) return ESP_ERR_NO_MEM;
 
     /* Pre-create runtime slots so the progress API can report a backend

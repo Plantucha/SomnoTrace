@@ -154,22 +154,25 @@ static ox_state_t *state_find_id(const char *id)
     return NULL;
 }
 
-/* Look up the state for a ref, optionally creating it.  One node per
+/* Look up the state for a recording, optionally creating it.  One node per
  * recording_id: a generation bump (re-conversion) resets the node in place —
- * the unit file is per recording, not per generation. */
-static ox_state_t *state_get(const upload_ox_ref_t *ref, bool create)
+ * the unit file is per recording, not per generation.  Scalar args, not a
+ * ref: upload_ox_ref_t is ~5.5 KB of path buffers and several callers run
+ * this in a loop on modest task stacks. */
+static ox_state_t *state_get(const char *id, const char *day, uint32_t gen,
+                             uint64_t fp, bool create)
 {
-    ox_state_t *u = state_find_id(ref->recording_id);
+    ox_state_t *u = state_find_id(id);
     if (u) {
-        if (u->generation != ref->generation) {
-            u->generation = ref->generation;
-            u->fingerprint = ref->fingerprint;
+        if (u->generation != gen) {
+            u->generation = gen;
+            u->fingerprint = fp;
             memset(u->backend, 0, sizeof(u->backend));
             memset(u->remote, 0, sizeof(u->remote));
             u->dirty = true;
         }
-        if (!u->day[0] && ref->day[0]) {
-            strlcpy(u->day, ref->day, sizeof(u->day));
+        if (!u->day[0] && day && day[0]) {
+            strlcpy(u->day, day, sizeof(u->day));
             u->dirty = true;
         }
         return u;
@@ -178,10 +181,10 @@ static ox_state_t *state_get(const upload_ox_ref_t *ref, bool create)
     u = heap_caps_calloc(1, sizeof(*u), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!u) u = calloc(1, sizeof(*u));
     if (!u) return NULL;
-    strlcpy(u->id, ref->recording_id, sizeof(u->id));
-    strlcpy(u->day, ref->day, sizeof(u->day));
-    u->generation = ref->generation;
-    u->fingerprint = ref->fingerprint;
+    strlcpy(u->id, id, sizeof(u->id));
+    if (day) strlcpy(u->day, day, sizeof(u->day));
+    u->generation = gen;
+    u->fingerprint = fp;
     u->next = s_states;
     s_states = u;
     return u;
@@ -287,14 +290,10 @@ static void load_unit_file(const char *path)
         return;
     }
 
-    upload_ox_ref_t ref;
-    memset(&ref, 0, sizeof(ref));
-    strlcpy(ref.recording_id, id->valuestring, sizeof(ref.recording_id));
-    ref.generation = (uint32_t)gen->valuedouble;
     cJSON *day = cJSON_GetObjectItem(root, "day");
-    if (cJSON_IsString(day)) strlcpy(ref.day, day->valuestring, sizeof(ref.day));
-
-    ox_state_t *u = state_get(&ref, true);
+    ox_state_t *u = state_get(id->valuestring,
+                            cJSON_IsString(day) ? day->valuestring : NULL,
+                            (uint32_t)gen->valuedouble, 0, true);
     if (!u) { cJSON_Delete(root); return; }
     u->fingerprint = strtoull(fp->valuestring, NULL, 16);
 
@@ -356,11 +355,8 @@ static void migrate_legacy(void)
             (!cJSON_IsNumber(fp) && !cJSON_IsString(fp))) continue;
         if (state_find_id(id->valuestring)) continue;   /* new format wins */
 
-        upload_ox_ref_t ref;
-        memset(&ref, 0, sizeof(ref));
-        strlcpy(ref.recording_id, id->valuestring, sizeof(ref.recording_id));
-        ref.generation = (uint32_t)gen->valuedouble;
-        ox_state_t *u = state_get(&ref, true);
+        ox_state_t *u = state_get(id->valuestring, NULL,
+                                  (uint32_t)gen->valuedouble, 0, true);
         if (!u) continue;
         u->fingerprint = cJSON_IsString(fp)
             ? strtoull(fp->valuestring, NULL, 16)
@@ -465,8 +461,15 @@ esp_err_t upload_ox_init(void)
         while ((e = readdir(d))) {
             const char *n = e->d_name;
             size_t l = strlen(n);
-            if (l < 6 || strcmp(n + l - 5, ".json") != 0) continue;
             char path[UPLOAD_OX_PATH_LEN];
+            if (l < 6 || strcmp(n + l - 5, ".json") != 0) {
+                /* Residue from a power loss between tmp write and rename. */
+                if (l > 9 && strcmp(n + l - 9, ".json.tmp") == 0 &&
+                    snprintf(path, sizeof(path), "%s/%s", OX_STATE_DIR, n) <
+                        (int)sizeof(path))
+                    unlink(path);
+                continue;
+            }
             if (snprintf(path, sizeof(path), "%s/%s", OX_STATE_DIR, n) >=
                 (int)sizeof(path)) continue;
             load_unit_file(path);
@@ -615,7 +618,9 @@ int upload_ox_reconcile(upload_ox_ref_t *out, int max_out, int max_days)
         }
         if (days_seen > max_days) continue;
         if (kept != i) out[kept] = out[i];
-        ox_state_t *u = state_get(&out[kept], true);
+        ox_state_t *u = state_get(out[kept].recording_id, out[kept].day,
+                                  out[kept].generation, out[kept].fingerprint,
+                                  true);
         if (u && u->fingerprint != out[kept].fingerprint) {
             /* Content changed since last seen — re-upload for all backends. */
             u->fingerprint = out[kept].fingerprint;
@@ -684,7 +689,8 @@ void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
     if (!ref || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL ||
         !ox_lock_init()) return;
     ox_lock();
-    ox_state_t *u = state_get(ref, true);
+    ox_state_t *u = state_get(ref->recording_id, ref->day, ref->generation,
+                              ref->fingerprint, true);
     if (!u) {
         /* Only reachable on allocation failure — log it: the previous silent
          * drop is what let a full table re-upload the same file forever. */
@@ -714,7 +720,10 @@ int upload_ox_pending(const upload_ox_ref_t *refs, int n_refs, int backend_slot)
 
 int upload_ox_cached_pending(int backend_slot)
 {
-    if (!s_loaded) upload_ox_init();
+    /* No lazy init here: upload_ox_init() does SD I/O and JSON printing now,
+     * too heavy for whatever task a summary query happens to arrive on (the
+     * MQTT task has 8 KB).  The scheduler inits at startup; before that the
+     * honest answer is "nothing loaded". */
     if (!s_loaded || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL) return 0;
     ox_lock();
     int n = 0;
