@@ -79,3 +79,12 @@ main/as11_events.c:38:relational:<→<=      # cJSON_GetArrayItem(events, n) ret
 #   or past the size, and the first statement in the body is "if (!ev) continue;", so the one extra
 #   iteration does nothing observable before the loop ends. The two forms return the same value for
 #   every input.
+
+# somno_stage_csv.c — the Zeo CSV writer. Each mutant differs only at a value where both versions agree.
+components/somno_ml/somno_stage_csv.c:59:relational:<→<=     # idx never reaches n_epochs: k <= n_zeo-1 with n_zeo = n*e/30 gives k*30+15 <= n*e-15, so idx = (k*30+15)/e < n
+components/somno_ml/somno_stage_csv.c:111:relational:>=→>    # first_sleep == 0: (0+1)/2 == 0, the same as the else branch
+components/somno_ml/somno_stage_csv.c:119:relational:<→<=    # zq == 0: clamping 0 to 0
+components/somno_ml/somno_stage_csv.c:120:relational:>→>=    # zq == 150: clamping 150 to 150
+components/somno_ml/somno_stage_csv.c:137:relational:<→<=    # fprintf returns 0 only when it writes nothing; the row is never shorter than its 19-char timestamp
+components/somno_ml/somno_stage_csv.c:147:relational:>→>=    # end == n_zeo: assigning n_zeo to end
+components/somno_ml/somno_stage_csv.c:211:logical:||→&&    # defence in depth: a flagged sidecar that passes this line is refused by sst_usable() before the write, with the same return value 1
