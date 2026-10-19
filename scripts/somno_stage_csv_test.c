@@ -189,6 +189,9 @@ static void test_30s_identity(void)
             row = strdup(row + 1);
             /* field order: 0 start,1 end,2 rise,3 ZQ,4 TimeToZ,5 Wake,
              * 6 REM,7 Light,8 Deep,9 Awakenings */
+            /* ZQ from the minutes below: (18/60 + 3/120 + 5*1.5/60 - 8/120
+             * - 1/15) * 8.5 = 2.69 -> 3.  Each of its terms moves it. */
+            CHECK(int_field(row, 3) == 3,   "ZQ != 3");
             CHECK(int_field(row, 4) == 5,   "Time to Z != 5 min");
             CHECK(int_field(row, 5) == 8,   "Time in Wake != 8 min");
             CHECK(int_field(row, 6) == 3,   "Time in REM != 3 min");
@@ -374,6 +377,135 @@ static void test_export_from_sst(void)
     free(conf);
 }
 
+/* A night that is asleep from its first epoch, and asleep in DEEP: sleep
+ * onset, the awakening count and the "was asleep" state must all treat Deep
+ * as sleep, and onset at slot 0 must still count the awakening after it. */
+static void test_onset_in_deep(void)
+{
+    /* 4 deep, 2 wake, 4 deep (30 s) */
+    const int runs[][2] = { {2,4}, {0,2}, {2,4} };
+    uint8_t *st = mk_stages(10, runs, 3);
+    somno_sst_header_t h = mk_hdr(10, 30, 0);
+    const char *path = "/tmp/sst_csv_deep/out.csv";
+    unlink(path);
+    CHECK(somno_stage_write_zeo_csv_file(path, &h, st) == 0, "deep-onset export failed");
+    char *txt = read_all(path);
+    char *row = txt ? strchr(txt, '\n') : NULL;
+    CHECK(row != NULL, "deep-onset CSV has no data row");
+    if (row) {
+        row = strdup(row + 1);
+        CHECK(int_field(row, 4) == 0, "Time to Z != 0 for a night asleep at slot 0");
+        CHECK(int_field(row, 8) == 4, "Time in Deep != 4 min");
+        CHECK(int_field(row, 9) == 1, "deep -> wake -> deep must count one awakening");
+        free(row);
+    }
+    free(txt);
+    free(st);
+}
+
+/* The 5-minute Sleep Graph: a last group shorter than 10 slots still gets a
+ * code, and a Deep majority (code 4, the highest) can win a group. */
+static void test_sleep_graph_tail_and_deep(void)
+{
+    /* 10 deep, then 5 REM: groups [0,10) and a 5-slot tail [10,15) */
+    const int runs[][2] = { {2,10}, {3,5} };
+    uint8_t *st = mk_stages(15, runs, 2);
+    somno_sst_header_t h = mk_hdr(15, 30, 0);
+    const char *path = "/tmp/sst_csv_sg/out.csv";
+    unlink(path);
+    CHECK(somno_stage_write_zeo_csv_file(path, &h, st) == 0, "sleep-graph export failed");
+    char *txt = read_all(path);
+    char *row = txt ? strchr(txt, '\n') : NULL;
+    char *sg = row ? quoted_field(row + 1, 1) : NULL;
+    int codes[4];
+    int n = sg ? parse_codes(sg, codes, 4) : 0;
+    CHECK(n == 2, "Sleep Graph != 2 groups for 15 slots");
+    CHECK(n == 2 && codes[0] == 4 && codes[1] == 2,
+          "Sleep Graph != \"4 2\" (deep group, then the 5-slot REM tail)");
+    free(sg);
+    free(txt);
+    free(st);
+}
+
+/* The limits are inclusive: SST_MAX_EPOCHS epochs and a 3600 s epoch are both
+ * valid sidecars, and start_ms 0 is not. ZQ is clamped to the Zeo 0..150 range. */
+static void test_limits(void)
+{
+    const uint32_t max_epochs = 100000u;   /* SST_MAX_EPOCHS */
+    uint8_t *st = malloc(max_epochs);
+    memset(st, 1, max_epochs);             /* all light */
+    somno_sst_header_t h = mk_hdr(max_epochs, 30, 0);
+    const char *path = "/tmp/sst_csv_lim/max.csv";
+    CHECK(somno_stage_write_zeo_csv_file(path, &h, st) == 0,
+          "SST_MAX_EPOCHS epochs rejected (the limit is inclusive)");
+    char *txt = read_all(path);
+    char *row = txt ? strchr(txt, '\n') : NULL;
+    CHECK(row && int_field(row + 1, 3) == 150, "ZQ not clamped to 150");
+    free(txt);
+
+    h = mk_hdr(1, 3600, 0);
+    CHECK(somno_stage_write_zeo_csv_file("/tmp/sst_csv_lim/hour.csv", &h, st) == 0,
+          "a 3600 s epoch rejected (the limit is inclusive)");
+
+    memset(st, 0, 10);                     /* all wake */
+    h = mk_hdr(10, 30, 0);
+    CHECK(somno_stage_write_zeo_csv_file("/tmp/sst_csv_lim/wake.csv", &h, st) == 0,
+          "all-wake export failed");
+    txt = read_all("/tmp/sst_csv_lim/wake.csv");
+    row = txt ? strchr(txt, '\n') : NULL;
+    CHECK(row && int_field(row + 1, 3) == 0, "ZQ not clamped to 0 for an all-wake night");
+    free(txt);
+
+    h = mk_hdr(10, 30, 0); h.start_ms = 0;
+    CHECK(somno_stage_write_zeo_csv_file("/tmp/sst_csv_lim/zero.csv", &h, st) != 0,
+          "start_ms 0 produced a CSV");
+
+    /* Every public entry point refuses a NULL it cannot use. */
+    h = mk_hdr(10, 30, 0);
+    CHECK(somno_stage_write_zeo_csv_stream(NULL, &h, st) == -1, "stream(NULL out) != -1");
+    CHECK(somno_stage_write_zeo_csv_file(NULL, &h, st) == -1, "file(NULL path) != -1");
+    CHECK(somno_stage_export_csv_from_sst(NULL, "/tmp/sst_csv_lim/x.csv") == -1,
+          "export(NULL sst) != -1");
+    CHECK(somno_stage_export_csv_from_sst("/tmp/sst_csv_lim/x.sst", NULL) == -1,
+          "export(NULL csv) != -1");
+
+    /* A '/' at byte 512 is one past mk_parents' buffer: it must be skipped,
+     * not copied (ASan reports the overflow if it is). */
+    char longp[560];
+    memset(longp, 'a', sizeof(longp));
+    memcpy(longp, "/tmp/", 5);
+    longp[512] = '/';
+    memcpy(longp + 513, "x.csv", 6);
+    (void)somno_stage_write_zeo_csv_file(longp, &h, st);
+    free(st);
+}
+
+/* sst -> csv: a sidecar of exactly SST_MAX_EPOCHS exports, and a flagged
+ * sidecar with a full body is still skipped. */
+static void test_export_limits(void)
+{
+    const char *sst = "/tmp/sst_csv_sst2/in.sst";
+    const char *csv = "/tmp/sst_csv_sst2/out.csv";
+    mkdir("/tmp/sst_csv_sst2", 0775);
+    const uint32_t n = 100000u;            /* SST_MAX_EPOCHS */
+    uint8_t *body = malloc(2u * n);
+    memset(body, 1, 2u * n);
+    somno_sst_header_t h = mk_hdr(n, 30, 0);
+    FILE *f = fopen(sst, "wb");
+    CHECK(f != NULL, "cannot write fixture sst");
+    if (f) { fwrite(&h, 1, sizeof(h), f); fwrite(body, 1, 2u * n, f); fclose(f); }
+    CHECK(somno_stage_export_csv_from_sst(sst, csv) == 0,
+          "an SST_MAX_EPOCHS sidecar was not exported (the limit is inclusive)");
+
+    h = mk_hdr(20, 30, SOMNO_SST_FLAG_PARTIAL);
+    f = fopen(sst, "wb");
+    if (f) { fwrite(&h, 1, sizeof(h), f); fwrite(body, 1, 40, f); fclose(f); }
+    unlink(csv);
+    CHECK(somno_stage_export_csv_from_sst(sst, csv) == 1,
+          "a PARTIAL sidecar with a full body was exported");
+    free(body);
+}
+
 int main(void)
 {
     /* The CSV embeds local-time timestamps; pin TZ so the run is identical
@@ -385,6 +517,10 @@ int main(void)
     test_32s_gen1_resample();
     test_rejections();
     test_export_from_sst();
+    test_onset_in_deep();
+    test_sleep_graph_tail_and_deep();
+    test_limits();
+    test_export_limits();
 
     if (g_failures) {
         printf("somno_stage_csv_test: %d FAILED\n", g_failures);
