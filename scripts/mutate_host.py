@@ -87,12 +87,44 @@ TESTS = {
     "vld3_decoder_test":    ["main/oximetry_vld3.c"],
     "as11_reconnect_test":  ["main/as11_reconnect.c"],
     "as11_adv_test":        ["main/as11_adv.c"],
+    # The SomnoStage export path: the Zeo-compatible CSV writer, the worker that derives each
+    # CSV's path from its .sst sidecar, and the uploader's stage-CSV state store.
+    "somno_stage_csv_test": ["components/somno_ml/somno_stage_csv.c"],
+    "upload_stage_test":    ["components/uploader/upload_stage.c", "@cjson"],
+    "somno_worker_test":    ["~components/somno_ml/somno_ml_features.c",
+                             "components/somno_ml/somno_stage_csv.c", "@cjson",
+                             "#components/somno_ml/somno_ml_worker.c"],
+    # "~" = linked so the test builds, NOT measured: somno_worker_test wraps somno_feat_create(),
+    # so the feature extractor never runs there and its canary would (rightly) VOID the sweep.
 }
+
+# Per-test compiler and linker flags, exactly as scripts/run_host_tests.sh passes them. They live
+# beside TESTS rather than in it because every reader of TESTS treats an entry as a file to link
+# or mutate. "-I<dir>" is resolved against the repo root (build() runs gcc in a scratch dir).
+FLAGS = {
+    "somno_stage_csv_test": ["-Icomponents/somno_ml", "-Icomponents/somno_ml/include"],
+    "upload_stage_test":    ["-Icomponents/uploader",
+                             '-DSD_MOUNT_POINT="/tmp/somnotrace_stt/sd"',
+                             '-DUPLOAD_STATE_DIR="/tmp/somnotrace_stt/ustate"'],
+    "somno_worker_test":    ["-Icomponents/somno_ml", "-Icomponents/somno_ml/include",
+                             "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+                             "-Wl,--wrap=somno_feat_create", "-Wl,--wrap=somno_feat_destroy"],
+}
+
+
+def test_flags(test: str) -> list[str]:
+    return [("-I" + os.path.join(ROOT, f[2:])) if f.startswith("-I") and not os.path.isabs(f[2:]) else f
+            for f in FLAGS.get(test, [])]
 
 
 def target_path(entry: str) -> str:
     """The repo-relative path a TESTS entry names, without the "#" include-marker."""
-    return entry[1:] if entry.startswith("#") else entry
+    return entry[1:] if entry.startswith(("#", "~")) else entry
+
+
+def measured(entry: str) -> bool:
+    """Is this TESTS entry a file the harness mutates and counts as covered?"""
+    return entry != "@cjson" and not entry.startswith("~")
 
 EQUIV_FILE = os.path.join(HERE, "mutate_equivalent.txt")
 SURVIVOR_FILE = os.path.join(HERE, "mutation_survivors.txt")
@@ -254,6 +286,8 @@ def sources_for(test: str) -> list[str] | None:
             # else: linked as -lcjson in build(), so there is no source to add here
         elif s.startswith("#"):
             continue      # already inside the test's translation unit -- see TESTS
+        elif s.startswith("~"):
+            out.append(os.path.join(ROOT, s[1:]))   # linked, not measured -- see TESTS
         elif not s.endswith(".h"):
             out.append(os.path.join(ROOT, s))
     return out
@@ -288,6 +322,7 @@ def build(test: str, outdir: str, coverage: bool = False) -> str | None:
     elif links_cjson and CJSON_SYS:
         cmd.append("-I" + CJSON_SYS)
     cmd += [f"-I{d}" for d in INC]
+    cmd += test_flags(test)
     cmd.append("-lm")
     if links_cjson and not CJSON and CJSON_SYS:
         cmd.append("-lcjson")           # -l goes after the objects that need it
@@ -397,7 +432,7 @@ def harness_blind_spot() -> tuple[int, int, list[str]]:
         if sources_for(t) is None:
             continue
         for src in TESTS[t]:
-            if src != "@cjson":
+            if measured(src):
                 covered.add(os.path.abspath(os.path.join(ROOT, target_path(src))))
     total = []
     for base in ("main", "components"):
@@ -421,6 +456,28 @@ OPS: list[tuple[str, str, str]] = [
     (" + ", " - ", "arithmetic"), (" - ", " + ", "arithmetic"),
     (" * ", " / ", "arithmetic"),
 ]
+
+# Where each operator may match. A bare substring test found the '>' of every member access
+# `p->x` and of every shift, and a line gets only its FIRST matching operator -- so on
+# `if (u->n > 0)` the one mutant spent itself on `->` (stillborn: it does not compile) and the
+# real comparison was never tried. The lookarounds keep '<' and '>' off '->', '<<', '>>' and
+# their compound forms; '<=' / '>=' stay off '<<=' / '>>='.
+_OP_RE = {
+    "<=": re.compile(r"(?<!<)<="),
+    "<":  re.compile(r"(?<![<-])<(?![<=])"),
+    ">=": re.compile(r"(?<![>-])>="),
+    ">":  re.compile(r"(?<![>-])>(?![>=])"),
+}
+
+
+def find_op(code: str, op: str) -> int:
+    """Index of the first occurrence of OPERATOR op in code, or -1."""
+    rx = _OP_RE.get(op)
+    if rx is None:
+        return code.find(op)
+    m = rx.search(code)
+    return m.start() if m else -1
+
 
 SKIP_LINE = re.compile(r'^\s*(//|/\*|\*|#include|#pragma)')
 
@@ -463,10 +520,11 @@ def gen_mutants(path: str, limit: int) -> list[tuple[int, str, str, str]]:
             continue          # string literals: a changed message is not a behaviour change
         code = code_of(line)
         for a, b, name in OPS:
-            if a in code:
+            at = find_op(code, a)
+            if at >= 0:
                 # Rebuild the line so the comment survives byte-for-byte: only the code
                 # half is edited, and only its first occurrence, exactly as before.
-                mutated = code.replace(a, b, 1) + line[len(code):]
+                mutated = code[:at] + b + code[at + len(a):] + line[len(code):]
                 out.append((i, f"{name}:{a.strip()}→{b.strip()}", line, mutated))
                 break
         if len(out) >= limit:
@@ -496,6 +554,11 @@ def self_test() -> int:
         if got != want:
             fails.append(f"{what}: got {got!r}, want {want!r}")
 
+    eq("find_op: '->' is not '>'", find_op("    p->x = 1;", ">"), -1)
+    eq("find_op: '>' after '->'", find_op("    if (u->n > 0)", ">"), 13)
+    eq("find_op: shift is not '<'", find_op("    x = a << 2;", "<"), -1)
+    eq("find_op: '>>=' is not '>='", find_op("    x >>= 1;", ">="), -1)
+    eq("find_op: plain '<='", find_op("    if (a <= b)", "<="), 10)
     eq("code_of: no comment", code_of("    if (a >= b) {\n"), "    if (a >= b) {\n")
     eq("code_of: block comment", code_of("    x = 1;  /* >= 0 */\n"), "    x = 1;  ")
     eq("code_of: line comment", code_of("    x = 1;  // >= 0\n"), "    x = 1;  ")
@@ -769,7 +832,7 @@ def main() -> int:
                           else "UNAVAILABLE — failing closed, every mutant will be run"))
 
     targets = a.files or ([os.path.join(ROOT, target_path(s))
-                           for t in TESTS for s in TESTS[t] if s != "@cjson"]
+                           for t in TESTS for s in TESTS[t] if measured(s)]
                           if a.all else [])
     targets = sorted({os.path.abspath(t if os.path.isabs(t) else os.path.join(ROOT, t))
                       for t in targets})

@@ -14,8 +14,28 @@
 #
 # Format:  <path>:<line>:<operator>      # the line as it stands today
 
-main/edf_annotations.c:105:arithmetic:*→/            # snt_event_t *ev_list = malloc(capacity * sizeof(snt_event_t));
-main/edf_annotations.c:120:logical:&&→||             # if (data_id && cJSON_IsString(data_id)) {
+components/somno_ml/somno_ml_worker.c:70:arithmetic:*→/ # #define FRAG_MERGE_GAP_MS  (90LL * 60 * 1000)
+components/somno_ml/somno_ml_worker.c:79:arithmetic:*→/ # #define RECON_RECENT_MS      (30LL * 60 * 1000)
+components/somno_ml/somno_ml_worker.c:80:arithmetic:*→/ # #define RECON_FULL_MS        (24LL * 60 * 60 * 1000)
+components/somno_ml/somno_ml_worker.c:81:arithmetic:*→/ # #define VERIFY_FIRST_MS      (3LL * 60 * 1000)
+components/somno_ml/somno_ml_worker.c:82:arithmetic:*→/ # #define VERIFY_RETRY_MS      (5LL * 60 * 1000)
+components/somno_ml/somno_ml_worker.c:125:logical:||→&& # if (!dir || !id) return;
+components/somno_ml/somno_ml_worker.c:127:relational:>=→> # if (strlen(dir) >= sizeof(job.dir) || strlen(id) >= sizeof(job.id)) re
+components/somno_ml/somno_ml_worker.c:269:arithmetic:-→+ # size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+components/somno_ml/somno_ml_worker.c:276:logical:&&→|| # int ok = cJSON_IsString(state) &&
+components/somno_ml/somno_ml_worker.c:278:relational:>→>= # cJSON_IsNumber(g) && g->valueint > 0;
+components/somno_ml/somno_ml_worker.c:293:relational:<→<= # return (n > 0 && n < (int)vs && m > 0 && m < (int)ss) ? 0 : -1;
+components/uploader/upload_stage.c:93:relational:>=→> # if (!s || !s[0] || strlen(s) >= max_len) return false;
+components/uploader/upload_stage.c:96:relational:<→<= # if (*p == '/' || *p == '\\' || *p < 0x20) return false;
+components/uploader/upload_stage.c:110:relational:>→>= # if (al + bl + 2 > n) return false;
+components/uploader/upload_stage.c:120:relational:<=→< # if (size <= 0 || size > 16 * 1024) { fclose(f); return NULL; }
+components/uploader/upload_stage.c:122:arithmetic:+→- # if (!buf) buf = malloc((size_t)size + 1);
+components/uploader/upload_stage.c:158:relational:>→>= # while (*pp && strcmp((*pp)->day, u->day) > 0)
+components/uploader/upload_stage.c:180:logical:&&→|| # if (!u->day[0] && day && day[0]) {
+components/uploader/upload_stage.c:234:equality:!=→== # if (rename(tmp, path) != 0) ok = false;
+components/uploader/upload_stage.c:262:relational:<→<= # for (int b = 0; b < upload_index_backend_count() && b < STAGE_MAX_BACK
+components/uploader/upload_stage.c:265:logical:||→&& # if (!bname ||
+main/as11_time.c:146:logical:||→&&                   # if (!off || !cJSON_IsString(off) || !off->valuestring) return false;
 main/edf_annotations.c:65:relational:<→<=            # for (size_t i = 0; i + 1 < count; i++) {   (moved into sort_and_dedup_events)
 main/edf_annotations.c:69:relational:<→<=            # before = strcmp(ev[j].label, ev[i].label) < 0;
 #   Swapping two events that compare equal reorders entries identical in BOTH sorted keys
@@ -23,6 +43,9 @@ main/edf_annotations.c:69:relational:<→<=            # before = strcmp(ev[j].l
 #   way, so which survives is currently unspecified rather than wrong. Asserting it would
 #   pin an arbitrary choice; making it defined needs a decision about whether a repeated
 #   event's longer or shorter duration should win, which is not this change's to make.
+main/edf_annotations.c:105:arithmetic:*→/            # snt_event_t *ev_list = malloc(capacity * sizeof(snt_event_t));
+main/edf_annotations.c:120:logical:&&→||             # if (data_id && cJSON_IsString(data_id)) {
+main/edf_gen.c:45:logical:&&→||                      # if (j && cJSON_IsString(j)) srn = j->valuestring;
 main/edf_gen.c:245:relational:<→<=                   # if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms)
 main/edf_gen.c:258:relational:>→>=                   # if (zle_ntp > 0) {
 main/edf_gen.c:269:relational:>→>=                   # if (maskon_as11 > 0) {
@@ -30,3 +53,5 @@ main/edf_gen.c:271:relational:<→<=                   # if (maskon_ntp > start_
 main/edf_gen.c:309:relational:<=→<                   # if (end_ntp <= 0) {
 main/edf_gen.c:311:relational:>→>=                   # if (maskoff_as11 > 0) {
 main/edf_gen.c:316:relational:>→>=                   # if (end_ntp > 0) {
+main/edf_gen.c:317:relational:<=→<                   # if (end_ntp > maskon_start_ms && end_ntp <= end_epoch_ms) {
+main/edf_gen.c:369:relational:<→<=                   # if (brp_samples < 1500) {       /* < one 60 s record at 25 Hz */
