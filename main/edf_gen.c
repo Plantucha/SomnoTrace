@@ -103,6 +103,171 @@ static bool day_metadata_fallback(const char *session_dir, const char *session_i
     return true;
 }
 
+static const char *ident_get_serial(const cJSON *ident)
+{
+    const cJSON *j = ident ? cJSON_GetObjectItem(ident, "SerialNumber") : NULL;
+    return (j && cJSON_IsString(j) && j->valuestring) ? j->valuestring : "";
+}
+
+static bool parse_8digit_day(const char *s, int *out_val)
+{
+    if (!s || strlen(s) != 8) return false;
+    int v = 0;
+    for (int i = 0; i < 8; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v * 10 + (s[i] - '0');
+    }
+    if (out_val) *out_val = v;
+    return true;
+}
+
+/* Derive the parent streams directory, the grandparent sessions root, and the
+ * day label from session_dir ("<sessions_root>/streams/<YYYYMMDD>").
+ * Works both on the device (/somnotrace/.somnotrace/sessions/streams/YYYYMMDD)
+ * and in host unit tests (<tmp>/streams/YYYYMMDD). */
+static void resolve_session_roots(const char *session_dir,
+                                  char *streams_root, size_t sr_len,
+                                  char *sessions_root, size_t ssr_len,
+                                  char *day_label, size_t dl_len)
+{
+    streams_root[0] = '\0';
+    sessions_root[0] = '\0';
+    day_label[0] = '\0';
+    if (!session_dir) return;
+
+    const char *last = strrchr(session_dir, '/');
+    if (last && last > session_dir) {
+        strlcpy(day_label, last + 1, dl_len);
+        size_t plen = (size_t)(last - session_dir);
+        if (plen >= sr_len) plen = sr_len - 1;
+        memcpy(streams_root, session_dir, plen);
+        streams_root[plen] = '\0';
+
+        const char *prev = strrchr(streams_root, '/');
+        if (prev && prev > streams_root) {
+            size_t gplen = (size_t)(prev - streams_root);
+            if (gplen >= ssr_len) gplen = ssr_len - 1;
+            memcpy(sessions_root, streams_root, gplen);
+            sessions_root[gplen] = '\0';
+        } else {
+            strlcpy(sessions_root, SD_SESSIONS_DIR, ssr_len);
+        }
+    } else {
+        strlcpy(streams_root, SD_STREAMS_DIR, sr_len);
+        strlcpy(sessions_root, SD_SESSIONS_DIR, ssr_len);
+    }
+}
+
+/* Search sibling day directories under streams_root for the chronologically
+ * closest day that holds a metadata file ending with `suffix` ("_ident.json"
+ * or "_settings.json").  When `want_serial` is non-empty and `suffix` is
+ * "_settings.json", candidates whose sibling "_ident.json" names a different
+ * SerialNumber are skipped so a machine swap never cross-pollinates settings. */
+static bool cross_day_metadata_fallback(const char *streams_root,
+                                        const char *current_day,
+                                        const char *suffix,
+                                        const char *want_serial,
+                                        char *out_path, size_t out_len)
+{
+    if (!streams_root || !streams_root[0] || !suffix || !out_path) return false;
+
+    DIR *d = opendir(streams_root);
+    if (!d) return false;
+
+    int cur_val = 0;
+    bool have_cur = parse_8digit_day(current_day, &cur_val);
+    int best_dist = INT_MAX;
+    int best_day_val = -1;
+    char best_path[420] = {0};
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        int cand_val = 0;
+        if (!parse_8digit_day(ent->d_name, &cand_val)) continue;
+        if (current_day && strcmp(ent->d_name, current_day) == 0) continue;
+
+        char cand_dir[360];
+        int n = snprintf(cand_dir, sizeof(cand_dir), "%s/%s",
+                         streams_root, ent->d_name);
+        if (n < 0 || (size_t)n >= sizeof(cand_dir)) continue;
+
+        char cand_file[420];
+        if (!day_metadata_fallback(cand_dir, NULL, suffix,
+                                   cand_file, sizeof(cand_file))) {
+            continue;
+        }
+
+        if (want_serial && want_serial[0] &&
+            strcmp(suffix, "_settings.json") == 0) {
+            char cand_ident_path[420];
+            if (day_metadata_fallback(cand_dir, NULL, "_ident.json",
+                                      cand_ident_path, sizeof(cand_ident_path))) {
+                cJSON *ci = edf_read_json_file(cand_ident_path);
+                if (ci) {
+                    const char *cs = ident_get_serial(ci);
+                    bool mismatch = (cs[0] != '\0' && strcmp(cs, want_serial) != 0);
+                    cJSON_Delete(ci);
+                    if (mismatch) continue;
+                }
+            }
+        }
+
+        int dist = have_cur ? abs(cand_val - cur_val) : 0;
+        if (best_day_val < 0 || dist < best_dist ||
+            (dist == best_dist && cand_val > best_day_val)) {
+            best_dist = dist;
+            best_day_val = cand_val;
+            strlcpy(best_path, cand_file, sizeof(best_path));
+        }
+    }
+    closedir(d);
+
+    if (!best_path[0]) return false;
+    strlcpy(out_path, best_path, out_len);
+    return true;
+}
+
+/* Load "ident" or "settings" from <sessions_root>/device_metadata.json (falling
+ * back to SD_DEVICE_METADATA_PATH).  When `want_serial` is non-empty, rejects a
+ * snapshot whose "serial" belongs to a different machine. */
+static cJSON *device_snapshot_fallback(const char *sessions_root,
+                                       const char *field,
+                                       const char *want_serial)
+{
+    char path[360];
+    cJSON *snap = NULL;
+    if (sessions_root && sessions_root[0]) {
+        snprintf(path, sizeof(path), "%s/device_metadata.json", sessions_root);
+        snap = edf_read_json_file(path);
+    }
+    if (!snap && (!sessions_root || strcmp(sessions_root, SD_SESSIONS_DIR) != 0)) {
+        snap = edf_read_json_file(SD_DEVICE_METADATA_PATH);
+    }
+    if (!snap) return NULL;
+
+    if (want_serial && want_serial[0]) {
+        const cJSON *js = cJSON_GetObjectItem(snap, "serial");
+        const char *snap_serial = (js && cJSON_IsString(js) && js->valuestring)
+                                ? js->valuestring : "";
+        if (!snap_serial[0]) {
+            const cJSON *id_obj = cJSON_GetObjectItem(snap, "ident");
+            snap_serial = ident_get_serial(id_obj);
+        }
+        if (snap_serial[0] && strcmp(snap_serial, want_serial) != 0) {
+            cJSON_Delete(snap);
+            return NULL;
+        }
+    }
+
+    cJSON *child = cJSON_DetachItemFromObject(snap, field);
+    cJSON_Delete(snap);
+    if (child && !cJSON_IsObject(child)) {
+        cJSON_Delete(child);
+        return NULL;
+    }
+    return child;
+}
+
 esp_err_t edf_gen_generate_ex(const char *out_root,
                               const char *session_dir, const char *session_id,
                               int64_t start_epoch_ms, int64_t end_epoch_ms,
@@ -173,38 +338,124 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
 
     /* Read identification.json for EDF header fields.
      *
-     * A session recovered after a crash never ran post-therapy collection, so
-     * it has no _ident.json or _settings.json of its own.  These describe the
-     * device and its therapy settings — not the session's samples — so the
-     * same night's other sessions carry equivalent values.  Borrowing them is
-     * what makes an automatically exported recovered session usable instead of
-     * headerless.  The substitution is logged so it is never silently assumed. */
-    char ident_path[330];
-    snprintf(ident_path, sizeof(ident_path), "%s/%s_ident.json", session_dir, session_id);
+     * Fallback hierarchy when <session_id>_ident.json is missing (e.g. a
+     * crash-recovered session or a stop-time BLE timeout):
+     *   1. Another session's _ident.json in the same day folder
+     *   2. The closest day's _ident.json in streams/
+     *   3. The pre-stream device_metadata.json snapshot
+     * When a fallback succeeds, <session_id>_ident.json is backfilled so
+     * edf_generate_identification_files() and future rebuilds find it in place. */
+    char streams_root[300], sessions_root[300], dir_day_label[16];
+    resolve_session_roots(session_dir, streams_root, sizeof(streams_root),
+                          sessions_root, sizeof(sessions_root),
+                          dir_day_label, sizeof(dir_day_label));
+    const char *lookup_day = dir_day_label[0] ? dir_day_label : day_folder;
+
+    char self_ident_path[330];
+    snprintf(self_ident_path, sizeof(self_ident_path), "%s/%s_ident.json",
+             session_dir, session_id);
+    char ident_path[420];
+    strlcpy(ident_path, self_ident_path, sizeof(ident_path));
+
     cJSON *ident = edf_read_json_file(ident_path);
     if (!ident && day_metadata_fallback(session_dir, session_id, "_ident.json",
                                         ident_path, sizeof(ident_path))) {
         ident = edf_read_json_file(ident_path);
         if (ident) {
-            ESP_LOGW(TAG, "session %s has no ident.json (recovered session?) — "
-                     "using %s from the same day", session_id, ident_path);
+            ESP_LOGW(TAG, "session %s has no ident.json — using %s from the same day",
+                     session_id, ident_path);
+        }
+    }
+    if (!ident && cross_day_metadata_fallback(streams_root, lookup_day, "_ident.json",
+                                              NULL, ident_path, sizeof(ident_path))) {
+        ident = edf_read_json_file(ident_path);
+        if (ident) {
+            ESP_LOGW(TAG, "session %s has no ident.json — using %s from another day",
+                     session_id, ident_path);
+            if (edf_write_json_file(self_ident_path, ident) == ESP_OK) {
+                strlcpy(ident_path, self_ident_path, sizeof(ident_path));
+            }
+        }
+    }
+    if (!ident) {
+        ident = device_snapshot_fallback(sessions_root, "ident", NULL);
+        if (ident) {
+            ESP_LOGW(TAG, "session %s has no ident.json — using device_metadata.json snapshot",
+                     session_id);
+            if (edf_write_json_file(self_ident_path, ident) == ESP_OK) {
+                strlcpy(ident_path, self_ident_path, sizeof(ident_path));
+            }
         }
     }
 
-    /* Read settings.json for STR.edf settings fields */
-    char settings_path[330];
-    snprintf(settings_path, sizeof(settings_path), "%s/%s_settings.json", session_dir, session_id);
+    const char *ident_serial = ident_get_serial(ident);
+
+    /* Read settings.json for STR.edf settings fields and CurrentSettings.json.
+     *
+     * Fallback hierarchy when <session_id>_settings.json is missing:
+     *   1. Another session's _settings.json in the same day folder
+     *   2. summaries/<day>.settings.json
+     *   3. The closest day's _settings.json in streams/ (same SerialNumber)
+     *   4. The pre-stream device_metadata.json snapshot (same SerialNumber) */
+    char self_settings_path[330];
+    snprintf(self_settings_path, sizeof(self_settings_path), "%s/%s_settings.json",
+             session_dir, session_id);
+    char settings_path[420];
+    strlcpy(settings_path, self_settings_path, sizeof(settings_path));
+
     cJSON *settings = edf_read_json_file(settings_path);
     if (!settings && day_metadata_fallback(session_dir, session_id, "_settings.json",
                                            settings_path, sizeof(settings_path))) {
         settings = edf_read_json_file(settings_path);
         if (settings) {
-            ESP_LOGW(TAG, "session %s has no settings.json (recovered session?) "
-                     "— using %s from the same day", session_id, settings_path);
+            ESP_LOGW(TAG, "session %s has no settings.json — using %s from the same day",
+                     session_id, settings_path);
+        }
+    }
+    if (!settings && sessions_root[0]) {
+        snprintf(settings_path, sizeof(settings_path), "%s/summaries/%s.settings.json",
+                 sessions_root, lookup_day);
+        settings = edf_read_json_file(settings_path);
+        if (settings) {
+            ESP_LOGW(TAG, "session %s has no settings.json — using %s",
+                     session_id, settings_path);
+        }
+    }
+    if (!settings && cross_day_metadata_fallback(streams_root, lookup_day, "_settings.json",
+                                                 ident_serial, settings_path,
+                                                 sizeof(settings_path))) {
+        settings = edf_read_json_file(settings_path);
+        if (settings) {
+            ESP_LOGW(TAG, "session %s has no settings.json — using %s from another day",
+                     session_id, settings_path);
+            edf_write_json_file(self_settings_path, settings);
+        }
+    }
+    if (!settings) {
+        settings = device_snapshot_fallback(sessions_root, "settings", ident_serial);
+        if (settings) {
+            ESP_LOGW(TAG, "session %s has no settings.json — using device_metadata.json snapshot",
+                     session_id);
+            edf_write_json_file(self_settings_path, settings);
         }
     }
     ESP_LOGI(TAG, "settings.json: path=%s %s", settings_path,
              settings ? "loaded OK" : "FAILED to load");
+
+    /* Refuse to write headerless EDFs (with blank SRN=/MID=/VID=) when no
+     * identification source exists anywhere on the card.  Because upload_scan
+     * treats per-session EDFs as immutable once written, publishing headerless
+     * files into DATALOG/ would lock them into the upload index and break
+     * downstream importers (Aerivue, SleepHQ, OSCAR). */
+    if (!ident) {
+        ESP_LOGW(TAG, "session %s has no device identification available — "
+                 "aborting EDF generation to avoid headerless export",
+                 session_id);
+        rmdir(day_dir);
+        if (settings) cJSON_Delete(settings);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_FAIL;
+    }
 
     /* Path to events.snt for EVE.edf / CSL.edf generation */
     char events_snt_path[330];

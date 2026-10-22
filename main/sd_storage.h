@@ -42,6 +42,7 @@
 #define SD_SESSIONS_DIR      SD_APP_DIR "/sessions"
 #define SD_STREAMS_DIR       SD_SESSIONS_DIR "/streams"
 #define SD_SUMMARIES_DIR     SD_SESSIONS_DIR "/summaries"
+#define SD_DEVICE_METADATA_PATH SD_SESSIONS_DIR "/device_metadata.json"
 
 /* Rotated device logs */
 #define SD_LOG_DIR           SD_APP_DIR "/logs"

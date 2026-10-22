@@ -232,6 +232,7 @@ bool upload_scan_bundle(upload_bundle_ref_t *out)
     };
 
     bool have_str = false;
+    bool have_ident = false;
     for (int i = 0; root_names[i]; i++) {
         char path[100];
         snprintf(path, sizeof(path), "%s/%s", SD_SDCARD_DIR, root_names[i]);
@@ -246,6 +247,7 @@ bool upload_scan_bundle(upload_bundle_ref_t *out)
             out->fp = fold_fp(out->fp, root_names[i], path, st.st_size);
         }
         if (i == 0) have_str = true;
+        if (i == 1) have_ident = true;
     }
 
     DIR *d = opendir(SD_SDCARD_SETTINGS);
@@ -278,10 +280,16 @@ bool upload_scan_bundle(upload_bundle_ref_t *out)
         closedir(d);
     }
 
-    /* Without STR.edf a backend cannot interpret any session, so treat the
-     * bundle as unavailable rather than uploading a useless partial set. */
+    /* Without STR.edf and Identification.json a backend cannot interpret or
+     * attribute any CPAP session, so treat the bundle as unavailable rather
+     * than uploading a useless partial set. */
     if (!have_str) {
         ESP_LOGW(TAG, "no STR.edf in %s — nothing to upload yet", SD_SDCARD_DIR);
+        return false;
+    }
+    if (!have_ident) {
+        ESP_LOGW(TAG, "no Identification.json in %s — root bundle incomplete, deferring CPAP upload",
+                 SD_SDCARD_DIR);
         return false;
     }
     return true;

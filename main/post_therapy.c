@@ -342,6 +342,178 @@ static const char *const SETTINGS_KEYS[] = {
     "SettingProfiles",
 };
 
+static const char *json_get_str(const cJSON *obj, const char *key)
+{
+    const cJSON *v = obj ? cJSON_GetObjectItem(obj, key) : NULL;
+    return (v && cJSON_IsString(v) && v->valuestring) ? v->valuestring : "";
+}
+
+static void save_device_metadata_snapshot(const cJSON *ident, const cJSON *settings)
+{
+    size_t existing_len = 0;
+    uint8_t *existing_raw = read_bin_file(SD_DEVICE_METADATA_PATH, &existing_len);
+    cJSON *existing = NULL;
+    if (existing_raw && existing_len > 0) {
+        char * str = malloc(existing_len + 1);
+        if (str) {
+            memcpy(str, existing_raw, existing_len);
+            str[existing_len] = '\0';
+            existing = cJSON_Parse(str);
+            free(str);
+        }
+    }
+
+    const cJSON *old_ident = existing ? cJSON_GetObjectItem(existing, "ident") : NULL;
+    const cJSON *old_settings = existing ? cJSON_GetObjectItem(existing, "settings") : NULL;
+    if (!cJSON_IsObject(old_ident)) old_ident = NULL;
+    if (!cJSON_IsObject(old_settings)) old_settings = NULL;
+
+    const cJSON *use_ident = ident ? ident : old_ident;
+    if (!use_ident) {
+        if (existing) cJSON_Delete(existing);
+        free(existing_raw);
+        return;
+    }
+
+    const char *serial = json_get_str(use_ident, "SerialNumber");
+    const char *old_serial = json_get_str(old_ident, "SerialNumber");
+
+    const cJSON *use_settings = settings;
+    if (!use_settings && old_settings) {
+        /* Only carry over cached settings if they belong to the same machine. */
+        if (!ident || strcmp(serial, old_serial) == 0) {
+            use_settings = old_settings;
+        }
+    }
+
+    cJSON *snap = cJSON_CreateObject();
+    if (snap) {
+        cJSON_AddStringToObject(snap, "serial", serial);
+        cJSON_AddItemReferenceToObject(snap, "ident", (cJSON *)use_ident);
+        if (use_settings) {
+            cJSON_AddItemReferenceToObject(snap, "settings", (cJSON *)use_settings);
+        }
+        char *new_str = cJSON_PrintUnformatted(snap);
+        cJSON_Delete(snap);
+        if (new_str) {
+            size_t new_len = strlen(new_str);
+            bool unchanged = (existing_raw && existing_len == new_len &&
+                              memcmp(existing_raw, new_str, new_len) == 0);
+            if (!unchanged) {
+                if (write_bin_atomic(SD_DEVICE_METADATA_PATH,
+                                     (const uint8_t *)new_str, new_len) == ESP_OK) {
+                    ESP_LOGI(TAG, "saved device metadata snapshot (serial=%s)",
+                             serial[0] ? serial : "?");
+                }
+            }
+            free(new_str);
+        }
+    }
+
+    if (existing) cJSON_Delete(existing);
+    free(existing_raw);
+}
+
+void post_therapy_cache_device_metadata(void)
+{
+    if (!sd_storage_is_ready()) return;
+
+    cJSON *ident = as11_ble_get_values(
+        IDENTITY_KEYS, sizeof(IDENTITY_KEYS) / sizeof(IDENTITY_KEYS[0]));
+    if (!ident) {
+        ESP_LOGW(TAG, "pre-stream metadata: failed to get device identification");
+        return;
+    }
+
+    cJSON *settings = as11_ble_get_values(
+        SETTINGS_KEYS, sizeof(SETTINGS_KEYS) / sizeof(SETTINGS_KEYS[0]));
+    if (settings) {
+        as11_offset_t as11_off;
+        if (as11_time_offset_from_settings(settings, &as11_off)) {
+            ESP_LOGI(TAG, "AS11 timezone offset %d min (from pre-stream settings)",
+                     (int)(as11_off / 60));
+        }
+    } else {
+        ESP_LOGW(TAG, "pre-stream metadata: failed to get device settings");
+    }
+
+    save_device_metadata_snapshot(ident, settings);
+    cJSON_Delete(ident);
+    if (settings) cJSON_Delete(settings);
+}
+
+static esp_err_t write_session_settings_files(const char *dir, const char *prefix,
+                                              const cJSON *settings)
+{
+    as11_offset_t as11_off;
+    if (as11_time_offset_from_settings(settings, &as11_off)) {
+        ESP_LOGI(TAG, "AS11 timezone offset %d min (from device settings)",
+                 (int)(as11_off / 60));
+    }
+
+    char path[330];
+    snprintf(path, sizeof(path), "%s/%s_settings.json", dir, prefix);
+    if (write_json_file(path, settings) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /* Also save to summaries directory for fast O(1) STR.edf lookup */
+    const char *slash = strrchr(dir, '/');
+    const char *day_label = slash ? slash + 1 : dir;
+    if (day_label && strlen(day_label) == 8) {
+        char sum_settings_path[300];
+        snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.settings.json",
+                 SD_SUMMARIES_DIR, day_label);
+        write_json_file(sum_settings_path, settings);
+    }
+    return ESP_OK;
+}
+
+static void fallback_from_device_metadata(const char *dir, const char *prefix,
+                                          bool *ident_ok, bool *settings_ok)
+{
+    size_t raw_len = 0;
+    uint8_t *raw = read_bin_file(SD_DEVICE_METADATA_PATH, &raw_len);
+    if (!raw || raw_len == 0) {
+        free(raw);
+        return;
+    }
+    char *str = malloc(raw_len + 1);
+    if (!str) {
+        free(raw);
+        return;
+    }
+    memcpy(str, raw, raw_len);
+    str[raw_len] = '\0';
+    free(raw);
+
+    cJSON *snap = cJSON_Parse(str);
+    free(str);
+    if (!snap) return;
+
+    if (ident_ok && !*ident_ok) {
+        cJSON *id_obj = cJSON_GetObjectItem(snap, "ident");
+        if (cJSON_IsObject(id_obj)) {
+            char path[330];
+            snprintf(path, sizeof(path), "%s/%s_ident.json", dir, prefix);
+            if (write_json_file(path, id_obj) == ESP_OK) {
+                ESP_LOGW(TAG, "used cached device identification for %s", prefix);
+                *ident_ok = true;
+            }
+        }
+    }
+    if (settings_ok && !*settings_ok) {
+        cJSON *st_obj = cJSON_GetObjectItem(snap, "settings");
+        if (cJSON_IsObject(st_obj)) {
+            if (write_session_settings_files(dir, prefix, st_obj) == ESP_OK) {
+                ESP_LOGW(TAG, "used cached device settings for %s", prefix);
+                *settings_ok = true;
+            }
+        }
+    }
+    cJSON_Delete(snap);
+}
+
 static esp_err_t collect_identification(const char *dir, const char *prefix)
 {
     cJSON *ident = as11_ble_get_values(
@@ -353,9 +525,10 @@ static esp_err_t collect_identification(const char *dir, const char *prefix)
 
     char path[330];
     snprintf(path, sizeof(path), "%s/%s_ident.json", dir, prefix);
-    write_json_file(path, ident);
+    esp_err_t err = write_json_file(path, ident);
+    save_device_metadata_snapshot(ident, NULL);
     cJSON_Delete(ident);
-    return ESP_OK;
+    return err;
 }
 
 static esp_err_t collect_settings(const char *dir, const char *prefix)
@@ -367,31 +540,10 @@ static esp_err_t collect_settings(const char *dir, const char *prefix)
         return ESP_FAIL;
     }
 
-    /* The device reports its own UTC offset here; capture it so Summary
-     * PeriodStart values can be mapped onto the AS11's noon-day boundaries
-     * even before any spool record has been parsed. */
-    as11_offset_t as11_off;
-    if (as11_time_offset_from_settings(settings, &as11_off)) {
-        ESP_LOGI(TAG, "AS11 timezone offset %d min (from device settings)",
-                 (int)(as11_off / 60));
-    }
-
-    char path[330];
-    snprintf(path, sizeof(path), "%s/%s_settings.json", dir, prefix);
-    write_json_file(path, settings);
-
-    /* Also save to summaries directory for fast O(1) STR.edf lookup */
-    const char *slash = strrchr(dir, '/');
-    const char *day_label = slash ? slash + 1 : dir;
-    if (day_label && strlen(day_label) == 8) {
-        char sum_settings_path[300];
-        snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.settings.json",
-                 SD_SUMMARIES_DIR, day_label);
-        write_json_file(sum_settings_path, settings);
-    }
-
+    esp_err_t err = write_session_settings_files(dir, prefix, settings);
+    save_device_metadata_snapshot(NULL, settings);
     cJSON_Delete(settings);
-    return ESP_OK;
+    return err;
 }
 
 /* ── Spool staleness detection ──────────────────────────────────────── */
@@ -717,15 +869,50 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
         errors++;
     }
 
-    /* 3. Get device identification → <prefix>_ident.json */
-    if (collect_identification(session_dir, file_prefix) != ESP_OK) {
-        errors++;
+    /* 3 & 4. Get device identification (<prefix>_ident.json) and current
+     * settings (<prefix>_settings.json).
+     *
+     * If an ATT write stalls here, NimBLE's 30 s ATT transaction timer will
+     * terminate the connection and auto-reconnect in ~5 s.  Wait passively
+     * for the new BLE session epoch (up to 45 s) and retry only the failed
+     * step(s); if BLE remains unreachable, fall back to the same-machine
+     * snapshot captured on session setup (SD_DEVICE_METADATA_PATH). */
+    uint32_t ble_epoch = as11_ble_get_session_epoch();
+    bool reconnected = false;
+
+    bool ident_ok = (collect_identification(session_dir, file_prefix) == ESP_OK);
+    if (!ident_ok) {
+        ESP_LOGW(TAG, "identification RPC failed (epoch=%lu) — waiting up to 45s for BLE reconnect",
+                 (unsigned long)ble_epoch);
+        if (as11_ble_wait_for_reconnect(ble_epoch, 45000)) {
+            reconnected = true;
+            ble_epoch = as11_ble_get_session_epoch();
+            ESP_LOGI(TAG, "BLE reconnected (epoch=%lu), retrying identification",
+                     (unsigned long)ble_epoch);
+            ident_ok = (collect_identification(session_dir, file_prefix) == ESP_OK);
+        }
     }
 
-    /* 4. Get current settings → <prefix>_settings.json */
-    if (collect_settings(session_dir, file_prefix) != ESP_OK) {
-        errors++;
+    bool settings_ok = (collect_settings(session_dir, file_prefix) == ESP_OK);
+    if (!settings_ok && !reconnected) {
+        ESP_LOGW(TAG, "settings RPC failed (epoch=%lu) — waiting up to 45s for BLE reconnect",
+                 (unsigned long)ble_epoch);
+        if (as11_ble_wait_for_reconnect(ble_epoch, 45000)) {
+            ble_epoch = as11_ble_get_session_epoch();
+            ESP_LOGI(TAG, "BLE reconnected (epoch=%lu), retrying settings",
+                     (unsigned long)ble_epoch);
+            if (!ident_ok) {
+                ident_ok = (collect_identification(session_dir, file_prefix) == ESP_OK);
+            }
+            settings_ok = (collect_settings(session_dir, file_prefix) == ESP_OK);
+        }
     }
+
+    if (!ident_ok || !settings_ok) {
+        fallback_from_device_metadata(session_dir, file_prefix, &ident_ok, &settings_ok);
+    }
+    if (!ident_ok) errors++;
+    if (!settings_ok) errors++;
 
     /* 5. Check if the current day's spool is fresh (updated after session end). */
     bool fresh = summary_spool_is_current(end_epoch_ms, clock_drift_ms);

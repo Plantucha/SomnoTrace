@@ -88,3 +88,10 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
  * Returns true if the spool became fresh, false if still stale after
  * timeout (caller should proceed with available data). */
 bool post_therapy_wait_spool_current(int64_t end_epoch_ms, int64_t clock_drift_ms);
+
+/* Capture machine identification and current settings over BLE while the
+ * link is idle (before StartStream) and persist them atomically to
+ * SD_DEVICE_METADATA_PATH (only writing when content changes).  Provides a
+ * same-machine fallback on the very first night or if BLE is unreachable at
+ * TherapyStop. */
+void post_therapy_cache_device_metadata(void);

@@ -427,13 +427,18 @@ static upload_result_t aer_day_end(const char *day, bool any_uploaded)
     char path[256];
     snprintf(path, sizeof(path), AER_PROCESS_FMT, s_import_id);
 
-    int status = aer_req("POST", path, NULL, NULL);
-    upload_result_t r = aer_map_status(status, NULL);
+    char *proc_body = NULL;
+    size_t proc_blen = 0;
+    int status = aer_req("POST", path, &proc_body, &proc_blen);
+    upload_result_t r = aer_map_status(status, proc_body);
     if (r != UPLOAD_OK) {
-        ESP_LOGW(TAG, "process import %s failed (HTTP %d)", s_import_id, status);
+        ESP_LOGW(TAG, "process import %s failed (HTTP %d): %.200s",
+                 s_import_id, status, proc_body ? proc_body : "(no body)");
+        free(proc_body);
         s_import_id[0] = '\0';
         return r;
     }
+    free(proc_body);
 
     /* Poll the import until done/failed (~60 s budget, same as SleepHQ). */
     snprintf(path, sizeof(path), AER_IMPORT_FMT, s_import_id);
@@ -455,8 +460,8 @@ static upload_result_t aer_day_end(const char *day, bool any_uploaded)
             continue;
         }
         cJSON *root = cJSON_Parse(body);
-        free(body);
         if (!root) {
+            free(body);
             if (attempt + 1 >= 30) break;
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
@@ -493,10 +498,12 @@ static upload_result_t aer_day_end(const char *day, bool any_uploaded)
             }
             err = ESP_OK;
         } else if (failed) {
-            ESP_LOGW(TAG, "import %s: remote status \"failed\"", s_import_id);
+            ESP_LOGW(TAG, "import %s: remote status \"failed\": %.240s",
+                     s_import_id, body ? body : "(no body)");
             err = ESP_FAIL;
         }
         cJSON_Delete(root);
+        free(body);
         if (err != ESP_ERR_TIMEOUT) break;
         vTaskDelay(pdMS_TO_TICKS(2000));
     }

@@ -1470,6 +1470,85 @@ static void test_identification_missing_source_is_refused(void)
     assert(ident_slurp(crc_path, NULL) == NULL);
 }
 
+/* Issue #326: when a session's post-therapy Get RPCs fail on a fresh day with
+ * only one session, edf_gen must:
+ *   1. refuse to write headerless EDFs (with blank SRN=/MID=/VID=) when no
+ *      identification exists anywhere on the card;
+ *   2. borrow _ident.json and _settings.json from another day in streams/
+ *      (when same-day metadata is absent) and backfill the session's files;
+ *   3. fall back to <sessions_root>/device_metadata.json when no day in
+ *      streams/ has metadata yet (first-night fallback). */
+static void test_cross_day_and_snapshot_metadata_fallback(void)
+{
+    set_tz("UTC");
+    char root[300], sd[400], out[400], p[600];
+    snprintf(root, sizeof(root), "%s/meta_fallback", g_root);
+    build_session(root, 2, SA2_N, sd, sizeof(sd));
+
+    /* Remove the session's own _ident.json and _settings.json. */
+    snprintf(p, sizeof(p), "%s/%s_ident.json", sd, SID);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/%s_settings.json", sd, SID);
+    unlink(p);
+
+    /* 1. With no metadata anywhere, export is refused before writing headerless EDFs. */
+    CHECK(generate(root, sd, out, sizeof(out)) == ESP_FAIL,
+          "export without any identification source must fail");
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", out, SID);
+    size_t brp_len = 0;
+    uint8_t *brp = read_file(p, &brp_len);
+    CHECK(brp == NULL, "headerless BRP.edf must not be written when ident is missing");
+    free(brp);
+
+    /* 2. Add a sibling day (20260302) with valid _ident.json and _settings.json. */
+    mk("%s/streams/20260302", root);
+    snprintf(p, sizeof(p), "%s/streams/20260302/20260302_220000_ident.json", root);
+    write_text(p, "{\"SerialNumber\":\"23249999999\",\"PlatformIdentifier\":46,\"VariantIdentifier\":3}\n");
+    snprintf(p, sizeof(p), "%s/streams/20260302/20260302_220000_settings.json", root);
+    write_text(p, "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"AutoSetProfile\"}}}\n");
+
+    CHECK(generate(root, sd, out, sizeof(out)) == ESP_OK,
+          "cross-day metadata fallback should allow export to succeed");
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", out, SID);
+    brp = read_file(p, &brp_len);
+    CHECK(brp != NULL && brp_len >= 256, "BRP.edf missing after cross-day fallback");
+    if (brp && brp_len >= 256) {
+        char rec_id[81];
+        memcpy(rec_id, brp + 88, 80);
+        rec_id[80] = '\0';
+        CHECK(strstr(rec_id, "SRN=23249999999 MID=46 VID=3") != NULL,
+              "BRP.edf recording_id did not carry borrowed identity: '%s'", rec_id);
+    }
+    free(brp);
+
+    /* 3. Device snapshot fallback when no streams/<day>/ has _ident.json. */
+    char root2[300], sd2[400], out2[400];
+    snprintf(root2, sizeof(root2), "%s/snap_fallback", g_root);
+    build_session(root2, 2, SA2_N, sd2, sizeof(sd2));
+    snprintf(p, sizeof(p), "%s/%s_ident.json", sd2, SID);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/%s_settings.json", sd2, SID);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/device_metadata.json", root2);
+    write_text(p, "{\"serial\":\"23248888888\","
+                  "\"ident\":{\"SerialNumber\":\"23248888888\",\"PlatformIdentifier\":46,\"VariantIdentifier\":3},"
+                  "\"settings\":{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"}}}}\n");
+
+    CHECK(generate(root2, sd2, out2, sizeof(out2)) == ESP_OK,
+          "device_metadata.json snapshot fallback should allow export to succeed");
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", out2, SID);
+    brp = read_file(p, &brp_len);
+    CHECK(brp != NULL && brp_len >= 256, "BRP.edf missing after snapshot fallback");
+    if (brp && brp_len >= 256) {
+        char rec_id[81];
+        memcpy(rec_id, brp + 88, 80);
+        rec_id[80] = '\0';
+        CHECK(strstr(rec_id, "SRN=23248888888 MID=46 VID=3") != NULL,
+              "BRP.edf recording_id did not carry snapshot identity: '%s'", rec_id);
+    }
+    free(brp);
+}
+
 /* ── edf_waveform: the guards in the event-file readers ──────────────────────
  * Eighteen of the harness's thirty-three survivors lived in these three
  * functions, all of them the same shape: a guard whose false branch nothing
@@ -1906,6 +1985,8 @@ int main(void)
         test_identification_absent_fields_are_empty_or_zero, NULL);
     run("a missing identification.json is refused and writes nothing",
         test_identification_missing_source_is_refused, NULL);
+    run("cross-day and device_metadata.json fallbacks recover missing ident/settings",
+        test_cross_day_and_snapshot_metadata_fallback, NULL);
 
     run("snt_available_samples refuses 0 channels and an empty file is 0",
         test_wf_available_samples_guards, NULL);

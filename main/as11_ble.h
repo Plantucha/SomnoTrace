@@ -159,6 +159,16 @@ esp_err_t as11_ble_spool_pull_bounded(const char *spool_type, const char *from_d
  * variable names to their values. */
 cJSON *as11_ble_get_values(const char *const *keys, int n_keys);
 
+/* Monotonic counter incremented each time an encrypted BLE session with the
+ * AS11 finishes setup and enters AS11_STATUS_PAIRED. */
+uint32_t as11_ble_get_session_epoch(void);
+
+/* Block until a new encrypted BLE session (with epoch != prev_epoch) is
+ * established and ready, or until timeout_ms elapses.  Used by post-therapy
+ * collection to passively wait out a 30 s ATT transaction timeout + auto-
+ * reconnect before retrying a failed metadata RPC. */
+bool as11_ble_wait_for_reconnect(uint32_t prev_epoch, uint32_t timeout_ms);
+
 /* Send EnterStandby RPC to stop therapy on the AS11.
  * Requires an active encrypted BLE session.
  * Returns ESP_OK on success. */

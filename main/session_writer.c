@@ -1608,7 +1608,6 @@ static void sw_post_task(void *arg)
         } else {
             ESP_LOGW(TAG, "post: EDF generation failed (%s), not triggering upload",
                      esp_err_to_name(ret));
-            if (!bsp_display_is_therapy_active()) uploader_request_scan();
         }
 
         /* 5b. Queue post-session sleep staging for the finalized sa2 stream

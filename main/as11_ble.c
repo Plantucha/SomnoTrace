@@ -42,6 +42,8 @@
 #include "as11_reconnect.h"
 #include "as11_adv.h"
 #include "session_writer.h"
+#include "post_therapy.h"
+#include "sd_storage.h"
 #include "bsp_display.h"
 #include "mqtt_manager.h"
 #include "time_sync.h"
@@ -234,6 +236,7 @@ static spool_collector_t *s_spool_collector = NULL;
 /* Encrypted session state (set after reconnect or pairing). */
 static uint8_t s_session_key[32];       /* AES-256 key */
 static bool s_session_encrypted = false;
+static volatile uint32_t s_session_epoch = 0;
 
 /* When true, the next BLE_GAP_EVENT_DISCONNECT will NOT trigger
  * auto-reconnect.  Set before intentional ble_gap_terminate() calls
@@ -1456,8 +1459,9 @@ static esp_err_t send_fig(uint16_t vcid, const char *json)
             ESP_LOGE(TAG, "write chunk start failed rc=%d off=%d", rc, off);
             return ESP_FAIL;
         }
-        if (wait_op(5000) != 0) {
-            ESP_LOGE(TAG, "write chunk failed off=%d", off);
+        int wrc = wait_op(5000);
+        if (wrc != 0) {
+            ESP_LOGE(TAG, "write chunk failed off=%d (rc=%d)", off, wrc);
             return ESP_FAIL;
         }
     }
@@ -1484,8 +1488,9 @@ static esp_err_t send_fig_raw(uint16_t vcid, const uint8_t *data, int len)
             ESP_LOGE(TAG, "write chunk failed rc=%d off=%d", rc, off);
             return ESP_FAIL;
         }
-        if (wait_op(5000) != 0) {
-            ESP_LOGE(TAG, "write chunk timeout off=%d", off);
+        int wrc = wait_op(5000);
+        if (wrc != 0) {
+            ESP_LOGE(TAG, "write chunk timeout off=%d (rc=%d)", off, wrc);
             return ESP_FAIL;
         }
     }
@@ -2621,6 +2626,17 @@ after_get_test:
     ESP_LOGI(TAG, "reconnect: time usable (source=%d), proceeding with stream setup",
              (int)time_source_get());
 
+    /* Capture machine identification and therapy settings while the link is
+     * idle (before StartStream begins 25 Hz notifications), so a same-machine
+     * fallback snapshot is on the SD card even on the very first night or if
+     * BLE drops at TherapyStop.  Skipped during active therapy (where stream
+     * gap time matters) and while post-therapy collection is in flight (which
+     * performs its own retry as soon as reconnect completes). */
+    if (!session_writer_get_active() && !session_writer_post_active() &&
+        sd_storage_is_ready()) {
+        post_therapy_cache_device_metadata();
+    }
+
     /* ---- Subscribe to therapy events (encrypted) ----
      * Four event selectors:
      *   TherapyEvents-RespiratoryEvents  — apnea/hypopnea events (EVE.edf)
@@ -2736,6 +2752,7 @@ after_subscribe:
     free(rpc);
 after_start_stream:
 
+    __atomic_add_fetch(&s_session_epoch, 1, __ATOMIC_SEQ_CST);
     set_state(AS11_STATUS_PAIRED);
     #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
     if (as11_ble_exp_coex_fix()) {
@@ -3066,6 +3083,30 @@ const char *as11_ble_get_error(void)
 bool as11_ble_is_paired(void)
 {
     return s_pair_cache.valid;
+}
+
+uint32_t as11_ble_get_session_epoch(void)
+{
+    return __atomic_load_n(&s_session_epoch, __ATOMIC_SEQ_CST);
+}
+
+bool as11_ble_wait_for_reconnect(uint32_t prev_epoch, uint32_t timeout_ms)
+{
+    const uint32_t step_ms = 250;
+    uint32_t waited = 0;
+    while (waited < timeout_ms) {
+        if (!s_pair_cache.valid || s_manual_disconnect) {
+            return false;
+        }
+        uint32_t cur = __atomic_load_n(&s_session_epoch, __ATOMIC_SEQ_CST);
+        if (s_session_encrypted && cur != prev_epoch &&
+            strcmp(s_state, AS11_STATUS_PAIRED) == 0) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        waited += step_ms;
+    }
+    return false;
 }
 
 cJSON *as11_ble_get_paired_info(void)
