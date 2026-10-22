@@ -96,6 +96,7 @@ void ox_store_part_remove(const char *name);
 #define OP_SETUP           0x10
 #define OP_SET_UTC_TIME    0xC0
 #define OP_GET_INFO        0xE1
+#define OP_RESET           0xE2  /* soft reset (vendor SDK "reset"); NOT 0xE3/0xEE */
 #define OP_GET_BATTERY     0xE4
 #define OP_GET_FILE_LIST   0xF1
 #define OP_READ_FILE_START 0xF2
@@ -289,6 +290,18 @@ static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
 #define OX_END_WINDOW_MS  130000
 #define OX_WORN_PROBE_MS  60000  /* LIVE_B interval while worn; END lasts ~120s */
 #define OX_F1_MAX_RETRIES 3      /* give up on F1 after N consecutive timeouts */
+
+/* Some rings (seen on SHQO2Pro fw 2D010003) ignore F1 for the whole END
+ * window after an overnight recording, but serve it on the first try
+ * after a power cycle.  When F1 is still refused after OX_F1_MAX_RETRIES
+ * attempts, send a soft reset (0xE2, the vendor SDK's "reset"; distinct
+ * from 0xE3 factory reset and 0xEE power-off) and pull again after the
+ * ring restarts.  At most one reset per OX_F1_RESET_GUARD_MS so a ring
+ * that still refuses F1 after the reset can never be put into a reset loop. */
+#define OX_F1_RESET_ENABLED   1
+#define OX_F1_RESET_GUARD_MS  (10 * 60 * 1000)
+static TickType_t s_f1_reset_at = 0;    /* 0 = never sent */
+static bool s_f1_reset_pending = false; /* reset sent, no file list served since */
 
 /* Persistent-mode polling: one held connection, unauthenticated LIVE_B.
  * See .ai/OXIMETRY2.md for the experiment that established this value. */
@@ -1537,6 +1550,25 @@ static bool do_pull_and_mark(bool *pulled_any)
                  s_resp_opcode, s_resp_payload_len,
                  s_f1_fail_count, OX_F1_MAX_RETRIES);
         if (s_f1_fail_count >= OX_F1_MAX_RETRIES) {
+#if OX_F1_RESET_ENABLED
+            bool reset_recent = s_f1_reset_at != 0 &&
+                (xTaskGetTickCount() - s_f1_reset_at) < pdMS_TO_TICKS(OX_F1_RESET_GUARD_MS);
+            if (!reset_recent && s_conn_handle != BLE_HS_CONN_HANDLE_NONE &&
+                oxyii_off_finger() != 0) {
+                ESP_LOGW(TAG, "F1 unreachable after %d attempts — sending soft reset 0xE2, "
+                         "will pull after the ring restarts",
+                         OX_F1_MAX_RETRIES);
+                esp_err_t rr = oxyii_request(OP_RESET, NULL, 0, true, 2000);
+                ESP_LOGI(TAG, "reset: %s", rr == ESP_OK ? "acked" : "no ack (ring may already be restarting)");
+                s_f1_reset_at = xTaskGetTickCount();
+                if (s_f1_reset_at == 0) s_f1_reset_at = 1;
+                s_f1_reset_pending = true;
+                s_f1_fail_count = 0;       /* post-reset attempts get the full budget */
+                s_pull_fail_count = -1;    /* caller's ++s_pull_fail_count lands at 0 */
+                s_connect_fail_count = 0;
+                return false;
+            }
+#endif
             /* F1 never responds on this ring (firmware quirk).
              * Mark served so we stop reconnecting — each connection
              * resets the ring's power-off timer.  Next sync window
@@ -1547,6 +1579,14 @@ static bool do_pull_and_mark(bool *pulled_any)
                      OX_F1_MAX_RETRIES);
         }
         return false;
+    }
+    if (s_f1_reset_pending) {
+        s_f1_reset_pending = false;
+        TickType_t dt = xTaskGetTickCount() - s_f1_reset_at;
+        if (dt < pdMS_TO_TICKS(OX_F1_RESET_GUARD_MS)) {
+            ESP_LOGI(TAG, "file list served %lus after soft reset",
+                     (unsigned long)(dt / configTICK_RATE_HZ));
+        }
     }
     s_f1_fail_count = 0;
     ESP_LOGI(TAG, "file list: %d files", count);
@@ -1776,8 +1816,10 @@ static void pull_task(void *arg)
                          * the curfew so the ring can power off and conserve
                          * battery between advertising cycles. */
                         if (++s_pull_fail_count < OX_PULL_MAX_FAST_RETRIES) {
-                            ESP_LOGW(TAG, "sync incomplete — fast retry %d/%d (ring still advertising)",
-                                     s_pull_fail_count, OX_PULL_MAX_FAST_RETRIES);
+                            if (s_pull_fail_count > 0) {
+                                ESP_LOGW(TAG, "sync incomplete — fast retry %d/%d (ring still advertising)",
+                                         s_pull_fail_count, OX_PULL_MAX_FAST_RETRIES);
+                            }
                         } else {
                             s_presence_served = true;
                             s_served_at = xTaskGetTickCount();
@@ -1904,8 +1946,10 @@ static void pull_task(void *arg)
              * the curfew so the ring can power off and conserve
              * battery between advertising cycles. */
             if (++s_pull_fail_count < OX_PULL_MAX_FAST_RETRIES) {
-                ESP_LOGW(TAG, "sync incomplete — fast retry %d/%d (ring still advertising)",
-                         s_pull_fail_count, OX_PULL_MAX_FAST_RETRIES);
+                if (s_pull_fail_count > 0) {
+                    ESP_LOGW(TAG, "sync incomplete — fast retry %d/%d (ring still advertising)",
+                             s_pull_fail_count, OX_PULL_MAX_FAST_RETRIES);
+                }
             } else {
                 s_presence_served = true;
                 s_served_at = xTaskGetTickCount();
