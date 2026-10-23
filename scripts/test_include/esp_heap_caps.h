@@ -31,7 +31,14 @@
 #define MALLOC_CAP_8BIT      0
 #define MALLOC_CAP_DEFAULT   0
 
-#define heap_caps_malloc(size, caps)        malloc(size)
+/* Opt-in fault injection: a test that DEFINES this flag and sets it non-zero
+ * makes heap_caps_malloc() return NULL, as an exhausted PSRAM pool does on the
+ * device, so the caller's plain-malloc fallback actually runs.  Weak, so every
+ * test that does not define it links unchanged and gets plain malloc. */
+extern int host_heap_caps_malloc_fail __attribute__((weak));
+#define heap_caps_malloc(size, caps)                                         \
+    ((&host_heap_caps_malloc_fail && host_heap_caps_malloc_fail)             \
+         ? NULL : malloc(size))
 #define heap_caps_calloc(n, size, caps)     calloc((n), (size))
 #define heap_caps_realloc(p, size, caps)    realloc((p), (size))
 #define heap_caps_free(p)                   free(p)

@@ -32,6 +32,17 @@
  *   phase B  fresh process = reboot: marks load from unit files; a changed
  *            CSV fingerprint resets only that unit; deleting the CSV evicts
  *            its state; the max_days window bounds pending/progress counts
+ *   phase C  unit-id validation at its edges: a state file whose id is one
+ *            byte too long for any scanned CSV is refused at load, the longest
+ *            legal id is accepted; a CSV id with a space (0x20) is tracked, one
+ *            with a control byte (0x1f) is not
+ *   phase D  a unit's day is fixed once known: a CSV that moves to another day
+ *            folder is evicted and re-offered, it does not inherit the mark
+ *   phase E  what reaches disk: only backends with an outcome, only registered
+ *            backends, and a failed rename leaves no .tmp and keeps the unit
+ *            dirty until a later flush succeeds
+ *   phase F  reboot with PSRAM exhausted: unit files still load through the
+ *            plain-malloc fallback
  *
  * Phases are separate exec'd processes because s_states is static — a reboot
  * has to lose it for the reload path to be exercised.
@@ -53,6 +64,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "cJSON.h"
 #include "upload_stage.h"
 
 /* ── Backend registry stub (upload_index.c is not linked) ──────────── */
@@ -62,20 +74,29 @@ static const char *const k_backends[] = { "smb", "sleephq", "ftp", "ha" };
 #define SLOT_SMB 0
 #define SLOT_SHQ 1
 
+/* How many backends are registered this boot.  The real registry
+ * (upload_index.c) can hold fewer than UPLOAD_MAX_BACKENDS, and its
+ * upload_index_backend_name() answers "?" — not NULL — for a slot past the
+ * registered count; the stub mirrors both so phase E can register three. */
+static int g_registered = N_BACKENDS;
+
 int upload_index_backend_slot(const char *backend_id)
 {
     if (!backend_id) return -1;
-    for (int i = 0; i < N_BACKENDS; i++)
+    for (int i = 0; i < g_registered; i++)
         if (strcmp(backend_id, k_backends[i]) == 0) return i;
     return -1;
 }
 
 const char *upload_index_backend_name(int slot)
 {
-    return (slot >= 0 && slot < N_BACKENDS) ? k_backends[slot] : NULL;
+    return (slot >= 0 && slot < g_registered) ? k_backends[slot] : "?";
 }
 
-int upload_index_backend_count(void) { return N_BACKENDS; }
+int upload_index_backend_count(void) { return g_registered; }
+
+/* esp_heap_caps.h shim hook: non-zero makes heap_caps_malloc() fail. */
+int host_heap_caps_malloc_fail;
 
 /* ── Harness ────────────────────────────────────────────────────────── */
 
@@ -173,6 +194,36 @@ static int state_files(void)
     return n;
 }
 
+/* Fresh card + state tree for a phase that must not see earlier phases. */
+static void reset_tree(void)
+{
+    rmtree(SD_MOUNT_POINT);
+    rmtree(UPLOAD_STATE_DIR);
+    mkdirs(STAGE_DIR);
+    mkdirs(UPLOAD_STATE_DIR);
+}
+
+static void write_text(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fputs(text, f);
+    fclose(f);
+}
+
+/* The "be" object of a unit's state file as the component wrote it. */
+static cJSON *read_unit_file(const char *id)
+{
+    char p[896], buf[4096];
+    snprintf(p, sizeof(p), "%s/%s.json", STATE_DIR, id);
+    FILE *f = fopen(p, "r");
+    if (!f) return NULL;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return cJSON_Parse(buf);
+}
+
 static const upload_stage_ref_t *find_ref(const upload_stage_ref_t *refs,
                                           int n, const char *id)
 {
@@ -259,7 +310,13 @@ static int phase_a(const char *self)
           "re-marked units still pending");
 
     free(refs);
-    int r = run_phase(self, "b");
+    int r = 0;
+    static const char *const k_phases[] = { "b", "c", "d", "e" };
+    for (size_t i = 0; i < sizeof(k_phases) / sizeof(k_phases[0]); i++) {
+        int pr = run_phase(self, k_phases[i]);
+        if (pr) printf("  FAIL phase %s exited %d\n", k_phases[i], pr);
+        r += pr;
+    }
     return g_failures + r;
 }
 
@@ -338,15 +395,172 @@ static int phase_b(void)
     return g_failures;
 }
 
+/* ── Phase C: unit-id validation at both edges ─────────────────────── */
+
+static int phase_c(void)
+{
+    reset_tree();
+    mkdirs(STATE_DIR);
+
+    /* A scanned CSV id is at most UPLOAD_STAGE_ID_LEN - 1 bytes (it has to
+     * fit the NUL-terminated id field), so a state file naming a longer id
+     * can only be corrupt and must be refused.  The longest legal id loads. */
+    char too_long[UPLOAD_STAGE_ID_LEN + 1], longest[UPLOAD_STAGE_ID_LEN];
+    memset(too_long, 'a', UPLOAD_STAGE_ID_LEN); too_long[UPLOAD_STAGE_ID_LEN] = '\0';
+    memset(longest, 'b', UPLOAD_STAGE_ID_LEN - 1); longest[UPLOAD_STAGE_ID_LEN - 1] = '\0';
+    char p[896], json[512];
+    snprintf(p, sizeof(p), "%s/too_long.json", STATE_DIR);
+    snprintf(json, sizeof(json), "{\"v\":1,\"id\":\"%s\",\"day\":\"20261101\",\"fp\":\"1\"}", too_long);
+    write_text(p, json);
+    snprintf(p, sizeof(p), "%s/%s.json", STATE_DIR, longest);
+    snprintf(json, sizeof(json), "{\"v\":1,\"id\":\"%s\",\"day\":\"20261102\",\"fp\":\"1\"}", longest);
+    write_text(p, json);
+
+    CHECK(upload_stage_init() == ESP_OK, "upload_stage_init failed");
+    CHECK(upload_stage_cached_pending(SLOT_SMB) == 1,
+          "load must refuse an id of UPLOAD_STAGE_ID_LEN bytes and keep one of LEN-1");
+    int done = -1, total = -1;
+    upload_stage_backend_progress(SLOT_SMB, WINDOW, &done, &total);
+    CHECK(total == 1, "an over-long state id was loaded as a day of its own");
+
+    /* Ids are path components: a space is a legal byte, anything below
+     * 0x20 is not. */
+    mk_stage_csv("20261103", "night 1", 1);
+    mk_stage_csv("20261103", "night\x1f" "2", 2);
+    upload_stage_ref_t *refs = calloc(UPLOAD_STAGE_MAX_UNITS, sizeof(*refs));
+    if (!refs) return 1;
+    int kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    CHECK(find_ref(refs, kept, "night 1") != NULL, "a CSV id containing a space was not tracked");
+    CHECK(find_ref(refs, kept, "night\x1f" "2") == NULL, "a CSV id with a control byte was tracked");
+    CHECK(kept == 1, "reconcile kept something other than the one valid CSV");
+    free(refs);
+    return g_failures;
+}
+
+/* ── Phase D: a CSV that changes day folder is a new upload ──────────── */
+
+static int phase_d(void)
+{
+    reset_tree();
+    mk_stage_csv("20261104", "moved", 7);
+    CHECK(upload_stage_init() == ESP_OK, "upload_stage_init failed");
+
+    upload_stage_ref_t *refs = calloc(UPLOAD_STAGE_MAX_UNITS, sizeof(*refs));
+    if (!refs) return 1;
+    int kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    CHECK(kept == 1, "the one CSV was not scanned");
+    if (kept == 1) upload_stage_mark(&refs[0], SLOT_SMB, UG_OK, NULL);
+    CHECK(kept == 1 && upload_stage_status(&refs[0], SLOT_SMB) == UG_OK, "mark not recorded");
+
+    /* Same bytes, same name, another day folder.  The state recorded for
+     * 20261104 describes a CSV that is gone; the unit's day is only ever
+     * filled in when it was missing, never rewritten. */
+    char from[896], to[896], dir[768];
+    unit_csv(from, sizeof(from), "20261104", "moved");
+    snprintf(dir, sizeof(dir), "%s/20261105", STAGE_DIR);
+    mkdirs(dir);
+    unit_csv(to, sizeof(to), "20261105", "moved");
+    CHECK(rename(from, to) == 0, "could not move the CSV");
+
+    kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    const upload_stage_ref_t *r = find_ref(refs, kept, "moved");
+    CHECK(r && !strcmp(r->day, "20261105"), "moved CSV not scanned under its new day");
+    CHECK(r && upload_stage_status(r, SLOT_SMB) != UG_OK,
+          "a CSV moved to another day inherited the old day's upload mark");
+    CHECK(upload_stage_pending(refs, kept, SLOT_SMB) == 1, "moved CSV not re-offered");
+    free(refs);
+    return g_failures;
+}
+
+/* ── Phase E: what the unit file contains, and a failed rename ───────── */
+
+static int phase_e(const char *self)
+{
+    reset_tree();
+    g_registered = 3;          /* smb, sleephq, ftp — "ha" is not registered */
+    mk_stage_csv("20261106", "u1", 1);
+    mk_stage_csv("20261106", "u2", 2);
+    CHECK(upload_stage_init() == ESP_OK, "upload_stage_init failed");
+
+    upload_stage_ref_t *refs = calloc(UPLOAD_STAGE_MAX_UNITS, sizeof(*refs));
+    if (!refs) return 1;
+    int kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    CHECK(kept == 2, "both CSVs not scanned");
+    const upload_stage_ref_t *u1 = find_ref(refs, kept, "u1");
+    const upload_stage_ref_t *u2 = find_ref(refs, kept, "u2");
+    if (!u1 || !u2) { free(refs); return g_failures + 1; }
+
+    /* Only a backend with an outcome is written; slot 3 is inside
+     * UPLOAD_MAX_BACKENDS but past the registered count, so it has no name
+     * to be written under and must not reach disk as "?". */
+    upload_stage_mark(u1, SLOT_SMB, UG_OK, NULL);
+    upload_stage_mark(u1, 3, UG_FAILED, NULL);
+    cJSON *root = read_unit_file("u1");
+    cJSON *be = root ? cJSON_GetObjectItem(root, "be") : NULL;
+    CHECK(cJSON_IsObject(be), "u1 unit file has no backend object");
+    CHECK(be && cJSON_GetObjectItem(be, "smb") != NULL, "the marked backend was not written");
+    CHECK(be && cJSON_GetObjectItem(be, "sleephq") == NULL && cJSON_GetObjectItem(be, "ftp") == NULL,
+          "untouched backends were written as pending");
+    CHECK(be && cJSON_GetObjectItem(be, "?") == NULL,
+          "an unregistered slot was written under the registry's placeholder name");
+    CHECK(be && cJSON_GetArraySize(be) == 1, "unit file holds backends other than the marked one");
+    cJSON_Delete(root);
+
+    /* A directory where u2's state file belongs: unlink() cannot clear it
+     * and rename() onto it fails.  The temp file must be cleaned up, and the
+     * unit stays dirty so the next flush writes it once the path is free. */
+    char sp[896], tmp[896];
+    snprintf(sp, sizeof(sp), "%s/u2.json", STATE_DIR);
+    snprintf(tmp, sizeof(tmp), "%s/u2.json.tmp", STATE_DIR);
+    mkdirs(sp);
+    upload_stage_mark(u2, SLOT_SMB, UG_OK, NULL);
+    CHECK(!exists(tmp), "a failed rename left the .tmp file behind");
+    CHECK(upload_stage_status(u2, SLOT_SMB) == UG_OK, "mark lost from RAM after a failed write");
+    rmdir(sp);
+    CHECK(!exists(sp), "test setup: blocker directory still present");
+    upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    root = read_unit_file("u2");
+    CHECK(root != NULL, "a unit whose save failed was not re-flushed by the next reconcile");
+    cJSON_Delete(root);
+
+    free(refs);
+    int r = run_phase(self, "f");
+    if (r) printf("  FAIL phase f exited %d\n", r);
+    return g_failures + r;
+}
+
+/* ── Phase F: reboot with heap_caps_malloc() failing ─────────────────── */
+
+static int phase_f(void)
+{
+    g_registered = 3;
+    host_heap_caps_malloc_fail = 1;   /* PSRAM exhausted: plain-malloc fallback */
+    CHECK(upload_stage_init() == ESP_OK, "upload_stage_init failed");
+    host_heap_caps_malloc_fail = 0;
+
+    upload_stage_ref_t *refs = calloc(UPLOAD_STAGE_MAX_UNITS, sizeof(*refs));
+    if (!refs) return 1;
+    int kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    CHECK(kept == 2, "reboot reconcile lost units");
+    CHECK(upload_stage_pending(refs, kept, SLOT_SMB) == 0,
+          "marks did not load when heap_caps_malloc() failed");
+    free(refs);
+    return g_failures;
+}
+
 int main(int argc, char **argv)
 {
     const char *phase = argc > 1 ? argv[1] : "a";
     int r;
     if      (!strcmp(phase, "a")) r = phase_a(argv[0]);
     else if (!strcmp(phase, "b")) r = phase_b();
+    else if (!strcmp(phase, "c")) r = phase_c();
+    else if (!strcmp(phase, "d")) r = phase_d();
+    else if (!strcmp(phase, "e")) r = phase_e(argv[0]);
+    else if (!strcmp(phase, "f")) r = phase_f();
     else r = 1;
 
     if (r) { printf("upload_stage_test: phase %s FAILED (%d)\n", phase, r); return 1; }
-    if (!strcmp(phase, "b")) printf("upload_stage_test: all phases passed\n");
+    if (!strcmp(phase, "a")) printf("upload_stage_test: all phases passed\n");
     return 0;
 }
