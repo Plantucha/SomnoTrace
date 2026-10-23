@@ -396,6 +396,20 @@ static upload_result_t smb_upload_file(struct smb2_context *smb2,
  * would not create themselves. */
 #define SMB_TEST_TIMEOUT_S 10
 
+/* Extract the NTSTATUS after a failed smb2_mkdir(). libsmb2's create_cb_1
+ * formats the CREATE status into error_string ("Create failed with status %d.")
+ * via smb2_set_error() without populating smb2->nterror. */
+static uint32_t smb_mkdir_nterror(struct smb2_context *ctx)
+{
+    uint32_t nt = (uint32_t)smb2_get_nterror(ctx);
+    if (nt != 0) return nt;
+    int status = 0;
+    if (sscanf(smb2_get_error(ctx), "Create failed with status %d", &status) == 1) {
+        return (uint32_t)status;
+    }
+    return 0;
+}
+
 /* Init + connect a private context for the test path. *connected reports
  * whether the share attached; the context is returned either way so the
  * caller can read smb2_get_error(). */
@@ -451,59 +465,57 @@ static bool smb_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
     /* The configured folder, relative to the share root. */
     const char *p = cfg.smb_path;
     while (*p == '/' || *p == '\\') p++;
-    if (*p) {
+
+    /* Write probe: mkdir the folder the uploader creates at session
+     * start anyway — a fresh create and OBJECT_NAME_COLLISION are both
+     * success, so nothing is made that uploads would not make. Running
+     * the probe before smb2_stat() ensures the first post-tree-connect
+     * request goes through the adaptive-signing retry on SMB 3.1.1. */
+    char probe[400];
+    snprintf(probe, sizeof(probe), "%sDATALOG", base);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int prc = smb2_mkdir(ctx, probe);
+        uint32_t nt = (prc == 0) ? 0 : smb_mkdir_nterror(ctx);
+        if (prc == 0 || nt == SMB2_STATUS_OBJECT_NAME_COLLISION) {
+            snprintf(msg, msg_len, *p ?
+                     "Connected to //%s/%s, folder '%s' found - write access OK" :
+                     "Connected to //%s/%s (share root) - write access OK",
+                     cfg.smb_host, cfg.smb_share, p);
+            if (signed_conn) s_sign_learned = true;
+            break;
+        }
+        /* Same adaptive signing as the upload path. */
+        if (attempt == 0 && !signed_conn && cfg.smb_pass[0] &&
+            nt == SMB2_STATUS_INVALID_PARAMETER &&
+            smb2_get_dialect(ctx) == SMB2_VERSION_0311) {
+            smb2_disconnect_share(ctx);
+            smb2_destroy_context(ctx);
+            signed_conn = true;
+            ctx = smb_test_ctx(&cfg, user, true, &connected);
+            if (!ctx) {
+                snprintf(msg, msg_len, "Out of memory");
+                return false;
+            }
+            if (!connected) {
+                snprintf(msg, msg_len, "Connected once, but the signed "
+                         "reconnect failed: %s", smb2_get_error(ctx));
+                ok = false;
+                break;
+            }
+            continue;
+        }
         struct smb2_stat_64 st;
-        if (smb2_stat(ctx, p, &st) != 0) {
+        if (*p && smb2_stat(ctx, p, &st) != 0) {
             snprintf(msg, msg_len, "Connected to //%s/%s, but folder '%s' was not "
                      "found on the share: create it or fix Remote Path",
                      cfg.smb_host, cfg.smb_share, p);
-            ok = false;
-        }
-    }
-
-    if (ok) {
-        /* Write probe: mkdir the folder the uploader creates at session
-         * start anyway — a fresh create and OBJECT_NAME_COLLISION are both
-         * success, so nothing is made that uploads would not make. */
-        char probe[400];
-        snprintf(probe, sizeof(probe), "%sDATALOG", base);
-        for (int attempt = 0; attempt < 2; attempt++) {
-            int prc = smb2_mkdir(ctx, probe);
-            uint32_t nt = (uint32_t)smb2_get_nterror(ctx);
-            if (prc == 0 || nt == SMB2_STATUS_OBJECT_NAME_COLLISION) {
-                snprintf(msg, msg_len, *p ?
-                         "Connected to //%s/%s, folder '%s' found - write access OK" :
-                         "Connected to //%s/%s (share root) - write access OK",
-                         cfg.smb_host, cfg.smb_share, p);
-                if (signed_conn) s_sign_learned = true;
-                break;
-            }
-            /* Same adaptive signing as the upload path. */
-            if (attempt == 0 && !signed_conn && cfg.smb_pass[0] &&
-                nt == SMB2_STATUS_INVALID_PARAMETER &&
-                smb2_get_dialect(ctx) == SMB2_VERSION_0311) {
-                smb2_disconnect_share(ctx);
-                smb2_destroy_context(ctx);
-                signed_conn = true;
-                ctx = smb_test_ctx(&cfg, user, true, &connected);
-                if (!ctx) {
-                    snprintf(msg, msg_len, "Out of memory");
-                    return false;
-                }
-                if (!connected) {
-                    snprintf(msg, msg_len, "Connected once, but the signed "
-                             "reconnect failed: %s", smb2_get_error(ctx));
-                    ok = false;
-                    break;
-                }
-                continue;
-            }
+        } else {
             snprintf(msg, msg_len, "Connected to //%s/%s, but write test "
                      "failed: %s - check write permission for '%s'",
                      cfg.smb_host, cfg.smb_share, smb2_get_error(ctx), user);
-            ok = false;
-            break;
         }
+        ok = false;
+        break;
     }
 
     if (connected) smb2_disconnect_share(ctx);
