@@ -66,7 +66,7 @@ typedef struct stage_state_s {
                              * reconcile — progress/pending ignore the rest */
     char     id[UPLOAD_STAGE_ID_LEN];
     char     day[12];       /* export day folder — for existence checks    */
-    uint64_t fingerprint;
+    uint64_t fingerprint;   uint64_t sst_fingerprint;
     upload_unit_t backend[STAGE_MAX_BACKENDS];
     char     remote[STAGE_MAX_BACKENDS][64];
 } stage_state_t;
@@ -272,12 +272,64 @@ static esp_err_t save_unit(stage_state_t *u)
         if (u->remote[b][0]) cJSON_AddStringToObject(bo, "r", u->remote[b]);
     }
 
+    if (u->sst_fingerprint) {
+        char sfp[17];
+        snprintf(sfp, sizeof(sfp), "%016llx", (unsigned long long)u->sst_fingerprint);
+        cJSON_AddStringToObject(root, "sst_fp", sfp);
+    }
+
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json) return ESP_ERR_NO_MEM;
     esp_err_t ret = write_json_atomic(path, json);
     cJSON_free(json);
     return ret;
+}
+
+static uint8_t s_slot_fmt[STAGE_MAX_BACKENDS];
+
+void upload_stage_set_backend_fmt(int backend_slot, upload_stage_fmt_t fmt)
+{
+    if (backend_slot < 0 || backend_slot >= STAGE_MAX_BACKENDS) return;
+    s_slot_fmt[backend_slot] = (fmt == UPLOAD_STAGE_FMT_SST)
+                             ? (uint8_t)UPLOAD_STAGE_FMT_SST
+                             : (uint8_t)UPLOAD_STAGE_FMT_CSV;
+}
+
+upload_stage_fmt_t upload_stage_get_backend_fmt(int backend_slot)
+{
+    if (backend_slot < 0 || backend_slot >= STAGE_MAX_BACKENDS)
+        return UPLOAD_STAGE_FMT_CSV;
+    return (upload_stage_fmt_t)s_slot_fmt[backend_slot];
+}
+
+bool upload_stage_ref_has_fmt(const upload_stage_ref_t *ref,
+                              upload_stage_fmt_t fmt)
+{
+    if (!ref) return false;
+    if (fmt == UPLOAD_STAGE_FMT_SST)
+        return ref->sst_path[0] != '\0' && ref->sst_fingerprint != 0;
+    return ref->csv_path[0] != '\0' && ref->fingerprint != 0;
+}
+
+void upload_stage_sst_filename(const upload_stage_ref_t *ref,
+                               char *out, size_t n)
+{
+    if (!out || n == 0) return;
+    if (!ref || !ref->unit_id[0]) { out[0] = '\0'; return; }
+    snprintf(out, n, "%s_stages.sst", ref->unit_id);
+}
+
+static uint64_t ref_fp_for_slot(const upload_stage_ref_t *ref, int slot)
+{
+    return (s_slot_fmt[slot] == UPLOAD_STAGE_FMT_SST)
+         ? ref->sst_fingerprint : ref->fingerprint;
+}
+
+static uint64_t state_fp_for_slot(const stage_state_t *u, int slot)
+{
+    return (s_slot_fmt[slot] == UPLOAD_STAGE_FMT_SST)
+         ? u->sst_fingerprint : u->fingerprint;
 }
 
 static void load_unit_file(const char *path)
@@ -287,8 +339,9 @@ static void load_unit_file(const char *path)
 
     cJSON *id = cJSON_GetObjectItem(root, "id");
     cJSON *fp = cJSON_GetObjectItem(root, "fp");
+    cJSON *sfp = cJSON_GetObjectItem(root, "sst_fp");
     if (!cJSON_IsString(id) || !safe_component(id->valuestring, UPLOAD_STAGE_ID_LEN) ||
-        !cJSON_IsString(fp)) {
+        (!cJSON_IsString(fp) && !cJSON_IsString(sfp))) {
         ESP_LOGW(TAG, "%s is not a valid unit file — re-deriving state", path);
         cJSON_Delete(root);
         return;
@@ -299,7 +352,10 @@ static void load_unit_file(const char *path)
                                  cJSON_IsString(day) ? day->valuestring : NULL,
                                  0, true);
     if (!u) { cJSON_Delete(root); return; }
-    u->fingerprint = strtoull(fp->valuestring, NULL, 16);
+    if (cJSON_IsString(fp))
+        u->fingerprint = strtoull(fp->valuestring, NULL, 16);
+    if (cJSON_IsString(sfp))
+        u->sst_fingerprint = strtoull(sfp->valuestring, NULL, 16);
 
     cJSON *be = cJSON_GetObjectItem(root, "be");
     for (cJSON *bo = be ? be->child : NULL; bo; bo = bo->next) {
@@ -446,95 +502,270 @@ esp_err_t upload_stage_init(void)
     return ESP_OK;
 }
 
-/* Best-effort source .sst resolution for future native-format endpoints.
+/* Validate an SST1 binary sidecar (mirrors somno_sst_header_t in
+ * components/somno_ml/include/somno_ml.h without introducing a component
+ * dependency).  Refuses INSUFFICIENT (0x04) and still-growing PARTIAL (0x01)
+ * stubs, truncated files, files > 256 KB, and files with no scored stage. */
+#define SST_MAGIC            0x31545353u /* "SST1" */
+#define SST_VERSION          1u
+#define SST_FLAG_PARTIAL     0x01u
+#define SST_FLAG_INSUFFICIENT 0x04u
+#define SST_HEADER_BYTES     64u
+#define SST_MAX_EPOCHS       100000u
+#define SST_MAX_BYTES        (256u * 1024u)
+
+static uint16_t rd_u16_le(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t rd_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int64_t rd_i64_le(const uint8_t *p)
+{
+    uint64_t lo = rd_u32_le(p);
+    uint64_t hi = rd_u32_le(p + 4);
+    return (int64_t)(lo | (hi << 32));
+}
+
+static bool validate_sst_file(const char *path)
+{
+    if (!path || !path[0]) return false;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (st.st_size <= (off_t)SST_HEADER_BYTES ||
+        st.st_size > (off_t)SST_MAX_BYTES) return false;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    uint8_t hdr[SST_HEADER_BYTES];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fclose(f);
+        return false;
+    }
+    uint32_t magic = rd_u32_le(hdr + 0);
+    uint16_t version = rd_u16_le(hdr + 4);
+    uint8_t flags = hdr[7];
+    uint32_t n_epochs = rd_u32_le(hdr + 36);
+    int64_t start_ms = rd_i64_le(hdr + 40);
+    uint32_t epoch_sec = rd_u32_le(hdr + 48);
+
+    if (magic != SST_MAGIC || version != SST_VERSION ||
+        (flags & (SST_FLAG_PARTIAL | SST_FLAG_INSUFFICIENT)) != 0 ||
+        n_epochs == 0 || n_epochs > SST_MAX_EPOCHS ||
+        epoch_sec == 0 || epoch_sec > 3600u || start_ms <= 0 ||
+        (uint64_t)st.st_size != (uint64_t)SST_HEADER_BYTES + 2ULL * n_epochs) {
+        fclose(f);
+        return false;
+    }
+
+    uint8_t buf[512];
+    uint32_t rem = n_epochs;
+    bool any_stage = false;
+    while (rem > 0) {
+        size_t chunk = rem < sizeof(buf) ? rem : sizeof(buf);
+        if (fread(buf, 1, chunk, f) != chunk) {
+            fclose(f);
+            return false;
+        }
+        for (size_t i = 0; i < chunk; i++) {
+            if (buf[i] < 4) { any_stage = true; break; }
+        }
+        if (any_stage) break;
+        rem -= (uint32_t)chunk;
+    }
+    fclose(f);
+    return any_stage;
+}
+
+static bool resolve_sst_candidate_path(const char *day, const char *unit_id,
+                                       char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (strncmp(unit_id, "as11_", 5) == 0) {
+        return snprintf(out, cap, "%s/%s/%s_stages.sst",
+                        SD_STREAMS_DIR, day, unit_id + 5) < (int)cap;
+    }
+    char rec_dir[128], pj[256];
+    if (!join2(rec_dir, sizeof(rec_dir), OX_RECORDINGS_DIR, day) ||
+        snprintf(pj, sizeof(pj), "%s/%s/recording.json", rec_dir,
+                 unit_id) >= (int)sizeof(pj)) return false;
+    cJSON *j = read_json_file(pj);
+    if (!j) return false;
+    cJSON *g = cJSON_GetObjectItem(j, "active_generation");
+    bool ok = cJSON_IsNumber(g) && g->valueint > 0 &&
+              snprintf(out, cap, "%s/%s/generations/%d/data/stages.sst",
+                       rec_dir, unit_id, g->valueint) < (int)cap;
+    if (!ok) out[0] = '\0';
+    cJSON_Delete(j);
+    return ok;
+}
+
+/* Best-effort source .sst resolution for native-format endpoints.
  * Ring units read the recording's active generation; as11_ units map back
- * to the streams day dir they were exported from.  Empty on failure — the
- * CSV remains the canonical upload object either way. */
+ * to the streams day dir they were exported from.  Validates the SST1 header
+ * and computes `sst_fingerprint`; clears `sst_path` on failure. */
 static void resolve_sst_path(upload_stage_ref_t *r)
 {
     r->sst_path[0] = '\0';
-    if (strncmp(r->unit_id, "as11_", 5) == 0) {
-        snprintf(r->sst_path, sizeof(r->sst_path), "%s/%s/%s_stages.sst",
-                 SD_STREAMS_DIR, r->day, r->unit_id + 5);
+    r->sst_fingerprint = 0;
+    if (!resolve_sst_candidate_path(r->day, r->unit_id,
+                                    r->sst_path, sizeof(r->sst_path)) ||
+        !validate_sst_file(r->sst_path)) {
+        r->sst_path[0] = '\0';
         return;
     }
-    /* OX_RECORDINGS_DIR + "/" + day fits comfortably; a longer compile-time
-     * SD_MOUNT_POINT simply leaves sst_path empty, which is legal. */
-    char rec_dir[128], pj[256];
-    if (!join2(rec_dir, sizeof(rec_dir), OX_RECORDINGS_DIR, r->day) ||
-        snprintf(pj, sizeof(pj), "%s/%s/recording.json", rec_dir,
-                 r->unit_id) >= (int)sizeof(pj)) return;
-    cJSON *j = read_json_file(pj);
-    if (!j) return;
-    cJSON *g = cJSON_GetObjectItem(j, "active_generation");
-    if (cJSON_IsNumber(g) && g->valueint > 0 &&
-        snprintf(r->sst_path, sizeof(r->sst_path),
-                 "%s/%s/generations/%d/data/stages.sst",
-                 rec_dir, r->unit_id, g->valueint) >= (int)sizeof(r->sst_path))
-        r->sst_path[0] = '\0';
-    cJSON_Delete(j);
+    char sname[UPLOAD_STAGE_ID_LEN + 16];
+    upload_stage_sst_filename(r, sname, sizeof(sname));
+    r->sst_fingerprint = file_fp(0, sname, r->sst_path);
+}
+
+static bool day_has_unit(const upload_stage_ref_t *out, int n, const char *id)
+{
+    for (int i = 0; i < n; i++)
+        if (strcmp(out[i].unit_id, id) == 0) return true;
+    return false;
 }
 
 static int scan_day(const char *day, upload_stage_ref_t *out, int max_out,
                     bool *truncated)
 {
-    char day_path[UPLOAD_STAGE_PATH_LEN];
-    if (!valid_day(day) || !join2(day_path, sizeof(day_path), STAGE_EXPORT_DIR, day))
-        return 0;
-    DIR *d = opendir(day_path);
-    if (!d) return 0;
+    if (!valid_day(day)) return 0;
     int n = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        size_t l = strlen(e->d_name);
-        if (l <= 4 || strcmp(e->d_name + l - 4, ".csv") != 0) continue;
-        if (l - 4 >= UPLOAD_STAGE_ID_LEN) continue;
-        char id[UPLOAD_STAGE_ID_LEN];
-        memcpy(id, e->d_name, l - 4);
-        id[l - 4] = '\0';
-        if (!safe_component(id, sizeof(id))) continue;
-        char local[UPLOAD_STAGE_PATH_LEN];
-        if (!join2(local, sizeof(local), day_path, e->d_name)) continue;
-        struct stat st;
-        if (stat(local, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-        if (n >= max_out) {
-            if (truncated) *truncated = true;
-            break;
+
+    /* 1. Consumer CSV exports in stages/<day>/<unit_id>.csv */
+    char day_path[UPLOAD_STAGE_PATH_LEN];
+    if (join2(day_path, sizeof(day_path), STAGE_EXPORT_DIR, day)) {
+        DIR *d = opendir(day_path);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t l = strlen(e->d_name);
+                if (l <= 4 || strcmp(e->d_name + l - 4, ".csv") != 0) continue;
+                if (l - 4 >= UPLOAD_STAGE_ID_LEN) continue;
+                char id[UPLOAD_STAGE_ID_LEN];
+                memcpy(id, e->d_name, l - 4);
+                id[l - 4] = '\0';
+                if (!safe_component(id, sizeof(id))) continue;
+                char local[UPLOAD_STAGE_PATH_LEN];
+                if (!join2(local, sizeof(local), day_path, e->d_name)) continue;
+                struct stat st;
+                if (stat(local, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                if (n >= max_out) {
+                    if (truncated) *truncated = true;
+                    break;
+                }
+                upload_stage_ref_t *r = &out[n];
+                memset(r, 0, sizeof(*r));
+                strlcpy(r->day, day, sizeof(r->day));
+                strlcpy(r->unit_id, id, sizeof(r->unit_id));
+                strlcpy(r->csv_path, local, sizeof(r->csv_path));
+                r->fingerprint = file_fp(0, e->d_name, local);
+                resolve_sst_path(r);
+                n++;
+            }
+            closedir(d);
         }
-        upload_stage_ref_t *r = &out[n];
-        memset(r, 0, sizeof(*r));
-        strlcpy(r->day, day, sizeof(r->day));
-        strlcpy(r->unit_id, id, sizeof(r->unit_id));
-        strlcpy(r->csv_path, local, sizeof(r->csv_path));
-        r->fingerprint = file_fp(0, e->d_name, local);
-        resolve_sst_path(r);
-        n++;
     }
-    closedir(d);
+
+    /* 2. Direct AS11 SST discovery (streams/<day>/<prefix>_stages.sst) in case
+     *    a valid sidecar exists without a CSV in STAGE_EXPORT_DIR. */
+    if (!(truncated && *truncated) &&
+        join2(day_path, sizeof(day_path), SD_STREAMS_DIR, day)) {
+        DIR *d = opendir(day_path);
+        if (d) {
+            static const char suf[] = "_stages.sst";
+            const size_t suflen = sizeof(suf) - 1;
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t l = strlen(e->d_name);
+                if (l <= suflen || strcmp(e->d_name + l - suflen, suf) != 0)
+                    continue;
+                size_t plen = l - suflen;
+                char id[UPLOAD_STAGE_ID_LEN];
+                if (5 + plen >= sizeof(id)) continue;
+                memcpy(id, "as11_", 5);
+                memcpy(id + 5, e->d_name, plen);
+                id[5 + plen] = '\0';
+                if (!safe_component(id, sizeof(id)) || day_has_unit(out, n, id))
+                    continue;
+                char local[UPLOAD_STAGE_PATH_LEN];
+                if (!join2(local, sizeof(local), day_path, e->d_name) ||
+                    !validate_sst_file(local))
+                    continue;
+                if (n >= max_out) {
+                    if (truncated) *truncated = true;
+                    break;
+                }
+                upload_stage_ref_t *r = &out[n];
+                memset(r, 0, sizeof(*r));
+                strlcpy(r->day, day, sizeof(r->day));
+                strlcpy(r->unit_id, id, sizeof(r->unit_id));
+                strlcpy(r->sst_path, local, sizeof(r->sst_path));
+                char sname[UPLOAD_STAGE_ID_LEN + 16];
+                upload_stage_sst_filename(r, sname, sizeof(sname));
+                r->sst_fingerprint = file_fp(0, sname, r->sst_path);
+                n++;
+            }
+            closedir(d);
+        }
+    }
+
+    /* 3. Direct Ring SST discovery (recordings/<day>/<rec_id>/generations/<g>/data/stages.sst) */
+    if (!(truncated && *truncated) &&
+        join2(day_path, sizeof(day_path), OX_RECORDINGS_DIR, day)) {
+        DIR *d = opendir(day_path);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (!safe_component(e->d_name, UPLOAD_STAGE_ID_LEN) ||
+                    strncmp(e->d_name, "as11_", 5) == 0 ||
+                    day_has_unit(out, n, e->d_name))
+                    continue;
+                char sst[UPLOAD_STAGE_PATH_LEN];
+                if (!resolve_sst_candidate_path(day, e->d_name, sst, sizeof(sst)) ||
+                    !validate_sst_file(sst))
+                    continue;
+                if (n >= max_out) {
+                    if (truncated) *truncated = true;
+                    break;
+                }
+                upload_stage_ref_t *r = &out[n];
+                memset(r, 0, sizeof(*r));
+                strlcpy(r->day, day, sizeof(r->day));
+                strlcpy(r->unit_id, e->d_name, sizeof(r->unit_id));
+                strlcpy(r->sst_path, sst, sizeof(r->sst_path));
+                char sname[UPLOAD_STAGE_ID_LEN + 16];
+                upload_stage_sst_filename(r, sname, sizeof(sname));
+                r->sst_fingerprint = file_fp(0, sname, r->sst_path);
+                n++;
+            }
+            closedir(d);
+        }
+    }
+
     return n;
 }
 
-static int scan_days(upload_stage_ref_t *out, int max_out, int max_days)
+static void collect_days_from_root(const char *root_path, char (*days)[12], int *ndp)
 {
-    if (!out || max_out <= 0) return 0;
-    upload_stage_init();
-    DIR *root = opendir(STAGE_EXPORT_DIR);
-    if (!root) return 0;
-
-    char (*days)[12] = heap_caps_calloc(UPLOAD_MAX_DAYS_CAP, sizeof(*days),
-                                        MALLOC_CAP_SPIRAM);
-    if (!days) {
-        closedir(root);
-        return 0;
-    }
-
-    int nd = 0;
+    DIR *root = opendir(root_path);
+    if (!root) return;
+    int nd = *ndp;
     struct dirent *e;
     while ((e = readdir(root)) != NULL) {
         if (!valid_day(e->d_name)) continue;
+        bool exists = false;
+        for (int k = 0; k < nd; k++) {
+            if (strcmp(days[k], e->d_name) == 0) { exists = true; break; }
+        }
+        if (exists) continue;
 
         if (nd < UPLOAD_MAX_DAYS_CAP) {
-            /* Insertion sort descending into days[0..nd] */
             int j = nd - 1;
             while (j >= 0 && strcmp(days[j], e->d_name) < 0) {
                 memcpy(days[j + 1], days[j], sizeof(days[0]));
@@ -554,6 +785,23 @@ static int scan_days(upload_stage_ref_t *out, int max_out, int max_days)
         }
     }
     closedir(root);
+    *ndp = nd;
+}
+
+static int scan_days(upload_stage_ref_t *out, int max_out, int max_days)
+{
+    if (!out || max_out <= 0) return 0;
+    upload_stage_init();
+
+    char (*days)[12] = heap_caps_calloc(UPLOAD_MAX_DAYS_CAP, sizeof(*days),
+                                        MALLOC_CAP_SPIRAM);
+    if (!days) days = calloc(UPLOAD_MAX_DAYS_CAP, sizeof(*days));
+    if (!days) return 0;
+
+    int nd = 0;
+    collect_days_from_root(STAGE_EXPORT_DIR, days, &nd);
+    collect_days_from_root(SD_STREAMS_DIR, days, &nd);
+    collect_days_from_root(OX_RECORDINGS_DIR, days, &nd);
 
     int n = 0, i = 0, days_with_data = 0;
     bool truncated = false;
@@ -579,6 +827,16 @@ int upload_stage_scan(upload_stage_ref_t *out, int max_out)
     return scan_days(out, max_out, 0);
 }
 
+static void reset_backends_for_fmt_locked(stage_state_t *u, upload_stage_fmt_t fmt)
+{
+    for (int b = 0; b < STAGE_MAX_BACKENDS; b++) {
+        if ((upload_stage_fmt_t)s_slot_fmt[b] == fmt) {
+            memset(&u->backend[b], 0, sizeof(u->backend[b]));
+            memset(u->remote[b], 0, sizeof(u->remote[b]));
+        }
+    }
+}
+
 int upload_stage_reconcile(upload_stage_ref_t *out, int max_out, int max_days)
 {
     if (max_days < 1) max_days = 1;
@@ -600,41 +858,67 @@ int upload_stage_reconcile(upload_stage_ref_t *out, int max_out, int max_days)
         }
         if (days_seen > max_days) continue;
         if (kept != i) out[kept] = out[i];
+        bool existed = (state_find_id(out[kept].unit_id) != NULL);
         stage_state_t *u = state_get(out[kept].unit_id, out[kept].day,
                                      out[kept].fingerprint, true);
         if (u) {
             u->in_window = true;
-            if (u->fingerprint != out[kept].fingerprint) {
-                /* Rescored / regenerated content — re-upload everywhere. */
-                u->fingerprint = out[kept].fingerprint;
-                memset(u->backend, 0, sizeof(u->backend));
-                memset(u->remote, 0, sizeof(u->remote));
-                u->dirty = true;
+            if (!existed) {
+                u->sst_fingerprint = out[kept].sst_fingerprint;
+            } else {
+                if (u->fingerprint != out[kept].fingerprint) {
+                    /* CSV changed — reset only CSV-consuming backends. */
+                    u->fingerprint = out[kept].fingerprint;
+                    reset_backends_for_fmt_locked(u, UPLOAD_STAGE_FMT_CSV);
+                    u->dirty = true;
+                }
+                if (u->sst_fingerprint != out[kept].sst_fingerprint) {
+                    /* SST changed — reset only SST-consuming backends. */
+                    u->sst_fingerprint = out[kept].sst_fingerprint;
+                    reset_backends_for_fmt_locked(u, UPLOAD_STAGE_FMT_SST);
+                    u->dirty = true;
+                }
             }
         }
         kept++;
     }
 
-    /* Evict states whose CSV no longer exists on the card, guarded on the
-     * export root being readable (see upload_ox.c for why). */
-    struct stat rst;
-    if (stat(STAGE_EXPORT_DIR, &rst) == 0 && S_ISDIR(rst.st_mode)) {
+    /* Evict states whose CSV and SST both no longer exist on the card,
+     * guarded on at least one stage source tree being readable. */
+    struct stat rst_csv, rst_str, rst_ox;
+    bool csv_root_ok = (stat(STAGE_EXPORT_DIR, &rst_csv) == 0 && S_ISDIR(rst_csv.st_mode));
+    bool sst_root_ok = (stat(SD_STREAMS_DIR, &rst_str) == 0 && S_ISDIR(rst_str.st_mode)) ||
+                       (stat(OX_RECORDINGS_DIR, &rst_ox) == 0 && S_ISDIR(rst_ox.st_mode));
+    if (csv_root_ok || sst_root_ok) {
         stage_state_t **pp = &s_states;
         while (*pp) {
             stage_state_t *u = *pp;
-            bool gone = false;
+            bool csv_gone = true;
+            bool sst_gone = true;
             if (u->day[0]) {
-                char path[UPLOAD_STAGE_PATH_LEN];
-                snprintf(path, sizeof(path), "%s/%s/%s.csv",
-                         STAGE_EXPORT_DIR, u->day, u->id);
-                struct stat st;
-                if (stat(path, &st) == 0) {
-                    if (!S_ISREG(st.st_mode)) gone = true;
-                } else if (errno == ENOENT || errno == ENOTDIR) {
-                    gone = true;
+                if (csv_root_ok) {
+                    char path[UPLOAD_STAGE_PATH_LEN];
+                    snprintf(path, sizeof(path), "%s/%s/%s.csv",
+                             STAGE_EXPORT_DIR, u->day, u->id);
+                    struct stat st;
+                    if (stat(path, &st) == 0) {
+                        csv_gone = !S_ISREG(st.st_mode);
+                    } else if (errno != ENOENT && errno != ENOTDIR) {
+                        csv_gone = false;
+                    }
+                } else {
+                    csv_gone = (u->fingerprint == 0);
                 }
+                if (sst_root_ok && u->sst_fingerprint != 0) {
+                    char sst[UPLOAD_STAGE_PATH_LEN];
+                    if (resolve_sst_candidate_path(u->day, u->id, sst, sizeof(sst)) &&
+                        validate_sst_file(sst))
+                        sst_gone = false;
+                }
+            } else {
+                csv_gone = false;
             }
-            if (gone) {
+            if (csv_gone && sst_gone) {
                 char path[UPLOAD_STAGE_PATH_LEN];
                 if (unit_path(path, sizeof(path), u->id)) unlink(path);
                 *pp = u->next;
@@ -655,10 +939,12 @@ int upload_stage_status(const upload_stage_ref_t *ref, int backend_slot)
 {
     if (!ref || backend_slot < 0 || backend_slot >= STAGE_MAX_BACKENDS ||
         !st_lock_init()) return UG_PENDING;
+    uint64_t rfp = ref_fp_for_slot(ref, backend_slot);
+    if (rfp == 0) return UG_OK;   /* format not present on this unit */
     /* Lookup only — never creates.  Reconcile is the legitimate creator. */
     st_lock();
     stage_state_t *u = state_find_id(ref->unit_id);
-    int s = (u && u->fingerprint == ref->fingerprint)
+    int s = (u && state_fp_for_slot(u, backend_slot) == rfp)
           ? u->backend[backend_slot].status : UG_PENDING;
     st_unlock();
     return s;
@@ -677,6 +963,11 @@ void upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
         st_unlock();
         return;
     }
+    if (s_slot_fmt[backend_slot] == UPLOAD_STAGE_FMT_SST) {
+        if (ref->sst_fingerprint) u->sst_fingerprint = ref->sst_fingerprint;
+    } else {
+        if (ref->fingerprint) u->fingerprint = ref->fingerprint;
+    }
     u->backend[backend_slot].status = status;
     u->backend[backend_slot].last_try_s = (uint32_t)time(NULL);
     if (status != UG_OK) u->backend[backend_slot].attempts++;
@@ -694,8 +985,10 @@ int upload_stage_pending(const upload_stage_ref_t *refs, int n_refs,
                          int backend_slot)
 {
     int n = 0;
-    for (int i = 0; i < n_refs; i++)
+    for (int i = 0; i < n_refs; i++) {
+        if (ref_fp_for_slot(&refs[i], backend_slot) == 0) continue;
         if (upload_stage_status(&refs[i], backend_slot) != UG_OK) n++;
+    }
     return n;
 }
 
@@ -708,7 +1001,8 @@ int upload_stage_cached_pending(int backend_slot)
     st_lock();
     int n = 0;
     for (stage_state_t *u = s_states; u; u = u->next)
-        if (u->in_window && u->backend[backend_slot].status != UG_OK) n++;
+        if (u->in_window && state_fp_for_slot(u, backend_slot) != 0 &&
+            u->backend[backend_slot].status != UG_OK) n++;
     st_unlock();
     return n;
 }
@@ -721,13 +1015,14 @@ void upload_stage_backend_progress(int backend_slot, int max_days,
         st_lock();
         if (max_days > 0 && max_days != s_window_days)
             apply_window_locked(max_days);
-        /* Count distinct in-window days in a single pass (s_states is kept
-         * sorted by day descending): a day is done when every stage export in
-         * it is UG_OK, matching CPAP's day-bundle semantics. */
+        /* Count distinct in-window days that have at least one unit in this
+         * backend's format (s_states is kept sorted by day descending): a day
+         * is done when every applicable unit in it is UG_OK. */
         const char *cur_day = NULL;
         bool day_ok = true;
         for (stage_state_t *u = s_states; u; u = u->next) {
-            if (!u->in_window || !u->day[0]) continue;
+            if (!u->in_window || !u->day[0] ||
+                state_fp_for_slot(u, backend_slot) == 0) continue;
             if (!cur_day || strcmp(u->day, cur_day) != 0) {
                 if (cur_day && day_ok) done++;
                 cur_day = u->day;

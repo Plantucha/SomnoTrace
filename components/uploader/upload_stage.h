@@ -34,6 +34,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
@@ -46,20 +47,35 @@
 #define UPLOAD_STAGE_ID_LEN    64
 #define UPLOAD_STAGE_PATH_LEN  192
 
+/* Stage representation consumed by a backend:
+ *   UPLOAD_STAGE_FMT_CSV — Zeo-compatible CSV in stages/<day>/<id>.csv (SMB)
+ *   UPLOAD_STAGE_FMT_SST — Native SST1 binary sidecar (Aerivue, BreathingRoom, …) */
+typedef enum {
+    UPLOAD_STAGE_FMT_CSV = 0,
+    UPLOAD_STAGE_FMT_SST = 1,
+} upload_stage_fmt_t;
+
 /* One stage unit as it exists on the card, ready to hand to a backend.
- * csv_path is the Zeo-compatible export; sst_path locates the internal
- * SST1 sidecar for future backends that want the native format (empty for
- * ring units whose generation could not be resolved, and is not part of the
- * tracking identity — fingerprint changes alone re-upload). */
+ * csv_path is the Zeo-compatible export (tracked via `fingerprint`);
+ * sst_path locates the internal SST1 sidecar (tracked via `sst_fingerprint`).
+ * Each backend slot is bound to the format it consumes so CSV and SST
+ * destinations are tracked and invalidated independently. */
 typedef struct {
     char     day[12];                         /* YYYYMMDD folder          */
     char     unit_id[UPLOAD_STAGE_ID_LEN];    /* <rec_id> | as11_<prefix> */
     char     csv_path[UPLOAD_STAGE_PATH_LEN];
     char     sst_path[UPLOAD_STAGE_PATH_LEN];
-    uint64_t fingerprint;
+    uint64_t fingerprint;                     /* CSV content fingerprint  */
+    uint64_t sst_fingerprint;                 /* SST content fingerprint  */
 } upload_stage_ref_t;
 
 esp_err_t upload_stage_init(void);
+void      upload_stage_set_backend_fmt(int backend_slot, upload_stage_fmt_t fmt);
+upload_stage_fmt_t upload_stage_get_backend_fmt(int backend_slot);
+bool      upload_stage_ref_has_fmt(const upload_stage_ref_t *ref,
+                                   upload_stage_fmt_t fmt);
+void      upload_stage_sst_filename(const upload_stage_ref_t *ref,
+                                    char *out, size_t n);
 int       upload_stage_scan(upload_stage_ref_t *out, int max_out);
 int       upload_stage_reconcile(upload_stage_ref_t *out, int max_out,
                                  int max_days);

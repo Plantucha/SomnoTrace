@@ -649,6 +649,7 @@ const upload_backend_t smb_backend = {
     .bundle_only_ok = true,     /* plain file copy, no side effects */
     .supports_ox = true,
     .supports_stage = true,
+    .stage_fmt = UPLOAD_STAGE_FMT_CSV,
     .is_configured = smb_is_configured,
     .session_begin = smb_session_begin,
     .day_begin = smb_day_begin,

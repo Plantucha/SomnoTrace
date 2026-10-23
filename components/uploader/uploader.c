@@ -61,6 +61,8 @@ void uploader_register_backend(const upload_backend_t *backend)
 {
     if (!backend || s_n_backends >= MAX_BACKENDS) return;
     s_backends[s_n_backends++] = backend;
+    int slot = upload_index_backend_slot(backend->id);
+    if (slot >= 0) upload_stage_set_backend_fmt(slot, backend->stage_fmt);
     ESP_LOGI(TAG, "registered backend: %s", backend->id);
 }
 

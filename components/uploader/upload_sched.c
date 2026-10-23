@@ -178,6 +178,7 @@ static backend_rt_t *rt_for(const upload_backend_t *be)
     memset(r, 0, sizeof(*r));
     r->be = be;
     r->slot = upload_index_backend_slot(be->id);
+    if (r->slot >= 0) upload_stage_set_backend_fmt(r->slot, be->stage_fmt);
     r->state = SB_IDLE;
     return r;
 }
@@ -572,6 +573,7 @@ static bool run_backend(backend_rt_t *r, int max_days,
         char st_day[12] = {0};
         bool st_day_any = false;
         for (int i = 0; i < n_st && fails < FAILS_BEFORE_SWITCH; i++) {
+            if (!upload_stage_ref_has_fmt(&st_refs[i], be->stage_fmt)) continue;
             if (upload_stage_status(&st_refs[i], r->slot) == UG_OK) continue;
             if (strcmp(st_day, st_refs[i].day) != 0) {
                 if (st_day_any && be->stage_day_end) {

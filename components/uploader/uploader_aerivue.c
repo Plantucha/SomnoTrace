@@ -412,6 +412,23 @@ static upload_result_t aer_put_oximetry(const upload_ox_ref_t *ref)
     return UPLOAD_ERR_PERMANENT;
 }
 
+/* Native SomnoStage (.sst v1) sidecar upload: sent as-is without resampling
+ * or conversion.  Aerivue identifies SST1 by its magic header and maps both
+ * 30 s and Gen1 32 s grids onto the night in the account's time zone. */
+static upload_result_t aer_put_stage(const upload_stage_ref_t *ref)
+{
+    if (!s_tls || !s_import_id[0] || !ref ||
+        !upload_stage_ref_has_fmt(ref, UPLOAD_STAGE_FMT_SST))
+        return UPLOAD_ERR_TRANSIENT;
+    char filename[UPLOAD_STAGE_ID_LEN + 16];
+    upload_stage_sst_filename(ref, filename, sizeof(filename));
+    upload_result_t r = aer_send_file(ref->sst_path, "/STAGES",
+                                      filename, UPH_MD5_FILE_NAME);
+    if (r != UPLOAD_OK) return r;
+    s_day_files++;
+    return UPLOAD_OK;
+}
+
 static upload_result_t aer_day_end(const char *day, bool any_uploaded)
 {
     if (!s_tls || !s_import_id[0]) return UPLOAD_ERR_TRANSIENT;
@@ -496,7 +513,34 @@ static upload_result_t aer_day_end(const char *day, bool any_uploaded)
                              cJSON_IsNumber(rr) ? rr->valueint : 0);
                 }
             }
-            err = ESP_OK;
+            bool stage_refused = false;
+            cJSON *stg = res ? cJSON_GetObjectItem(res, "stages") : NULL;
+            if (cJSON_IsArray(stg)) {
+                cJSON *item;
+                cJSON_ArrayForEach(item, stg) {
+                    cJSON *sn = cJSON_GetObjectItem(item, "name");
+                    cJSON *ss = cJSON_GetObjectItem(item, "status");
+                    cJSON *se = cJSON_GetObjectItem(item, "epochs");
+                    cJSON *sc = cJSON_GetObjectItem(item, "source");
+                    cJSON *sd = cJSON_GetObjectItem(item, "calendarDate");
+                    cJSON *serr = cJSON_GetObjectItem(item, "error");
+                    const char *st_str = cJSON_IsString(ss) ? ss->valuestring : "?";
+                    if (strcmp(st_str, "refused") == 0) {
+                        stage_refused = true;
+                        ESP_LOGW(TAG, "  stages %s: refused (%s)",
+                                 cJSON_IsString(sn) ? sn->valuestring : "?",
+                                 cJSON_IsString(serr) ? serr->valuestring : "no reason");
+                    } else {
+                        ESP_LOGI(TAG, "  stages %s: %s (%s, %d epochs, source=%s)",
+                                 cJSON_IsString(sn) ? sn->valuestring : "?",
+                                 st_str,
+                                 cJSON_IsString(sd) ? sd->valuestring : "?",
+                                 cJSON_IsNumber(se) ? se->valueint : 0,
+                                 cJSON_IsString(sc) ? sc->valuestring : "?");
+                    }
+                }
+            }
+            err = stage_refused ? ESP_FAIL : ESP_OK;
         } else if (failed) {
             ESP_LOGW(TAG, "import %s: remote status \"failed\": %.240s",
                      s_import_id, body ? body : "(no body)");
@@ -557,7 +601,8 @@ const upload_backend_t aerivue_backend = {
     .label = "Aerivue",
     .bundle_only_ok = false,    /* an import with no sessions is clutter */
     .supports_ox = true,
-    .supports_stage = false,   /* no Zeo-CSV stage import today; units stay pending until it does */
+    .supports_stage = true,
+    .stage_fmt = UPLOAD_STAGE_FMT_SST,
     .is_configured = aer_is_configured,
     .session_begin = aer_session_begin,
     .day_begin = aer_day_begin,
@@ -565,6 +610,9 @@ const upload_backend_t aerivue_backend = {
     .ox_day_begin = aer_day_begin,
     .put_oximetry = aer_put_oximetry,
     .ox_day_end = aer_day_end,
+    .stage_day_begin = aer_day_begin,
+    .put_stage = aer_put_stage,
+    .stage_day_end = aer_day_end,
     .put_bundle = aer_put_bundle,
     .day_end = aer_day_end,
     .session_end = aer_session_end,

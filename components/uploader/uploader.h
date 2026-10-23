@@ -100,12 +100,13 @@ typedef struct {
 
     /* Does this backend accept SomnoStage sleep stage units?  The unit
      * carries both the Zeo-compatible CSV (what SMB copies for OSCAR's
-     * "Import ZEO Data") and the source .sst path, so a future backend can
-     * choose either representation.  False means stage units stay pending —
-     * never attempted, never failed — and are omitted from this backend's
-     * progress counts; flipping it true backfills existing CSVs on the next
-     * pass. */
+     * "Import ZEO Data") and the source .sst path, so a backend can
+     * choose either representation via `stage_fmt`.  False means stage units
+     * stay pending — never attempted, never failed — and are omitted from
+     * this backend's progress counts; flipping it true backfills existing
+     * stage files on the next pass. */
     bool supports_stage;
+    upload_stage_fmt_t stage_fmt;
 
     /* Check if this backend has valid configuration (config keys in NVS). */
     bool (*is_configured)(void);
