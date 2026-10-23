@@ -80,14 +80,19 @@ static void check_period_end(const char *what, int y, int m, int d, int h, int m
 /* Feed one TimeZoneOffset string through the settings parser, in the FlowGenerator shape
  * Scenario 4 builds by hand. A successful parse also makes the value the anchor for every
  * later noon-stamp derivation, which is what Scenario 11 relies on. */
-static bool parse_tz_setting(const char *value, as11_offset_t *out)
+static bool parse_tz_node(int type, const char *value, as11_offset_t *out)
 {
-    cJSON n_off = { .child = NULL, .next = NULL, .string = "TimeZoneOffset", .valuestring = (char *)value, .type = cJSON_String };
+    cJSON n_off = { .child = NULL, .next = NULL, .string = "TimeZoneOffset", .valuestring = (char *)value, .type = type };
     cJSON n_tz = { .child = &n_off, .next = NULL, .string = "TimeZoneFeature", .valuestring = NULL, .type = 0 };
     cJSON n_fp = { .child = &n_tz, .next = NULL, .string = "FeatureProfiles", .valuestring = NULL, .type = 0 };
     cJSON n_sp = { .child = &n_fp, .next = NULL, .string = "SettingProfiles", .valuestring = NULL, .type = 0 };
     cJSON n_fg = { .child = &n_sp, .next = NULL, .string = "FlowGenerator", .valuestring = NULL, .type = 0 };
     return as11_time_offset_from_settings(&n_fg, out);
+}
+
+static bool parse_tz_setting(const char *value, as11_offset_t *out)
+{
+    return parse_tz_node(cJSON_String, value, out);
 }
 
 int main(void)
@@ -350,6 +355,25 @@ int main(void)
     expect_str("date written when time_out is NULL", edf_date, "07.08.26");
     as11_time_format_edf_datetime(1786138713027LL, NULL, 0, edf_time, 0);
     expect_str("time_len 0 leaves time_out untouched", edf_time, "keep");
+    reset_offset();
+
+    printf("\n=== Scenario 13: Settings Offset Must Be a JSON String ===\n");
+    /* The offset is "±HH:MM" text; a TimeZoneOffset that is not a string node is not an
+     * offset, whatever text it happens to carry (a cJSON raw node keeps its text in
+     * valuestring too). Every earlier settings case is a well-formed string node, so the
+     * type check was never the thing that decided. The rejection must also leave the
+     * stored offset and *out exactly as they were. */
+    as11_time_set_offset(3600, "test");
+    off = 777;
+    expect_int("non-string node carrying \"+05:00\" refused",
+               parse_tz_node(cJSON_Number, "+05:00", &off) ? 1 : 0, 0);
+    expect_int("...and *out left untouched", off, 777);
+    expect_int("...and the stored offset kept",
+               as11_time_get_offset(&off) ? off : -999999, 3600);
+    off = 777;
+    expect_int("string node with NULL valuestring refused",
+               parse_tz_node(cJSON_String, NULL, &off) ? 1 : 0, 0);
+    expect_int("...and *out left untouched", off, 777);
     reset_offset();
     printf("\n%s (%d failure%s)\n", fails ? "FAILURES" : "ALL PASS",
            fails, fails == 1 ? "" : "s");
