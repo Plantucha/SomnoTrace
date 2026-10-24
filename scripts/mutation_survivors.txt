@@ -35,7 +35,6 @@ components/uploader/upload_stage.c:180:logical:&&→|| # if (!u->day[0] && day &
 components/uploader/upload_stage.c:234:equality:!=→== # if (rename(tmp, path) != 0) ok = false;
 components/uploader/upload_stage.c:262:relational:<→<= # for (int b = 0; b < upload_index_backend_count() && b < STAGE_MAX_BACK
 components/uploader/upload_stage.c:265:logical:||→&& # if (!bname ||
-main/as11_time.c:146:logical:||→&&                   # if (!off || !cJSON_IsString(off) || !off->valuestring) return false;
 main/edf_annotations.c:65:relational:<→<=            # for (size_t i = 0; i + 1 < count; i++) {   (moved into sort_and_dedup_events)
 main/edf_annotations.c:69:relational:<→<=            # before = strcmp(ev[j].label, ev[i].label) < 0;
 #   Swapping two events that compare equal reorders entries identical in BOTH sorted keys
