@@ -27,7 +27,9 @@
 #include <stdint.h>
 #include "esp_err.h"
 
+#ifndef SD_MOUNT_POINT
 #define SD_MOUNT_POINT   "/somnotrace"
+#endif
 
 /* All SomnoTrace-managed data lives under a single dotted app-root folder on
  * the card (the FATFS mount point itself is /somnotrace). The subfolders are
@@ -61,6 +63,14 @@
 #define SD_SDCARD_DIR        SD_MOUNT_POINT "/SDCARD"
 #define SD_SDCARD_DATALOG    SD_SDCARD_DIR "/DATALOG"
 #define SD_SDCARD_SETTINGS   SD_SDCARD_DIR "/SETTINGS"
+
+/* EDF import inbox.  Drop a ResMed card layout (DATALOG/<day>/EDFs +
+ * STR.edf + Identification.json/.tgt + SETTINGS/) or bare day folders /
+ * flat EDF files here — by FTP or by writing the card on a PC — and the
+ * importer converts them to native .snt sessions, then deletes the sources.
+ * SomnoBridge (Phase 2) stages into IMPORT/DATALOG/ the same way. */
+#define SD_IMPORT_DIR        SD_MOUNT_POINT "/IMPORT"
+#define SD_IMPORT_DATALOG    SD_IMPORT_DIR "/DATALOG"
 
 /* Initialise SDMMC 4-bit mode and mount FATFS at /somnotrace.
  * Creates the .somnotrace/ and SDCARD/ directory trees if they don't exist.

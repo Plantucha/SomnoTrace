@@ -191,6 +191,7 @@ else
     skip_test br_parse_test "no cJSON"
     skip_test br_backend_test "no cJSON"
     skip_test mqtt_live_contract_test "no cJSON"
+    skip_test edf_import_test "no cJSON"
 fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
@@ -224,6 +225,14 @@ if [ -n "$CJ_INC" ]; then
         "$SOMNO_DIR/somno_stage_csv.c" \
         -Wl,--gc-sections -Wl,--wrap=somno_feat_create -Wl,--wrap=somno_feat_destroy \
         $CJ_SRC $CJ_LIB -lm
+    # EDF→SNT import engine (Phase 1 of IMPORT-EDFs.md): synthetic EDF
+    # fixtures → native streams/manifests/spools.  -DEDF_IMPORT_HOST keeps
+    # the FreeRTOS worker + edf_gen/uploader hooks out; SD_MOUNT_POINT is
+    # redirected to scratch space under /tmp.
+    run_test edf_import_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
+        -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_imp/sd"' \
+        scripts/edf_import_test.c "$MAIN_DIR/edf_import.c" \
+        "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
 fi
 
 # The mutation harness's TEXTUAL layer has nothing else to catch a mistake in it. Every

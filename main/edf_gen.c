@@ -491,7 +491,46 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     /* True once a real data-gating signal (_ZLE rising or MaskOn) was found.
      * When false the AS11 never began delivering gated flow data. */
     bool therapy_gated = false;
+    /* Per-file wave emission: a pre_gated (imported) session emits a wave
+     * EDF only when its stream actually holds samples — annotation-only
+     * sessions export EVE/CSL alone, matching what the AS11 writes for
+     * mask-less sessions (no 0-record BRP/PLD/SA2). */
+    bool emit_brp = true, emit_sa2 = true, emit_pld = true;
     {
+        /* Imported sessions (edf_import) carry pre-gated waveforms: the
+         * .snt streams already start at MaskOn — waveform_offset_ms after
+         * the session's TherapyStart anchor — so no _ZLE/MaskOn search or
+         * leading-sample skip applies.  The synthesized MaskOn/MaskOff
+         * events still drive the end-truncation path below. */
+        char manifest_path[656];
+        snprintf(manifest_path, sizeof(manifest_path), "%s/%s_session.json",
+                 session_dir, session_id);
+        cJSON *mani = edf_read_json_file(manifest_path);
+        cJSON *jpg = mani ? cJSON_GetObjectItem(mani, "pre_gated") : NULL;
+        bool pre_gated = jpg && cJSON_IsTrue(jpg);
+        if (pre_gated) {
+            int64_t wav_off = 0;
+            cJSON *jo = cJSON_GetObjectItem(mani, "waveform_offset_ms");
+            if (jo && cJSON_IsNumber(jo)) wav_off = (int64_t)jo->valuedouble;
+            if (wav_off < 0 || wav_off > 120000) wav_off = 0;
+            maskon_start_ms = start_epoch_ms + wav_off;
+            if (maskon_start_ms >= end_epoch_ms)
+                maskon_start_ms = start_epoch_ms;
+            therapy_gated = true;
+            cJSON *c;
+            if ((c = cJSON_GetObjectItem(mani, "brp_samples")) &&
+                cJSON_IsNumber(c) && c->valuedouble <= 0) emit_brp = false;
+            if ((c = cJSON_GetObjectItem(mani, "sa2_samples")) &&
+                cJSON_IsNumber(c) && c->valuedouble <= 0) emit_sa2 = false;
+            if ((c = cJSON_GetObjectItem(mani, "pld_samples")) &&
+                cJSON_IsNumber(c) && c->valuedouble <= 0) emit_pld = false;
+            ESP_LOGI(TAG, "pre_gated: maskon_start=%lld (offset %lld ms, "
+                          "streams already gated — no skip)",
+                     (long long)maskon_start_ms, (long long)wav_off);
+        }
+        cJSON_Delete(mani);
+
+        if (!pre_gated) {
         int64_t zle_ntp = edf_find_zle_edge_time(events_snt_path, 1, clock_drift_ms);
         if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms) {
             maskon_start_ms = zle_ntp;
@@ -544,6 +583,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                              "for BRP/PLD/SA2");
             }
         }
+        }   /* !pre_gated */
 
         /* BRP/PLD/SA2 end timestamp (for end truncation).
          * AS11 EDF data spans exactly the _ZLE gating window, but .snt
@@ -661,7 +701,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * v2 format: flow.snt + press.snt (separate 1-ch files).
      * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
      * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_brp) {
         char snt_path[300], edf_path[350], press_path[300];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
         snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
@@ -694,7 +734,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     }
 
     /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_sa2) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
@@ -736,7 +776,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
      * limitation and cannot be fixed by firmware changes.
      * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_pld) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);

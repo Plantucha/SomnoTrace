@@ -157,6 +157,9 @@ esp_err_t sd_storage_init(void)
     mkdir(SD_SDCARD_DATALOG, 0775);
     mkdir(SD_SDCARD_SETTINGS, 0775);
 
+    /* EDF import inbox (FTP-visible at card root) */
+    mkdir(SD_IMPORT_DIR, 0775);
+
     ESP_LOGI(TAG, "SD mounted at %s, directory tree ready", SD_MOUNT_POINT);
 
     return ESP_OK;
@@ -441,6 +444,7 @@ esp_err_t sd_storage_format(void)
     mkdir(SD_SDCARD_DIR, 0775);
     mkdir(SD_SDCARD_DATALOG, 0775);
     mkdir(SD_SDCARD_SETTINGS, 0775);
+    mkdir(SD_IMPORT_DIR, 0775);
 
     ESP_LOGI(TAG, "format: SD card formatted and directory tree recreated");
     return ESP_OK;

@@ -56,6 +56,7 @@
 #include "nvs_flash.h"
 #include "somno_ml.h"
 #include "oximetry_canonical.h"
+#include "edf_import.h"
 
 
 static const char *TAG = "somnotrace";
@@ -234,6 +235,13 @@ void app_main(void)
      * worker export days that boot recovery queued: doing it earlier could
      * run a multi-minute rebuild while a live session was trying to start. */
     session_writer_enable_deferred_export();
+
+    /* 4c-ter-2. IMPORT inbox scan — historical EDFs dropped under
+     * /somnotrace/IMPORT/ (manual SD/FTP copies; SomnoBridge lands them the
+     * same way).  Deferred like post-therapy exports: the worker waits for
+     * SD + quiesces behind the EXPORT lease before touching the inbox. */
+    if (sd_ret == ESP_OK)
+        edf_import_start_worker();
 
     /* 4d. Init therapy alert subsystem (loads config from NVS). */
     therapy_alert_set_beep_fn(bsp_audio_beep);
