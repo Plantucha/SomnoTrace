@@ -3994,6 +3994,33 @@ function calStepMonth(delta, ev) {
   renderCalendar();
 }
 
+/* First day of the week for the browser's locale, as a JS day index
+ * (0=Sun..6=Sat).  Intl.Locale.weekInfo/getWeekInfo() covers modern engines;
+ * the tables below mirror CLDR weekData for older ones (Safari <=16). */
+var calFirstDay = -1;
+function localeFirstDay() {
+  if (calFirstDay >= 0) return calFirstDay;
+  try {
+    var loc = new Intl.Locale(navigator.language || 'en');
+    var wi = (typeof loc.getWeekInfo === 'function') ? loc.getWeekInfo() : loc.weekInfo;
+    if (wi && wi.firstDay >= 1 && wi.firstDay <= 7) {
+      calFirstDay = wi.firstDay % 7;        /* ISO 1=Mon..7=Sun -> JS 0=Sun..6=Sat */
+      return calFirstDay;
+    }
+  } catch (e) { /* old engine: use the region table */ }
+  var tag = String(navigator.language || '').split('-');
+  var reg = tag.length > 1 ? tag[tag.length - 1].toUpperCase() : '';
+  if (/^(AG|AS|BD|BR|BS|BT|BW|BZ|CA|CO|DM|DO|ET|GT|GU|HK|HN|ID|IL|IN|IS|JM|JP|KE|KH|KR|LA|MH|MM|MO|MT|MX|MZ|NI|NP|PA|PE|PH|PK|PR|PT|PY|SA|SG|SV|TH|TT|TW|UM|US|VE|VI|WS|YE|ZA|ZW)$/.test(reg)) calFirstDay = 0;
+  else if (/^(AF|BH|DJ|DZ|EG|IQ|IR|JO|KW|LY|OM|QA|SD|SY)$/.test(reg)) calFirstDay = 6;
+  else if (reg === 'MV') calFirstDay = 5;
+  else if (!reg)
+    /* no region subtag: infer from the language (en/pt/ja/ko default to
+     * Sunday-first regions, ar to Saturday-first) */
+    calFirstDay = /^(en|pt|ja|ko)$/i.test(tag[0]) ? 0 : (/^ar$/i.test(tag[0]) ? 6 : 1);
+  else calFirstDay = 1;
+  return calFirstDay;
+}
+
 function renderCalendar() {
   var el = document.getElementById('dash-calendar');
   if (!el) return;
@@ -4007,11 +4034,15 @@ function renderCalendar() {
     '<div class="dash-cal-title">' + monthName + '</div>' +
     '<button class="dash-cal-nav" onclick="calStepMonth(1,event)">&rsaquo;</button></div>';
   html += '<div class="dash-cal-grid">';
-  var dows = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  for (var i = 0; i < 7; i++) html += '<div class="dash-cal-dow">' + dows[i] + '</div>';
+  var fd = localeFirstDay();
+  /* Localised weekday names in locale order: 2024-01-07 was a Sunday, so
+   * day index k is formatted by new Date(2024, 0, 7 + k). */
+  var dowFmt = new Intl.DateTimeFormat(navigator.language, { weekday: 'short' });
+  for (var i = 0; i < 7; i++)
+    html += '<div class="dash-cal-dow">' + dowFmt.format(new Date(2024, 0, 7 + ((fd + i) % 7))) + '</div>';
   var first = new Date(y, m, 1);
-  /* Monday-based leading blanks */
-  var lead = (first.getDay() + 6) % 7;
+  /* leading blanks before the 1st, relative to the locale's first weekday */
+  var lead = (first.getDay() - fd + 7) % 7;
   for (var b = 0; b < lead; b++) html += '<div></div>';
   var daysInMonth = new Date(y, m + 1, 0).getDate();
   for (var day = 1; day <= daysInMonth; day++) {
