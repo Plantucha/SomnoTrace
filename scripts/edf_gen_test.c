@@ -850,6 +850,76 @@ static void test_maskoff_truncates_the_export(void)
     free(bg); free(b0);
 }
 
+/* Imported sessions carry "pre_gated":true in their manifest — the .snt
+ * streams already start at MaskOn and end at MaskOff, so neither the
+ * MaskOn skip nor the MaskOff end truncation may touch the export.
+ * Without the guard a MaskOff at +70 s would cut the 3-minute wave back
+ * to one record (the failure the IMPORT-EDFs spec calls out). */
+static void test_pre_gated_session_is_not_truncated(void)
+{
+    set_tz("UTC");
+    char root[300], sd[400], out[400], p[600];
+    snprintf(root, sizeof(root), "%s/pregated", g_root);
+    build_session(root, 2, SA2_N, sd, sizeof(sd));
+    write_events(sd, 10000, 70000);
+    snprintf(p, sizeof(p), "%s/%s_session.json", sd, SID);
+    write_text(p, "{\"id\":\"" SID "\",\"pre_gated\":true,"
+                  "\"waveform_offset_ms\":0,"
+                  "\"brp_samples\":4500,\"sa2_samples\":180,"
+                  "\"pld_samples\":90}\n");
+
+    CHECK(generate(root, sd, out, sizeof(out)) == ESP_OK, "generate failed");
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", out, SID);
+    size_t n = 0;
+    uint8_t *b = read_file(p, &n);
+    CHECK(b != NULL, "BRP.edf not written");
+    if (b) {
+        edf_t e;
+        if (edf_parse(b, n, &e))
+            CHECK(e.ndr == 3,
+                  "records: got %d want 3 — pre_gated streams must not be "
+                  "end-truncated at MaskOff", e.ndr);
+        else
+            CHECK(false, "BRP.edf header/size inconsistent");
+        free(b);
+    }
+}
+
+/* The importer clusters wave files within ±2 s of the EVE anchor, so a
+ * manifest's waveform_offset_ms can legitimately be a small NEGATIVE
+ * number — the BRP must keep that exact start (filename + starttime),
+ * not snap forward to the TherapyStart anchor. */
+static void test_pre_gated_negative_waveform_offset(void)
+{
+    set_tz("UTC");
+    char root[300], sd[400], out[400], p[600];
+    snprintf(root, sizeof(root), "%s/pregated_neg", g_root);
+    build_session(root, 2, SA2_N, sd, sizeof(sd));
+    snprintf(p, sizeof(p), "%s/%s_session.json", sd, SID);
+    write_text(p, "{\"id\":\"" SID "\",\"pre_gated\":true,"
+                  "\"waveform_offset_ms\":-2000,"
+                  "\"brp_samples\":4500,\"sa2_samples\":180,"
+                  "\"pld_samples\":90}\n");
+
+    CHECK(generate(root, sd, out, sizeof(out)) == ESP_OK, "generate failed");
+    /* maskon = START_MS - 2 s → 2026-03-01 21:59:58 */
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_215958_BRP.edf", out);
+    size_t n = 0;
+    uint8_t *b = read_file(p, &n);
+    CHECK(b != NULL, "BRP.edf missing at the -2 s offset name");
+    if (b) {
+        char t[16];
+        memcpy(t, b + 176, 8); t[8] = 0;
+        CHECK(!strcmp(t, "21.59.58"), "EDF starttime %s, want 21.59.58", t);
+        edf_t e;
+        if (edf_parse(b, n, &e))
+            CHECK(e.ndr == 3, "records: got %d want 3", e.ndr);
+        else
+            CHECK(false, "BRP.edf header/size inconsistent");
+        free(b);
+    }
+}
+
 /* The _ZLE rising edge is the primary gate, and its timestamp is in the AS11
  * clock: the exporter must ADD the measured drift to reach NTP time.  With
  * _ZLE at AS11 +7 s and a drift of +3 s, the gate is NTP +10 s — the same
@@ -1949,6 +2019,10 @@ int main(void)
     run("overflow saturates at the declared digital maximum",
         test_overflow_clamps_to_declared_digital_max, NULL);
     run("MaskOff ends the export", test_maskoff_truncates_the_export, NULL);
+    run("a pre_gated session is not end-truncated at MaskOff",
+        test_pre_gated_session_is_not_truncated, NULL);
+    run("a pre_gated session keeps a negative waveform offset",
+        test_pre_gated_negative_waveform_offset, NULL);
     run("the _ZLE gate applies the AS11->NTP clock drift",
         test_zle_gate_applies_clock_drift, NULL);
     run("the MaskOn fallback applies the AS11->NTP clock drift",

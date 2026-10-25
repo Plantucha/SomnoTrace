@@ -192,6 +192,7 @@ void app_main(void)
             ESP_LOGE(TAG, "session writer init failed; recording unavailable");
             bsp_display_set_notice("Recording OFF");
         }
+        edf_import_cleanup_residue();
         session_writer_recover();
     }
 
@@ -236,13 +237,6 @@ void app_main(void)
      * run a multi-minute rebuild while a live session was trying to start. */
     session_writer_enable_deferred_export();
 
-    /* 4c-ter-2. IMPORT inbox scan — historical EDFs dropped under
-     * /somnotrace/IMPORT/ (manual SD/FTP copies; SomnoBridge lands them the
-     * same way).  Deferred like post-therapy exports: the worker waits for
-     * SD + quiesces behind the EXPORT lease before touching the inbox. */
-    if (sd_ret == ESP_OK)
-        edf_import_start_worker();
-
     /* 4d. Init therapy alert subsystem (loads config from NVS). */
     therapy_alert_set_beep_fn(bsp_audio_beep);
     therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);
@@ -270,6 +264,13 @@ void app_main(void)
      * is accepted when the DHCP ACK arrives and renewal handlers are active.
      * Starts SNTP (which will simply time out or retry if offline). */
     time_sync_init();
+
+    /* 6b. IMPORT inbox scan — historical EDFs dropped under
+     * /somnotrace/IMPORT/ (manual SD/FTP copies; SomnoBridge lands them the
+     * same way).  Runs after time_sync_init() so the NVS timezone is active
+     * before any civil-time EDF headers/filenames are parsed. */
+    if (sd_ret == ESP_OK)
+        edf_import_start_worker();
 
     /* 7. Try to connect to configured Wi-Fi. */
     char ip[16] = "0.0.0.0";

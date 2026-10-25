@@ -70,6 +70,11 @@ typedef struct edf_import_ctx edf_import_ctx_t;
  * used by the worker trigger). */
 bool edf_import_pending(void);
 
+/* Remove stale *.part files and any incomplete <id>_* import artifacts
+ * (where <id>_session.json.importing exists without <id>_session.json).
+ * Safe to call at boot before session_writer_recover(). */
+void edf_import_cleanup_residue(void);
+
 edf_import_ctx_t *edf_import_ctx_create(void);
 void              edf_import_ctx_destroy(edf_import_ctx_t *ctx);
 

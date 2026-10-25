@@ -1521,9 +1521,9 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         for (int j = i + 1; j < n_spool; j++) {
             if (strcmp(spool_names[j], spool_names[i]) < 0) {
                 char tmp[15];
-                strcpy(tmp, spool_names[i]);
-                strcpy(spool_names[i], spool_names[j]);
-                strcpy(spool_names[j], tmp);
+                memcpy(tmp, spool_names[i], 15);
+                memcpy(spool_names[i], spool_names[j], 15);
+                memcpy(spool_names[j], tmp, 15);
             }
         }
     }

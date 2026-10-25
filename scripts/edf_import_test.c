@@ -414,6 +414,33 @@ static void phase_a(void)
         CHECK(v && !strcmp(v->valuestring, "file_import"), "import source");
         CHECK((v = cJSON_GetObjectItem(m, "brp_samples")) &&
               (int)v->valuedouble == 75, "brp_samples=75");
+        /* start_iso / end_iso are LOCAL civil strings (localtime_r) —
+         * "YYYY-MM-DDTHH:MM:SS" (19 chars, no Z, no millis).  The old
+         * imp_dev_to_iso format was "...SS.mmmZ" — catch a regression
+         * by shape and by exact value against localtime_r. */
+        v = cJSON_GetObjectItem(m, "start_iso");
+        CHECK(v && cJSON_IsString(v) && strlen(v->valuestring) == 19 &&
+              v->valuestring[10] == 'T' && v->valuestring[16] == ':',
+              "start_iso is local civil (no Z, no millis)");
+        if (v && cJSON_IsString(v)) {
+            time_t tt = (time_t)(1705356600000LL / 1000);
+            struct tm lt;
+            char want[32];
+            localtime_r(&tt, &lt);
+            strftime(want, sizeof(want), "%Y-%m-%dT%H:%M:%S", &lt);
+            CHECK(!strcmp(v->valuestring, want), "start_iso localtime value");
+        }
+        v = cJSON_GetObjectItem(m, "end_iso");
+        if (v && cJSON_IsString(v)) {
+            time_t tt = (time_t)((1705356600000LL + 10000) / 1000);
+            struct tm lt;
+            char want[32];
+            localtime_r(&tt, &lt);
+            strftime(want, sizeof(want), "%Y-%m-%dT%H:%M:%S", &lt);
+            CHECK(!strcmp(v->valuestring, want), "end_iso localtime value");
+        } else {
+            CHECK(false, "end_iso present");
+        }
         cJSON_Delete(m);
     }
 
@@ -728,6 +755,38 @@ static void phase_e(void)
         cJSON_Delete(m2);
     }
     edf_import_ctx_destroy(c);
+
+    /* estimate with half_ms > 5000 → NOT usable: drift stays 0, session id
+     * and epochs are unshifted, but the sidecar is still preserved. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"has_drift\":true,\"clock_drift_ms\":\"3000\","
+          "\"half_ms\":15000}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m3 = parse_json_file(p);
+    CHECK(m3 != NULL, "unusable-estimate manifest parses");
+    if (m3) {
+        cJSON *v = cJSON_GetObjectItem(m3, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 0,
+              "unusable estimate → drift 0");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m3, "clock_drift_valid")),
+              "unusable estimate → not valid");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m3, "clock_drift_usable")),
+              "estimate ±15s → not usable");
+        v = cJSON_GetObjectItem(m3, "start_epoch_ms");
+        CHECK(v && (int64_t)v->valuedouble == 1705356600000LL,
+              "unusable estimate → unshifted start");
+        v = cJSON_GetObjectItem(m3, "somnobridge_drift");
+        CHECK(v && cJSON_IsObject(v), "unusable sidecar still embedded");
+        cJSON_Delete(m3);
+    }
+    edf_import_ctx_destroy(c);
     printf("phase e OK (%d checks)\n", g_checks);
 }
 
@@ -816,6 +875,33 @@ static int64_t pb_find_varint(const unsigned char *b, size_t n, int want)
             if (field == want) return (int64_t)v;
         } else if (wire == 2) {
             i += (size_t)pb_varint(b, n, &i);
+        } else if (wire == 5) {
+            i += 4;
+        } else if (wire == 1) {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    return -1;
+}
+
+/* Summary metrics are length-delimited submessages (outer field = metric
+ * id, inner varints = percentile slots 1..5). */
+static int64_t pb_find_nested_varint(const unsigned char *b, size_t n,
+                                     int outer, int inner)
+{
+    size_t i = 0;
+    while (i < n) {
+        uint64_t tag = pb_varint(b, n, &i);
+        int field = (int)(tag >> 3), wire = (int)(tag & 7);
+        if (wire == 2) {
+            uint64_t len = pb_varint(b, n, &i);
+            if (field == outer)
+                return pb_find_varint(b + i, (size_t)len, inner);
+            i += (size_t)len;
+        } else if (wire == 0) {
+            (void)pb_varint(b, n, &i);
         } else if (wire == 5) {
             i += 4;
         } else if (wire == 1) {
@@ -1094,6 +1180,163 @@ static void phase_j(void)
     printf("phase j OK (%d checks)\n", g_checks);
 }
 
+/* ── phase k: AS10 PLD aliases + label boundary + S.* settings overlay ── */
+static void phase_k(void)
+{
+    fresh_tree();
+    char dir[256], p[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+
+    /* Overwrite PLD.edf with the AS10 short-label variant — every channel
+     * carries a distinct dig so a misrouted probe cannot pass silently.
+     * phys = dig/10, stored native = phys*100 = dig*10. */
+    static int16_t s_mp[3]={110,111,112}, s_pr[3]={220,221,222},
+                   s_epr[3]={330,331,332}, s_lk[3]={440,441,442},
+                   s_rr[3]={550,551,552}, s_vt[3]={660,661,662},
+                   s_mv[3]={770,771,772}, s_tg[3]={880,881,882},
+                   s_ie[3]={990,991,992}, s_sn[3]={120,240,360},
+                   s_fl[3]={150,250,350}, s_ti[3]={260,360,460};
+    const fx_sig_t pld_s[] = {
+        {"MaskPress.2s","",0,100,0,1000,1,s_mp,NULL,0},
+        {"Press.2s","",0,100,0,1000,1,s_pr,NULL,0},
+        {"EprPress.2s","",0,100,0,1000,1,s_epr,NULL,0},
+        {"Leak.2s","",0,100,0,1000,1,s_lk,NULL,0},
+        {"RR.2s","",0,100,0,1000,1,s_rr,NULL,0},     /* AS10 RespRate */
+        {"Vt.2s","",0,100,0,1000,1,s_vt,NULL,0},     /* AS10 TidVol   */
+        {"MV.2s","",0,100,0,1000,1,s_mv,NULL,0},     /* AS10 MinVent  */
+        {"TgMV.2s","",0,100,0,1000,1,s_tg,NULL,0},   /* AS10 TgtVent  */
+        {"I:E.2s","",0,100,0,1000,1,s_ie,NULL,0},    /* AS10 IERatio  */
+        {"Snore.2s","",0,100,0,1000,1,s_sn,NULL,0},
+        {"FL.2s","",0,100,0,1000,1,s_fl,NULL,0},     /* AS10 FlowLim  */
+        {"Ti.2s","",0,100,0,1000,1,s_ti,NULL,0},
+    };
+    snprintf(p, sizeof(p), "%s/20240115_221007_PLD.edf", dir);
+    fx_write_edf(p, "SRN=22199876543 MID=38 VID=1",
+                 2024, 1, 15, 22, 10, 7, "", "1", 3, 3, pld_s, 12, 0);
+
+    /* CurrentSettings.json — carries a marker field the STR does not
+     * cover; the S.* overlay must preserve it (not stub the tree). */
+    snprintf(p, sizeof(p), "%s/SETTINGS", IMPORT_DIR);
+    mkpath(p);
+    snprintf(p, sizeof(p), "%s/SETTINGS/CurrentSettings.json", IMPORT_DIR);
+    FILE *f = fopen(p, "w");
+    fputs("{\"FlowGenerator\":{\"SettingProfiles\":{\"TherapyProfiles\":"
+          "{\"CpapProfile\":{\"SetPressure\":4.0}},"
+          "\"FeatureProfiles\":{\"PatientViewFeature\":"
+          "{\"PatientView\":\"Basic\"}}}}}", f);
+    fclose(f);
+
+    /* STR.edf — one day, Mode=3 (CPAP), S.* settings channels, plus a
+     * Flow.50 decoy ahead of Flow.5 so an unbounded prefix lookup would
+     * read the median into the 5th-percentile slot. */
+    static int16_t k_date[1]={19737}, k_dur[1]={420}, k_mode[1]={3},
+                   k_cp[1]={500}, k_ramp[1]={2}, k_hum[1]={6},
+                   k_mask[1]={3}, k_cc[1]={1},
+                   k_f50[1]={300}, k_f5[1]={500};
+    const fx_sig_t str_s[] = {
+        {"Date","d",0,40000,0,40000,1,k_date,NULL,0},
+        {"Duration","min",0,1440,0,1440,1,k_dur,NULL,0},
+        {"Mode","",0,32,0,32,1,k_mode,NULL,0},
+        {"S.C.Press","cmH2O",0,40,0,2000,1,k_cp,NULL,0},
+        {"S.RampEnable","",0,4,0,4,1,k_ramp,NULL,0},
+        {"S.HumLevel","",0,8,0,8,1,k_hum,NULL,0},
+        {"S.Mask","",0,8,0,8,1,k_mask,NULL,0},
+        {"S.ClimateControl","",0,4,0,4,1,k_cc,NULL,0},
+        {"Flow.50","L/s",-2,3,-1000,1500,1,k_f50,NULL,0},  /* decoy */
+        {"Flow.5","L/s",-2,3,-1000,1500,1,k_f5,NULL,0},
+    };
+    snprintf(p, sizeof(p), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(p, "SRN=22199876543 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 5, "", "86400", 1, 1, str_s, 10, 0);
+
+    /* Identification.json so the root pass resolves AS11 (1-indexed enums) */
+    snprintf(p, sizeof(p), "%s/Identification.json", IMPORT_DIR);
+    f = fopen(p, "w");
+    fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{"
+          "\"Product\":{\"SerialNumber\":\"22199876543\","
+          "\"ProductName\":\"AirSense 11 AutoSet\","
+          "\"PlatformIdentifier\":46,\"VariantIdentifier\":1},"
+          "\"Software\":{\"SoftwareVersion\":\"SX566-0302\"}}}}", f);
+    fclose(f);
+
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    int units;
+    edf_import_unit_t t = drain(c, &units);
+    CHECK(t.sessions_imported == 1, "session imported");
+    CHECK(t.spools_written == 1, "one spool from STR");
+
+    /* AS10 aliases — all 12 channels decoded, none stuck at 0. */
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_pld.snt",
+             SD_STREAMS_DIR, DAY);
+    snt_header_t h; int16_t *d;
+    CHECK(snt_read(p, &h, &d), "as10 pld.snt readable");
+    if (h.magic == SNT_MAGIC) {
+        CHECK(h.n_channels == 12 && h.sample_count == 3, "pld header");
+        CHECK(d[4] == 5500 && d[5] == 6600 && d[6] == 7700,
+              "RR/Vt/MV aliases");
+        CHECK(d[7] == 8800 && d[8] == 9900 && d[10] == 1500,
+              "TgMV/I:E/FL aliases");
+        CHECK(d[11] == 2600, "Ti channel");
+    }
+    free(d);
+
+    /* Flow.5 must decode from the Flow.5 signal (dig 500 → 500*1/5 = 100),
+     * not the Flow.50 decoy that precedes it (dig 300 → 60). */
+    snprintf(p, sizeof(p), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    size_t n = 0;
+    uint8_t *blob = read_bin(p, &n);
+    CHECK(blob != NULL, "spool exists");
+    if (blob) {
+        CHECK(pb_find_nested_varint(blob, n, 37, 1) == 100,
+              "Flow.5 decoded (not Flow.50)");
+        free(blob);
+    }
+
+    /* <day>.settings.json = CurrentSettings overlaid with S.* channels:
+     * SetPressure 10.0 (dig 500/50) replaces the stub's 4.0; PatientView
+     * "Basic" survives because no S.* channel covers it. */
+    snprintf(p, sizeof(p), "%s/20240115.settings.json", SD_SUMMARIES_DIR);
+    cJSON *sj = parse_json_file(p);
+    CHECK(sj != NULL, "day settings written");
+    if (sj) {
+        cJSON *sp = cJSON_GetObjectItem(sj, "SettingProfiles");
+        cJSON *ap = cJSON_GetObjectItem(sp, "ActiveProfiles");
+        cJSON *v = cJSON_GetObjectItem(ap, "TherapyProfile");
+        CHECK(v && !strcmp(v->valuestring, "CpapProfile"),
+              "Mode 3 → CpapProfile");
+        cJSON *tp = cJSON_GetObjectItem(sp, "TherapyProfiles");
+        cJSON *cpap = cJSON_GetObjectItem(tp, "CpapProfile");
+        v = cJSON_GetObjectItem(cpap, "SetPressure");
+        CHECK(v && cJSON_IsNumber(v) && v->valuedouble == 10.0,
+              "S.C.Press 500 → SetPressure 10.0");
+        cJSON *fp = cJSON_GetObjectItem(sp, "FeatureProfiles");
+        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "AutoRampFeature"),
+                                "RampEnable");
+        CHECK(v && !strcmp(v->valuestring, "On"), "S.RampEnable 2 → On");
+        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "ClimateFeature"),
+                                "HumidifierLevel");
+        CHECK(v && cJSON_IsNumber(v) && v->valuedouble == 6.0,
+              "S.HumLevel 6 → 6.0");
+        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "ClimateFeature"),
+                                "ClimateControl");
+        CHECK(v && !strcmp(v->valuestring, "Auto"),
+              "S.ClimateControl 1 → Auto");
+        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "CircuitFeature"),
+                                "MaskType");
+        CHECK(v && !strcmp(v->valuestring, "FullFace"),
+              "S.Mask 3 → FullFace (1-idx)");
+        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "PatientViewFeature"),
+                                "PatientView");
+        CHECK(v && !strcmp(v->valuestring, "Basic"),
+              "unmapped CurrentSettings field preserved");
+        cJSON_Delete(sj);
+    }
+    edf_import_ctx_destroy(c);
+    printf("phase k OK (%d checks)\n", g_checks);
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
@@ -1111,6 +1354,7 @@ int main(void)
     phase_h();
     phase_i();
     phase_j();
+    phase_k();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
