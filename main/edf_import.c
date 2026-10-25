@@ -1939,7 +1939,10 @@ static int cluster_files(imp_file_t *files, int n_files,
      * share the wave anchor, all ann files at one timestamp share the ann
      * anchor. */
     typedef struct { int64_t ts; int idx; } grp_t;
-    grp_t waves[IMP_MAX_SESSIONS], anns[IMP_MAX_SESSIONS];
+    /* Zero-fill so cppcheck's uninitvar can see the initialized-prefix
+     * invariant: reads are bounded by nw/na but the arrays are written
+     * conditionally under `nw < IMP_MAX_SESSIONS` guards. */
+    grp_t waves[IMP_MAX_SESSIONS] = {0}, anns[IMP_MAX_SESSIONS] = {0};
     int nw = 0, na = 0;
 
     for (int i = 0; i < n; i++) {
