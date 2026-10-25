@@ -60,6 +60,9 @@ typedef struct {
     int  files_consumed;    /* source files deleted after durable commit */
     int  files_rejected;    /* corrupt files moved aside to *.bad */
     int  spools_written;
+    bool deferred;          /* nothing processed: the next unit's files were
+                             * modified within the quiescence window (a copy
+                             * may still be in flight) — call again later */
 } edf_import_unit_t;
 
 /* Opaque scan context: keeps the resolved identification/settings trees and
@@ -78,8 +81,17 @@ void edf_import_cleanup_residue(void);
 edf_import_ctx_t *edf_import_ctx_create(void);
 void              edf_import_ctx_destroy(edf_import_ctx_t *ctx);
 
+/* Quiescence window: a unit whose source files (or drift sidecar) were
+ * modified less than `seconds` ago is deferred (edf_import_unit_t.deferred)
+ * instead of imported — the user may still be copying the card.  Default is
+ * 15 s on target and 0 (off) under EDF_IMPORT_HOST.  An explicit "import
+ * now" trigger can pass 0.  Files dated in the future (unset clocks) never
+ * count as recent. */
+void edf_import_ctx_set_quiesce(edf_import_ctx_t *ctx, int seconds);
+
 /* Process exactly one pending unit.
- *   ESP_OK            — a unit was processed; *out describes it.
+ *   ESP_OK            — a unit was processed (or, with out->deferred set,
+ *                       held back for quiescence); *out describes it.
  *   ESP_ERR_NOT_FOUND — the inbox is empty and all follow-up work is done.
  *   other errors      — partial progress was still made (see *out); safe
  *                       to call again. */

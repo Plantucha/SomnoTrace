@@ -192,6 +192,7 @@ else
     skip_test br_backend_test "no cJSON"
     skip_test mqtt_live_contract_test "no cJSON"
     skip_test edf_import_test "no cJSON"
+    skip_test edf_roundtrip_test "no cJSON"
 fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
@@ -232,6 +233,14 @@ if [ -n "$CJ_INC" ]; then
     run_test edf_import_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_imp/sd"' \
         scripts/edf_import_test.c "$MAIN_DIR/edf_import.c" \
+        "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+    # Round trip: a live night exported by edf_gen, staged as an IMPORT/ card
+    # image, imported, and exported again must be byte-identical.  edf_gen's
+    # output is the real-card reference, so this catches layout assumptions
+    # (e.g. EVE/CSL 0.00 s records) that hand-written fixtures cannot.
+    run_test edf_roundtrip_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
+        -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_rt/sd"' \
+        scripts/edf_roundtrip_test.c "$MAIN_DIR/edf_import.c" \
         "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
 fi
 

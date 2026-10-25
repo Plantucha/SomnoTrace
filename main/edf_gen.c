@@ -268,6 +268,46 @@ static cJSON *device_snapshot_fallback(const char *sessions_root,
     return child;
 }
 
+/* Pre-gated (imported) session marker read from <id>_session.json.  Kept
+ * out of line: its 656-byte path buffer would otherwise sit in
+ * edf_gen_generate_ex's frame for the whole export — that function already
+ * has the deepest frame on every export call chain (post-therapy worker,
+ * httpd "rebuild day", importer worker). */
+typedef struct {
+    bool    pre_gated;
+    int64_t wav_off;                    /* waveform_offset_ms, validated */
+    bool    emit_brp, emit_sa2, emit_pld;
+} pre_gate_info_t;
+
+static __attribute__((noinline)) void
+read_pre_gate_info(const char *session_dir, const char *session_id,
+                   pre_gate_info_t *out)
+{
+    out->pre_gated = false;
+    out->wav_off = 0;
+    out->emit_brp = out->emit_sa2 = out->emit_pld = true;
+
+    char manifest_path[656];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/%s_session.json",
+             session_dir, session_id);
+    cJSON *mani = edf_read_json_file(manifest_path);
+    cJSON *jpg = mani ? cJSON_GetObjectItem(mani, "pre_gated") : NULL;
+    out->pre_gated = jpg && cJSON_IsTrue(jpg);
+    if (out->pre_gated) {
+        cJSON *jo = cJSON_GetObjectItem(mani, "waveform_offset_ms");
+        if (jo && cJSON_IsNumber(jo)) out->wav_off = (int64_t)jo->valuedouble;
+        if (out->wav_off < -2000 || out->wav_off > 120000) out->wav_off = 0;
+        cJSON *c;
+        if ((c = cJSON_GetObjectItem(mani, "brp_samples")) &&
+            cJSON_IsNumber(c) && c->valuedouble <= 0) out->emit_brp = false;
+        if ((c = cJSON_GetObjectItem(mani, "sa2_samples")) &&
+            cJSON_IsNumber(c) && c->valuedouble <= 0) out->emit_sa2 = false;
+        if ((c = cJSON_GetObjectItem(mani, "pld_samples")) &&
+            cJSON_IsNumber(c) && c->valuedouble <= 0) out->emit_pld = false;
+    }
+    cJSON_Delete(mani);
+}
+
 esp_err_t edf_gen_generate_ex(const char *out_root,
                               const char *session_dir, const char *session_id,
                               int64_t start_epoch_ms, int64_t end_epoch_ms,
@@ -502,33 +542,21 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
          * waveform_offset_ms after the session's TherapyStart anchor — so
          * neither _ZLE/MaskOn leading-sample skip nor MaskOff tail
          * truncation applies. */
-        char manifest_path[656];
-        snprintf(manifest_path, sizeof(manifest_path), "%s/%s_session.json",
-                 session_dir, session_id);
-        cJSON *mani = edf_read_json_file(manifest_path);
-        cJSON *jpg = mani ? cJSON_GetObjectItem(mani, "pre_gated") : NULL;
-        bool pre_gated = jpg && cJSON_IsTrue(jpg);
+        pre_gate_info_t pg;
+        read_pre_gate_info(session_dir, session_id, &pg);
+        bool pre_gated = pg.pre_gated;
         if (pre_gated) {
-            int64_t wav_off = 0;
-            cJSON *jo = cJSON_GetObjectItem(mani, "waveform_offset_ms");
-            if (jo && cJSON_IsNumber(jo)) wav_off = (int64_t)jo->valuedouble;
-            if (wav_off < -2000 || wav_off > 120000) wav_off = 0;
-            maskon_start_ms = start_epoch_ms + wav_off;
+            maskon_start_ms = start_epoch_ms + pg.wav_off;
             if (maskon_start_ms >= end_epoch_ms)
                 maskon_start_ms = start_epoch_ms;
             therapy_gated = true;
-            cJSON *c;
-            if ((c = cJSON_GetObjectItem(mani, "brp_samples")) &&
-                cJSON_IsNumber(c) && c->valuedouble <= 0) emit_brp = false;
-            if ((c = cJSON_GetObjectItem(mani, "sa2_samples")) &&
-                cJSON_IsNumber(c) && c->valuedouble <= 0) emit_sa2 = false;
-            if ((c = cJSON_GetObjectItem(mani, "pld_samples")) &&
-                cJSON_IsNumber(c) && c->valuedouble <= 0) emit_pld = false;
+            emit_brp = pg.emit_brp;
+            emit_sa2 = pg.emit_sa2;
+            emit_pld = pg.emit_pld;
             ESP_LOGI(TAG, "pre_gated: maskon_start=%lld (offset %lld ms, "
                           "streams already gated — no skip)",
-                     (long long)maskon_start_ms, (long long)wav_off);
+                     (long long)maskon_start_ms, (long long)pg.wav_off);
         }
-        cJSON_Delete(mani);
 
         if (!pre_gated) {
         int64_t zle_ntp = edf_find_zle_edge_time(events_snt_path, 1, clock_drift_ms);

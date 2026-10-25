@@ -41,6 +41,15 @@
  *            on the next scan; committed marker left alone
  *   phase i  annotation-only session (EVE+CSL, no waveforms) → empty
  *            streams + events + manifest
+ *   phase k  AS10 PLD aliases, STR label boundary, S.* settings overlay
+ *   phase l  real ResMed EVE/CSL layout (0.00 s records, one per
+ *            annotation): events kept, mask-less span, 0 s waveform → .bad
+ *   phase m  drift sidecar size budget: verbatim embed when small, compact
+ *            projection + relocated copy when large, manifest always under
+ *            the 4096 B cap of the pre-existing readers
+ *   phase n  quiescence window: files modified moments ago (group, root,
+ *            drift sidecar) defer instead of importing; future-dated files
+ *            and window 0 never defer
  *
  * Fixtures are synthetic — no patient data. */
 
@@ -110,6 +119,8 @@ typedef struct {
     const int16_t *samples;   /* nrec*spr values; NULL → zeros */
     const char *tal;          /* annotation-channel record bytes */
     int         tal_len;
+    const char *const *tals;  /* optional: one annotation block per record */
+    const int  *tal_lens;     /*           (overrides tal/tal_len)          */
 } fx_sig_t;
 
 static void fx_field(char *dst, int w, const char *s)
@@ -195,7 +206,11 @@ static void fx_write_edf(const char *path, const char *rec_id,
         long off = 0;
         for (int i = 0; i < nsig; i++) {
             const fx_sig_t *sg = &sigs[i];
-            if (sg->tal)
+            if (sg->tals)
+                memcpy(rec + off, sg->tals[r],
+                       (size_t)sg->tal_lens[r] < (size_t)sg->spr * 2
+                           ? (size_t)sg->tal_lens[r] : (size_t)sg->spr * 2);
+            else if (sg->tal)
                 memcpy(rec + off, sg->tal,
                        (size_t)sg->tal_len < (size_t)sg->spr * 2
                            ? (size_t)sg->tal_len : (size_t)sg->spr * 2);
@@ -217,6 +232,35 @@ static void fx_write_edf(const char *path, const char *rec_id,
     }
     free(rec);
     fclose(f);
+}
+
+/* Real ResMed EVE/CSL layout: EDF+D, data-record duration 0.00, one 62-byte
+ * annotation record (31 samples) per annotation, each led by its own
+ * time-keeping TAL "+0\x14\x14\x00".  anns[0] is "Recording starts" on real
+ * cards.  Every annotation block carries its trailing NUL; lens[] are the
+ * block lengths. */
+static void fx_write_real_ann(const char *path, int y, int mo, int d,
+                              int h, int mi, int s,
+                              const char *const *anns, const int *lens, int n)
+{
+    static const char tk[] = "+0\x14\x14\x00";
+    char bufs[16][64];
+    const char *ptr[16];
+    int ln[16];
+    if (n > 16) n = 16;
+    for (int r = 0; r < n; r++) {
+        memset(bufs[r], 0, sizeof(bufs[r]));
+        memcpy(bufs[r], tk, sizeof(tk) - 1);
+        memcpy(bufs[r] + sizeof(tk) - 1, anns[r], (size_t)lens[r]);
+        ptr[r] = bufs[r];
+        ln[r] = (int)sizeof(tk) - 1 + lens[r];
+    }
+    const fx_sig_t sig[] = {
+        { "EDF Annotations", "", -32768.0, 32767.0, -32768, 32767, 31,
+          NULL, NULL, 0, ptr, ln },
+    };
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1", y, mo, d, h, mi, s,
+                 "EDF+D", "0.00", n, n, sig, 1, 0);
 }
 
 /* ── SNT read-back ─────────────────────────────────────────────────── */
@@ -309,30 +353,27 @@ static void build_session_dir(const char *dir, const char *ts_wave,
     fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
                  y, mo, d, wh, wm, ws, "", "1", 3, 3, pld_s, 9, 0);
 
-    /* EVE.edf — EDF+D with one annotation channel.
-     * TAL in record 0: +2.1s Obstructive Apnea 9.4s; +5.0 Hypopnea.
-     * (Adjacent-literal split after \x14 — a label starting with a hex
-     * char would extend the escape.) */
-    static const char tal[] = "+0\x14\x14\x00+2.1\x15\x39.4\x14" "Obstructive Apnea\x14\x00"
-                              "+5.0\x15\x31\x30\x14" "Hypopnea\x14\x00";
-    const fx_sig_t eve_s[] = {
-        { "EDF Annotations", "", -32768.0, 32767.0, -32768, 32767, 50,
-          NULL, tal, (int)sizeof(tal) - 1 },
-    };
+    /* EVE.edf — real ResMed structure (record duration 0.00, one record per
+     * annotation): "Recording starts", +2.1s Obstructive Apnea 9.4s,
+     * +5.0 Hypopnea 10s.  (Adjacent-literal splits after \x15/\x14 — a
+     * digit or hex char right after the escape would extend it.) */
+    static const char e0[] = "+0\x15" "0\x14" "Recording starts\x14\x00";
+    static const char e1[] = "+2.1\x15" "9.4\x14" "Obstructive Apnea\x14\x00";
+    static const char e2[] = "+5.0\x15" "10\x14" "Hypopnea\x14\x00";
+    const char *const eve_a[] = { e0, e1, e2 };
+    const int eve_l[] = { (int)sizeof(e0) - 1, (int)sizeof(e1) - 1,
+                          (int)sizeof(e2) - 1 };
     snprintf(p, sizeof(p), "%s/%s_EVE.edf", dir, ts_eve);
-    fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
-                 y, mo, d, eh, em, es, "EDF+D", "1", 1, 1, eve_s, 1, 0);
+    fx_write_real_ann(p, y, mo, d, eh, em, es, eve_a, eve_l, 3);
 
-    /* CSL.edf — one CSR window */
-    static const char tal2[] = "+0\x14\x14\x00+1.0\x14" "CSR Start\x14\x00"
-                               "+2.0\x14" "CSR End\x14\x00";
-    const fx_sig_t csl_s[] = {
-        { "EDF Annotations", "", -32768.0, 32767.0, -32768, 32767, 50,
-          NULL, tal2, (int)sizeof(tal2) - 1 },
-    };
     snprintf(p, sizeof(p), "%s/%s_CSL.edf", dir, ts_eve);
-    fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
-                 y, mo, d, eh, em, es, "EDF+D", "1", 1, 1, csl_s, 1, 0);
+    /* CSL.edf — one CSR window, same real structure */
+    static const char c1[] = "+1.0\x14" "CSR Start\x14\x00";
+    static const char c2[] = "+2.0\x14" "CSR End\x14\x00";
+    const char *const csl_a[] = { e0, c1, c2 };
+    const int csl_l[] = { (int)sizeof(e0) - 1, (int)sizeof(c1) - 1,
+                          (int)sizeof(c2) - 1 };
+    fx_write_real_ann(p, y, mo, d, eh, em, es, csl_a, csl_l, 3);
 }
 
 static void fresh_tree(void)
@@ -1039,6 +1080,17 @@ static void phase_g(void)
     }
     edf_import_ctx_destroy(c);
 
+    /* Re-importing the same STR: both spools exist already, so none counts
+     * as new (the worker would otherwise rebuild + re-offer a day for no
+     * reason) */
+    snprintf(sp, sizeof(sp), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(sp, "SRN=22199876543 MID=46 VID=1",
+                 2024, 1, 16, 0, 0, 5, "", "86400", 2, 2, str_s, 8, 0);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.spools_written == 0, "re-imported STR creates no new spools");
+    edf_import_ctx_destroy(c);
+
     /* A fresh ctx with no root ident falls back to EDF recording_id */
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, "20240116");
     build_session_dir(dir, "20240116_221007", "20240116_221000", true,
@@ -1337,6 +1389,367 @@ static void phase_k(void)
     printf("phase k OK (%d checks)\n", g_checks);
 }
 
+/* ── phase l: real ResMed annotation layout (record duration 0.00) ───── */
+static void phase_l(void)
+{
+    char dir[256], p[700];
+    static const char r0[] = "+0\x15" "0\x14" "Recording starts\x14\x00";
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+
+    /* l1: annotation-only session, events out to +300 s.  The 0 s records
+     * give no span, so the session must stretch to the last annotation. */
+    fresh_tree();
+    mkpath(dir);
+    static const char h1[] = "+60.0\x15" "12\x14" "Hypopnea\x14\x00";
+    static const char o1[] = "+300.0\x15" "10\x14" "Obstructive Apnea\x14\x00";
+    static const char s1[] = "+120.0\x14" "CSR Start\x14\x00";
+    static const char s2[] = "+180.0\x14" "CSR End\x14\x00";
+    const char *const ea[] = { r0, h1, o1 };
+    const int el[] = { (int)sizeof(r0) - 1, (int)sizeof(h1) - 1, (int)sizeof(o1) - 1 };
+    const char *const ca[] = { r0, s1, s2 };
+    const int cl_[] = { (int)sizeof(r0) - 1, (int)sizeof(s1) - 1, (int)sizeof(s2) - 1 };
+    snprintf(p, sizeof(p), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(p, 2024, 1, 15, 22, 10, 0, ea, el, 3);
+    snprintf(p, sizeof(p), "%s/20240115_221000_CSL.edf", dir);
+    fx_write_real_ann(p, 2024, 1, 15, 22, 10, 0, ca, cl_, 3);
+
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    int units;
+    edf_import_unit_t t = drain(c, &units);
+    CHECK(t.sessions_imported == 1 && t.sessions_failed == 0,
+          "real-layout annotation-only session imports");
+    CHECK(t.files_consumed == 2, "EVE + CSL consumed");
+
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_events.snt", SD_STREAMS_DIR, DAY);
+    char *ev = read_text(p);
+    CHECK(ev != NULL, "events readable");
+    if (ev) {
+        CHECK(strstr(ev, "\"HypopneaEnd\""), "0.00-duration EVE: hypopnea kept");
+        CHECK(strstr(ev, "\"ObstructiveApneaEnd\""), "0.00-duration EVE: OSA kept");
+        CHECK(strstr(ev, "\"CsrStart\"") && strstr(ev, "\"CsrEnd\""),
+              "0.00-duration CSL: CSR pair kept");
+        CHECK(!strstr(ev, "Recording starts"), "Recording starts skipped");
+        free(ev);
+    }
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_session.json", SD_STREAMS_DIR, DAY);
+    cJSON *m = parse_json_file(p);
+    CHECK(m != NULL, "manifest parses");
+    if (m) {
+        cJSON *a = cJSON_GetObjectItem(m, "start_epoch_ms");
+        cJSON *b = cJSON_GetObjectItem(m, "end_epoch_ms");
+        CHECK(a && b && (int64_t)b->valuedouble - (int64_t)a->valuedouble == 310000,
+              "session spans to the last annotation end (+300 s + 10 s)");
+        cJSON_Delete(m);
+    }
+    /* the zero-wave session is counted in the synthesized day spool */
+    snprintf(p, sizeof(p), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    size_t n = 0;
+    uint8_t *blob = read_bin(p, &n);
+    CHECK(blob != NULL, "day spool synthesized");
+    if (blob) {
+        CHECK(pb_find_varint(blob, n, 39) == 1, "session counted in spool");
+        CHECK(pb_find_varint(blob, n, 5) == 5, "310 s → 5 whole minutes");
+        free(blob);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* l2: only "Recording starts" (no events) — still a valid, positive-length
+     * session so it isn't dropped from the day's SessionModeEntries. */
+    fresh_tree();
+    mkpath(dir);
+    const char *const ra[] = { r0 };
+    const int rl[] = { (int)sizeof(r0) - 1 };
+    snprintf(p, sizeof(p), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(p, 2024, 1, 15, 22, 10, 0, ra, rl, 1);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1, "event-less real-layout session imports");
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_session.json", SD_STREAMS_DIR, DAY);
+    m = parse_json_file(p);
+    if (m) {
+        cJSON *a = cJSON_GetObjectItem(m, "start_epoch_ms");
+        cJSON *b = cJSON_GetObjectItem(m, "end_epoch_ms");
+        CHECK(a && b && (int64_t)b->valuedouble - (int64_t)a->valuedouble == 1000,
+              "zero-length session floors at +1 s");
+        cJSON_Delete(m);
+    }
+    snprintf(p, sizeof(p), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    blob = read_bin(p, &n);
+    CHECK(blob && pb_find_varint(blob, n, 39) == 1, "floor keeps it in the spool");
+    free(blob);
+    edf_import_ctx_destroy(c);
+
+    /* l3: the relaxation is for annotation files only — a waveform file
+     * declaring a 0 s record is malformed and must be quarantined, never
+     * converted. */
+    fresh_tree();
+    mkpath(dir);
+    for (int i = 0; i < 75; i++) brp_flow[i] = (int16_t)(i * 10);
+    for (int i = 0; i < 75; i++) brp_press[i] = (int16_t)(100 + i);
+    const fx_sig_t brp_s[] = {
+        { "Flow.40ms", "L/s", -2.0, 3.0, -1000, 1500, 25, brp_flow, NULL, 0 },
+        { "Press.40ms", "cmH2O", 0.0, 40.0, 0, 2000, 25, brp_press, NULL, 0 },
+    };
+    snprintf(p, sizeof(p), "%s/20240115_221007_BRP.edf", dir);
+    fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 7, "", "0", 3, 3, brp_s, 2, 0);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 0 && t.sessions_failed == 1,
+          "waveform with 0 s records is rejected");
+    CHECK(t.files_rejected == 1, "…and quarantined");
+    char bad[760];
+    snprintf(bad, sizeof(bad), "%s.bad", p);
+    CHECK(file_exists(bad) && !file_exists(p), "BRP renamed to .bad");
+    snprintf(p, sizeof(p), "%s/%s/20240115_221007_session.json", SD_STREAMS_DIR, DAY);
+    CHECK(!file_exists(p), "no manifest committed");
+    CHECK(!edf_import_pending(), ".bad does not keep the inbox pending");
+    edf_import_ctx_destroy(c);
+
+    printf("phase l OK (%d checks)\n", g_checks);
+}
+
+/* ── phase m: drift sidecar size budget ────────────────────────────── */
+
+/* A GET_DRIFT-shaped sidecar: scalar tier records plus the bulky members
+ * (file tuples, component lists, a free-text flags string) that real
+ * records carry.  n_files tunes the size; flags_len adds one giant scalar. */
+static cJSON *mk_sidecar(int n_files, int flags_len)
+{
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddNumberToObject(r, "schema", 5);
+    cJSON *sot = cJSON_AddObjectToObject(r, "source_of_truth");
+    cJSON_AddStringToObject(sot, "clock_drift_ms", "214000");
+    cJSON_AddNumberToObject(sot, "half_ms", 300);
+    cJSON_AddStringToObject(sot, "quality", "qualified");
+    cJSON_AddStringToObject(sot, "basis", "anchor");
+    cJSON_AddNumberToObject(sot, "reference_at_ms", 1705356700000.0);
+    cJSON *files = cJSON_AddArrayToObject(sot, "files");
+    for (int i = 0; i < n_files; i++) {
+        cJSON *f = cJSON_CreateObject();
+        char nm[96];
+        snprintf(nm, sizeof(nm), "A:\\DATALOG\\20240115\\20240115_2210%02d_BRP.edf", i % 60);
+        cJSON_AddStringToObject(f, "path", nm);
+        cJSON_AddNumberToObject(f, "size", 123456 + i);
+        cJSON_AddStringToObject(f, "raw_start", "2024-01-15T22:10:07");
+        cJSON_AddItemToArray(files, f);
+    }
+    cJSON *sc = cJSON_AddArrayToObject(sot, "systematic_components");
+    for (int i = 0; i < 4; i++) {
+        cJSON *c = cJSON_CreateObject();
+        cJSON_AddStringToObject(c, "name", "timezone_prior");
+        cJSON_AddNumberToObject(c, "bound_ms", 1000 + i);
+        cJSON_AddItemToArray(sc, c);
+    }
+    if (flags_len > 0) {
+        char *big = malloc((size_t)flags_len + 1);
+        memset(big, 'x', (size_t)flags_len);
+        big[flags_len] = '\0';
+        cJSON_AddStringToObject(sot, "flags", big);
+        free(big);
+    }
+    return r;
+}
+
+typedef struct {
+    bool compact_present;     /* somnobridge_drift in the manifest */
+    bool truncated;           /* somnobridge_drift_truncated */
+    bool file_ref;            /* somnobridge_drift_file + the file on disk */
+    int  files_in_manifest;   /* sot.files length inside the manifest (-1 absent) */
+    int  files_in_copy;       /* sot.files length in the relocated copy (-1 absent) */
+    long manifest_bytes;
+} drift_case_t;
+
+static drift_case_t run_sidecar_case(const char *label, int n_files, int flags_len)
+{
+    drift_case_t out = { false, false, false, -1, -1, 0 };
+    fresh_tree();
+    char dir[256], dp[700], p[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    cJSON *sc = mk_sidecar(n_files, flags_len);
+    char *txt = cJSON_PrintUnformatted(sc);
+    cJSON_Delete(sc);
+    snprintf(dp, sizeof(dp), "%s/_bridge_drift.json", dir);
+    FILE *f = fopen(dp, "w");
+    fputs(txt, f);
+    fclose(f);
+    free(txt);
+
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    int units;
+    edf_import_unit_t t = drain(c, &units);
+    char msg[120];
+    snprintf(msg, sizeof(msg), "%s: session imported", label);
+    CHECK(t.sessions_imported == 1 && t.sessions_failed == 0, msg);
+    CHECK(!file_exists(dp), "sidecar consumed");
+
+    /* id is in the drifted domain: 22:10:00 + 214 s */
+    snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json", SD_STREAMS_DIR, DAY);
+    struct stat st;
+    if (stat(p, &st) == 0) out.manifest_bytes = (long)st.st_size;
+    snprintf(msg, sizeof(msg), "%s: manifest within the 4096 B reader cap", label);
+    CHECK(out.manifest_bytes > 0 && out.manifest_bytes < 4096, msg);
+    snprintf(msg, sizeof(msg), "%s: manifest within the importer budget", label);
+    CHECK(out.manifest_bytes > 0 && out.manifest_bytes <= 3584, msg);
+
+    cJSON *m = parse_json_file(p);
+    CHECK(m != NULL, "manifest parses");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 214000, "drift still applied");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m, "clock_drift_usable")), "still usable");
+        v = cJSON_GetObjectItem(m, "start_epoch_ms");
+        CHECK(v && (int64_t)v->valuedouble == 1705356600000LL + 214000, "drifted start");
+        cJSON *d = cJSON_GetObjectItem(m, "somnobridge_drift");
+        out.compact_present = (d != NULL);
+        out.truncated = cJSON_IsTrue(cJSON_GetObjectItem(m, "somnobridge_drift_truncated"));
+        if (d) {
+            cJSON *fl = cJSON_GetObjectItem(cJSON_GetObjectItem(d, "source_of_truth"), "files");
+            if (cJSON_IsArray(fl)) out.files_in_manifest = cJSON_GetArraySize(fl);
+        }
+        cJSON *fr = cJSON_GetObjectItem(m, "somnobridge_drift_file");
+        if (fr && cJSON_IsString(fr)) {
+            snprintf(p, sizeof(p), "%s/%s/%s", SD_STREAMS_DIR, DAY, fr->valuestring);
+            cJSON *cp = parse_json_file(p);
+            out.file_ref = (cp != NULL);
+            if (cp) {
+                cJSON *fl2 = cJSON_GetObjectItem(cJSON_GetObjectItem(cp, "source_of_truth"), "files");
+                if (cJSON_IsArray(fl2)) out.files_in_copy = cJSON_GetArraySize(fl2);
+                cJSON_Delete(cp);
+            }
+        }
+        cJSON_Delete(m);
+    }
+    edf_import_ctx_destroy(c);
+    return out;
+}
+
+static void phase_m(void)
+{
+    /* m1: small sidecar — embedded verbatim, nothing relocated (unchanged) */
+    drift_case_t a = run_sidecar_case("small", 1, 0);
+    CHECK(a.compact_present && !a.truncated && !a.file_ref, "small: verbatim embed");
+    CHECK(a.files_in_manifest == 1, "small: files array kept in the manifest");
+
+    /* m2: ~6.6 KB (a typical large GET_DRIFT record) — compact projection in
+     * the manifest, verbatim copy beside it */
+    a = run_sidecar_case("large", 60, 0);
+    CHECK(a.compact_present && a.truncated, "large: compact projection + truncated flag");
+    CHECK(a.files_in_manifest == -1, "large: bulky files[] kept out of the manifest");
+    CHECK(a.file_ref && a.files_in_copy == 60, "large: verbatim copy relocated intact");
+
+    /* m3: > 64 KiB — projection only, no relocated copy */
+    a = run_sidecar_case("huge", 700, 0);
+    CHECK(a.compact_present && a.truncated && !a.file_ref,
+          "huge: projection only, copy skipped");
+
+    /* m4: a giant scalar defeats even the projection — the embed is dropped,
+     * the session (and its drift fields) survive */
+    a = run_sidecar_case("giant-scalar", 1, 6000);
+    CHECK(!a.compact_present && a.truncated, "giant-scalar: embed dropped, flagged");
+    CHECK(a.file_ref, "giant-scalar: verbatim copy still relocated");
+    printf("phase m OK (%d checks)\n", g_checks);
+}
+
+/* ── phase n: quiescence window (copy still in flight) ─────────────── */
+
+/* Stamp every file under `root` with mtime = now + delta_s. */
+static void touch_tree(const char *root, long delta_s)
+{
+    char cmd[900];
+    snprintf(cmd, sizeof(cmd), "find '%s' -type f -exec touch -d @%ld {} +",
+             root, (long)time(NULL) + delta_s);
+    if (system(cmd) != 0) printf("  warn: touch_tree %s failed\n", root);
+}
+
+static void phase_n(void)
+{
+    char dir[256], p[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    int units;
+
+    /* n1: files modified moments ago → deferred, nothing consumed; once they
+     * have been quiet for the window the same unit imports. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true, 2024, 1, 15);
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 60);
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK, "n1: call ok");
+    CHECK(u.deferred && u.sessions_imported == 0 && u.files_consumed == 0,
+          "n1: fresh files are deferred");
+    snprintf(p, sizeof(p), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(file_exists(p), "n1: sources untouched while deferred");
+    CHECK(edf_import_pending(), "n1: still pending");
+    touch_tree(IMPORT_DIR, -120);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred &&
+          u.sessions_imported == 1, "n1: quiet files import");
+    CHECK(!file_exists(p), "n1: sources consumed after import");
+    edf_import_ctx_destroy(c);
+
+    /* n2: a root copy in flight (Identification.json just written) holds
+     * the whole inbox, aged day files included — sessions need the root's
+     * ident/settings. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    touch_tree(IMPORT_DIR, -120);
+    snprintf(p, sizeof(p), "%s/Identification.json", IMPORT_DIR);
+    FILE *f = fopen(p, "w");
+    fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+          "{\"SerialNumber\":\"22199876543\",\"PlatformIdentifier\":46}}}}", f);
+    fclose(f);                                   /* mtime = now */
+    c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 60);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred && u.root_pass,
+          "n2: fresh root file defers the root pass");
+    snprintf(p, sizeof(p), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(file_exists(p), "n2: day files held back too");
+    touch_tree(IMPORT_DIR, -120);
+    edf_import_unit_t t = drain(c, &units);
+    CHECK(t.sessions_imported == 1, "n2: everything imports once quiet");
+    edf_import_ctx_destroy(c);
+
+    /* n3: a fresh drift sidecar also holds its group */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    touch_tree(IMPORT_DIR, -120);
+    snprintf(p, sizeof(p), "%s/_bridge_drift.json", dir);
+    f = fopen(p, "w");
+    fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"1000\",\"half_ms\":300}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 60);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred,
+          "n3: fresh sidecar defers the group");
+    touch_tree(IMPORT_DIR, -120);
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1, "n3: imports once the sidecar is quiet");
+    edf_import_ctx_destroy(c);
+
+    /* n4: files dated in the future (unset device clock / fast PC clock)
+     * carry no recency information and must not defer forever */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    touch_tree(IMPORT_DIR, 3600);
+    c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 60);
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1, "n4: future-dated files import");
+    edf_import_ctx_destroy(c);
+
+    /* n5: window 0 (explicit "import now") ignores recency */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 0);
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1, "n5: quiesce 0 imports fresh files");
+    edf_import_ctx_destroy(c);
+
+    printf("phase n OK (%d checks)\n", g_checks);
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
@@ -1355,6 +1768,9 @@ int main(void)
     phase_i();
     phase_j();
     phase_k();
+    phase_l();
+    phase_m();
+    phase_n();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);

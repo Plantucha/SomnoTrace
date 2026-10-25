@@ -67,6 +67,7 @@
 #include "edf_gen.h"
 #include "somno_ml.h"
 #include "uploader.h"
+#include "ftp.h"
 #endif
 
 static const char *TAG = "edf_import";
@@ -301,8 +302,12 @@ static esp_err_t imp_edf_open(imp_edf_t *e, const char *path)
     e->n_sigs     = (int)strtol(nsig, NULL, 10);
     long hdr_bytes = strtol(hb, NULL, 10);
 
+    /* EDF+D annotation files (EVE/CSL) declare a data-record duration of 0
+     * on real ResMed cards — every record carries its own time-keeping TAL.
+     * Only waveform/summary files need a positive duration. */
+    bool rdur_ok = e->rdur_s > 0 || (e->rdur_s == 0 && e->is_ann);
     if (e->n_sigs < 1 || e->n_sigs > IMP_MAX_SIGS ||
-        hdr_bytes != 256L * (e->n_sigs + 1) || e->rdur_s <= 0) {
+        hdr_bytes != 256L * (e->n_sigs + 1) || !rdur_ok) {
         fclose(f);
         return ESP_ERR_INVALID_SIZE;
     }
@@ -941,6 +946,21 @@ out:
     return ret;
 }
 
+/* End of the last annotation (onset + duration) relative to the file's own
+ * start, in ms; 0 when the file has none or can't be read. */
+static int64_t imp_ann_span_ms(const char *path, bool csl)
+{
+    imp_ev_list_t L = {0};
+    int64_t end = 0;
+    if (collect_tal(path, &L, csl) == ESP_OK)
+        for (int i = 0; i < L.n; i++) {
+            int64_t t = L.ev[i].onset_ms + L.ev[i].dur_ms;
+            if (t > end) end = t;
+        }
+    free(L.ev);
+    return end;
+}
+
 /* Emit one EventNotification JSON line per event (each well under the
  * 512/640-byte consumer line buffers). */
 static int emit_event_line(FILE *f, const char *data_id, const char *event,
@@ -1015,7 +1035,11 @@ static esp_err_t write_events_snt(const char *dir, const char *id,
         if (!src) continue;
         bool csl = (pass == 1);
         imp_ev_list_t L = {0};
-        if (collect_tal(src->path, &L, csl) == ESP_OK && L.n > 0) {
+        esp_err_t cr = collect_tal(src->path, &L, csl);
+        if (cr != ESP_OK)
+            ESP_LOGW(TAG, "import: %s annotations unreadable (%s) — events skipped",
+                     src->path, esp_err_to_name(cr));
+        if (cr == ESP_OK && L.n > 0) {
             qsort(L.ev, L.n, sizeof(imp_ev_t), imp_event_cmp);
             for (int i = 0; i < L.n && ret == ESP_OK; i++) {
                 const char *name = imp_event_name(L.ev[i].label, csl);
@@ -1401,6 +1425,7 @@ struct edf_import_ctx {
     bool    root_done;
     bool    cleaned;
     bool    sweep_done;
+    int     quiesce_s;      /* defer units modified within this window; 0 = off */
     imp_edf_t *scratch;     /* reusable header buffer */
 };
 
@@ -1421,8 +1446,9 @@ static const char *mode_to_profile(int dig, bool as10)
 }
 
 /* Write summaries/<day>.spool (atomic) for one decoded STR day. */
-static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite)
+static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *wrote)
 {
+    if (wrote) *wrote = false;
     /* Date is days since epoch → noon-day label = that civil date */
     if (d->day_number <= 0) return ESP_ERR_INVALID_ARG;
     int y, mo, dd;
@@ -1460,6 +1486,7 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite)
         }
     }
     free(b.buf);
+    if (ret == ESP_OK && wrote) *wrote = true;
     return ret;
 }
 
@@ -1704,8 +1731,12 @@ static int import_str_edf(const char *path, edf_import_ctx_t *ctx,
         if (!imp_edf_rec_crc_ok(e, rec)) continue;   /* corrupt day → skip */
         decode_str_record(e, rec, d);
         if (d->day_number <= 0) continue;
-        if (write_spool_for_day(d, false) != ESP_OK) continue;
-        written++;
+        bool spool_new = false;
+        if (write_spool_for_day(d, false, &spool_new) != ESP_OK) continue;
+        /* Only a spool this pass created counts: re-importing a card whose
+         * days already exist must not look like new data (the worker would
+         * rebuild and re-offer the newest day for nothing). */
+        if (spool_new) written++;
 
         int y, mo, dd;
         imp_civil_from_days(d->day_number, &y, &mo, &dd);
@@ -2142,6 +2173,101 @@ static esp_err_t pick_session_id(const char *dir, int64_t start_ntp,
     return ESP_ERR_INVALID_SIZE;
 }
 
+/* ── Drift sidecar placement ────────────────────────────────────────────
+ * <id>_session.json is read by pre-existing consumers that silently SKIP a
+ * manifest above a fixed size: session_graph.c and the net_provision.c
+ * "recreate" path at 4096 B (a skipped session vanishes from the web graph
+ * and from recreate), time_sync.c at 8192 B, edf_gen's day rebuild and
+ * session_writer_recover() at 16384 B (the latter then treats the session
+ * as interrupted).  A SomnoBridge GET_DRIFT record can be up to 8 KiB, so
+ * the sidecar is embedded verbatim only while it is small.  Larger ones put
+ * a compact scalar projection in the manifest and keep the verbatim record
+ * next to it as <id>_bridge_drift.json. */
+#define IMP_DRIFT_EMBED_MAX   2048        /* embed verbatim up to this many bytes */
+#define IMP_DRIFT_FILE_MAX    (64 * 1024) /* relocated verbatim copy cap */
+#define IMP_MANIFEST_MAX      3584        /* hard cap, under the 4096 B reader limit */
+
+static bool imp_json_scalar(const cJSON *j)
+{
+    return cJSON_IsNumber(j) || cJSON_IsString(j) || cJSON_IsBool(j) ||
+           cJSON_IsNull(j);
+}
+
+/* Scalar members of the sidecar and of each tier record (one level down);
+ * arrays and deeper objects are dropped. */
+static cJSON *drift_compact(const cJSON *raw)
+{
+    cJSON *out = cJSON_CreateObject();
+    if (!out) return NULL;
+    for (const cJSON *m = raw->child; m; m = m->next) {
+        if (!m->string) continue;
+        if (imp_json_scalar(m)) {
+            cJSON_AddItemToObject(out, m->string, cJSON_Duplicate(m, false));
+        } else if (cJSON_IsObject(m)) {
+            cJSON *o = cJSON_AddObjectToObject(out, m->string);
+            if (!o) continue;
+            for (const cJSON *c = m->child; c; c = c->next)
+                if (c->string && imp_json_scalar(c))
+                    cJSON_AddItemToObject(o, c->string, cJSON_Duplicate(c, false));
+        }
+    }
+    return out;
+}
+
+/* Stage the verbatim sidecar as <id>_bridge_drift.json.part; publish_parts()
+ * renames it with the rest of the session, residue cleanup removes it on
+ * failure. */
+static esp_err_t stage_drift_copy(const char *dir, const char *id, const char *txt)
+{
+    char p[448];
+    snprintf(p, sizeof(p), "%s/%s_bridge_drift.json.part", dir, id);
+    FILE *f = fopen(p, "w");
+    if (!f) return ESP_FAIL;
+    if (fputs(txt, f) < 0 || fputc('\n', f) != '\n') {
+        fclose(f);
+        unlink(p);
+        return ESP_FAIL;
+    }
+    esp_err_t r = imp_flush_close(f, p);
+    if (r != ESP_OK) unlink(p);
+    return r;
+}
+
+/* Add the sidecar to the manifest: verbatim when small, else the compact
+ * projection (+ pointer to the relocated copy when one was staged). */
+static void manifest_add_drift(cJSON *r, const imp_drift_t *d, bool big,
+                               const char *id, bool filed)
+{
+    if (!d->raw) return;
+    if (!big) {
+        cJSON_AddItemToObject(r, "somnobridge_drift", cJSON_Duplicate(d->raw, true));
+        return;
+    }
+    cJSON *c = drift_compact(d->raw);
+    if (c) cJSON_AddItemToObject(r, "somnobridge_drift", c);
+    cJSON_AddBoolToObject(r, "somnobridge_drift_truncated", true);
+    if (filed) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "%s_bridge_drift.json", id);
+        cJSON_AddStringToObject(r, "somnobridge_drift_file", nm);
+    }
+}
+
+/* Last line of defence: even a compact projection can blow the budget (e.g.
+ * a huge scalar string) — drop the embed rather than the session. */
+static void manifest_enforce_cap(cJSON *r)
+{
+    char *txt = cJSON_PrintUnformatted(r);
+    bool over = txt && strlen(txt) + 1 > IMP_MANIFEST_MAX;
+    free(txt);
+    if (!over || !cJSON_GetObjectItem(r, "somnobridge_drift")) return;
+    ESP_LOGW(TAG, "import: manifest over %d B — dropping embedded drift record",
+             IMP_MANIFEST_MAX);
+    cJSON_DeleteItemFromObject(r, "somnobridge_drift");
+    if (!cJSON_GetObjectItem(r, "somnobridge_drift_truncated"))
+        cJSON_AddBoolToObject(r, "somnobridge_drift_truncated", true);
+}
+
 static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
                                 const imp_drift_t *drift)
 {
@@ -2156,17 +2282,30 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
 
     /* Longest member file span ends the session */
     const imp_file_t *memb[] = { cl->brp, cl->pld, cl->sa2, cl->eve, cl->csl };
+    const bool ann_only = !cl->brp && !cl->pld && !cl->sa2;
     for (int i = 0; i < 5; i++) {
         if (!memb[i]) continue;
         imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
         if (e && imp_edf_open(e, memb[i]->path) == ESP_OK) {
-            int64_t fend = e->ts_dev_ms >= 0
-                           ? e->ts_dev_ms + (int64_t)(e->rdur_s * 1000.0) * e->n_records
-                           : memb[i]->ts_dev_ms;
+            int64_t span = (int64_t)(e->rdur_s * 1000.0) * e->n_records;
+            /* Annotation files declare 0 s records, so a mask-less session's
+             * span is its last annotation's end instead.  With waveforms the
+             * waveform files alone define the end. */
+            if (ann_only && e->is_ann) {
+                int64_t a = imp_ann_span_ms(memb[i]->path, i == 4);
+                if (a > span) span = a;
+            }
+            int64_t fend = e->ts_dev_ms >= 0 ? e->ts_dev_ms + span
+                                             : memb[i]->ts_dev_ms;
             if (fend > end_dev) end_dev = fend;
         }
         free(e);
     }
+    /* A mask-less session still needs end > start: the day spool and
+     * SessionModeEntries ignore zero-length windows, and the AS11 itself
+     * records MaskOff = MaskOn for 0-duration sessions. */
+    if (ann_only && end_dev <= anchor_dev)
+        end_dev = anchor_dev + 1000;
     int64_t end_ntp = end_dev + drift->drift_ms;
 
     /* Noon-day stream folder — raw device time, never drifted.  Create the
@@ -2189,6 +2328,7 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
     if (write_import_marker(dir, w->id) != ESP_OK) return ESP_FAIL;
     esp_err_t ret = ESP_FAIL;
     uint32_t n_flow = 0, n_press = 0, n_mm = 0, n_sa2 = 0, n_pld = 0, n_ev = 0;
+    bool drift_big = false, drift_filed = false;
 
     /* ── Waveforms → staged .part ──
      * A source file that opens but carries none of its expected signals
@@ -2277,6 +2417,18 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
                          cl->eve_ts, wav_dev, end_dev, &n_ev) != ESP_OK)
         goto out;
 
+    /* ── Drift sidecar: embed verbatim, or project + relocate (see above) ── */
+    if (drift->raw) {
+        char *dtxt = cJSON_PrintUnformatted(drift->raw);
+        if (dtxt) {
+            size_t dl = strlen(dtxt);
+            drift_big = dl > IMP_DRIFT_EMBED_MAX;
+            if (drift_big && dl <= IMP_DRIFT_FILE_MAX)
+                drift_filed = (stage_drift_copy(dir, w->id, dtxt) == ESP_OK);
+            free(dtxt);
+        }
+    }
+
     /* ── Publish all staged parts, then the manifest (commit point) ── */
     if (publish_parts(dir, w->id) != ESP_OK) goto out;
     {
@@ -2316,9 +2468,8 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
             cJSON_AddStringToObject(r, "source_device_family", w->src_family);
         if (w->src_serial && w->src_serial[0])
             cJSON_AddStringToObject(r, "source_serial", w->src_serial);
-        if (drift->raw)
-            cJSON_AddItemToObject(r, "somnobridge_drift",
-                                  cJSON_Duplicate(drift->raw, true));
+        manifest_add_drift(r, drift, drift_big, w->id, drift_filed);
+        manifest_enforce_cap(r);
         char mp[448];
         snprintf(mp, sizeof(mp), "%s/%s_session.json", dir, w->id);
         esp_err_t wr = write_json_atomic(mp, r);
@@ -3042,10 +3193,24 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
 
 /* ── Public API ─────────────────────────────────────────────────────── */
 
+/* Quiescence window default.  Host tests create fixtures "just now", so the
+ * host default is off; the firmware waits for a copy to go quiet. */
+#ifdef EDF_IMPORT_HOST
+#define IMP_QUIESCE_DEFAULT_S  0
+#else
+#define IMP_QUIESCE_DEFAULT_S  15
+#endif
+
 edf_import_ctx_t *edf_import_ctx_create(void)
 {
     edf_import_ctx_t *c = imp_calloc(1, sizeof(*c));
+    if (c) c->quiesce_s = IMP_QUIESCE_DEFAULT_S;
     return c;
+}
+
+void edf_import_ctx_set_quiesce(edf_import_ctx_t *ctx, int seconds)
+{
+    if (ctx) ctx->quiesce_s = seconds < 0 ? 0 : seconds;
 }
 
 void edf_import_ctx_destroy(edf_import_ctx_t *ctx)
@@ -3160,6 +3325,45 @@ static void final_needs_spool_sweep(void)
     closedir(d);
 }
 
+/* ── Quiescence ─────────────────────────────────────────────────────────
+ * A file modified moments ago may still be mid-copy.  FATFS only refreshes a
+ * file's directory entry (size/mtime) on close/sync, so stat() alone cannot
+ * prove an FTP upload is finished — the worker additionally holds off while
+ * the FTP server is receiving (see edf_import_task); this check covers the
+ * tail after the last close and any other writer.  A file dated in the
+ * future (clock not yet set, or a PC with a fast clock) says nothing about
+ * recency and never defers. */
+static bool imp_recent(const char *path, int quiesce_s)
+{
+    if (quiesce_s <= 0) return false;
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    time_t now = time(NULL);
+    if (st.st_mtime > now + 2) return false;
+    return (now - st.st_mtime) < quiesce_s;
+}
+
+static bool root_files_recent(int quiesce_s)
+{
+    static const char *const paths[] = {
+        IMP_IMPORT_DIR "/STR.edf",
+        IMP_IMPORT_DIR "/Identification.json",
+        IMP_IMPORT_DIR "/Identification.tgt",
+        IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+        if (imp_recent(paths[i], quiesce_s)) return true;
+    return false;
+}
+
+static bool group_recent(const imp_group_t *g, int quiesce_s)
+{
+    if (g->drift_path[0] && imp_recent(g->drift_path, quiesce_s)) return true;
+    for (int i = 0; i < g->n_files; i++)
+        if (imp_recent(g->files[i].path, quiesce_s)) return true;
+    return false;
+}
+
 esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
 {
     if (!ctx || !out) return ESP_ERR_INVALID_ARG;
@@ -3171,15 +3375,33 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
     }
 
     if (!ctx->root_done) {
-        ctx->root_done = true;
-        if (root_files_pending())
+        if (root_files_pending()) {
+            /* Root files come first — sessions use the resolved ident and
+             * settings — so a root copy still in flight holds everything. */
+            if (root_files_recent(ctx->quiesce_s)) {
+                ESP_LOGI(TAG, "import: root files modified within %d s — deferred",
+                         ctx->quiesce_s);
+                out->root_pass = true;
+                out->deferred = true;
+                return ESP_OK;
+            }
+            ctx->root_done = true;
             return process_root_pass(ctx, out);
+        }
+        ctx->root_done = true;
         /* fall through — no root files, look for day groups */
     }
 
     imp_group_t *g = imp_calloc(1, sizeof(imp_group_t));
     if (!g) return ESP_ERR_NO_MEM;
     bool have = next_group(g);
+    if (have && group_recent(g, ctx->quiesce_s)) {
+        ESP_LOGI(TAG, "import: %s modified within %d s — deferred",
+                 g->src_dir, ctx->quiesce_s);
+        out->deferred = true;
+        free(g);
+        return ESP_OK;
+    }
     if (have) {
         process_group(ctx, g, out);
         free(g);
@@ -3203,6 +3425,8 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
 #define IMP_WORKER_STACK   (20 * 1024)   /* PSRAM — cJSON_Parse recursion + inlined converters */
 #define IMP_WORKER_PRIO    4
 #define IMP_SETTLE_MS      15000   /* let SD + FTP quieten before scanning */
+#define IMP_DEFER_POLL_MS  3000    /* re-check cadence while a copy is in flight */
+#define IMP_DEFER_MAX_MS   (30 * 60 * 1000)  /* give up on a copy that never settles */
 
 static volatile bool s_worker_running;
 
@@ -3214,9 +3438,24 @@ static void edf_import_task(void *arg)
     edf_import_ctx_t *ctx = edf_import_ctx_create();
     bool any_imported = false;
     int idle = 0;
+    int defer_ms = 0;
     if (ctx) {
         for (;;) {
             if (!sd_storage_is_ready() || sd_storage_recording_active()) break;
+
+            /* An FTP client writing into IMPORT/ is mid-copy by definition,
+             * and FATFS only refreshes size/mtime on close — so stat() can't
+             * tell.  Wait it out (no lease held), bounded. */
+            if ((ftp_getstate() & 0xFF) == E_FTP_STE_CONTINUE_FILE_RX) {
+                defer_ms += IMP_DEFER_POLL_MS;
+                if (defer_ms > IMP_DEFER_MAX_MS) {
+                    ESP_LOGW(TAG, "import: FTP still receiving after %d min — giving up until next trigger",
+                             IMP_DEFER_MAX_MS / 60000);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(IMP_DEFER_POLL_MS));
+                continue;
+            }
             if (!edf_import_pending()) {
                 /* Empty inbox: still sweep stale residue once (the boot
                  * cleanup normally did this, but the worker can also be
@@ -3241,6 +3480,17 @@ static void edf_import_task(void *arg)
             esp_err_t r = edf_import_process_next(ctx, &u);
             sd_storage_lease_release(SD_LEASE_EXPORT);
 
+            if (r == ESP_OK && u.deferred) {
+                defer_ms += IMP_DEFER_POLL_MS;
+                if (defer_ms > IMP_DEFER_MAX_MS) {
+                    ESP_LOGW(TAG, "import: inbox still changing after %d min — giving up until next trigger",
+                             IMP_DEFER_MAX_MS / 60000);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(IMP_DEFER_POLL_MS));
+                continue;
+            }
+            defer_ms = 0;
             if (r == ESP_ERR_NOT_FOUND) {
                 if (++idle >= 3) break;
                 vTaskDelay(pdMS_TO_TICKS(10000));
@@ -3285,7 +3535,8 @@ static void edf_import_task(void *arg)
      * the reconcile pass is a no-op for days already scored. */
     if (any_imported) somno_ml_reconcile();
 
-    ESP_LOGI(TAG, "import: inbox drained");
+    ESP_LOGI(TAG, "import: inbox drained (worker stack: %u of %u bytes never used)",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)IMP_WORKER_STACK);
     s_worker_running = false;
     vTaskDelete(NULL);
 }
