@@ -181,12 +181,25 @@ static uploader_lease_release_fn_t s_lease_release = NULL;
 
 /* Injected "progress changed" notifier (the app's WebSocket push). */
 static uploader_progress_notify_fn_t s_progress_notify = NULL;
+static uploader_tz_name_fn_t        s_tz_name_fn = NULL;
 
 void uploader_set_lease_fns(uploader_lease_acquire_fn_t acquire,
                             uploader_lease_release_fn_t release)
 {
     s_lease_acquire = acquire;
     s_lease_release = release;
+}
+
+void uploader_set_tz_name_fn(uploader_tz_name_fn_t fn)
+{
+    s_tz_name_fn = fn;
+}
+
+void uploader_tz_name(char *out, size_t n)
+{
+    if (!out || n == 0) return;
+    out[0] = '\0';
+    if (s_tz_name_fn) s_tz_name_fn(out, n);
 }
 
 void uploader_set_progress_notify_fn(uploader_progress_notify_fn_t fn)

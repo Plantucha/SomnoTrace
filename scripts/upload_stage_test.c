@@ -319,7 +319,7 @@ static int phase_a(const char *self)
 
     free(refs);
     int r = 0;
-    static const char *const k_phases[] = { "b", "e", "f", "g" };   /* b runs c and d; g runs h */
+    static const char *const k_phases[] = { "b", "e", "f", "g", "i" };   /* b runs c and d; g runs h */
     for (size_t i = 0; i < sizeof(k_phases) / sizeof(k_phases[0]); i++) {
         int pr = run_phase(self, k_phases[i]);
         if (pr) printf("  FAIL phase %s exited %d\n", k_phases[i], pr);
@@ -805,6 +805,83 @@ static int phase_h(void)
     return g_failures;
 }
 
+/* ── phase i: time-zone hint for backends that want one ────────────────
+ * BreathingRoom derives the local offset from the unit id unless epoch 0 of
+ * the SST sits >5 min from the id's local stamp (after snapping the implied
+ * offset to 15 min).  upload_stage_needs_timezone() mirrors that rule. */
+
+static void write_sst_at(const char *path, int64_t start_ms)
+{
+    uint8_t hdr[64];
+    memset(hdr, 0, sizeof(hdr));
+    wr_u32_le(hdr + 0, 0x31545353u);
+    wr_u16_le(hdr + 4, 1);
+    hdr[6] = 2;
+    strcpy((char *)(hdr + 8), "v4.2.3-test");
+    wr_u32_le(hdr + 36, 1);            /* n_epochs */
+    wr_i64_le(hdr + 40, start_ms);
+    wr_u32_le(hdr + 48, 30);           /* epoch_sec */
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(hdr, 1, sizeof(hdr), f);
+    uint8_t tail[2] = { 1, 200 };      /* one stage + one confidence byte */
+    fwrite(tail, 1, sizeof(tail), f);
+    fclose(f);
+}
+
+static int phase_i(void)
+{
+    /* 2026-10-23 01:44:32 as UTC ms — the same instant the unit ids below
+     * name in local time. */
+    const int64_t base = 1792719872000LL;
+    const char *sst = "/tmp/upload_stage_i.sst";
+    upload_stage_ref_t r;
+
+    memset(&r, 0, sizeof(r));
+    snprintf(r.unit_id, sizeof(r.unit_id), "%s", "as11_20261023_014432");
+    snprintf(r.sst_path, sizeof(r.sst_path), "%s", sst);
+
+    write_sst_at(sst, base);
+    CHECK(!upload_stage_needs_timezone(&r),
+          "as11 id matching epoch 0 needs no zone");
+
+    /* 22 min: the implied offset snaps to 15, leaving 7 min of residual —
+     * beyond the server's 5-minute tolerance. */
+    write_sst_at(sst, base + 22 * 60000LL);
+    CHECK(upload_stage_needs_timezone(&r),
+          "as11 id 22 min away from epoch 0 needs a zone");
+
+    /* 2 min: snaps to 0, well inside the tolerance. */
+    write_sst_at(sst, base + 2 * 60000LL);
+    CHECK(!upload_stage_needs_timezone(&r),
+          "as11 id 2 min away is still derivable");
+
+    snprintf(r.unit_id, sizeof(r.unit_id), "%s", "20261023014432");
+    write_sst_at(sst, base);
+    CHECK(!upload_stage_needs_timezone(&r),
+          "ring id matching epoch 0 needs no zone");
+
+    write_sst_at(sst, base + 2 * 60000LL);
+    CHECK(!upload_stage_needs_timezone(&r),
+          "ring id 2 min away is still derivable");
+
+    write_sst_at(sst, base + 22 * 60000LL);
+    CHECK(upload_stage_needs_timezone(&r),
+          "ring id 22 min away is not derivable (7 min after the snap)");
+
+    snprintf(r.unit_id, sizeof(r.unit_id), "%s", "not-a-timestamp");
+    write_sst_at(sst, base);
+    CHECK(upload_stage_needs_timezone(&r),
+          "an id without local time always needs a zone");
+
+    r.sst_path[0] = '\0';
+    CHECK(!upload_stage_needs_timezone(&r), "no SST path never asks for a zone");
+    CHECK(!upload_stage_needs_timezone(NULL), "NULL ref is safe");
+
+    unlink(sst);
+    return g_failures;
+}
+
 int main(int argc, char **argv)
 {
     const char *phase = argc > 1 ? argv[1] : "a";
@@ -817,6 +894,7 @@ int main(int argc, char **argv)
     else if (!strcmp(phase, "f")) r = phase_f();
     else if (!strcmp(phase, "g")) r = phase_g(argv[0]);
     else if (!strcmp(phase, "h")) r = phase_h();
+    else if (!strcmp(phase, "i")) r = phase_i();
     else r = 1;
 
     if (r) { printf("upload_stage_test: phase %s FAILED (%d)\n", phase, r); return 1; }

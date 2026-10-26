@@ -459,6 +459,7 @@ void app_main(void)
             }
             uploader_init();
             uploader_set_progress_notify_fn(log_stream_request_upload_push);
+            uploader_set_tz_name_fn(time_sync_get_tz_name);
 
             char mdns_name[12];
             netprov_get_mdns_name(mdns_name, sizeof(mdns_name));

@@ -39,6 +39,7 @@ static bool change_directory;
 static int alloc_calls, fail_alloc_call;
 static upload_day_t index_day;
 static char sent_paths[1000][128], sent_names[8][128], remote_id[64];
+static char sent_field[32], sent_value[64];
 static const char *response = "{\"created\":1,\"skipped\":0,\"deferred\":0,\"sessions\":[]}";
 
 static DIR *mock_opendir(const char *path)
@@ -109,6 +110,40 @@ void upload_ox_mark(const upload_ox_ref_t *ref, int slot,
     marks++;
     snprintf(remote_id, sizeof(remote_id), "%s", id);
 }
+/* Stage-unit plumbing the backend now calls.  stage_needs_tz is driven by
+ * the test so the "send timeZone only when the server cannot derive it"
+ * branch is exercised in both directions. */
+static bool stage_needs_tz;
+static int stage_marks;
+bool upload_stage_needs_timezone(const upload_stage_ref_t *ref)
+{
+    (void)ref;
+    return stage_needs_tz;
+}
+void uploader_tz_name(char *out, size_t n)
+{
+    snprintf(out, n, "%s", "Australia/Melbourne");
+}
+bool upload_stage_ref_has_fmt(const upload_stage_ref_t *ref,
+                              upload_stage_fmt_t fmt)
+{
+    (void)ref;
+    return fmt == UPLOAD_STAGE_FMT_SST;
+}
+void upload_stage_sst_filename(const upload_stage_ref_t *ref,
+                               char *out, size_t n)
+{
+    snprintf(out, n, "%s_stages.sst", ref->unit_id);
+}
+void upload_stage_mark(const upload_stage_ref_t *ref, int slot,
+                       upload_unit_status_t state, const char *id)
+{
+    (void)ref; (void)slot;
+    assert(state == UG_OK && id && id[0]);
+    stage_marks++;
+    snprintf(remote_id, sizeof(remote_id), "%s", id);
+}
+
 esp_tls_t *uph_connect(const char *host, int timeout)
 {
     (void)host; (void)timeout;
@@ -123,7 +158,9 @@ int uph_put_files_named(esp_tls_t *tls, const char *host, const char *path,
                         char **body, size_t cap, bool *pc)
 {
     (void)tls; (void)host; (void)path; (void)bearer; (void)accept;
-    (void)field; (void)value; (void)cap;
+    (void)cap;
+    snprintf(sent_field, sizeof(sent_field), "%s", field ? field : "");
+    snprintf(sent_value, sizeof(sent_value), "%s", value ? value : "");
     send_count++;
     sent_n = n;
     assert(n <= 1000);
@@ -152,7 +189,9 @@ static void reset(void)
 {
     open_calls = fail_open_call = read_calls = fail_read_call = 0;
     alloc_calls = fail_alloc_call = 0;
-    warning_count = send_count = sent_n = marks = 0;
+    warning_count = send_count = sent_n = marks = stage_marks = 0;
+    sent_field[0] = sent_value[0] = '\0';
+    stage_needs_tz = false;
     change_directory = false;
     memset(&index_day, 0, sizeof(index_day));
     s_tls = (esp_tls_t *)1;
@@ -308,6 +347,66 @@ int main(void)
     assert(rmdir("SDCARD/DATALOG") == 0);
     assert(rmdir("SDCARD") == 0);
     assert(chdir("/") == 0 && rmdir(root) == 0);
+    /* ── sleep stages (/api/sleep/upload) ─────────────────────────── */
+    {
+        upload_stage_ref_t st = {0};
+        snprintf(st.unit_id, sizeof(st.unit_id), "%s", "as11_20260102_015519");
+        snprintf(st.sst_path, sizeof(st.sst_path), "%s",
+                 "streams/20260101/20260102_015519_stages.sst");
+
+        status = 200;
+        response = "{\"results\":[{\"filename\":\"as11_20260102_015519_stages.sst\","
+                   "\"status\":\"imported\",\"id\":\"stage-id-1\",\"epochs\":42}]}";
+        reset();
+        assert(br_put_stage(&st) == UPLOAD_OK && stage_marks == 1);
+        assert(strcmp(remote_id, "stage-id-1") == 0);
+        assert(sent_n == 1);
+        assert(strcmp(sent_names[0], "as11_20260102_015519_stages.sst") == 0);
+        assert(strcmp(sent_paths[0], "streams/20260101/20260102_015519_stages.sst") == 0);
+        assert(sent_field[0] == '\0' && sent_value[0] == '\0');
+
+        /* The server cannot derive the offset → the zone goes with the file. */
+        response = "{\"results\":[{\"filename\":\"as11_20260102_015519_stages.sst\","
+                   "\"status\":\"replaced\",\"id\":\"stage-id-1\"}]}";
+        reset();
+        stage_needs_tz = true;
+        assert(br_put_stage(&st) == UPLOAD_OK && stage_marks == 1);
+        assert(strcmp(sent_field, "timeZone") == 0);
+        assert(strcmp(sent_value, "Australia/Melbourne") == 0);
+
+        /* Per-file rejection: transient only for a storage error. */
+        response = "{\"results\":[{\"filename\":\"as11_20260102_015519_stages.sst\","
+                   "\"status\":\"rejected\",\"reason\":\"partial scoring run\"}]}";
+        reset();
+        assert(br_put_stage(&st) == UPLOAD_ERR_PERMANENT && stage_marks == 0);
+        response = "{\"results\":[{\"filename\":\"as11_20260102_015519_stages.sst\","
+                   "\"status\":\"rejected\",\"reason\":\"storage error\"}]}";
+        reset();
+        assert(br_put_stage(&st) == UPLOAD_ERR_TRANSIENT && stage_marks == 0);
+
+        /* Premium gate: 402 latches for the rest of the pass. */
+        status = 402;
+        response = "{\"error\":\"Premium required\",\"feature\":\"tracker\"}";
+        reset();
+        assert(br_put_stage(&st) == UPLOAD_ERR_PERMANENT);
+        assert(send_count == 1);
+        reset();
+        s_stage_blocked = true;          /* what the 402 above latched */
+        assert(br_put_stage(&st) == UPLOAD_ERR_PERMANENT && send_count == 0);
+        s_stage_blocked = false;
+
+        /* A dead socket is transient, not permanent; a bare ref is not sent. */
+        status = 200;
+        response = "{\"results\":[{\"filename\":\"as11_20260102_015519_stages.sst\","
+                   "\"status\":\"imported\",\"id\":\"stage-id-1\"}]}";
+        reset();
+        s_tls = NULL;
+        assert(br_put_stage(&st) == UPLOAD_ERR_TRANSIENT);
+        reset();
+        st.sst_path[0] = '\0';
+        assert(br_put_stage(&st) == UPLOAD_ERR_PERMANENT);
+    }
+
     puts("br_backend_test: matching, collection, scan failures, names and result validation passed");
     return 0;
 }

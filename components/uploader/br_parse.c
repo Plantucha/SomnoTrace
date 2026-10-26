@@ -66,6 +66,12 @@ bool br_parse_import(const char *body, br_import_result_t *out)
     return true;
 }
 
+bool br_parse_stage_files(const char *body, br_ox_result_t *out,
+                          const char *const *filenames, int n_files)
+{
+    return br_parse_oximetry_files(body, out, filenames, n_files);
+}
+
 bool br_parse_oximetry_files(const char *body, br_ox_result_t *out,
                               const char *const *filenames, int n_files)
 {

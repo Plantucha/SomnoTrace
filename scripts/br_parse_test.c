@@ -204,6 +204,65 @@ int main(void)
         check(!br_parse_oximetry_files(good, &r, wrong, 2), "ox: unrelated filename rejected");
     }
 
+    /* ── /api/sleep/upload (SomnoStage) responses ───────────────────── */
+
+    /* Live shape: an AS11 unit imported and a ring unit replaced */
+    {
+        const char *names[] = {"as11_20261023_014432_stages.sst",
+                               "20261023014432_stages.sst"};
+        br_ox_result_t r;
+        check(br_parse_stage_files(
+            "{\"results\":["
+            "{\"filename\":\"as11_20261023_014432_stages.sst\",\"status\":\"imported\","
+            "\"id\":\"5d1b4f3e-8a47-4f0e-9c1d-3a6f1b2e7c90\",\"nightDate\":\"2026-10-22\","
+            "\"startedAt\":\"2026-10-23T01:44:32-04:00\",\"epochSec\":30,\"epochs\":842,"
+            "\"sourceType\":\"airsense11\",\"offsetSource\":\"unit\"},"
+            "{\"filename\":\"20261023014432_stages.sst\",\"status\":\"replaced\","
+            "\"id\":\"00000000-0000-4000-8000-000000000002\"}]}",
+            &r, names, 2), "stage: parse imported+replaced");
+        check(r.n_results == 2 && r.n_imported == 2 && r.n_rejected == 0,
+              "stage: imported+replaced counts");
+        check(strcmp(r.first_id, "5d1b4f3e-8a47-4f0e-9c1d-3a6f1b2e7c90") == 0,
+              "stage: first id captured");
+    }
+
+    /* A rejected file carries its reason; the request itself succeeded */
+    {
+        const char *names[] = {"as11_20261023_014432_stages.sst"};
+        br_ox_result_t r;
+        check(br_parse_stage_files(
+            "{\"results\":[{\"filename\":\"as11_20261023_014432_stages.sst\","
+            "\"status\":\"rejected\",\"reason\":\"partial scoring run\"}]}",
+            &r, names, 1), "stage: parse rejection");
+        check(r.n_rejected == 1 && r.n_imported == 0, "stage: rejection counted");
+        check(strcmp(r.first_reason, "partial scoring run") == 0,
+              "stage: rejection reason captured");
+    }
+
+    /* The transient-vs-permanent split keys off this exact reason string */
+    {
+        const char *names[] = {"20261023014432_stages.sst"};
+        br_ox_result_t r;
+        check(br_parse_stage_files(
+            "{\"results\":[{\"filename\":\"20261023014432_stages.sst\","
+            "\"status\":\"rejected\",\"reason\":\"storage error\"}]}",
+            &r, names, 1), "stage: parse storage error");
+        check(strstr(r.first_reason, "storage error") != NULL,
+              "stage: storage error reason captured");
+    }
+
+    /* Filename mismatch and error bodies are not valid stage responses */
+    {
+        const char *names[] = {"20261023014432_stages.sst"};
+        br_ox_result_t r;
+        check(!br_parse_stage_files(
+            "{\"results\":[{\"filename\":\"other_stages.sst\","
+            "\"status\":\"imported\",\"id\":\"x\"}]}", &r, names, 1),
+            "stage: unrelated filename rejected");
+        check(!br_parse_stage_files("{\"error\":\"Invalid timeZone\"}", &r, names, 1),
+              "stage: error body rejected");
+    }
+
     printf("br_parse_test: %d passed, %d failed\n", n_pass, n_fail);
     return n_fail ? 1 : 0;
 }
