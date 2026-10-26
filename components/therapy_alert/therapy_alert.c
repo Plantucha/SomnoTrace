@@ -23,6 +23,7 @@
  */
 
 #include "therapy_alert.h"
+#include "alert_auth.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -46,6 +47,7 @@ static const char *TAG = "therapy_alert";
 #define NVS_NAMESPACE  "alert"
 #define NVS_KEY_CFG    "cfg"
 #define NVS_KEY_LEAK   "leak"
+#define NVS_KEY_AUTH   "auth"   /* ntfy credentials, own blob */
 
 /* ── Injected functions ─────────────────────────────────────────────── */
 static alert_beep_fn_t          s_beep_fn  = NULL;
@@ -98,6 +100,10 @@ static therapy_alert_config_t s_cfg = ALERT_DEFAULTS;
 static therapy_alert_config_t s_cfg_staged = ALERT_DEFAULTS;
 static leak_alert_config_t    s_leak_cfg = LEAK_ALERT_DEFAULTS;
 static leak_alert_config_t    s_leak_cfg_staged = LEAK_ALERT_DEFAULTS;
+/* ntfy credentials live in their own blob (NVS_KEY_AUTH) so the "cfg" blob
+ * stays byte-identical across upgrades and downgrades. */
+static alert_auth_t           s_auth = ALERT_AUTH_DEFAULTS;
+static alert_auth_t           s_auth_staged = ALERT_AUTH_DEFAULTS;
 static bool s_cfg_loaded = false;
 
 static StaticSemaphore_t s_cfg_mtx_buf;
@@ -347,6 +353,67 @@ static esp_err_t do_load_leak(void *arg)
     return err;
 }
 
+static esp_err_t do_save_auth(void *arg)
+{
+    const alert_auth_t *a = (const alert_auth_t *)arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(h, NVS_KEY_AUTH, a, sizeof(*a));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t do_load_auth(void *arg)
+{
+    alert_auth_t *out = arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    size_t required = sizeof(*out);
+    err = nvs_get_blob(h, NVS_KEY_AUTH, out, &required);
+    nvs_close(h);
+    if (err == ESP_OK && (required != sizeof(*out) ||
+                          out->version != ALERT_AUTH_VERSION))
+        err = ESP_ERR_INVALID_VERSION;
+    return err;
+}
+
+/* Snapshot under the config mutex, like cfg_snapshot()/leak handling. */
+static void auth_snapshot(alert_auth_t *out)
+{
+    if (s_cfg_mtx && xSemaphoreTake(s_cfg_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+        *out = s_auth;
+        xSemaphoreGive(s_cfg_mtx);
+    } else {
+        *out = s_auth;
+    }
+}
+
+/* Merge an "ntfy_auth" object into *auth.  An absent/empty "secret" keeps
+ * the stored one (the UI never echoes it back), "clear_secret" wipes it. */
+static void auth_from_json(const cJSON *root, alert_auth_t *auth)
+{
+    const cJSON *j = cJSON_GetObjectItem(root, "ntfy_auth");
+    if (!cJSON_IsObject(j)) return;
+
+    const char *s;
+    int m = alert_auth_mode_from_name(
+        cJSON_GetStringValue(cJSON_GetObjectItem(j, "mode")));
+    if (m >= 0) auth->mode = (uint8_t)m;
+
+    const cJSON *vq = cJSON_GetObjectItem(j, "via_query");
+    if (cJSON_IsBool(vq)) auth->via_query = cJSON_IsTrue(vq);
+
+    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(j, "user"))))
+        strlcpy(auth->user, s, sizeof(auth->user));
+    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(j, "secret"))) && s[0])
+        strlcpy(auth->secret, s, sizeof(auth->secret));
+    if (cJSON_IsTrue(cJSON_GetObjectItem(j, "clear_secret")))
+        auth->secret[0] = '\0';
+}
+
 esp_err_t therapy_alert_load_config(therapy_alert_config_t *cfg)
 {
     if (!cfg) return ESP_ERR_INVALID_ARG;
@@ -413,11 +480,27 @@ esp_err_t therapy_alert_save_config_json(const char *json_str)
         leak_touched = true;
     }
 
+    /* ntfy credentials: own blob, own key.  Validate before anything is
+     * written so a half-filled form cannot persist a broken config. */
+    alert_auth_t auth;
+    auth_snapshot(&auth);
+    auth_from_json(root, &auth);
+    auth.version = ALERT_AUTH_VERSION;
+    if (!alert_auth_valid(&auth)) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "config rejected: incomplete ntfy authentication");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     cJSON_Delete(root);
 
     /* Persist via injected NVS executor (safe from PSRAM-stack httpd). */
     esp_err_t err = s_nvs_exec ? s_nvs_exec(do_save_config, &cfg)
                                : do_save_config(&cfg);
+    if (err == ESP_OK) {
+        err = s_nvs_exec ? s_nvs_exec(do_save_auth, &auth)
+                         : do_save_auth(&auth);
+    }
     if (err == ESP_OK && leak_touched) {
         err = s_nvs_exec ? s_nvs_exec(do_save_leak, &leak)
                          : do_save_leak(&leak);
@@ -429,15 +512,20 @@ esp_err_t therapy_alert_save_config_json(const char *json_str)
         if (s_cfg_mtx && xSemaphoreTake(s_cfg_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
             s_cfg_staged = cfg;
             s_leak_cfg_staged = leak;
+            s_auth_staged = auth;
             xSemaphoreGive(s_cfg_mtx);
         } else {
             s_cfg_staged = cfg;
             s_leak_cfg_staged = leak;
+            s_auth_staged = auth;
         }
         ESP_LOGI(TAG, "config saved: en=%d win=%d-%d d1=%d push=%d buzz=%d "
-                 "leak_en=%d leak_thresh=%d",
+                 "leak_en=%d leak_thresh=%d ntfy_auth=%s%s",
                  cfg.enabled, cfg.win_start, cfg.win_end, cfg.delay1,
-                 cfg.push_en, cfg.buzz_en, leak.enabled, leak.thresh_lpm);
+                 cfg.push_en, cfg.buzz_en, leak.enabled, leak.thresh_lpm,
+                 alert_auth_mode_name(auth.mode),
+                 (auth.mode != ALERT_AUTH_MODE_NONE && auth.via_query)
+                     ? " (in URL)" : "");
         /* Re-evaluate state on the owner task: a schedule change may
          * arm or disarm. */
         post_evt(EVT_CONFIG, 0, 0);
@@ -476,6 +564,16 @@ esp_err_t therapy_alert_get_config_json(char **out_json)
     cJSON_AddBoolToObject(root, "leak_en", leak.enabled);
     cJSON_AddNumberToObject(root, "leak_thresh", leak.thresh_lpm);
 
+    /* ntfy credentials: never echo the secret — the UI only needs to know
+     * whether one is stored. */
+    alert_auth_t auth;
+    auth_snapshot(&auth);
+    cJSON *ja = cJSON_AddObjectToObject(root, "ntfy_auth");
+    cJSON_AddStringToObject(ja, "mode", alert_auth_mode_name(auth.mode));
+    cJSON_AddBoolToObject(ja, "via_query", auth.via_query);
+    cJSON_AddStringToObject(ja, "user", auth.user);
+    cJSON_AddBoolToObject(ja, "has_secret", auth.secret[0] != '\0');
+
     cJSON *st = cJSON_AddObjectToObject(root, "state");
     cJSON_AddStringToObject(st, "alert", therapy_alert_state_str(therapy_alert_get_state()));
     cJSON_AddStringToObject(st, "leak", therapy_alert_leak_state_str(therapy_alert_get_leak_state()));
@@ -492,17 +590,56 @@ esp_err_t therapy_alert_get_config_json(char **out_json)
 
 /* ── ntfy push notification ─────────────────────────────────────────── */
 
+/* Build the request URL (and, when credentials go in the URL, the ?auth=
+ * fragment).  Worst case: srv 64 + '/' + topic 64 + '?' + auth= + percent-
+ * encoded base64 of "Basic user:secret" (~3x expansion) < 640. */
+static esp_err_t build_ntfy_url(const char *srv, const char *topic,
+                                const alert_auth_t *auth,
+                                char *url, size_t url_len,
+                                char *hdr, size_t hdr_len)
+{
+    hdr[0] = '\0';
+    int hl = alert_auth_header(auth, hdr, hdr_len);
+    if (hl < 0) {
+        ESP_LOGW(TAG, "ntfy: incomplete credentials — check the auth settings");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (auth && auth->mode != ALERT_AUTH_MODE_NONE && auth->via_query) {
+        char query[576];
+        if (alert_auth_query(auth, query, sizeof(query)) < 0) {
+            ESP_LOGW(TAG, "ntfy: cannot encode credentials for the URL");
+            return ESP_ERR_INVALID_ARG;
+        }
+        int n = snprintf(url, url_len, "%s/%s?%s", srv, topic, query);
+        if (n < 0 || (size_t)n >= url_len) return ESP_ERR_INVALID_SIZE;
+    } else {
+        int n = snprintf(url, url_len, "%s/%s", srv, topic);
+        if (n < 0 || (size_t)n >= url_len) return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t send_ntfy_push(const char *srv, const char *topic,
                                 const char *title, const char *body,
-                                uint8_t priority)
+                                uint8_t priority, const alert_auth_t *auth)
 {
     if (!srv || !topic || !topic[0]) {
         ESP_LOGW(TAG, "ntfy: topic empty, skipping push");
         return ESP_ERR_INVALID_ARG;
     }
 
-    char url[192];
-    snprintf(url, sizeof(url), "%s/%s", srv, topic);
+    /* Worst case 64 + '/' + 64 + '?' + 5 + 540 + NUL ≈ 676 bytes: heap, not
+     * stack, so the httpd task (which serves the test button) stays lean. */
+    char *url = malloc(704);
+    if (!url) return ESP_ERR_NO_MEM;
+    char auth_hdr[160];
+    esp_err_t uerr = build_ntfy_url(srv, topic, auth, url, 704,
+                                    auth_hdr, sizeof(auth_hdr));
+    if (uerr != ESP_OK) {
+        free(url);
+        return uerr;
+    }
 
     esp_http_client_config_t config = {
         .url = url,
@@ -512,13 +649,18 @@ static esp_err_t send_ntfy_push(const char *srv, const char *topic,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return ESP_FAIL;
+    if (!client) {
+        free(url);
+        return ESP_FAIL;
+    }
 
     char prio_hdr[8];
     snprintf(prio_hdr, sizeof(prio_hdr), "%d", priority);
     esp_http_client_set_header(client, "Title", title);
     esp_http_client_set_header(client, "Priority", prio_hdr);
     esp_http_client_set_header(client, "Tags", "warning");
+    if (auth_hdr[0])
+        esp_http_client_set_header(client, "Authorization", auth_hdr);
 
     esp_http_client_set_post_field(client, body, strlen(body));
 
@@ -526,12 +668,23 @@ static esp_err_t send_ntfy_push(const char *srv, const char *topic,
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
         ESP_LOGI(TAG, "ntfy push: HTTP %d", status);
+        if (status == 401 || status == 403)
+            ESP_LOGW(TAG, "ntfy push: credentials rejected (HTTP %d) — "
+                     "check the server authentication settings", status);
         if (status < 200 || status >= 300) err = ESP_FAIL;
     } else {
-        ESP_LOGW(TAG, "ntfy push failed: %s", esp_err_to_name(err));
+        /* esp_http_client answers a 401 by parsing WWW-Authenticate; with
+         * CONFIG_ESP_HTTP_CLIENT_ENABLE_BASIC_AUTH off that surfaces as
+         * ESP_ERR_NOT_SUPPORTED, so name the real cause for the user. */
+        if (err == ESP_ERR_NOT_SUPPORTED)
+            ESP_LOGW(TAG, "ntfy push: server requires authentication — "
+                     "check the server authentication settings");
+        else
+            ESP_LOGW(TAG, "ntfy push failed: %s", esp_err_to_name(err));
     }
 
     esp_http_client_cleanup(client);
+    free(url);
     return err;
 }
 
@@ -539,6 +692,8 @@ esp_err_t therapy_alert_send_test_push(const char *json_override)
 {
     therapy_alert_config_t cfg;
     cfg_snapshot(&cfg);
+    alert_auth_t auth;
+    auth_snapshot(&auth);          /* stored credentials unless overridden */
 
     if (json_override && json_override[0]) {
         cJSON *root = cJSON_Parse(json_override);
@@ -548,6 +703,7 @@ esp_err_t therapy_alert_send_test_push(const char *json_override)
             if ((j = cJSON_GetObjectItem(root, "ntfy_srv")))   { const char *s = cJSON_GetStringValue(j); if (s) strlcpy(cfg.ntfy_srv, s, sizeof(cfg.ntfy_srv)); }
             if ((j = cJSON_GetObjectItem(root, "ntfy_topic"))) { const char *s = cJSON_GetStringValue(j); if (s) strlcpy(cfg.ntfy_topic, s, sizeof(cfg.ntfy_topic)); }
             if ((j = cJSON_GetObjectItem(root, "ntfy_prio")))  cfg.ntfy_prio = (uint8_t)j->valuedouble;
+            auth_from_json(root, &auth);
             cJSON_Delete(root);
         }
     }
@@ -556,9 +712,13 @@ esp_err_t therapy_alert_send_test_push(const char *json_override)
         ESP_LOGW(TAG, "test push: push disabled or topic empty");
         return ESP_ERR_INVALID_STATE;
     }
+    if (!alert_auth_valid(&auth)) {
+        ESP_LOGW(TAG, "test push: incomplete credentials");
+        return ESP_ERR_INVALID_ARG;
+    }
     return send_ntfy_push(cfg.ntfy_srv, cfg.ntfy_topic,
                           "SomnoTrace test", "Test notification from SomnoTrace",
-                          cfg.ntfy_prio);
+                          cfg.ntfy_prio, &auth);
 }
 
 /* ── Buzzer ─────────────────────────────────────────────────────────── */
@@ -629,9 +789,11 @@ static void alert_routine_task(void *arg)
             snprintf(body, sizeof(body),
                      "High leak rate: %.1f L/min (2-min avg, limit %u)",
                      (double)avg, (unsigned)thresh);
+            alert_auth_t auth;
+            auth_snapshot(&auth);
             esp_err_t err = send_ntfy_push(cfg.ntfy_srv, cfg.ntfy_topic,
                                            "SomnoTrace Alert", body,
-                                           cfg.ntfy_prio);
+                                           cfg.ntfy_prio, &auth);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "leak push failed: %s", esp_err_to_name(err));
             }
@@ -701,9 +863,11 @@ static void alert_routine_task(void *arg)
                  tm.tm_hour, tm.tm_min);
 
         routine_request_state(gen, ALERT_PUSH_SENT);
+        alert_auth_t auth;
+        auth_snapshot(&auth);
         esp_err_t err = send_ntfy_push(cfg.ntfy_srv, cfg.ntfy_topic,
                                        "SomnoTrace Alert", body,
-                                       cfg.ntfy_prio);
+                                       cfg.ntfy_prio, &auth);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "push failed, falling through to buzzer");
         }
@@ -945,10 +1109,12 @@ static void promote_staged_config(void)
     if (s_cfg_mtx && xSemaphoreTake(s_cfg_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
         s_cfg = s_cfg_staged;
         s_leak_cfg = s_leak_cfg_staged;
+        s_auth = s_auth_staged;
         xSemaphoreGive(s_cfg_mtx);
     } else {
         s_cfg = s_cfg_staged;
         s_leak_cfg = s_leak_cfg_staged;
+        s_auth = s_auth_staged;
     }
 }
 
@@ -1212,6 +1378,20 @@ esp_err_t therapy_alert_init(void)
             ESP_LOGI(TAG, "no saved leak config, using defaults (disabled)");
         }
         s_leak_cfg_staged = s_leak_cfg;
+    }
+
+    /* ntfy credentials are a separate blob too — missing means "no auth",
+     * which is exactly the pre-existing behaviour. */
+    {
+        esp_err_t aerr = s_nvs_exec ? s_nvs_exec(do_load_auth, &s_auth)
+                                    : do_load_auth(&s_auth);
+        if (aerr == ESP_OK) {
+            ESP_LOGI(TAG, "ntfy auth loaded: mode=%s via_query=%d",
+                     alert_auth_mode_name(s_auth.mode), (int)s_auth.via_query);
+        } else {
+            s_auth = (alert_auth_t)ALERT_AUTH_DEFAULTS;
+        }
+        s_auth_staged = s_auth;
     }
 
     s_cfg_staged = s_cfg;

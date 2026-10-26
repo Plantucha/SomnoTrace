@@ -298,6 +298,43 @@ The request blocks for up to the backend's probe timeout (about 10 s), and is re
 ```
 `404 Not Found` — unknown backend.
 
+### 4.8 Therapy / leak alert config (`GET|POST /api/alert/config`, `POST /api/alert/test`)
+
+`GET` returns the full alert config. `POST` merges the supplied fields into the
+stored config (absent fields are left unchanged) and returns `{"ok":true}`;
+an incomplete ntfy credential set is rejected with `400` before anything is
+written. `POST /api/alert/test` sends a push using the stored config, or the
+fields supplied in its JSON body — so credentials can be validated before they
+are saved.
+
+```json
+{
+  "enabled": true, "win_start": 1380, "win_end": 360, "delay1": 5,
+  "push_en": true, "buzz_en": true, "delay2": 5,
+  "ntfy_srv": "https://ntfy.sh", "ntfy_topic": "somnotrace-…", "ntfy_prio": 5,
+  "ntfy_auth": { "mode": "basic", "via_query": false, "user": "me", "has_secret": true },
+  "leak_en": true, "leak_thresh": 15,
+  "state": { "alert": "disarmed", "leak": "idle", "leak_roll": null }
+}
+```
+
+`ntfy_auth` (ntfy Pro or a self-hosted server with access control; optional,
+`mode:"none"` by default):
+
+| field | direction | meaning |
+|---|---|---|
+| `mode` | both | `none` \| `basic` (username + password) \| `token` (access token) |
+| `via_query` | both | send the credentials in the URL (`?auth=…`) instead of the `Authorization` header — for proxies that strip the header |
+| `user` | both | username for `basic` |
+| `secret` | **write-only** | password or `tk_…` token. Never returned; `has_secret` reports whether one is stored. An absent/empty value keeps the stored secret, `"clear_secret": true` wipes it |
+| `has_secret` | read-only | `true` when a secret is stored |
+
+Credentials are stored in their own NVS blob (namespace `alert`, key `auth`) so
+the pre-existing `cfg` blob layout is untouched — an upgrade or downgrade never
+disturbs existing alert settings. Wire format (verified against ntfy 2.34):
+`Authorization: Basic base64(user:pass)` / `Authorization: Bearer tk_…`, and
+`?auth=` takes the **unpadded** base64 of that header value, percent-encoded.
+
 ---
 
 ## 5. Security / privacy considerations
