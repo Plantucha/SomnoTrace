@@ -2588,6 +2588,18 @@ static bool next_group(imp_group_t *g)
             memcpy(t->key, ent->d_name, 9);   /* name_is_dir8 ⇒ exactly 8 + NUL */
             scan_group_dir(t->src_dir, t);
             if (t->has_part) continue;          /* transfer in flight */
+            if (t->n_files == 0 && !t->drift_path[0]) {
+                /* Nothing importable in here: an already-drained husk, or a
+                 * folder holding only leftovers (AS10 *.crc before the
+                 * sidecar fix, quarantined *.bad, a user's own files).
+                 * Remove it when it is empty and SKIP it — a candidate we
+                 * cannot consume must never abort the scan, or it shadows
+                 * every later day forever (issue #338). */
+                if (!t->is_flat && rmdir(t->src_dir) != 0)
+                    ESP_LOGI(TAG, "import: %s holds no session EDFs — skipped",
+                             t->src_dir);
+                continue;
+            }
             if (!have || strcmp(t->key, g->key) < 0) {
                 memcpy(g, t, sizeof(*g));
                 have = true;
@@ -2654,12 +2666,6 @@ static bool next_group(imp_group_t *g)
         }
     }
 
-    /* A day-dir group with neither files nor a drift sidecar is junk —
-     * drop it so the sweep can finish. */
-    if (have && g->n_files == 0 && !g->drift_path[0]) {
-        if (!g->is_flat) rmdir(g->src_dir);
-        have = false;
-    }
     return have;
 }
 
@@ -3030,8 +3036,27 @@ static esp_err_t synthesize_day_spool(const char *day, bool *out_wrote)
 
 /* ── Per-group processing ───────────────────────────────────────────── */
 
+/* ResMed AS10 cards write a <name>.crc checksum beside every EDF in a
+ * DATALOG day folder (AS11 cards do not).  It covers the file we are about
+ * to consume, so it goes with it — otherwise the day dir can never become
+ * empty and its husk shadows every later day (issue #338). */
+static void delete_sidecar_crc(const char *edf_path)
+{
+    char crc[400];
+    size_t n = strlen(edf_path);
+    /* AS10 replaces the extension (<name>.edf → <name>.crc); a few tools
+     * append instead (<name>.edf.crc) — try both. */
+    if (n > 4 && !strcasecmp(edf_path + n - 4, ".edf")) {
+        snprintf(crc, sizeof(crc), "%.*s.crc", (int)(n - 4), edf_path);
+        unlink(crc);
+    }
+    snprintf(crc, sizeof(crc), "%s.crc", edf_path);
+    unlink(crc);                 /* ENOENT is the normal AS11 case */
+}
+
 static void delete_source(const imp_file_t *f)
 {
+    delete_sidecar_crc(f->path);
     if (unlink(f->path) == 0) return;
     ESP_LOGW(TAG, "import: cannot delete %s: %s", f->path, strerror(errno));
 }
@@ -3135,8 +3160,10 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
                 /* imp_rename_replace unlinks a stale <name>.bad first —
                  * without it a repeated failure wedges the source in
                  * IMPORT/ on FATFS (rename-to-existing fails). */
-                if (imp_rename_replace(srcs[s]->path, bad) == 0)
+                if (imp_rename_replace(srcs[s]->path, bad) == 0) {
+                    delete_sidecar_crc(srcs[s]->path);
                     u->files_rejected++;
+                }
             }
         }
     }
@@ -3418,6 +3445,13 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
         ctx->sweep_done = true;
         final_needs_spool_sweep();
     }
+    /* EDFs are visible to the cheap pending check but no group could be
+     * built from them — say so rather than reporting a clean empty inbox
+     * (that silence is what made #338 hard to diagnose). */
+    if (dir_has_pending(IMP_IMPORT_DIR, 2))
+        ESP_LOGW(TAG, "import: EDFs remain in %s but no importable day group "
+                 "was found (unsupported names or a folder with no session?)",
+                 IMP_IMPORT_DIR);
     return ESP_ERR_NOT_FOUND;
 }
 

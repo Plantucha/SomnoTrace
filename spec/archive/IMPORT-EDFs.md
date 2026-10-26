@@ -139,6 +139,8 @@ Imported EDFs in `/somnotrace/IMPORT/` are transient staging inputs and are dele
    - Once all staged day folders in the batch are processed and `IMPORT/STR.edf`, `IMPORT/Identification.*`, and `IMPORT/SETTINGS/*` have been ingested into `.somnotrace/sessions/summaries/` and `device_metadata.json`, those root staging files are unlinked as well, leaving `/somnotrace/IMPORT/` clean.
 3. **Corrupt / Unparseable Files:**
    - If a file in `/somnotrace/IMPORT/` fails EDF header validation or has a truncated record body, it is **not** silently converted into corrupt `.snt` data; `edf_import` logs a clear error, records the failure in `/api/import/status`, and moves/renames the bad file to `<name>.bad` (or deletes it if 0 bytes) so it does not loop forever.
+   - **AS10 `.crc` sidecars.** Every EDF in an AS10 `DATALOG/<day>/` folder has a sibling checksum file named `<name>.crc` (extension replaced, not appended). The importer consumes it together with the EDF it covers — on success and on `.bad` quarantine — otherwise the day folder can never become empty and its husk shadows every later day (issue #338).
+   - **Junk candidates never abort the scan.** A day folder that holds no importable EDF (a drained husk, only quarantined `*.bad`, AS10 `*.crc` from an older build, or a user's own files) is skipped; it is `rmdir`'d when empty and left alone otherwise, and the scan continues to the next folder. A leftover-only folder with the lowest date must never stop later days from importing.
 
 ---
 

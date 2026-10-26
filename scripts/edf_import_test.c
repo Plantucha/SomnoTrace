@@ -50,6 +50,9 @@
  *   phase n  quiescence window: files modified moments ago (group, root,
  *            drift sidecar) defer instead of importing; future-dated files
  *            and window 0 never defer
+ *   phase o  AS10 *.crc sidecars consumed with their EDF; a leftover-only
+ *            or quarantined day folder is skipped, never aborting the scan
+ *            for later days (issue #338)
  *
  * Fixtures are synthetic — no patient data. */
 
@@ -61,6 +64,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1750,6 +1754,95 @@ static void phase_n(void)
     printf("phase n OK (%d checks)\n", g_checks);
 }
 
+/* ── phase o: AS10 *.crc sidecars + junk husks must not wedge the scan ── */
+
+/* AS10 cards keep a <name>.crc beside every EDF in a DATALOG day folder. */
+static int crc_siblings(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t nl = strlen(e->d_name);
+        if (nl <= 4 || strcasecmp(e->d_name + nl - 4, ".edf") != 0) continue;
+        char p[700], c[720];
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        /* AS10 replaces the extension: <name>.edf → <name>.crc */
+        snprintf(c, sizeof(c), "%.*s.crc", (int)(strlen(p) - 4), p);
+        FILE *f = fopen(c, "wb");
+        if (f) { fputs("0000\n", f); fclose(f); n++; }
+    }
+    closedir(d);
+    return n;
+}
+
+static void phase_o(void)
+{
+    char dir[256], p[720];
+    int units;
+
+    /* o1: AS10 day folders carry a .crc beside every EDF.  Importing the
+     * first day must consume them, remove the husk, and reach the SECOND
+     * day in the same drain — issue #338: the husk used to shadow every
+     * later day, so each reboot imported exactly one folder. */
+    fresh_tree();
+    snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true, 2024, 1, 15);
+    CHECK(crc_siblings(dir) == 5, "o1: 5 .crc siblings written");
+    snprintf(dir, sizeof(dir), "%s/20240116", IMPORT_DIR);
+    build_session_dir(dir, "20240116_221007", "20240116_221000", true, 2024, 1, 16);
+    CHECK(crc_siblings(dir) == 5, "o1: second day's .crc siblings written");
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t t = drain(c, &units);
+    CHECK(units == 2 && t.sessions_imported == 2,
+          "o1: both day folders import in one drain");
+    char h1[300], h2[300];
+    snprintf(h1, sizeof(h1), "%s/20240115", IMPORT_DIR);
+    snprintf(h2, sizeof(h2), "%s/20240116", IMPORT_DIR);
+    CHECK(!file_exists(h1) && !file_exists(h2),
+          "o1: husks removed (.crc consumed with their EDF)");
+    CHECK(!edf_import_pending(), "o1: inbox empty afterwards");
+    edf_import_ctx_destroy(c);
+
+    /* o2: a leftover-only folder with the LOWEST key is skipped, not an
+     * abort of the whole scan */
+    fresh_tree();
+    snprintf(p, sizeof(p), "%s/20240114", IMPORT_DIR);
+    mkpath(p);
+    snprintf(p, sizeof(p), "%s/20240114/notes.txt", IMPORT_DIR);
+    FILE *f = fopen(p, "w");
+    if (f) { fputs("keep me\n", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1, "o2: day after a leftover-only folder imports");
+    char notes[320];
+    snprintf(notes, sizeof(notes), "%s/20240114/notes.txt", IMPORT_DIR);
+    CHECK(file_exists(notes), "o2: the user's own file is left alone");
+    edf_import_ctx_destroy(c);
+
+    /* o3: a corrupt EDF is quarantined *.bad and must not pin the inbox */
+    fresh_tree();
+    snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    snprintf(p, sizeof(p), "%s/20240115_221007_BRP.edf", dir);
+    f = fopen(p, "wb");
+    if (f) { fputs("garbage", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/20240116", IMPORT_DIR);
+    build_session_dir(dir, "20240116_221007", "20240116_221000", false, 2024, 1, 16);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.files_rejected >= 1, "o3: corrupt EDF quarantined");
+    CHECK(t.sessions_imported == 1, "o3: the healthy day still imports");
+    snprintf(h2, sizeof(h2), "%s/20240116", IMPORT_DIR);
+    CHECK(!file_exists(h2), "o3: healthy day's husk removed");
+    edf_import_ctx_destroy(c);
+
+    printf("phase o OK (%d checks)\n", g_checks);
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
@@ -1771,6 +1864,7 @@ int main(void)
     phase_l();
     phase_m();
     phase_n();
+    phase_o();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
