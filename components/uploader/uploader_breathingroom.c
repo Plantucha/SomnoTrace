@@ -40,6 +40,14 @@
  *                              re-sending a day is a no-op. 402 feature
  *                              tracker on free accounts (Premium only).
  *   DELETE /api/oximetry/{id}  owner-only; ids returned by the upload.
+ *   POST /api/sleep/upload     same `files` layout, one `<unit_id>_stages.sst`
+ *                              per file (unit id = ring recording id or
+ *                              as11_<session start>), optional `timeZone`
+ *                              text part. 200 {"results":[…]} imported |
+ *                              replaced | rejected (+reason). A known unit id
+ *                              answers `replaced` with the same id, so a
+ *                              re-send is safe. 402 feature tracker on free
+ *                              accounts (Premium only), 256 KB per file.
  *
  * Auth is a static "slp_…" bearer PAT (Settings → Security → Access
  * tokens). Read-only tokens answer 403 token_read_only; bad ones 401.
@@ -80,6 +88,7 @@ static const char *TAG = "upload_br";
 #define BR_HOST          "breathingroom.io"
 #define BR_IMPORTS_PATH  "/api/imports/upload"
 #define BR_OX_PATH       "/api/oximetry/upload"
+#define BR_SLEEP_PATH    "/api/sleep/upload"
 #define BR_ACCEPT        "application/json"
 
 #define BR_TIMEOUT_MS        30000
@@ -95,6 +104,7 @@ static esp_tls_t *s_tls;
 static char s_key[80];            /* bearer PAT, loaded at session_begin */
 static bool s_peer_close;
 static bool s_ox_blocked;         /* 402 seen this pass — Premium gate   */
+static bool s_stage_blocked;      /* 402 on the sleep route — Premium    */
 
 /* HTTP status → scheduler semantics:
  *   401/403  bad/revoked or read-only token — permanent, surface it
@@ -128,6 +138,7 @@ static upload_result_t br_session_begin(void)
     snprintf(s_key, sizeof(s_key), "%s", cfg.br_key);
     s_peer_close = false;
     s_ox_blocked = false;
+    s_stage_blocked = false;
 
     /* Validate write access up front with a zero-file probe on the CPAP
      * route: 400 "No files provided" means the token authenticated and may
@@ -589,12 +600,88 @@ static bool br_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
     return ok;
 }
 
+/* SomnoStage sleep stages: one `<unit_id>_stages.sst` per request, sent
+ * byte-for-byte.  The file carries UTC only; the server derives the local
+ * offset from the unit id unless epoch 0 sits >5 min away from the id's local
+ * stamp, in which case we send the device's IANA zone (an unknown zone name
+ * is a 400 for the whole request, so it is only sent when it looks valid). */
+static upload_result_t br_put_stage(const upload_stage_ref_t *ref)
+{
+    if (!s_tls || !ref) return UPLOAD_ERR_TRANSIENT;
+    if (!upload_stage_ref_has_fmt(ref, UPLOAD_STAGE_FMT_SST))
+        return UPLOAD_ERR_PERMANENT;
+    if (s_stage_blocked) return UPLOAD_ERR_PERMANENT;
+
+    char filename[UPLOAD_STAGE_ID_LEN + 16];
+    upload_stage_sst_filename(ref, filename, sizeof(filename));
+    if (!filename[0] || !ref->sst_path[0]) return UPLOAD_ERR_PERMANENT;
+
+    const char *tz_field = NULL, *tz_value = NULL;
+    char tz[40];
+    if (upload_stage_needs_timezone(ref)) {
+        uploader_tz_name(tz, sizeof(tz));
+        if (strchr(tz, '/')) {
+            tz_field = "timeZone";
+            tz_value = tz;
+            ESP_LOGI(TAG, "  stages %s: epoch 0 is not derivable from the "
+                     "unit id — sending timeZone %s", ref->unit_id, tz);
+        }
+    }
+
+    const char *paths[1] = { ref->sst_path };
+    const char *names[1] = { filename };
+    char *body = NULL;
+    int status = br_send_files(paths, 1, names, BR_SLEEP_PATH,
+                               tz_field, tz_value, &body);
+    if (status == 402) {
+        s_stage_blocked = true;
+        ESP_LOGW(TAG, "sleep stages need a BreathingRoom Premium account "
+                      "(402) — skipping stage uploads for this pass");
+        free(body);
+        return UPLOAD_ERR_PERMANENT;
+    }
+    upload_result_t r = br_map_status(status);
+    if (r == UPLOAD_OK) {
+        br_ox_result_t res;
+        if (!body || !br_parse_stage_files(body, &res, names, 1) ||
+            res.n_results != 1) {
+            ESP_LOGW(TAG, "  stages %s: unparseable response", ref->unit_id);
+            free(body);
+            return UPLOAD_ERR_TRANSIENT;
+        }
+        if (res.n_rejected > 0) {
+            ESP_LOGW(TAG, "  stages %s rejected: %s", ref->unit_id,
+                     res.first_reason[0] ? res.first_reason : "?");
+            free(body);
+            /* Only a storage error is worth retrying; every other reason is
+             * permanent for that file (bad name, unsupported version, out of
+             * range, partial run, unknown source type, …). */
+            if (res.first_reason[0] && strstr(res.first_reason, "storage error"))
+                return UPLOAD_ERR_TRANSIENT;
+            return UPLOAD_ERR_PERMANENT;
+        }
+        ESP_LOGI(TAG, "  stages %s: uploaded (id %s)", ref->unit_id,
+                 res.first_id[0] ? res.first_id : "-");
+        if (res.first_id[0]) {
+            /* Scheduler marks this unit right after we return; it passes
+             * NULL remote_id, which leaves the id stored here intact. */
+            upload_stage_mark(ref, upload_index_backend_slot("breathingroom"),
+                              UG_OK, res.first_id);
+        }
+        free(body);
+        return UPLOAD_OK;
+    }
+    if (body) ESP_LOGW(TAG, "  stages HTTP %d: %.200s", status, body);
+    free(body);
+    return r;
+}
+
 const upload_backend_t breathingroom_backend = {
     .id = "breathingroom",
     .label = "BreathingRoom",
     .bundle_only_ok = true,    /* settings-only upload is meaningful */
     .supports_ox = true,
-    .supports_stage = false,   /* SST stage support pending; units stay pending until enabled */
+    .supports_stage = true,
     .stage_fmt = UPLOAD_STAGE_FMT_SST,
     .is_configured = br_is_configured,
     .session_begin = br_session_begin,
@@ -603,6 +690,9 @@ const upload_backend_t breathingroom_backend = {
     .ox_day_begin = NULL,
     .put_oximetry = br_put_oximetry,
     .ox_day_end = NULL,
+    .stage_day_begin = NULL,    /* one request per unit — no day scope */
+    .put_stage = br_put_stage,
+    .stage_day_end = NULL,
     .put_bundle = br_put_bundle,
     .day_end = NULL,
     .session_end = br_session_end,

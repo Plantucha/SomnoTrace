@@ -2833,13 +2833,22 @@ void session_writer_recover(void)
             const char *flow_suffix = strstr(day_ent->d_name, "_flow.snt");
             const char *brp_suffix  = strstr(day_ent->d_name, "_brp.snt");
             const char *suffix = flow_suffix ? flow_suffix : brp_suffix;
-            if (!suffix) continue;
+            if (!suffix || strcmp(suffix, flow_suffix ? "_flow.snt" : "_brp.snt") != 0)
+                continue;
             bool is_v2 = (flow_suffix != NULL);
 
             size_t prefix_len = suffix - day_ent->d_name;
             if (prefix_len >= sizeof(ctx->prefix)) continue;
             memcpy(ctx->prefix, day_ent->d_name, prefix_len);
             ctx->prefix[prefix_len] = '\0';
+
+            /* An unfinished EDF import carries a .importing marker and will
+             * be cleaned + re-imported from IMPORT/ by edf_import — never
+             * fabricate a live "interrupted" manifest for it. */
+            snprintf(ctx->tmp_path, sizeof(ctx->tmp_path), "%s/%s_session.json.importing",
+                     ctx->day_path, ctx->prefix);
+            struct stat imp_st;
+            if (stat(ctx->tmp_path, &imp_st) == 0) continue;
 
             /* Leftover temp manifest from a crash mid-rename. */
             snprintf(ctx->tmp_path, sizeof(ctx->tmp_path), "%s/%s_session.json.tmp",

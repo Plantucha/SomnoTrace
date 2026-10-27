@@ -157,6 +157,8 @@ run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_
 run_test upload_park_test -I"$UPLOADER_DIR" scripts/upload_park_test.c
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test leak_roll_test     -I"$SHIM" -I"$MAIN_DIR" scripts/leak_roll_test.c "$MAIN_DIR/leak_roll.c"
+# ntfy credential encoding: Basic/Bearer headers + the ?auth= query form
+run_test alert_auth_test     -I"$SHIM" -Icomponents/therapy_alert scripts/alert_auth_test.c components/therapy_alert/alert_auth.c
 run_test as11_adv_test       -I"$SHIM" -I"$MAIN_DIR" scripts/as11_adv_test.c "$MAIN_DIR/as11_adv.c"
 run_test update_check_test   -I"$SHIM" -I"$MAIN_DIR" scripts/update_check_test.c "$MAIN_DIR/update_check_core.c"
 run_test http_query_test     -I"$SHIM" -I"$MAIN_DIR" scripts/http_query_test.c "$MAIN_DIR/http_query.c" \
@@ -191,6 +193,8 @@ else
     skip_test br_parse_test "no cJSON"
     skip_test br_backend_test "no cJSON"
     skip_test mqtt_live_contract_test "no cJSON"
+    skip_test edf_import_test "no cJSON"
+    skip_test edf_roundtrip_test "no cJSON"
 fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
@@ -224,6 +228,22 @@ if [ -n "$CJ_INC" ]; then
         "$SOMNO_DIR/somno_stage_csv.c" \
         -Wl,--gc-sections -Wl,--wrap=somno_feat_create -Wl,--wrap=somno_feat_destroy \
         $CJ_SRC $CJ_LIB -lm
+    # EDF→SNT import engine (Phase 1 of IMPORT-EDFs.md): synthetic EDF
+    # fixtures → native streams/manifests/spools.  -DEDF_IMPORT_HOST keeps
+    # the FreeRTOS worker + edf_gen/uploader hooks out; SD_MOUNT_POINT is
+    # redirected to scratch space under /tmp.
+    run_test edf_import_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
+        -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_imp/sd"' \
+        scripts/edf_import_test.c "$MAIN_DIR/edf_import.c" \
+        "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+    # Round trip: a live night exported by edf_gen, staged as an IMPORT/ card
+    # image, imported, and exported again must be byte-identical.  edf_gen's
+    # output is the real-card reference, so this catches layout assumptions
+    # (e.g. EVE/CSL 0.00 s records) that hand-written fixtures cannot.
+    run_test edf_roundtrip_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
+        -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_rt/sd"' \
+        scripts/edf_roundtrip_test.c "$MAIN_DIR/edf_import.c" \
+        "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
 fi
 
 # The mutation harness's TEXTUAL layer has nothing else to catch a mistake in it. Every

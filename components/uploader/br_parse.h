@@ -63,3 +63,9 @@ bool br_parse_import(const char *body, br_import_result_t *out);
 bool br_parse_oximetry(const char *body, br_ox_result_t *out);
 bool br_parse_oximetry_files(const char *body, br_ox_result_t *out,
                               const char *const *filenames, int n_files);
+
+/* POST /api/sleep/upload answers the same {results:[{filename,status,id?,
+ * reason?}]} shape as the oximetry route (plus fields we ignore), so the
+ * stage parser is the oximetry parser under a name that says what it reads. */
+bool br_parse_stage_files(const char *body, br_ox_result_t *out,
+                          const char *const *filenames, int n_files);

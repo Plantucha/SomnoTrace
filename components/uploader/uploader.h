@@ -266,6 +266,24 @@ void uploader_set_lease_fns(uploader_lease_acquire_fn_t acquire,
 typedef void (*uploader_progress_notify_fn_t)(void);
 void uploader_set_progress_notify_fn(uploader_progress_notify_fn_t fn);
 
+/* Device time-zone name provider (IANA, e.g. "Australia/Melbourne"), injected
+ * for the same reason as the other hooks: this component does not depend on
+ * the app.  Backends whose API wants an explicit zone next to a UTC-only file
+ * (BreathingRoom sleep stages) ask for it; "" means unknown and the field is
+ * omitted — an unknown zone name is a hard 400 on that API. */
+typedef void (*uploader_tz_name_fn_t)(char *out, size_t n);
+void uploader_set_tz_name_fn(uploader_tz_name_fn_t fn);
+void uploader_tz_name(char *out, size_t n);
+
+/* Device time-zone name provider (IANA, e.g. "Australia/Melbourne"), injected
+ * for the same reason as the other hooks: this component does not depend on
+ * the app.  Backends whose API wants an explicit zone next to a UTC-only file
+ * (BreathingRoom sleep stages) ask for it; "" means unknown and the field is
+ * omitted — an unknown zone name is a hard 400 on that API. */
+typedef void (*uploader_tz_name_fn_t)(char *out, size_t n);
+void uploader_set_tz_name_fn(uploader_tz_name_fn_t fn);
+void uploader_tz_name(char *out, size_t n);
+
 /* Check if specific backends are configured and enabled. */
 bool uploader_is_smb_configured(void);
 bool uploader_is_sleephq_configured(void);

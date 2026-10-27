@@ -768,7 +768,7 @@ BreathingRoom Upload
 <span id="br-test-status" class="status-msg" style="margin-left:8px;text-align:left"></span>
 </div>
 <div style="margin-top:14px;padding:10px 14px;border-radius:8px;background:rgba(56,189,248,.08);border:1px solid rgba(56,189,248,.25);font-size:.8rem;line-height:1.5;color:var(--text-muted)">
-<div style="margin-bottom:6px"><span style="font-weight:600;color:var(--primary,#38bdf8)">Oximetry requires a Premium account.</span> CPAP session uploads are free at every tier.</div>
+<div style="margin-bottom:6px"><span style="font-weight:600;color:var(--primary,#38bdf8)">Oximetry and sleep-stage uploads require a Premium account.</span> CPAP session uploads are free at every tier.</div>
 <div><span style="font-weight:600">How to get your Access Token:</span> sign in at <a href="https://breathingroom.io" target="_blank" rel="noopener" style="color:var(--primary,#38bdf8);text-decoration:underline">breathingroom.io</a> &rarr; <strong>Settings</strong> &rarr; <strong>Security</strong> &rarr; <strong>Access tokens</strong> &rarr; create a <em>read-write</em> token and paste it above (it starts with <code>slp_</code>).</div>
 </div>
 </div>
@@ -1070,6 +1070,35 @@ Therapy Alerts
 <option value="3">Default (regular)</option>
 <option value="5" selected>Max (urgent)</option>
 </select>
+</div>
+<div class="advanced-section" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--card-border)">
+<details>
+<summary>Advanced — server authentication</summary>
+<p class="card-desc" style="margin:10px 0 12px 0">Only needed for <strong>ntfy Pro</strong> (ntfy.sh) or a self-hosted server with access control. Leave as <em>None</em> for the free public ntfy.sh.</p>
+<div class="form-group">
+<label>Authentication</label>
+<select id="alert-auth-mode" class="form-control" onchange="onAlertAuthModeChange();autoSaveAlert()">
+<option value="none">None</option>
+<option value="basic">Username &amp; password</option>
+<option value="token">Access token</option>
+</select>
+</div>
+<div class="form-group" id="alert-auth-user-group">
+<label>Username</label>
+<input type="text" id="alert-auth-user" class="form-control" placeholder="username" maxlength="31" spellcheck="false" autocapitalize="none" onchange="autoSaveAlert()">
+</div>
+<div class="form-group" id="alert-auth-secret-group">
+<label id="alert-auth-secret-label">Password</label>
+<input type="password" id="alert-auth-secret" class="form-control" placeholder="••••••••" maxlength="63" spellcheck="false" autocapitalize="none" autocomplete="new-password" oninput="this.setAttribute('data-dirty','true')" onchange="autoSaveAlert()">
+</div>
+<div id="alert-auth-query-group">
+<div class="toggle-row">
+<label for="alert-auth-via-query">Send credentials in the URL</label>
+<label class="toggle"><input type="checkbox" id="alert-auth-via-query" onchange="autoSaveAlert()"><span class="toggle-slider"></span></label>
+</div>
+<p class="card-desc" style="margin:-6px 0 12px 0">Instead of the <code>Authorization</code> header. Use only if a proxy in front of your server strips that header.</p>
+</div>
+</details>
 </div>
 </div>
 <div id="alert-push-group" style="margin-top:12px">
@@ -2908,6 +2937,25 @@ function testAlertVolume() {
 }
 
 /* ── Therapy Alert Config ──────────────────────────────────────── */
+/* Show only the fields the chosen ntfy auth mode needs.  The section itself
+ * lives in a collapsed <details> so the common (no-auth) case stays clean. */
+function onAlertAuthModeChange() {
+  var mode = (document.getElementById('alert-auth-mode') || {}).value || 'none';
+  var userG = document.getElementById('alert-auth-user-group');
+  var secG = document.getElementById('alert-auth-secret-group');
+  var qG = document.getElementById('alert-auth-query-group');
+  var label = document.getElementById('alert-auth-secret-label');
+  var secret = document.getElementById('alert-auth-secret');
+  if (userG) userG.style.display = (mode === 'basic') ? '' : 'none';
+  if (secG) secG.style.display = (mode === 'none') ? 'none' : '';
+  if (qG) qG.style.display = (mode === 'none') ? 'none' : '';
+  if (label) label.textContent = (mode === 'token') ? 'Access token' : 'Password';
+  if (secret) {
+    var saved = alertAuthHasSecret ? ' (saved)' : '';
+    secret.placeholder = (mode === 'token') ? ('tk_…' + saved) : ('••••••••' + saved);
+  }
+}
+
 function onAlertModeChange(sel) {
   var mode = sel.value;
   var d2group = document.getElementById('alert-delay2-group');
@@ -2916,6 +2964,33 @@ function onAlertModeChange(sel) {
   if (ntfyGroup) ntfyGroup.style.display = (mode === 'sound') ? 'none' : '';
   var pushGroup = document.getElementById('alert-push-group');
   if (pushGroup) pushGroup.style.display = (mode === 'sound') ? 'none' : '';
+}
+var alertAuthHasSecret = false;
+/* True while the auth form cannot be saved yet (mode picked, secret not typed
+ * and none stored).  The rest of the config still saves — ntfy_auth is simply
+ * left out of the request until the form is complete. */
+function alertAuthIncomplete() {
+  var mode = (document.getElementById('alert-auth-mode') || {}).value || 'none';
+  if (mode === 'none') return false;
+  var user = (document.getElementById('alert-auth-user') || {}).value || '';
+  if (mode === 'basic' && !user) return true;
+  var secret = document.getElementById('alert-auth-secret');
+  var dirty = secret && secret.getAttribute('data-dirty') === 'true';
+  return !dirty && !alertAuthHasSecret;
+}
+/* Credentials are only sent when the user actually typed one: the API keeps
+ * the stored secret for an absent/empty "secret" field (the GET never echoes
+ * it back), so an unrelated settings change cannot wipe it. */
+function alertAuthPayload() {
+  var mode = (document.getElementById('alert-auth-mode') || {}).value || 'none';
+  var body = {
+    mode: mode,
+    via_query: !!(document.getElementById('alert-auth-via-query') || {}).checked,
+    user: (document.getElementById('alert-auth-user') || {}).value || ''
+  };
+  var secret = document.getElementById('alert-auth-secret');
+  if (secret && secret.getAttribute('data-dirty') === 'true') body.secret = secret.value || '';
+  return body;
 }
 var alertSaveTimer = null;
 function autoSaveAlert() {
@@ -2937,11 +3012,19 @@ function autoSaveAlert() {
       leak_en: !!(document.getElementById('alert-leak-en') || {}).checked,
       leak_thresh: parseInt((document.getElementById('alert-leak-thresh') || {}).value || '24', 10)
     };
+    if (!alertAuthIncomplete()) body.ntfy_auth = alertAuthPayload();
     fetch('/api/alert/config', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     }).then(function(r) {
       setStatus('alert-save-status', r.ok ? '✓' : '✗', r.ok);
+      var secret = document.getElementById('alert-auth-secret');
+      if (r.ok && secret && secret.getAttribute('data-dirty') === 'true') {
+        secret.value = '';
+        secret.setAttribute('data-dirty', 'false');
+        alertAuthHasSecret = true;
+        onAlertAuthModeChange();
+      }
     }).catch(function() {
       setStatus('alert-save-status', '✗', false);
     });
@@ -2995,6 +3078,17 @@ function renderAlertConfig(d) {
     else modeSel.value = 'sound';
     onAlertModeChange(modeSel);
   }
+  var auth = d.ntfy_auth || {};
+  alertAuthHasSecret = !!auth.has_secret;
+  setVal('alert-auth-mode', auth.mode || 'none');
+  setChk('alert-auth-via-query', auth.via_query);
+  setVal('alert-auth-user', auth.user || '');
+  var secretEl = document.getElementById('alert-auth-secret');
+  if (secretEl) {
+    secretEl.value = '';
+    secretEl.setAttribute('data-dirty', 'false');
+  }
+  onAlertAuthModeChange();
   setChk('alert-leak-en', d.leak_en);
   var lt = d.leak_thresh || 24;
   if (lt < 15) lt = 15; if (lt > 60) lt = 60;
@@ -3994,6 +4088,33 @@ function calStepMonth(delta, ev) {
   renderCalendar();
 }
 
+/* First day of the week for the browser's locale, as a JS day index
+ * (0=Sun..6=Sat).  Intl.Locale.weekInfo/getWeekInfo() covers modern engines;
+ * the tables below mirror CLDR weekData for older ones (Safari <=16). */
+var calFirstDay = -1;
+function localeFirstDay() {
+  if (calFirstDay >= 0) return calFirstDay;
+  try {
+    var loc = new Intl.Locale(navigator.language || 'en');
+    var wi = (typeof loc.getWeekInfo === 'function') ? loc.getWeekInfo() : loc.weekInfo;
+    if (wi && wi.firstDay >= 1 && wi.firstDay <= 7) {
+      calFirstDay = wi.firstDay % 7;        /* ISO 1=Mon..7=Sun -> JS 0=Sun..6=Sat */
+      return calFirstDay;
+    }
+  } catch (e) { /* old engine: use the region table */ }
+  var tag = String(navigator.language || '').split('-');
+  var reg = tag.length > 1 ? tag[tag.length - 1].toUpperCase() : '';
+  if (/^(AG|AS|BD|BR|BS|BT|BW|BZ|CA|CO|DM|DO|ET|GT|GU|HK|HN|ID|IL|IN|IS|JM|JP|KE|KH|KR|LA|MH|MM|MO|MT|MX|MZ|NI|NP|PA|PE|PH|PK|PR|PT|PY|SA|SG|SV|TH|TT|TW|UM|US|VE|VI|WS|YE|ZA|ZW)$/.test(reg)) calFirstDay = 0;
+  else if (/^(AF|BH|DJ|DZ|EG|IQ|IR|JO|KW|LY|OM|QA|SD|SY)$/.test(reg)) calFirstDay = 6;
+  else if (reg === 'MV') calFirstDay = 5;
+  else if (!reg)
+    /* no region subtag: infer from the language (en/pt/ja/ko default to
+     * Sunday-first regions, ar to Saturday-first) */
+    calFirstDay = /^(en|pt|ja|ko)$/i.test(tag[0]) ? 0 : (/^ar$/i.test(tag[0]) ? 6 : 1);
+  else calFirstDay = 1;
+  return calFirstDay;
+}
+
 function renderCalendar() {
   var el = document.getElementById('dash-calendar');
   if (!el) return;
@@ -4007,11 +4128,15 @@ function renderCalendar() {
     '<div class="dash-cal-title">' + monthName + '</div>' +
     '<button class="dash-cal-nav" onclick="calStepMonth(1,event)">&rsaquo;</button></div>';
   html += '<div class="dash-cal-grid">';
-  var dows = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  for (var i = 0; i < 7; i++) html += '<div class="dash-cal-dow">' + dows[i] + '</div>';
+  var fd = localeFirstDay();
+  /* Localised weekday names in locale order: 2024-01-07 was a Sunday, so
+   * day index k is formatted by new Date(2024, 0, 7 + k). */
+  var dowFmt = new Intl.DateTimeFormat(navigator.language, { weekday: 'short' });
+  for (var i = 0; i < 7; i++)
+    html += '<div class="dash-cal-dow">' + dowFmt.format(new Date(2024, 0, 7 + ((fd + i) % 7))) + '</div>';
   var first = new Date(y, m, 1);
-  /* Monday-based leading blanks */
-  var lead = (first.getDay() + 6) % 7;
+  /* leading blanks before the 1st, relative to the locale's first weekday */
+  var lead = (first.getDay() - fd + 7) % 7;
   for (var b = 0; b < lead; b++) html += '<div></div>';
   var daysInMonth = new Date(y, m + 1, 0).getDate();
   for (var day = 1; day <= daysInMonth; day++) {

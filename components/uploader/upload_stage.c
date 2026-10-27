@@ -532,6 +532,87 @@ static int64_t rd_i64_le(const uint8_t *p)
     return (int64_t)(lo | (hi << 32));
 }
 
+/* ── Unit-id local stamp / server offset derivation ─────────────────── */
+
+/* Days since 1970-01-01 for a proleptic Gregorian date (Hinnant). */
+static int64_t days_from_civil(int y, int m, int d)
+{
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + (int)doe - 719468;
+}
+
+/* The unit id's local wall-clock stamp expressed as "milliseconds as if UTC",
+ * 0 when the id carries no local time.  Ring ids are 14 digits
+ * (YYYYMMDDhhmmss, ring local); AS11 ids are as11_YYYYMMDD_HHMMSS (session
+ * start, device local). */
+static int64_t unit_id_stamp_ms(const char *unit_id)
+{
+    int y, mo, d, h, mi, sec;
+    char date[9], time[7];
+
+    if (!unit_id || !unit_id[0]) return 0;
+
+    if (strncmp(unit_id, "as11_", 5) == 0) {
+        const char *p = unit_id + 5;
+        if (strlen(p) < 15 || p[8] != '_') return 0;
+        memcpy(date, p, 8); date[8] = '\0';
+        memcpy(time, p + 9, 6); time[6] = '\0';
+    } else {
+        if (strlen(unit_id) < 14) return 0;
+        for (int i = 0; i < 14; i++)
+            if (unit_id[i] < '0' || unit_id[i] > '9') return 0;
+        memcpy(date, unit_id, 8); date[8] = '\0';
+        memcpy(time, unit_id + 8, 6); time[6] = '\0';
+    }
+    if (sscanf(date, "%4d%2d%2d", &y, &mo, &d) != 3) return 0;
+    if (sscanf(time, "%2d%2d%2d", &h, &mi, &sec) != 3) return 0;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60)
+        return 0;
+
+    return days_from_civil(y, mo, d) * 86400000LL +
+           (int64_t)h * 3600000LL + (int64_t)mi * 60000LL + (int64_t)sec * 1000LL;
+}
+
+/* Epoch 0 of an SST1 file (UTC ms), 0 when unreadable. */
+static int64_t sst_start_ms(const char *path)
+{
+    if (!path || !path[0]) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t hdr[SST_HEADER_BYTES];
+    size_t n = fread(hdr, 1, sizeof(hdr), f);
+    fclose(f);
+    if (n != sizeof(hdr) || rd_u32_le(hdr + 0) != SST_MAGIC ||
+        rd_u16_le(hdr + 4) != SST_VERSION)
+        return 0;
+    return rd_i64_le(hdr + 40);
+}
+
+bool upload_stage_needs_timezone(const upload_stage_ref_t *ref)
+{
+    if (!ref || !ref->sst_path[0]) return false;
+
+    const int64_t stamp = unit_id_stamp_ms(ref->unit_id);
+    if (stamp <= 0) return true;            /* id carries no local time */
+
+    const int64_t start = sst_start_ms(ref->sst_path);
+    if (start <= 0) return false;           /* filtered by validate_sst_file */
+
+    /* Mirror the server: snap the implied offset to 15 minutes, then require
+     * epoch 0 to land within five minutes of the id's local stamp. */
+    const int64_t step = 15 * 60 * 1000;
+    int64_t off = stamp - start;
+    int64_t snapped = (off >= 0 ? (off + step / 2) / step
+                                : -((-off + step / 2) / step)) * step;
+    int64_t diff = start + snapped - stamp;
+    if (diff < 0) diff = -diff;
+    return diff > 5 * 60 * 1000;
+}
+
 static bool validate_sst_file(const char *path)
 {
     if (!path || !path[0]) return false;

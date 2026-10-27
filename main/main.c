@@ -56,6 +56,7 @@
 #include "nvs_flash.h"
 #include "somno_ml.h"
 #include "oximetry_canonical.h"
+#include "edf_import.h"
 
 
 static const char *TAG = "somnotrace";
@@ -191,6 +192,7 @@ void app_main(void)
             ESP_LOGE(TAG, "session writer init failed; recording unavailable");
             bsp_display_set_notice("Recording OFF");
         }
+        edf_import_cleanup_residue();
         session_writer_recover();
     }
 
@@ -262,6 +264,13 @@ void app_main(void)
      * is accepted when the DHCP ACK arrives and renewal handlers are active.
      * Starts SNTP (which will simply time out or retry if offline). */
     time_sync_init();
+
+    /* 6b. IMPORT inbox scan — historical EDFs dropped under
+     * /somnotrace/IMPORT/ (manual SD/FTP copies; SomnoBridge lands them the
+     * same way).  Runs after time_sync_init() so the NVS timezone is active
+     * before any civil-time EDF headers/filenames are parsed. */
+    if (sd_ret == ESP_OK)
+        edf_import_start_worker();
 
     /* 7. Try to connect to configured Wi-Fi. */
     char ip[16] = "0.0.0.0";
@@ -450,6 +459,7 @@ void app_main(void)
             }
             uploader_init();
             uploader_set_progress_notify_fn(log_stream_request_upload_push);
+            uploader_set_tz_name_fn(time_sync_get_tz_name);
 
             char mdns_name[12];
             netprov_get_mdns_name(mdns_name, sizeof(mdns_name));

@@ -76,6 +76,11 @@ bool      upload_stage_ref_has_fmt(const upload_stage_ref_t *ref,
                                    upload_stage_fmt_t fmt);
 void      upload_stage_sst_filename(const upload_stage_ref_t *ref,
                                     char *out, size_t n);
+/* True when a backend that wants an explicit time zone should send one: the
+ * unit id carries no local time, or epoch 0 of the SST sits more than five
+ * minutes from the id's local stamp (BreathingRoom derives the offset from
+ * that stamp, snapped to 15 minutes).  Pure — host-testable. */
+bool      upload_stage_needs_timezone(const upload_stage_ref_t *ref);
 int       upload_stage_scan(upload_stage_ref_t *out, int max_out);
 int       upload_stage_reconcile(upload_stage_ref_t *out, int max_out,
                                  int max_days);

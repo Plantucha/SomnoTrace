@@ -268,6 +268,46 @@ static cJSON *device_snapshot_fallback(const char *sessions_root,
     return child;
 }
 
+/* Pre-gated (imported) session marker read from <id>_session.json.  Kept
+ * out of line: its 656-byte path buffer would otherwise sit in
+ * edf_gen_generate_ex's frame for the whole export — that function already
+ * has the deepest frame on every export call chain (post-therapy worker,
+ * httpd "rebuild day", importer worker). */
+typedef struct {
+    bool    pre_gated;
+    int64_t wav_off;                    /* waveform_offset_ms, validated */
+    bool    emit_brp, emit_sa2, emit_pld;
+} pre_gate_info_t;
+
+static __attribute__((noinline)) void
+read_pre_gate_info(const char *session_dir, const char *session_id,
+                   pre_gate_info_t *out)
+{
+    out->pre_gated = false;
+    out->wav_off = 0;
+    out->emit_brp = out->emit_sa2 = out->emit_pld = true;
+
+    char manifest_path[656];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/%s_session.json",
+             session_dir, session_id);
+    cJSON *mani = edf_read_json_file(manifest_path);
+    cJSON *jpg = mani ? cJSON_GetObjectItem(mani, "pre_gated") : NULL;
+    out->pre_gated = jpg && cJSON_IsTrue(jpg);
+    if (out->pre_gated) {
+        cJSON *jo = cJSON_GetObjectItem(mani, "waveform_offset_ms");
+        if (jo && cJSON_IsNumber(jo)) out->wav_off = (int64_t)jo->valuedouble;
+        if (out->wav_off < -2000 || out->wav_off > 120000) out->wav_off = 0;
+        cJSON *c;
+        if ((c = cJSON_GetObjectItem(mani, "brp_samples")) &&
+            cJSON_IsNumber(c) && c->valuedouble <= 0) out->emit_brp = false;
+        if ((c = cJSON_GetObjectItem(mani, "sa2_samples")) &&
+            cJSON_IsNumber(c) && c->valuedouble <= 0) out->emit_sa2 = false;
+        if ((c = cJSON_GetObjectItem(mani, "pld_samples")) &&
+            cJSON_IsNumber(c) && c->valuedouble <= 0) out->emit_pld = false;
+    }
+    cJSON_Delete(mani);
+}
+
 esp_err_t edf_gen_generate_ex(const char *out_root,
                               const char *session_dir, const char *session_id,
                               int64_t start_epoch_ms, int64_t end_epoch_ms,
@@ -491,7 +531,34 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     /* True once a real data-gating signal (_ZLE rising or MaskOn) was found.
      * When false the AS11 never began delivering gated flow data. */
     bool therapy_gated = false;
+    /* Per-file wave emission: a pre_gated (imported) session emits a wave
+     * EDF only when its stream actually holds samples — annotation-only
+     * sessions export EVE/CSL alone, matching what the AS11 writes for
+     * mask-less sessions (no 0-record BRP/PLD/SA2). */
+    bool emit_brp = true, emit_sa2 = true, emit_pld = true;
     {
+        /* Imported sessions (edf_import) carry pre-gated waveforms: the
+         * .snt streams already start at MaskOn and end at MaskOff —
+         * waveform_offset_ms after the session's TherapyStart anchor — so
+         * neither _ZLE/MaskOn leading-sample skip nor MaskOff tail
+         * truncation applies. */
+        pre_gate_info_t pg;
+        read_pre_gate_info(session_dir, session_id, &pg);
+        bool pre_gated = pg.pre_gated;
+        if (pre_gated) {
+            maskon_start_ms = start_epoch_ms + pg.wav_off;
+            if (maskon_start_ms >= end_epoch_ms)
+                maskon_start_ms = start_epoch_ms;
+            therapy_gated = true;
+            emit_brp = pg.emit_brp;
+            emit_sa2 = pg.emit_sa2;
+            emit_pld = pg.emit_pld;
+            ESP_LOGI(TAG, "pre_gated: maskon_start=%lld (offset %lld ms, "
+                          "streams already gated — no skip)",
+                     (long long)maskon_start_ms, (long long)pg.wav_off);
+        }
+
+        if (!pre_gated) {
         int64_t zle_ntp = edf_find_zle_edge_time(events_snt_path, 1, clock_drift_ms);
         if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms) {
             maskon_start_ms = zle_ntp;
@@ -557,6 +624,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
          * and the file simply ended wherever the .snt capture stopped. */
         int64_t end_ntp = edf_find_zle_edge_time(events_snt_path, 0, clock_drift_ms);
         const char *end_src = "_ZLE-falling";
+        (void)end_src;   /* host ESP_LOG* are no-ops — string is log-only */
         if (end_ntp <= 0) {
             int64_t maskoff_as11 = edf_find_mask_off_time(events_snt_path);
             if (maskoff_as11 > 0) {
@@ -586,6 +654,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
             ESP_LOGI(TAG, "no _ZLE falling edge or MaskOff in events.snt, "
                           "no end truncation");
         }
+        }   /* !pre_gated */
     }
     /* ── Aborted session with no therapy: emit no per-session files ──
      * The AS11 writes no DATALOG files at all for a session where the mask was
@@ -661,7 +730,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * v2 format: flow.snt + press.snt (separate 1-ch files).
      * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
      * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_brp) {
         char snt_path[300], edf_path[350], press_path[300];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
         snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
@@ -694,7 +763,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     }
 
     /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_sa2) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
@@ -736,7 +805,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
      * limitation and cannot be fixed by firmware changes.
      * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
+    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_pld) {
         char snt_path[300], edf_path[350];
         snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
         snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
@@ -1116,6 +1185,7 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
             cJSON *jv = cJSON_GetObjectItem(j, "clock_drift_valid");
             bool measured = jv && cJSON_IsTrue(jv);
             bool usable = ju ? cJSON_IsTrue(ju) : measured;
+            (void)usable;   /* host ESP_LOG* are no-ops — value is log-only */
             if (!measured) {
                 ESP_LOGW(TAG, "rebuild: %s drift is an estimate (usable=%d)",
                          out->session_id, (int)usable);
