@@ -444,9 +444,13 @@ main{padding:8px}
  * plotting area (every pixel counts on a narrow screen). */
 .dashboard-charts-panel{padding:10px 4px}
 .save-footer{flex-direction:column;align-items:stretch;padding:12px;bottom:8px}
-.logs-container{height:calc(100dvh - 145px);height:calc(100dvh - 145px);min-height:340px}
+/* Keep the log pane a pane on narrow screens: without `flex:0 0 auto` the
+ * base `flex:1` (flex-basis:0%) wins over this height in the column flex
+ * chain, the card grows to the whole log, and the terminal never scrolls —
+ * opening the tab then shows the OLDEST line on a 10,000px page. */
+.logs-container{flex:0 0 auto;height:calc(100dvh - 145px);min-height:340px}
 body.fixed-height{height:auto;overflow:auto}
-body.fixed-height .logs-container{height:calc(100dvh - 145px);min-height:340px}
+body.fixed-height .logs-container{flex:0 0 auto;height:calc(100dvh - 145px);min-height:340px}
 }
 
 /* ── Loading state for settings sections ─────────────────────────── */
@@ -3919,6 +3923,19 @@ function logLineClass(line) {
   return m ? LOG_LEVEL_CLASS[m[1]] : 'log-plain';
 }
 
+/* Put the view at the newest line.  The pane scrolls itself on desktop, but
+ * on narrow layouts the page is the scroller instead (the <=900px block lets
+ * body grow), so follow whichever element can actually scroll. */
+function scrollLogsToEnd() {
+  var term = document.getElementById('log-terminal');
+  if (!term) return;
+  if (term.scrollHeight > term.clientHeight + 1) {
+    term.scrollTop = term.scrollHeight;
+  } else if (document.documentElement.scrollHeight > window.innerHeight + 1) {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+  }
+}
+
 function renderLogTerminal(forceScroll) {
   var term = document.getElementById('log-terminal');
   if (!term) return;
@@ -3932,7 +3949,11 @@ function renderLogTerminal(forceScroll) {
   term.innerHTML = html;
   /* Auto-scroll to bottom unless user has scrolled up deliberately. */
   var atBottom = forceScroll || (term.scrollHeight - term.scrollTop - term.clientHeight) < 80;
-  if (atBottom) term.scrollTop = term.scrollHeight;
+  if (!atBottom) return;
+  scrollLogsToEnd();
+  /* Forced (tab open): the tab may have just become visible and the history
+   * fetch may still be growing the pane — re-apply once the frame settles. */
+  if (forceScroll) requestAnimationFrame(scrollLogsToEnd);
 }
 
 function filterLogs(q) {
